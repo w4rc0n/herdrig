@@ -1,0 +1,5 @@
+{
+  "global": {
+    "ctrl-alt-r": "mod.open:rig-palette"
+  }
+}
