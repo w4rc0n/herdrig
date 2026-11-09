@@ -1,11 +1,10 @@
-# OpenRig
+# Herdrig
 
-A sidebar that turns the `herdr` window into a view onto an OpenRig rig: six collapsible branches of live
-topology, specs, scopes, terminals, needs-you items and system state, where every row opens a full graphical page
-in its own tab. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar always stays put while you
-read.
+Herdrig brings OpenRig into the `herdr` window: a sidebar with six collapsible branches of a rig's live topology,
+specs, scopes, terminals, needs-you items and system state, where every row opens a full graphical page in its own
+tab. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar always stays put while you read.
 
-![OpenRig](preview.png)
+![Herdrig](preview.png)
 
 Before you install it: this mod **reaches OpenRig's local address** (`127.0.0.1:7433` unless that OpenRig uses another
 port) over HTTP and SSE (reads live state and, when you click an action, posts to OpenRig: Decision Card acts, a usage

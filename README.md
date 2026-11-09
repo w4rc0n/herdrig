@@ -1,19 +1,89 @@
-# OpenRig Mod for Herdr
+# Herdrig
+
+**OpenRig Mod for Herdr**
 
 > **EARLY DEVELOPMENT** — This mod is in early development. Contributions are welcome.
 
-A sidebar mod that brings an OpenRig rig into the `herdr` window: six collapsible branches of live topology, specs, scopes, terminals, needs-you items, and system state (`rig`), a graphical Page tab (`rig-view`), a command palette on `ctrl-alt-r` (`rig-palette`), and right-click menus (`rig-menu`).
+![Herdrig](preview.png)
 
-![OpenRig](preview.png)
+Herdrig puts [OpenRig](https://github.com/mvschwarz/openrig) inside the `herdr` window: your rigs, their seats and the
+decisions waiting for you, in a sidebar beside your own tabs. Every row opens a full page in its own tab, and you can
+act from there (answer a request, message a seat, attach to it) without leaving Herdr.
+
+## Features
+
+- **Sidebar tree** with six branches: **Topology** (host, rig, pod, seat, helper), **Specs**, **Scopes**,
+  **Terminals**, **Needs** and **System**, each seat with its status and context usage.
+- **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
+  OpenRig reports.
+- **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
+  questions, or reply in your own words), with quiet hours and modes in **System → People**.
+- **Command palette** on `ctrl-alt-r`.
+- **Right-click menus** on seats (send, queue, pause or resume, change model), Needs requests, specs and slices.
+- **Attach** opens a live seat in its own tab, and Herdr's **Agents** section shows its status.
+- **Works with or without OpenRig running:** when OpenRig is missing, stopped or unhealthy, the sidebar says so in
+  plain words, with the fix (for example **Start OpenRig**). Controls your OpenRig version doesn't support are greyed
+  out, each with its reason.
 
 ## Install
 
-Give [`RECIPE.md`](RECIPE.md) to your `herdr` agent. It walks through checking or setting up OpenRig, copying the four mod folders (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`) into `<appHome>/mods/`, merging `ctrl-alt-r` into `keys.json`, and fitting `{ "mod": "rig" }` into your layout.
+In Herdr, tell your agent:
+
+```
+Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/w4rc0n/herdrig
+```
+
+Or give [`RECIPE.md`](RECIPE.md) to your `herdr` agent. It checks for OpenRig (and installs it with OpenRig's own guide
+only on your yes), copies the four mod folders (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`)
+into `<appHome>/mods/`, merges `ctrl-alt-r` into `keys.json`, and adds `{ "mod": "rig" }` to your layout after telling
+you.
+
+Herdr doesn't review mods: check what your agent runs and which keys it changes.
 
 ## Requirements
 
-- **Herdr** (`herdr-app` + `hc`).
-- **OpenRig** (`rig` CLI and local daemon). Works with your existing OpenRig setup as-is: Decision Card actions and core browsing work on OpenRig `0.7.7+`, optimistic concurrency (`expectedRevision`) and idempotent `operationId` retries use `0.7.9+`, and controls whose CLI flags are absent on older OpenRig versions are disabled in place with their reason rather than failing.
+- **Herdr:** `herdr-app` and `hc`.
+- **OpenRig:** the `rig` CLI and its local daemon, used exactly as you have it set up (its home, port and sign-in).
+  - Decision Cards and browsing: OpenRig `0.7.7` or later.
+  - The concurrency guard (`expectedRevision`, which keeps your draft if a request changed while open) and the
+    `operationId` retry (**Check and finish**): `0.7.9` or later.
+  - On an older OpenRig, the controls it can't support are disabled with their reason; the rest works.
+
+## What it does on your machine
+
+- **Network:** only OpenRig's local address (`127.0.0.1:7433` unless your OpenRig uses another port), over HTTP and SSE.
+  It reads live state, and sends a `POST` only when you click an action:
+  - a Decision Card act;
+  - a usage refresh;
+  - spec validation and library sync, when you save a spec or copy one to the library.
+
+  Nothing leaves the machine.
+- **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**), `tmux` only through OpenRig's own
+  attach command for a seat, `hc` for attaching and the TUI tab, and `node` for the status relay of an attached seat.
+- **Files:** it reads `<appHome>/openrig/config.json` (optional: your OpenRig name), `<appHome>/openrig/state.json`,
+  and the spec and slice files you open in its viewer. It writes `<appHome>/openrig/state.json` and the user spec files
+  you edit and save in its spec editor (only files in OpenRig's spec library). It reads none of OpenRig's own files.
+
+The full list, with every route, is in [`RECIPE.md`](RECIPE.md) under **Built from**.
+
+## Known limitations
+
+- **The Page needs a space open in Herdr.** With no space yet, opening the Page fails and Herdr says "no space yet"; make a space first.
+- **OpenRig and Herdr on one machine.** The mod talks to OpenRig's local address and runs the local `rig`. A Herdr
+  window on another machine than its OpenRig isn't supported.
+- **With upstream OpenRig's own `herdr-app` provider** serving the window, the four mods work with less chrome: no
+  cell-level seat identity, follow countdown or per-view row.
+- **Follow and auto-prune** stay disabled on an OpenRig whose `rig terminal open` has no `--follow`.
+- **Some actions need your OpenRig name.** Sending, queueing, changing a seat's model, and editing quiet hours or
+  modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
+- **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.
+- **The sidebar wants 260 px.** It's cramped between 160 and 260 px, and becomes a rail of rig chips below 160.
+- **The four folders go together.** Copying only some leaves menus and the palette opening nothing. Don't rename them
+  without editing the `MOD_IDS` map in each folder's `rig-lib.js` (see **Watch out** in the recipe).
+
+## Contributing
+
+Issues and pull requests are welcome.
 
 ## License
 
