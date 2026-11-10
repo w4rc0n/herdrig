@@ -762,6 +762,11 @@ export function personDisableReason(action, config) {
   return null;
 }
 
+/** The CLI options the mods pass that take a value: the token after one is its value, never an option of its own. */
+const VALUE_OPTIONS = new Set(["--actor", "--app-home", "--availability", "--body", "--cell", "--cwd", "--daily", "--decision-room",
+  "--destination", "--expected-back", "--expected-plan", "--grid", "--host", "--label", "--name", "--provider", "--prune-after",
+  "--quiet", "--reason", "--replace", "--rig", "--save", "--summary", "--until"]);
+
 /**
  * The command a write runs: the CLI against the mods' daemon and OpenRig home. A seat's identity and
  * database inherited by herdr-app are removed first, so nothing is attributed to a managed seat.
@@ -771,6 +776,7 @@ export function personDisableReason(action, config) {
  * instead they pass `--actor <person>@external` with both `OPENRIG_SESSION_NAME` and `RIGGED_SESSION_NAME` unset by `cliEnv`.
  */
 export function writeCommand(config, args, { env = [] } = {}) {
+  if (!Array.isArray(args)) return null;
   const hasPerson = Boolean(config?.person);
   if (!hasPerson && requiresPersonForWrite(args)) return null;
   const isGatewayHuman = args?.[0] === "gateway" && args?.[1] === "human";
@@ -783,7 +789,11 @@ export function writeCommand(config, args, { env = [] } = {}) {
   const withJson = baseArgs.includes("--json") || NO_JSON.has(baseArgs[0]) ? baseArgs : end < 0 ? [...baseArgs, "--json"] : [...baseArgs.slice(0, end), "--json", ...baseArgs.slice(end)];
   // Pin this machine unless `--host` names another, so a saved remote `host.selected` in config.json never redirects a
   // local write such as Pause, Resume, Send or Fresh.
-  const hostPin = baseArgs.includes("--host") || env.some((e) => e.startsWith("OPENRIG_HOST_SELECTED=")) ? [] : ["OPENRIG_HOST_SELECTED=local"];
+  // Only an option names a host: a `--host` after `--`, or as the value of another option (`--cell --host`), is an
+  // argument, and leaves the pin in place.
+  const optionArgs = end < 0 ? baseArgs : baseArgs.slice(0, end);
+  const namesHost = optionArgs.some((a, i) => a === "--host" && !VALUE_OPTIONS.has(optionArgs[i - 1]));
+  const hostPin = namesHost || env.some((e) => e.startsWith("OPENRIG_HOST_SELECTED=")) ? [] : ["OPENRIG_HOST_SELECTED=local"];
   const personEnv = hasPerson && !isGatewayHuman ? [`OPENRIG_SESSION_NAME=${config.person}`] : [];
   return { command: "env", args: [...cliEnv(config), ...personEnv, ...hostPin, ...env, ...(config?.rig ?? ["rig"]), ...withJson] };
 }
@@ -1310,11 +1320,22 @@ export function filterAllowedModels(models) {
  * - Tier 2 (`codex <-> claude-code`): Handover (`requiresConfirm: true`).
  * - Tier 3 (cross-harness involving `agy`, `copilot`, `omp`, `pi`): Re-import (`requiresConfirm: true`).
  */
+/** One line of plain text: control characters and newlines become spaces. */
+function oneLine(v) {
+  return String(v ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+}
+
+/** A shell-style single-quoted word, for command lines in text an agent reads. */
+function shq(v) {
+  return `'${String(v ?? "").replace(/'/g, "'\\''")}'`;
+}
+
 export function changeModelPlan(target = {}, pick = {}, extra = null) {
-  const rig = target.rig ?? (typeof target.session === "string" && target.session.includes("@") ? target.session.slice(target.session.lastIndexOf("@") + 1) : "rig");
-  const logicalId = target.logicalId ?? (typeof target.session === "string" ? target.session.split("@")[0].replace(/-/g, ".") : "seat");
-  const session = target.session ?? `${logicalId.replace(/\./g, "-")}@${rig}`;
-  const pod = String(target.pod ?? (logicalId.includes(".") ? logicalId.split(".")[0] : "dev")).trim() || "dev";
+  // The names go into text a lead agent reads and runs: one line each, and quoted in every command.
+  const rig = oneLine(target.rig ?? (typeof target.session === "string" && target.session.includes("@") ? target.session.slice(target.session.lastIndexOf("@") + 1) : "rig"));
+  const logicalId = oneLine(target.logicalId ?? (typeof target.session === "string" ? target.session.split("@")[0].replace(/-/g, ".") : "seat"));
+  const session = oneLine(target.session ?? `${logicalId.replace(/\./g, "-")}@${rig}`);
+  const pod = oneLine(String(target.pod ?? (logicalId.includes(".") ? logicalId.split(".")[0] : "dev")).trim() || "dev");
   const isLeadTarget = logicalId === "orch.lead" || session.startsWith("orch-lead@");
   const seats = Array.isArray(extra)
     ? (extra.find((r) => r.name === rig || r.id === rig)?.pods ?? []).flatMap((p) => p.seats ?? [])
@@ -1399,33 +1420,33 @@ export function changeModelPlan(target = {}, pick = {}, extra = null) {
   ].join(" · ");
   const tierShort = tier === 1 ? "Lossless" : tier === 2 ? "Handover" : "Re-import";
   const tierLabel = `Tier ${tier} · ${badge}`;
-  const setCmd = `rig seat set ${logicalId}@${rig} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""}`;
+  const setCmd = `rig seat set ${shq(`${logicalId}@${rig}`)} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""}`;
   const summary = `[model-swap] ${logicalId}: Seat hot-swap (${tierShort}) → ${pickDesc}`;
   const fallbackRecipient = destinationSession ?? `orch-lead@${rig}`;
   const procedureLines = tier === 1
     ? [
-        ...(nextEffort ? [`rig seat set-effort ${session} --effort ${nextEffort}`] : []),
-        ...(nextModel ? [`rig seat set-model ${session} --model ${nextModel}`, `rig send ${session} "/model ${nextModel}"`] : []),
+        ...(nextEffort ? [`rig seat set-effort ${shq(session)} --effort ${nextEffort}`] : []),
+        ...(nextModel ? [`rig seat set-model ${shq(session)} --model ${nextModel}`, `rig send ${shq(session)} "/model ${nextModel}"`] : []),
       ]
     : tier === 2
       ? [
-          `rig seat set-runtime ${session} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""} --reason ${JSON.stringify(reason)}`,
+          `rig seat set-runtime ${shq(session)} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""} --reason ${JSON.stringify(reason)}`,
         ]
       : [
-          `1. Save handover packet: rig transcript ${session} --tail 120 > workspace/handover/${logicalId}-${nextRuntime}.md`,
-          `2. Update rig/rig.yaml member ${logicalId} runtime to ${nextRuntime}${nextModel ? ` (model: ${nextModel})` : ""}`,
-          `3. rig snapshot ${rig}`,
-          `4. rig remove ${rig} ${logicalId} --fallback ${fallbackRecipient}`,
-          `5. rig add ${rig} ${pod} <member-fragment.yaml>`,
-          `6. rig send ${session} "Read handover packet workspace/handover/${logicalId}-${nextRuntime}.md"`,
+          `1. Save handover packet: rig transcript ${shq(session)} --tail 120 > ${shq(`workspace/handover/${logicalId}-${nextRuntime}.md`)}`,
+          `2. Update rig/rig.yaml member ${JSON.stringify(logicalId)} runtime to ${nextRuntime}${nextModel ? ` (model: ${nextModel})` : ""}`,
+          `3. rig snapshot ${shq(rig)}`,
+          `4. rig remove ${shq(rig)} ${shq(logicalId)} --fallback ${shq(fallbackRecipient)}`,
+          `5. rig add ${shq(rig)} ${shq(pod)} <member-fragment.yaml>`,
+          `6. rig send ${shq(session)} ${shq(`Read handover packet workspace/handover/${logicalId}-${nextRuntime}.md`)}`,
         ];
   const cliPreview = procedureLines[0] ?? setCmd;
   const continuity = tier === 1 ? "lossless" : isFreshCross ? "fresh" : "handover";
   const tone = tier === 1 ? "working" : tier === 2 ? "warn" : "blocked";
   const body = [
     `Seat hot-swap request from the Rig mod (D7):`,
-    `- seat: ${logicalId} (${session})`,
-    `- rig: ${rig}`,
+    `- seat: ${JSON.stringify(logicalId)} (${JSON.stringify(session)})`,
+    `- rig: ${JSON.stringify(rig)}`,
     `- from: runtime=${curRuntime}, model=${curModel ?? "default"}, effort=${curEffort ?? "default"}`,
     `- target: runtime=${nextRuntime}, model=${nextModel ?? (isAgy ? "agy-settings" : "default")}, effort=${nextEffort ?? (isAgy ? "agy-settings" : "default")}`,
     `- continuity: Tier ${tier} — ${badge}`,
@@ -1482,14 +1503,26 @@ export function changeModelPlan(target = {}, pick = {}, extra = null) {
   };
 }
 
-/** The CLI behind each menu action (`home` is the app home the herdr-app provider writes to). */
+/** What an action says when `actionArgs` refused what the daemon named (null). */
+export const ACTION_REFUSED = "Refused: OpenRig named a seat, cell or plan this action won't pass on (it must not start with -).";
+
+/** The CLI behind each menu action (`home` is the app home the herdr-app provider writes to); null when a value the
+ *  daemon named can't be passed on safely. */
 export function actionArgs(target, action, text, home) {
   const appHomeArgs = ["--app-home", home];
+  // Options first, then `--`, then what the daemon named (a rig, a view, a terminal): a value such as `--host` stays an
+  // argument and can't become an option. A session must also be a name OpenRig makes, and a value the daemon named that
+  // goes in an option (a cell, an expected plan) mustn't start with `-`.
+  const session = target?.session;
+  if ((action === "send" || action === "queue") && !isValidSessionName(session)) return null;
+  const cell = target?.cellId ?? target?.seat ?? target?.terminal;
+  if (action === "close-cell" && (typeof cell !== "string" || cell === "" || cell.startsWith("-"))) return null;
+  if (action === "open-view" && target?.plan && String(target.plan).startsWith("-")) return null;
   switch (action) {
-    case "send": return ["send", target.session, text];
+    case "send": return ["send", "--", session, text];
     case "queue": {
       const [summary, ...rest] = text.split("\n");
-      return ["queue", "create", "--destination", target.session, "--summary", summary.trim(), "--body", (rest.join("\n").trim() || summary.trim())];
+      return ["queue", "create", "--destination", session, "--summary", summary.trim(), "--body", (rest.join("\n").trim() || summary.trim())];
     }
     case "change-model": {
       const plan = changeModelPlan(target, {
@@ -1499,23 +1532,24 @@ export function actionArgs(target, action, text, home) {
         reason: text || target.reason,
         updateSpec: target.updateSpec,
       });
+      if (!isValidSessionName(plan.destinationSession)) return null;
       return ["queue", "create", "--destination", plan.destinationSession, "--summary", plan.summary, "--body", plan.body];
     }
-    case "open-view": return ["terminal", "open", target.view, "--provider", "herdr-app", ...appHomeArgs, ...(target.plan ? ["--expected-plan", target.plan] : [])];
-    case "open-seat": return ["terminal", "open", `seat:${target.rig}/${target.logicalId}`, "--provider", "herdr-app", ...appHomeArgs];
-    case "keyboard": return ["terminal", "keyboard", target.terminal, ...appHomeArgs];
-    case "snapshot": return ["snapshot", target.rig];
-    case "follow": return ["terminal", "open", target.view, "--provider", "herdr-app", ...appHomeArgs, "--follow"];
-    case "unfollow": return ["terminal", "open", target.view, "--provider", "herdr-app", ...appHomeArgs, "--no-follow"];
-    case "prune": return ["terminal", "open", target.view, "--provider", "herdr-app", ...appHomeArgs, "--follow", "--prune-after", target.prune];
-    case "close-view": return ["terminal", "close", target.viewId, ...appHomeArgs];
-    case "close-cell": return ["terminal", "close", target.viewId, "--cell", target.cellId ?? target.seat ?? target.terminal, ...(home ? appHomeArgs : []), "--json"];
-    case "open-designed-view": return ["terminal", "open", target.view ?? `rig:${target.rig}`, "--provider", "herdr-app", ...(home ? appHomeArgs : []),
+    case "open-view": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, ...(target.plan ? ["--expected-plan", target.plan] : []), "--", target.view];
+    case "open-seat": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--", `seat:${target.rig}/${target.logicalId}`];
+    case "keyboard": return ["terminal", "keyboard", ...appHomeArgs, "--", target.terminal];
+    case "snapshot": return ["snapshot", "--", target.rig];
+    case "follow": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--follow", "--", target.view];
+    case "unfollow": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--no-follow", "--", target.view];
+    case "prune": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--follow", "--prune-after", target.prune, "--", target.view];
+    case "close-view": return ["terminal", "close", ...appHomeArgs, "--", target.viewId];
+    case "close-cell": return ["terminal", "close", "--cell", cell, ...(home ? appHomeArgs : []), "--json", "--", target.viewId];
+    case "open-designed-view": return ["terminal", "open", "--provider", "herdr-app", ...(home ? appHomeArgs : []),
       "--grid", typeof target.grid === "string" ? target.grid : JSON.stringify(exportGrid(target.grid)),
       ...(target.save ? ["--save", target.save] : []), ...(target.name ? ["--name", target.name] : []), ...(target.replace ? ["--replace", target.replace] : []),
-      ...(target.follow ? ["--follow"] : target.noFollow ? ["--no-follow"] : []), "--json"];
-    case "pause": return ["down", target.rig, "--yes"];
-    case "resume": return ["up", target.rig, "--existing"];
+      ...(target.follow ? ["--follow"] : target.noFollow ? ["--no-follow"] : []), "--json", "--", target.view ?? `rig:${target.rig}`];
+    case "pause": return ["down", "--yes", "--", target.rig];
+    case "resume": return ["up", "--existing", "--", target.rig];
     case "fresh": return freshArgs(target.logicalId, target.rig, target.reason ?? "fresh-prime after restore");
     default: return null;
   }
@@ -2577,7 +2611,7 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
   const hasDegradedSource = Array.isArray(sources) && sources.some((s) => s && s.state && s.state !== "available");
 
   const actionable = items.map(needsToastFor).filter(Boolean);
-  const mergedMap = hasDegradedSource ? { ...prevSeen } : {};
+  const mergedMap = Object.assign(Object.create(null), hasDegradedSource ? prevSeen : {});
   for (const c of actionable) mergedMap[c.id] = c.at;
 
   let entries = Object.entries(mergedMap).map(([id, at], idx) => ({ id, at, idx }));
@@ -2586,15 +2620,16 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
       .sort((a, b) => (a.at === b.at ? a.idx - b.idx : a.at < b.at ? -1 : 1))
       .slice(-maxSeen);
   }
-  const nextSeen = {};
+  const nextSeen = Object.create(null);
   for (const e of entries) nextSeen[e.id] = e.at;
 
-  const nextState = { seeded: true, seen: nextSeen };
+  // A plain copy for storage: spreading a null-prototype map makes each id, even `__proto__`, an own key.
+  const nextState = { seeded: true, seen: { ...nextSeen } };
   if (!isSeeded) {
     return { toasts: [], nextState };
   }
   const rawCandidates = actionable.filter((c) => {
-    if (!(c.id in prevSeen)) return true;
+    if (!Object.prototype.hasOwnProperty.call(prevSeen, c.id)) return true;
     const prevAt = prevSeen[c.id];
     return Boolean(c.at && prevAt && c.at > prevAt);
   });
@@ -3350,7 +3385,7 @@ export function withoutFrontmatter(text) {
 
 /** The exact recipe for starting one seat fresh (the CLI's own, `cli/src/fresh-seat-command.ts`). */
 export function freshArgs(logicalId, rig, reason) {
-  return ["seat", "launch", `${logicalId}@${rig}`, "--fresh", "--reason", reason];
+  return ["seat", "launch", "--fresh", "--reason", reason, "--", `${logicalId}@${rig}`];
 }
 
 /** `rig tui` as the configured CLI runs it: the recorded node and entry, pinned to the mods' daemon and
@@ -4326,6 +4361,79 @@ export function unsafeSpecWritePath(sourcePath, allowed = null) {
   return !(p === dir || p.startsWith(`${dir}/`));
 }
 
+/** An absolute path with no `..` segment, without its trailing slashes; otherwise null. */
+function plainAbsolute(p) {
+  return typeof p === "string" && p.startsWith("/") && !p.split("/").includes("..") ? p.replace(/(.)\/+$/, "$1") : null;
+}
+
+/** A path with every symlink resolved, by this machine's `realpath` (a mod has no file system calls); null when it
+ *  can't be resolved, so the caller refuses. */
+async function realPath(execFn, p) {
+  try {
+    const r = await execFn("realpath", ["--", p]);
+    const out = String(r?.stdout ?? "").replace(/\n$/, "");
+    return r?.code === 0 && !out.includes("\n") ? plainAbsolute(out) : null;
+  } catch (_) { return null; }
+}
+
+/**
+ * The spec folders the spec editor may read and write: local facts only, never the daemon's list.
+ * - OpenRig's instance spec library, `<home>/specs` (OpenRig's documented instance layout), where the home is the
+ *   mods' configured `openrigHome`, else `OPENRIG_HOME` in Herdr's own environment, else `$HOME/.openrig`;
+ * - `workspace.specs_root` from this machine's `rig` CLI (`rig config get`, which reads OpenRig's local settings, not
+ *   the daemon).
+ * Each folder is returned with its symlinks resolved; a folder that doesn't resolve is left out.
+ */
+export async function localSpecRoots(config, execFn, homeDir) {
+  let ohome = plainAbsolute(config?.openrigHome || null);
+  if (!ohome) {
+    try {
+      const r = await execFn("printenv", ["OPENRIG_HOME"]);
+      if (r?.code === 0) ohome = plainAbsolute(String(r.stdout ?? "").trim());
+    } catch (_) { /* no printenv: the default home */ }
+  }
+  if (!ohome && plainAbsolute(homeDir)) ohome = `${plainAbsolute(homeDir).replace(/\/$/, "")}/.openrig`;
+  const wanted = ohome ? [`${ohome}/specs`] : [];
+  try {
+    const { command, args } = readCommand(config ?? {}, ["config", "get", "workspace.specs_root", "--json"]);
+    const r = await execFn(command, args);
+    const v = plainAbsolute(JSON.parse(String(r?.stdout ?? "{}"))?.value);
+    if (v) wanted.push(v);
+  } catch (_) { /* no CLI: only the home root */ }
+  const roots = [];
+  for (const w of new Set(wanted)) {
+    const real = await realPath(execFn, w);
+    if (real && real !== "/") roots.push(real);
+  }
+  return [...new Set(roots)];
+}
+
+/** A spec path outside the local spec folders (`localSpecRoots`): not absolute, a `..` segment, not YAML, or under none
+ *  of them. Compared by path segment (`<root>/`), so `/a/specs-evil` isn't inside `/a/specs`. */
+export function outsideSpecRoots(sourcePath, roots) {
+  const p = String(sourcePath ?? "");
+  if (!p.startsWith("/") || p.split(/[\\/]/).includes("..") || !/\.ya?ml$/i.test(p)) return true;
+  return !(Array.isArray(roots) ? roots : []).some((r) => typeof r === "string" && r.startsWith("/") && p.startsWith(`${r}/`));
+}
+
+/** Why the spec editor refused a file, with what to do: no folder resolved at all (no `realpath`, which macOS has from
+ *  13 on, or no spec folder yet), or the file is elsewhere (a home outside the default needs `openrigHome`). */
+export function specFolderRefusal(roots) {
+  if (!Array.isArray(roots) || roots.length === 0) {
+    return "Refused: no spec folder could be resolved on this machine. The spec editor needs `realpath` (macOS 13 or later) and an existing OpenRig spec folder.";
+  }
+  return "Refused: the spec file isn't in this machine's spec folders. If your OpenRig home is somewhere other than the default, set openrigHome in <appHome>/openrig/config.json.";
+}
+
+/** The spec file to read or write, with its symlinks resolved, when it is inside a local spec folder after resolving:
+ *  a link from a spec folder to a file elsewhere is refused. Null means refuse (outside, or it didn't resolve). */
+export async function resolveInSpecRoots(sourcePath, roots, execFn) {
+  const p = String(sourcePath ?? "");
+  if (!p.startsWith("/") || p.split(/[\\/]/).includes("..") || !/\.ya?ml$/i.test(p)) return null;
+  const real = await realPath(execFn, p);
+  return real && !outsideSpecRoots(real, roots) ? real : null;
+}
+
 /** A short hash of a spec's text, to tell which file contents a draft was started from. */
 export function simpleHash(text) {
   let h = 5381;
@@ -5021,159 +5129,89 @@ export function formatOsc7501Sequence({ state = "idle", kind = "", app = "openri
 }
 
 /**
- * Build the `argv` for an interactive single-seat Attach terminal with an OSC 7501 relay.
- * Spawns a lightweight Node wrapper around `seat.tmuxAttachCommand` that:
- * 1. Emits initial `\x1b]7501;state=<state>:app=<runtime>:title=<base64(<logicalId>@<rig>)>\x07` on stdout so Herdr's Agents mod registers the terminal immediately.
- * 2. Polls OpenRig `/api/rigs/<rig>/nodes` (falling back to `/api/rigs/summary` ID resolution or `/api/nodes`) to emit updated OSC 7501 state transitions (`working | blocked | idle | done | clear`).
- * 3. Emits `\x1b]7501;state=clear\x07` when the seat stops or the attached tmux client detaches/exits.
+ * A tmux session name the mod will use anywhere (UI, labels, the relay's argv): OpenRig's own session charset
+ * (`[a-zA-Z0-9-_.@]`, its validateSessionName), tightened to no leading `-` or `@`, not empty, at most 200 chars. tmux
+ * matches `-t` by prefix and glob; this charset has no `*`, `?`, `:` or whitespace, and the relay targets `=<name>`.
+ * The relay (`rig-attach-relay.cjs`) checks the same rule again.
  */
-export function buildAttachRelayArgv(config, seat = {}) {
+export const SESSION_NAME_RE = /^[A-Za-z0-9._][A-Za-z0-9._@-]{0,199}$/;
+export function isValidSessionName(session) {
+  return typeof session === "string" && SESSION_NAME_RE.test(session);
+}
+
+/** Why a session name is refused, in the person's words. */
+export function sessionNameRefusal(session) {
+  return `Refused: "${String(session ?? "").slice(0, 80)}" isn't a tmux session name OpenRig makes (letters, digits, . _ - @, not starting with - or @).`;
+}
+
+/**
+ * The tmux server flags in OpenRig's `tmuxAttachCommand`, parsed into the exact shapes OpenRig writes
+ * (`tmux attach -t <session>`, `tmux -L <name> attach -t <session>`, `tmux -S <path> attach -t <session>`), with the
+ * session equal to the one already checked. Returns `[]`, `["-L", name]` or `["-S", path]`; null for anything else.
+ * Nothing in the string is ever run: only these two checked values reach the relay's argv.
+ */
+export function tmuxServerArgsFrom(tmuxAttachCommand, session) {
+  if (tmuxAttachCommand === undefined || tmuxAttachCommand === null || tmuxAttachCommand === "") return [];
+  const m = /^tmux(?: -L ([A-Za-z0-9._][A-Za-z0-9._-]{0,63})| -S (\/[A-Za-z0-9._\/-]{1,255}))? attach(?:-session)? -t (\S+)$/.exec(String(tmuxAttachCommand));
+  if (!m || m[3] !== session || !isValidSessionName(session)) return null;
+  if (m[1]) return ["-L", m[1]];
+  if (m[2]) return m[2].split("/").includes("..") ? null : ["-S", m[2]];
+  return [];
+}
+
+/** Why `tmuxServerArgsFrom` refused, in the person's words: a socket path with a character it doesn't pass on (a space or
+ *  `@` in a home folder's name) says so; anything else isn't the plain attach OpenRig writes. */
+export function serverArgsRefusal(tmuxAttachCommand, session) {
+  const sock = /^tmux -S (\/.+) attach(?:-session)? -t (\S+)$/.exec(String(tmuxAttachCommand ?? ""));
+  if (sock && sock[2] === session && /[^A-Za-z0-9._\/-]/.test(sock[1]) && !sock[1].split("/").includes("..")) {
+    return "Refused: the tmux socket path in OpenRig's attach command for this seat has a space or a character such as @, which the mod doesn't pass on (only letters, digits, ., _, - and /).";
+  }
+  return "Refused: OpenRig's attach command for this seat isn't the plain tmux attach it writes.";
+}
+
+/** Where a mod folder's relay file is, for `node <path>`: `<appHome>/mods/<modId>/rig-attach-relay.cjs`. */
+export function attachRelayPath(appHomeDir, modId) {
+  const home = String(appHomeDir ?? "");
+  return home.startsWith("/") ? `${home.replace(/\/+$/, "")}/mods/${modId}/rig-attach-relay.cjs` : null;
+}
+
+/**
+ * The argv for an Attach terminal: `[node, <relayPath>, <base64 JSON payload>]`, run by herdr with no shell. The relay
+ * (`rig-attach-relay.cjs`, shipped in each mod folder) starts `tmux [server flags] attach-session -t =<session>` directly
+ * and reports the seat's state as OSC 7501. The payload is data only (no command string): the checked session, the
+ * checked server flags, and what to show. Throws, with the reason to show, on a name or flags it won't use.
+ */
+export function buildAttachRelayArgv(config, seat = {}, relayPath = null) {
   const nodeBin = Array.isArray(config?.rig) && config.rig.length > 0 && /(?:^|\/)node(?:\.exe)?$/i.test(String(config.rig[0]))
     ? config.rig[0]
     : "node";
   const session = String(seat.session ?? seat.canonicalSessionName ?? "");
+  if (!isValidSessionName(session)) throw new Error(sessionNameRefusal(session));
+  const serverArgs = tmuxServerArgsFrom(seat.tmuxAttachCommand, session);
+  if (serverArgs === null) throw new Error(serverArgsRefusal(seat.tmuxAttachCommand, session));
+  if (typeof relayPath !== "string" || !relayPath.startsWith("/") || !relayPath.endsWith("/rig-attach-relay.cjs")) {
+    throw new Error("Attach can't find the mod's relay file (rig-attach-relay.cjs); reinstall the mod.");
+  }
   const logicalId = String(seat.logicalId ?? seat.member ?? (session.includes("@") ? session.split("@")[0].replace(/-/g, ".") : session) ?? "seat");
   const rig = String(seat.rig ?? (session.includes("@") ? session.slice(session.lastIndexOf("@") + 1) : ""));
   const rigId = String(seat.rigId ?? "");
   const runtime = String(seat.runtime ?? "openrig").replace(/[^A-Za-z0-9_.+\-,/=]/g, "").slice(0, 32);
   const title = rig ? `${logicalId}@${rig}` : logicalId;
-  const initialState = mapSeatStateToOsc7501(seat);
-  const attachCmd = String(seat.tmuxAttachCommand ?? (session ? `tmux attach-session -t ${session}` : ""));
-  const pollIntervalMs = Number(seat.pollIntervalMs ?? 1500) || 1500;
   const payload = base64EncodeUtf8(JSON.stringify({
     daemonUrl: config?.daemonUrl ?? "",
-    openrigHome: config?.openrigHome ?? "",
+    // The mod's own config (local): where the relay may look for a private tmux server when OpenRig names none.
+    openrigHome: typeof config?.openrigHome === "string" ? config.openrigHome : "",
     session,
+    serverArgs,
     logicalId,
     rig,
     rigId,
     app: runtime || "openrig",
     titleB64: base64EncodeUtf8(title),
-    initialState,
-    attachCmd,
-    pollIntervalMs,
+    initialState: mapSeatStateToOsc7501(seat),
+    pollIntervalMs: Number(seat.pollIntervalMs ?? 1500) || 1500,
   }));
-  const relayScript = [
-    "const { spawn } = require('node:child_process');",
-    "const fs = require('node:fs');",
-    "const path = require('node:path');",
-    "const cfg = JSON.parse(Buffer.from(process.argv[1], 'base64').toString('utf8'));",
-    "const cleanApp = (v) => String(v || '').replace(/[^A-Za-z0-9_.+\\-,/=]/g, '').slice(0, 32);",
-    "let lastSeq = '';",
-    "const emit = (st, kind) => {",
-    "  if (!st) return;",
-    "  if (st === 'clear') {",
-    "    const seq = '\\x1b]7501;state=clear\\x07';",
-    "    if (seq === lastSeq) return;",
-    "    lastSeq = seq;",
-    "    try { process.stdout.write(seq); } catch (_) {}",
-    "    return;",
-    "  }",
-    "  const parts = [`state=${st}`];",
-    "  if (st === 'blocked' && (kind === 'permission' || kind === 'question' || kind === 'auth')) parts.push(`kind=${kind}`);",
-    "  const app = cleanApp(cfg.app);",
-    "  if (app) parts.push(`app=${app}`);",
-    "  if (cfg.titleB64) parts.push(`title=${cfg.titleB64}`);",
-    "  const seq = `\\x1b]7501;${parts.join(':')}\\x07`;",
-    "  if (seq === lastSeq) return;",
-    "  lastSeq = seq;",
-    "  try { process.stdout.write(seq); } catch (_) {}",
-    "};",
-    "const mapNode = (n) => {",
-    "  if (!n) return { state: 'clear' };",
-    "  const running = n.sessionStatus ? (n.sessionStatus === 'running' || n.sessionStatus === 'ready' || n.sessionStatus === 'starting') : n.sessionAlive !== false;",
-    "  if (!running || n.sessionAlive === false) return { state: 'done', clearAfter: true };",
-    "  const act = n.agentActivity?.state ?? n.activityState?.state;",
-    "  const disp = n.activityState?.display;",
-    "  const arb = n.arbitratedNeedsInput ?? n.activityState?.needsInput;",
-    "  const hasLiveActivity = Boolean(n.activityState && typeof n.activityState === 'object');",
-    "  const needs = hasLiveActivity",
-    "    ? Boolean(act === 'needs_input' || disp === 'needs-input' || disp === 'needs_input' || disp === 'blocked' || (arb && (arb.count > 0 || arb.needed)))",
-    "    : Boolean(n.needsAttention || act === 'needs_input' || (arb !== undefined && arb !== null ? (typeof arb === 'object' ? (arb.count > 0 || Boolean(arb.needed)) : Boolean(arb)) : false) || n.lifecycleState === 'attention_required' || n.lifecycleState === 'failed' || n.blockedWorkCount > 0);",
-    "  if (needs) {",
-    "    const ev = String(arb?.kind ?? arb?.reason ?? n.needsInputEvidence?.kind ?? n.agentActivity?.reason ?? '').toLowerCase();",
-    "    const kind = ev.includes('perm') ? 'permission' : ev.includes('auth') ? 'auth' : 'question';",
-    "    return { state: 'blocked', kind };",
-    "  }",
-    "  if (act === 'working' || act === 'running' || disp === 'working' || disp === 'active') return { state: 'working' };",
-    "  if (act === 'done') return { state: 'done' };",
-    "  if (act === 'idle' || act === 'starting' || disp === 'idle') return { state: 'idle' };",
-    "  return { state: n.inProgressWorkCount > 0 ? 'working' : 'idle' };",
-    "};",
-    "emit(cfg.initialState || 'idle');",
-    "let resolvedRigId = cfg.rigId || cfg.rig || '';",
-    "const fetchNodes = async () => {",
-    "  if (!cfg.daemonUrl) return null;",
-    "  if (resolvedRigId) {",
-    "    const r = await fetch(`${cfg.daemonUrl}/api/rigs/${encodeURIComponent(resolvedRigId)}/nodes`);",
-    "    if (r.ok) { const d = await r.json(); return Array.isArray(d) ? d : (Array.isArray(d?.nodes) ? d.nodes : []); }",
-    "  }",
-    "  if (cfg.rig) {",
-    "    const sr = await fetch(`${cfg.daemonUrl}/api/rigs/summary`);",
-    "    if (sr.ok) {",
-    "      const list = await sr.json();",
-    "      const hit = Array.isArray(list) ? list.find((x) => x && (x.name === cfg.rig || x.id === cfg.rig)) : null;",
-    "      if (hit?.id) {",
-    "        resolvedRigId = hit.id;",
-    "        const r2 = await fetch(`${cfg.daemonUrl}/api/rigs/${encodeURIComponent(resolvedRigId)}/nodes`);",
-    "        if (r2.ok) { const d2 = await r2.json(); return Array.isArray(d2) ? d2 : (Array.isArray(d2?.nodes) ? d2.nodes : []); }",
-    "      }",
-    "    }",
-    "  }",
-    "  const nr = await fetch(`${cfg.daemonUrl}/api/nodes`);",
-    "  if (nr.ok) { const nd = await nr.json(); return Array.isArray(nd) ? nd : (Array.isArray(nd?.nodes) ? nd.nodes : []); }",
-    "  return null;",
-    "};",
-    "const poll = async () => {",
-    "  try {",
-    "    const nodes = await fetchNodes();",
-    "    if (!Array.isArray(nodes)) return null;",
-    "    const hit = nodes.find((n) => n && (n.canonicalSessionName === cfg.session || (n.logicalId === cfg.logicalId && (!cfg.rig || !n.rigName || n.rigName === cfg.rig))));",
-    "    if (hit) {",
-    "      const mapped = mapNode(hit);",
-    "      if (mapped.clearAfter) {",
-    "        if (lastSeq !== 'done:clear') {",
-    "          emit(mapped.state, mapped.kind);",
-    "          emit('clear');",
-    "          lastSeq = 'done:clear';",
-    "        }",
-    "      } else {",
-    "        emit(mapped.state, mapped.kind);",
-    "      }",
-    "    }",
-    "    return hit || null;",
-    "  } catch (_) { return null; }",
-    "};",
-    "(async () => {",
-    "  const firstHit = await poll();",
-    "  let resolvedCmd = (firstHit && firstHit.tmuxAttachCommand) || cfg.attachCmd;",
-    "  const timer = setInterval(poll, cfg.pollIntervalMs || 1500);",
-    "  timer.unref?.();",
-    "  const childEnv = { ...process.env };",
-    "  delete childEnv.TMUX;",
-    "  if (cfg.openrigHome) {",
-    "    childEnv.OPENRIG_HOME = cfg.openrigHome;",
-    "    try {",
-    "      const parentDir = path.dirname(cfg.openrigHome);",
-    "      const tmuxDir = fs.readdirSync(parentDir).find((f) => f.startsWith('tmux-'));",
-    "      if (tmuxDir) {",
-    "        const fullTmuxDir = path.join(parentDir, tmuxDir);",
-    "        try { fs.chmodSync(fullTmuxDir, 0o700); } catch (_) {}",
-    "        childEnv.TMUX_TMPDIR = parentDir;",
-    "        const sockPath = path.join(fullTmuxDir, 'default');",
-    "        if (fs.existsSync(sockPath) && /^tmux\\s+attach/.test(resolvedCmd) && !resolvedCmd.includes(' -S ') && !resolvedCmd.includes(' -L ')) {",
-    "          resolvedCmd = resolvedCmd.replace(/^tmux\\s+/, `tmux -S ${JSON.stringify(sockPath)} `);",
-    "        }",
-    "      }",
-    "    } catch (_) {}",
-    "  }",
-    "  const child = spawn('sh', ['-c', resolvedCmd], { stdio: 'inherit', env: childEnv });",
-    "  const cleanup = () => { clearInterval(timer); emit('clear'); };",
-    "  child.on('exit', (code) => { cleanup(); process.exit(code ?? 0); });",
-    "  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { cleanup(); try { child.kill(sig); } catch (_) {} });",
-    "})();",
-  ].join("\n");
-  return [nodeBin, "-e", relayScript, payload];
+  return [nodeBin, relayPath, payload];
 }
 
 /**
@@ -5241,6 +5279,8 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   const session = String(seat?.session ?? seat?.canonicalSessionName ?? "").trim();
   const logicalId = String(seat?.logicalId ?? seat?.name ?? (session.includes("@") ? session.split("@")[0].replace(/-/g, ".") : session) ?? "seat");
   const rigName = String(seat?.rig ?? (session.includes("@") ? session.slice(session.lastIndexOf("@") + 1) : ""));
+  // The session is checked before any use: labels, the relay's argv, the tab.
+  if (!isValidSessionName(session)) return { ok: false, disabled: true, reason: sessionNameRefusal(session) };
   const isOperator = logicalId === "operator.agent" || session === "operator-agent@kernel" || options?.operator === true;
   const tabDisplayName = String(options?.name ?? seat?.tabName ?? (isOperator ? "Operator" : logicalId));
   const effectiveDaemonUrl = config?.daemonUrl ?? options?.daemonUrl ?? null;
@@ -5276,7 +5316,12 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
     return { ok: false, disabled: true, reason: "Stopped: seat has no running session to attach" };
   }
 
-  const argv = buildAttachRelayArgv(config, { ...seat, session, logicalId, rig: rigName });
+  let argv;
+  try {
+    argv = buildAttachRelayArgv(config, { ...seat, session, logicalId, rig: rigName }, host.relayPath ?? options?.relayPath ?? null);
+  } catch (e) {
+    return { ok: false, disabled: true, reason: String(e?.message ?? e) };
+  }
   const activeSpace = (Array.isArray(sp) ? sp : []).find((s) => s?.active) ?? sp?.[0] ?? null;
   if (activeSpace && !activeSpace.machine && typeof host.hc === "function") {
     const slug = (isOperator ? "operator" : logicalId).replace(/[^a-zA-Z0-9_-]/g, "-");

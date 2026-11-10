@@ -58,13 +58,23 @@ Herdr doesn't review mods: check what your agent runs and which keys it changes.
   - spec validation and library sync, when you save a spec or copy one to the library.
 
   Nothing leaves the machine.
-- **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**), `tmux` only through OpenRig's own
-  attach command for a seat, `hc` for attaching and the TUI tab, and `node` for the status relay of an attached seat.
+- **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**); for Attach, `hc` starts `node` on the
+  mod's own `rig-attach-relay.cjs`, which runs `tmux attach-session -t =<session>` directly, with no shell, for a
+  session name OpenRig makes; `hc` also opens the TUI tab. For the spec editor, `printenv OPENRIG_HOME` and `realpath`.
 - **Files:** it reads `<appHome>/openrig/config.json` (optional: your OpenRig name), `<appHome>/openrig/state.json`,
   and the spec and slice files you open in its viewer. It writes `<appHome>/openrig/state.json` and the user spec files
-  you edit and save in its spec editor (only files in OpenRig's spec library). It reads none of OpenRig's own files.
+  you edit and save in its spec editor. Those are only files in this machine's spec folders, with symlinks resolved:
+  OpenRig's spec library `<OpenRig home>/specs`, and `workspace.specs_root` from the local `rig`. The home is
+  `openrigHome` if you set it, else `OPENRIG_HOME` in Herdr's environment, else `~/.openrig`, so a default install
+  edits with no setup. A link out of those folders, or a path only the daemon names, is refused. It reads none of
+  OpenRig's own files.
 
 The full list, with every route, is in [`RECIPE.md`](RECIPE.md) under **Built from**.
+
+## Security update
+
+**Update now.** Earlier versions ran the daemon's attach command through a shell. This version starts `tmux` itself,
+with no shell, and attaches only to session names OpenRig makes.
 
 ## Known limitations
 

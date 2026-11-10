@@ -18,7 +18,7 @@ import { h_flex, v_flex } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, setShared, shared, nextCommand, notify, watchFolder, keys, window, spaces, panes, terminals, hc } from "herdr";
 import net from "net";
 import {
-  MOD_IDS, STATE_COPY, NO_PERSON, TERMINAL_TOKEN_PROTECTED, REMOTE_OPERATOR_REASON, s1CopyLine,
+  MOD_IDS, STATE_COPY, NO_PERSON, ACTION_REFUSED, TERMINAL_TOKEN_PROTECTED, REMOTE_OPERATOR_REASON, s1CopyLine,
   utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine,
   buildTopology, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
@@ -31,6 +31,7 @@ import {
   selectSidebarNode, isSelectionElsewhere, orderSiblings, applySiblingDrop, resetGroupOrder,
   parseSidebarState, serializeSidebarState, treeKeyNav, rigViewsBranch, attachToSeat, isLoopbackDaemonUrl, formatSeatContextPct, isSeatContextWarning,
   tierOf, sortNeedsByTier, enrichAttentionItems, quietModeHeaderChip, whoseQueueSummary,
+  attachRelayPath, isValidSessionName, sessionNameRefusal,
 } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.sidebar` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
@@ -302,7 +303,7 @@ export default class RigSidebar extends View {
             });
     cx.spawn(async (cx) => {
       const res = await attachToSeat(
-        { spaces, panes, terminals, hc, run, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) },
+        { spaces, panes, terminals, hc, run, relayPath: attachRelayPath(appHome(), MOD_IDS.sidebar), wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) },
         opSeat,
         config,
         { name: "Operator", operator: true, daemonUrl: config?.daemonUrl },
@@ -357,13 +358,22 @@ export default class RigSidebar extends View {
     });
   }
 
+  /** `rig.attach:<session>`: a seat this sidebar knows, by its exact session name. Anything else is refused, never
+   *  guessed (no stand-in seat, no command built from the name). */
   attachSeatBySession(cx, session) {
-    if (!session) return;
+    if (!isValidSessionName(session)) {
+      notify({ title: "Attach", body: sessionNameRefusal(session), level: "warning" });
+      return;
+    }
     const allSeats = (this.data?.topology ?? []).flatMap((r) => r.pods.flatMap((p) => p.seats.map((s) => ({ ...s, rig: r.name, rigId: r.id }))));
-    const seat = allSeats.find((s) => s.session === session || s.logicalId === session) ?? { session, sessionAlive: true };
+    const seat = allSeats.find((s) => s.session === session);
+    if (!seat) {
+      notify({ title: `Attach ${session}`, body: "That seat isn't in OpenRig's topology here.", level: "warning" });
+      return;
+    }
     const config = this.config;
     cx.spawn(async (cx) => {
-      const res = await attachToSeat({ spaces, panes, terminals, hc, run, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, seat, config);
+      const res = await attachToSeat({ spaces, panes, terminals, hc, run, relayPath: attachRelayPath(appHome(), MOD_IDS.sidebar), wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, seat, config);
       if (!res?.ok && res?.reason) {
         notify({ title: `Attach ${seat.logicalId ?? session}`, body: res.reason, level: "warning" });
       }
@@ -411,9 +421,10 @@ export default class RigSidebar extends View {
     let r;
     try {
       const config = this.config ?? parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
-      const cmd = writeCommand(config, actionArgs(target, action, "", appHome()));
+      const args = actionArgs(target, action, "", appHome());
+      const cmd = args ? writeCommand(config, args) : null;
       r = cmd ? writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }))
-        : { ok: false, text: NO_PERSON };
+        : { ok: false, text: args ? NO_PERSON : ACTION_REFUSED };
     } catch (e) { r = { ok: false, text: String(e?.message ?? e) }; }
     const words = r.ok ? (r.text || doneWords(target, action)) : (r.text || "It didn't work, and the CLI gave no reason.");
     const statusRig = target?.rig ?? (typeof target?.view === "string" && target.view.startsWith("rig:") ? target.view.slice(4) : null);
@@ -619,7 +630,7 @@ export default class RigSidebar extends View {
       }
       if (!unreachableState) {
         const summary = await this.get("/api/rigs/summary");
-        const nodesByRig = {};
+        const nodesByRig = Object.create(null); // keyed by the daemon's rig ids: no prototype keys
         await Promise.all(summary.filter((r) => !r.archivedAt).map(async (r) => { nodesByRig[r.id] = await this.get(`/api/rigs/${encodeURIComponent(r.id)}/nodes`); }));
         const attention = await this.get("/api/attention").catch(() => null);
         const attentionAgg = await this.get("/api/queue/attention-aggregate").catch(() => null);

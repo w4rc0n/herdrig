@@ -7,8 +7,8 @@
 // space's TUI (or opens one, with the recorded CLI).
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
-import { appHome, readTextFile, theme, run, exec, shared, setShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout } from "herdr";
-import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab } from "./rig-lib.js";
+import { appHome, readTextFile, theme, run, exec, shared, setShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout, notify } from "herdr";
+import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath } from "./rig-lib.js";
 
 /** The palette's own commands, offered first when they match what is typed. */
 export { LOCAL_COMMANDS };
@@ -280,7 +280,8 @@ export default class RigPalette extends View {
 
   openOperator(cx) {
     const config = this.config ?? parseConfig(null);
-    const daemonUrl = config.daemonUrl ?? shared("rig.data")?.config?.daemonUrl ?? null;
+    const sharedUrl = shared("rig.data")?.config?.daemonUrl;
+    const daemonUrl = config.daemonUrl ?? (sharedUrl && isLoopbackDaemonUrl(sharedUrl) ? sharedUrl : null);
     if (!isLoopbackDaemonUrl(daemonUrl)) {
       this.error = REMOTE_OPERATOR_REASON;
       this.note = null;
@@ -307,7 +308,8 @@ export default class RigPalette extends View {
     this.busy = true; cx.notify();
     cx.spawn(async () => {
       try {
-        await attachToSeat({ run, hc, spaces, panes, terminals: () => terminals?.() ?? [], layout }, target, { ...config, daemonUrl }, { name: "Operator" });
+        const res = await attachToSeat({ run, hc, spaces, panes, terminals: () => terminals?.() ?? [], layout, relayPath: attachRelayPath(appHome(), MOD_IDS.palette) }, target, { ...config, daemonUrl }, { name: "Operator" });
+        if (res && res.ok === false && res.reason) notify({ title: "Open operator", body: res.reason, level: "warning" });
       } finally {
         this.dismiss();
       }
@@ -317,8 +319,9 @@ export default class RigPalette extends View {
 
   async resolveDaemonUrl() {
     if (this.config?.daemonUrl) return this.config.daemonUrl;
+    // Another mod's shared state may name the daemon only when it's on this machine (loopback).
     const fromShared = shared("rig.data")?.config?.daemonUrl;
-    if (fromShared) {
+    if (fromShared && isLoopbackDaemonUrl(fromShared)) {
       this.config = { ...(this.config ?? parseConfig(null)), daemonUrl: fromShared, daemonUrlSource: "cli" };
       return fromShared;
     }

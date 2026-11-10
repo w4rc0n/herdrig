@@ -16,13 +16,13 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc } from "herdr";
-import { MOD_IDS, NO_PERSON, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath,
+import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
   SWAP_RUNTIMES, SWAP_MODELS_BY_RUNTIME, SWAP_EFFORTS_BY_RUNTIME, filterAllowedModels, changeModelPlan,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, closeRigInspection, selectWorkerView,
-  currentCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, attachToSeat, resetGroupOrder, submitMissionActions } from "./rig-lib.js";
+  currentCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, attachToSeat, resetGroupOrder, submitMissionActions, attachRelayPath, layoutHasMod, isLoopbackDaemonUrl } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.menu` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.menu}`;
@@ -42,8 +42,9 @@ const dialog = (target, step, height = 260) => openOverlay({ mod: MOD_IDS.menu, 
 const configNow = async () => {
   const cfg = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
   if (cfg.daemonUrl) return cfg;
+  // Another mod's shared state may name the daemon only when it's on this machine (loopback).
   const fromShared = shared("rig.data")?.config?.daemonUrl;
-  if (fromShared) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
+  if (fromShared && isLoopbackDaemonUrl(fromShared)) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
   const status = await discoverDaemonFromCli(cfg, exec);
   if (status.reachable && status.daemonUrl) return { ...cfg, daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
   return { ...cfg, daemonMessage: status.message || cfg.daemonMessage };
@@ -326,6 +327,7 @@ export default class RigMenu extends View {
 
   /** Runs one CLI write as the person; returns { ok, json, text }. */
   async write(args, options) {
+    if (!args) return { ok: false, text: ACTION_REFUSED };
     const cmd = writeCommand(this.config, args, options);
     if (!cmd) return { ok: false, text: NO_PERSON };
     return writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
@@ -378,8 +380,12 @@ export default class RigMenu extends View {
       out.push({
         icon: "terminal",
         label: "Attach",
+        // The sidebar outlives this popup and holds the config: hand it Attach (rig.attach). Without it, Attach runs here
+        // with the config and this folder's relay.
         act: () => {
-          attachToSeat(target, { run, hc, spaces, panes, terminals: terminals?.() ?? [], layout, notify });
+          if (layoutHasMod(layout(), MOD_IDS.sidebar)) { run(`rig.attach:${target.session}`); return; }
+          void attachToSeat({ run, hc, spaces, panes, terminals, layout, notify, relayPath: attachRelayPath(appHome(), MOD_IDS.menu) }, target, this.config)
+            .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); });
         },
         disabled: stoppedSeat,
         reason: stoppedSeat ? "Stopped: seat has no running session to attach" : null,

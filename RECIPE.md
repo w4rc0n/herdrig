@@ -8,11 +8,13 @@ tab. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar
 
 Before you install it: this mod **reaches OpenRig's local address** (`127.0.0.1:7433` unless that OpenRig uses another
 port) over HTTP and SSE (reads live state and, when you click an action, posts to OpenRig: Decision Card acts, a usage
-refresh, spec validation and library sync), **runs programs** (`rig`, `tmux` through OpenRig's own attach command,
-`hc`, `node`), **reads files outside its own folder**: `<appHome>/openrig/config.json` (optional: the person's OpenRig
+refresh, spec validation and library sync), **runs programs** (`rig`, `tmux` started directly by the mod's relay, never through a shell,
+`hc`, `node`, and `printenv`/`realpath` for the spec editor's folders), **reads files outside its own folder**: `<appHome>/openrig/config.json` (optional: the person's OpenRig
 name), `state.json`, and the spec/slice files you open in its file viewer (`SPEC.md`, `PROGRESS.md` and similar, from
 the folders OpenRig reports), and **writes** `<appHome>/openrig/state.json` plus the user spec file you edit and save
-in its spec editor (only files in OpenRig's spec library). It **runs the `rig` CLI, which uses the person's existing
+in its spec editor (only files in this machine's spec folders, symlinks resolved: OpenRig's spec library
+`<OpenRig home>/specs`, where the home is `openrigHome` if set, else `OPENRIG_HOME` in Herdr's environment, else
+`~/.openrig`, and the local `rig`'s `workspace.specs_root`; never a link out of them or a path only the daemon names). It **runs the `rig` CLI, which uses the person's existing
 OpenRig setup** (its home, port and sign-in); it reads none of OpenRig's own files. With a click, **Start
 OpenRig** runs `rig daemon start`. It does nothing else on the network.
 
@@ -225,15 +227,16 @@ the mod `POST`s your decision to `/api/mission-control/action` (with `actorSessi
 is set in `<appHome>/openrig/config.json`, or `actorSession: "human@host"` and `authority: "primary-user"` when
 unattributed; never with an `X-OpenRig-Session` header). Clicking **Refresh** on per-host usage `POST`s
 `/api/provider/usage/hosts/refresh`. In the spec editor, clicking **Save** on a user spec validates the YAML with
-`POST /api/agents/validate` or `POST /api/rigs/import/validate`, writes that user spec file in place (limited to paths
-in OpenRig's spec library; built-in specs are not editable), and calls `POST /api/specs/library/sync` (which also runs
+`POST /api/agents/validate` or `POST /api/rigs/import/validate`, writes that user spec file in place (limited to this
+machine's spec folders after resolving symlinks, never a link out of them or a path only the daemon names; built-in
+specs are not editable), and calls `POST /api/specs/library/sync` (which also runs
 after **Copy to library**). Every other write runs a `rig` command you could have typed (`rig send`, `rig queue`,
 `rig gateway human quiet|mode …`, `rig specs add …`, `rig snapshot`, `rig seat …`, `rig terminal …`, or
 `rig daemon start` when you click **Start OpenRig**).
 
 ## Built from
 
-**Blocks.** Four mods, each a folder in `mods/`, each self-contained (its own `main.js`, `mod.json`, `rig-lib.js`
+**Blocks.** Four mods, each a folder in `mods/`, each self-contained (its own `main.js`, `mod.json`, `rig-lib.js`, `rig-attach-relay.cjs`
 and the 24 `rig-*.svg` icons it draws) — this repo ships exactly these, and nothing else:
 
 | Mod | `place` | Role |
@@ -271,9 +274,15 @@ keeps working when it does not.
 
 **Programs it runs.** `rig` (the OpenRig CLI — `rig ps`, `rig queue`, `rig gateway human quiet|mode …`, `rig terminal …`,
 `rig snapshot`, `rig seat …`, `rig specs …`, the rest of the one-click actions, and, with your yes, **Start OpenRig**
-runs `rig daemon start`), `tmux` **only** through OpenRig's recorded `tmuxAttachCommand` for a seat (never a bare
-`tmux`), `hc` for attaching (`--label herdr-openrig.role=attach --label herdr-openrig.attach=<session>`) and for the
-TUI terminal (`--label herdr-openrig.role=tui`), and `node` for the inline OSC 7501 status relay when attaching a seat.
+runs `rig daemon start`), `tmux` for Attach, started directly by the mod's relay (`node rig-attach-relay.cjs`) as
+`tmux [-L name | -S path] attach-session -t =<session>` with no shell. The session must be a name OpenRig makes, and
+the `-L`/`-S` flag is only what OpenRig's recorded `tmuxAttachCommand` names, parsed and checked; nothing in that string
+is run. A daemon can still name a session on such a server, so Attach can open a session of yours by its exact name,
+with no command run. `hc` for attaching (`--label herdr-openrig.role=attach --label herdr-openrig.attach=<session>`) and for the
+TUI terminal (`--label herdr-openrig.role=tui`), and `node` to run that relay, which also reports the seat's state to herdr (OSC 7501). For the spec editor,
+`printenv OPENRIG_HOME` (Herdr's own environment: a Herdr started from a desktop launcher may not have the variable
+your shell sets, so set `openrigHome` in `<appHome>/openrig/config.json` for a home outside `~/.openrig`) and
+`realpath`, which resolves each spec folder and file so a symlink can't lead the editor elsewhere.
 
 **Network, programs, files — the full disclosure.** It **reaches OpenRig's local address** (`127.0.0.1:7433` unless
 that OpenRig uses another port), read from `rig status --json`, for local HTTP reads (`/healthz`, `/api/kernel/status`,

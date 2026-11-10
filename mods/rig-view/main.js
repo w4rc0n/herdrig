@@ -11,7 +11,7 @@
 // Resolve, Ctrl+Enter); the item page shows the same. Drafts are rig-menu's (`shared("rig.drafts")`, draftKey).
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window, notify } from "herdr";
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
   configRows, crumbsFor, navPush, navBack, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
@@ -20,7 +20,8 @@ import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview,
   rowStatusGlyph, formatHonestCount, attachToSeat,
   tierOf, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
-  viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead } from "./rig-lib.js";
+  viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath,
+  localSpecRoots, resolveInSpecRoots, specFolderRefusal, isLoopbackDaemonUrl, isValidSessionName } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -100,9 +101,10 @@ export default class RigView extends View {
     this.present = {}; // file path → true | false (on disk)
     this.handle = cx.focus_handle();
     this.replies = {}; // need id → { input, key, target, busy, result }: the inline reply boxes
-    this.answered = {}; // need id → { summary, words, at }: replies sent from here, said for a moment after the item goes
-    this.questionChoices = {}; // need id → { [questionId]: optionId }
-    this.askerNotes = {}; // need id → string note when Open seat fails or seat isn't loaded
+    // Keyed by ids the daemon sends: null-prototype maps, so an id such as `__proto__` is just a key.
+    this.answered = Object.create(null); // need id → { summary, words, at }: replies sent from here, said for a moment after the item goes
+    this.questionChoices = Object.create(null); // need id → { [questionId]: optionId }
+    this.askerNotes = Object.create(null); // need id → string note when Open seat fails or seat isn't loaded
     this.peopleBusy = false;
     this.peopleResult = null;
     this.peopleForm = { quietUntil: "2h", quietStart: "22:00", quietEnd: "08:00", modeName: "sleep", modePolicy: "hold", modeDuration: "8h", showSaveMode: false, showQuietUntil: false, showQuietDaily: false };
@@ -173,6 +175,8 @@ export default class RigView extends View {
       if (sameConfig(next, this.config)) return;
       if (this.config && next.daemonUrl !== this.config.daemonUrl) this.cache = {};
       this.config = next;
+      // The spec editor's folders, from local facts only (never the daemon's list).
+      this.specRoots = await localSpecRoots(next, exec, home());
       cx.notify();
     });
   }
@@ -199,8 +203,9 @@ export default class RigView extends View {
   async resolveDaemonUrl() {
     if (!this.config) return null;
     if (this.config.daemonUrl) return this.config.daemonUrl;
+    // Another mod's shared state may name the daemon only when it's on this machine (loopback).
     const fromShared = shared("rig.data")?.config?.daemonUrl;
-    if (fromShared) {
+    if (fromShared && isLoopbackDaemonUrl(fromShared)) {
       const nextCfg = { ...this.config, daemonUrl: fromShared, daemonUrlSource: this.config.daemonUrlSource ?? "cli" };
       delete nextCfg.daemonMessage;
       this.config = nextCfg;
@@ -963,7 +968,8 @@ export default class RigView extends View {
     const effortGot = inlineEffort ? null : this.read(cx, effortPath);
     const effortText = inlineEffort ?? effortGot?.data?.effort ?? effortGot?.data?.currentEffort ?? (effortGot?.loading ? "loading…" : "default");
 
-    const attachCmd = n.tmuxAttachCommand ?? `tmux attach -t ${n.canonicalSessionName}`;
+    // Shown for the person to read or copy; never run. Attach builds its own argv from the checked session.
+    const attachCmd = n.tmuxAttachCommand ?? (isValidSessionName(n.canonicalSessionName) ? `tmux attach -t ${n.canonicalSessionName}` : "—");
     const transcript = transcriptPath(this.config, entry.rig, n.canonicalSessionName);
 
     const healthGot = this.read(cx, "/api/health");
@@ -1022,7 +1028,7 @@ export default class RigView extends View {
       runtime: n.runtime,
       model: n.model ?? n.resolvedModel ?? null,
       effort: inlineEffort,
-      tmuxAttachCommand: attachCmd,
+      tmuxAttachCommand: n.tmuxAttachCommand ?? null,
       attachable: !stoppedSeat,
     };
     const dialog = (step, height) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
@@ -1034,7 +1040,9 @@ export default class RigView extends View {
     const modelReason = personDisableReason("change-model", this.config);
 
     const doAttach = () => {
-      void attachToSeat({ run, hc, spaces, panes, terminals, layout }, target, this.config);
+      // A refusal (a name OpenRig doesn't make, an attach command not in OpenRig's shape) says why.
+      void attachToSeat({ run, hc, spaces, panes, terminals, layout, relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, target, this.config)
+        .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); });
     };
     const doFocusPane = () => {
       const hit = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? []);
@@ -1290,11 +1298,6 @@ export default class RigView extends View {
   specDirty(box) { return !!box?.state && box.state.value() !== box.loaded; }
 
   /** The paths the library lists as the person's own files: the only ones Save may write. */
-  userSpecPaths() {
-    const list = this.cache["/api/specs/library"]?.data;
-    return (Array.isArray(list) ? list : []).filter((x) => x.sourceType === "user_file" && x.sourcePath).map((x) => x.sourcePath);
-  }
-
   /** Running rigs that use a spec: a rig spec's rigs by name, an agent spec's by the seats that resolve to it. */
   runningRigsOf(cx, s) {
     const rigs = (this.read(cx, "/api/rigs/summary").data ?? []).filter((r) => !r.archivedAt && (r.lifecycleState ?? r.lifecycle) === "running");
@@ -1313,7 +1316,7 @@ export default class RigView extends View {
   specBody(t, cx, s, single) {
     const isBuiltin = s.sourceType === "builtin" || !s.sourcePath;
     const sfx = (name, plain = false) => (single && plain ? name : `${name}-${s.id}`);
-    let box = (this.specBoxes ??= {})[s.id];
+    let box = (this.specBoxes ??= Object.create(null))[s.id];
     if (!box) {
       const startEditing = Boolean(this.specAutoEdit?.delete?.(s.id)) && !isBuiltin;
       box = this.specBoxes[s.id] = { loading: true, editing: startEditing };
@@ -1456,7 +1459,10 @@ export default class RigView extends View {
     cx.spawn(async (cx) => {
       await Promise.resolve();
       try {
-        let text = s.sourcePath ? await readTextFile(s.sourcePath).catch(() => null) : null;
+        // The file is read only inside the local spec folders, symlinks resolved; otherwise the daemon's own copy is
+        // shown, so no file of this machine's is sent anywhere because the daemon named it.
+        const file = s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
+        let text = file ? await readTextFile(file).catch(() => null) : null;
         if (text == null && this.config) {
           const daemonUrl = await this.resolveDaemonUrl();
           if (daemonUrl) {
@@ -1539,12 +1545,16 @@ export default class RigView extends View {
     if (!box?.state || box.saving || !box.editing || s.sourceType === "builtin" || !s.sourcePath || !this.specDirty(box)) return;
     const edited = box.state.value();
     box.errors = null; box.conflict = null; box.note = null; box.savedText = null;
-    if (unsafeSpecWritePath(s.sourcePath, this.userSpecPaths())) { box.note = "Refused: spec path is outside the allowed spec library."; cx.notify(); return; }
+    const refused = specFolderRefusal(this.specRoots);
+    if (unsafeSpecWritePath(s.sourcePath)) { box.note = refused; cx.notify(); return; }
     if (!this.config) { box.note = "The daemon address isn't known yet."; cx.notify(); return; }
     box.saving = true; cx.notify();
     const conflict = (onDisk) => { box.conflict = "The file changed on disk since you opened it."; if (onDisk != null) box.diskText = onDisk; };
     cx.spawn(async (cx) => {
       try {
+        // Written only inside the local spec folders, at the resolved path: a symlink out of them is refused.
+        const file = await resolveInSpecRoots(s.sourcePath, this.specRoots, exec);
+        if (!file) { box.note = refused; return; }
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) { box.note = "The daemon address isn't known yet."; return; }
         const route = s.kind === "agent" ? "/api/agents/validate" : "/api/rigs/import/validate";
@@ -1554,11 +1564,11 @@ export default class RigView extends View {
           box.errors = Array.isArray(data?.errors) && data.errors.length ? data.errors : [data?.error ?? data?.message ?? `Validation failed (${r.status})`];
           return;
         }
-        const onDisk = await readTextFile(s.sourcePath).catch(() => null);
+        const onDisk = await readTextFile(file).catch(() => null);
         if (onDisk != null && onDisk !== box.loaded) { conflict(onDisk); return; }
-        try { await writeTextFile(s.sourcePath, edited, box.loaded); } catch (e) {
+        try { await writeTextFile(file, edited, box.loaded); } catch (e) {
           // A changed file is a conflict; any other failure (permissions, I/O) says what it was.
-          const now = await readTextFile(s.sourcePath).catch(() => null);
+          const now = await readTextFile(file).catch(() => null);
           if (now != null && now !== box.loaded) conflict(now); else box.errors = [String(e?.message ?? e)];
           return;
         }
@@ -1940,7 +1950,7 @@ export default class RigView extends View {
     delete this.askerNotes[n.id];
     const config = this.config;
     cx.spawn(async (cx) => {
-      const res = await attachToSeat({ run, hc, spaces, panes, terminals, layout }, resolved.seat, config);
+      const res = await attachToSeat({ run, hc, spaces, panes, terminals, layout, relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, resolved.seat, config);
       if (res && res.ok === false && res.reason) {
         this.askerNotes[n.id] = res.reason;
       }
@@ -2278,7 +2288,7 @@ export default class RigView extends View {
     const openCount = qState.openCount;
 
     const toggleOptionPill = (qId, optId, cx) => {
-      const cur = { ...(this.questionChoices[n.id] ?? {}) };
+      const cur = Object.assign(Object.create(null), this.questionChoices[n.id] ?? {});
       if (cur[qId] === optId) delete cur[qId];
       else cur[qId] = optId;
       this.questionChoices[n.id] = cur;
