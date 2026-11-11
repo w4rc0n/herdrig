@@ -17,7 +17,7 @@ import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc } from "herdr";
 import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath,
-  fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
+  fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
   SWAP_RUNTIMES, SWAP_MODELS_BY_RUNTIME, SWAP_EFFORTS_BY_RUNTIME, filterAllowedModels, changeModelPlan,
@@ -664,10 +664,12 @@ export default class RigMenu extends View {
     }
     if (step.action === "launch-spec") {
       const folder = this.folder?.value() ?? "", host = this.host?.value() ?? "";
-      const problem = launchFolderProblem(folder);
-      const args = launchSpecArgs(target.sourcePath ?? target.name, folder, host);
+      const source = target.sourcePath ?? target.name;
+      const folderProblem = launchFolderProblem(folder);
+      const problem = launchSourceProblem(source) ?? folderProblem;
+      const args = launchSpecArgs(source, folder, host);
       const drafts = { ...(shared("rig.drafts") ?? {}), "launch-host": host.trim() };
-      if (!problem) drafts["launch-folder"] = folder.trim();
+      if (!folderProblem) drafts["launch-folder"] = folder.trim();
       setShared("rig.drafts", drafts);
       if (problem || !args) { this.result = { ok: false, text: problem ?? "Nothing to launch: the spec has no name or file." }; cx.notify(); return; }
       this.run(cx, "Launching", async () => { const r = await this.write(args, { env: launchSpecEnv(host) }); if (r.ok) run("rig.refresh"); return r; });
@@ -1138,8 +1140,12 @@ export default class RigMenu extends View {
     } else if (step.action === "launch-spec" && !this.result?.ok && !this.busy) {
       const field = (label, state) => v_flex().gap(3).child(div().text_size(11.5).text_color(t.dim).child(label))
         .child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(Input.new(state)));
+      // The exact source rig up is given, not only the spec's name: what the person approves is what runs.
+      const source = target.sourcePath ?? target.name;
+      const sourceProblem = launchSourceProblem(source);
       body = v_flex().gap(8)
-        .child(div().text_color(t.muted).child(`rig up ${target.name}: the seats start in the folder below and run until paused.`))
+        .child(div().text_color(t.muted).child(`${target.name}: the seats start in the folder below and run until paused.`))
+        .child(div().id("launch-source").text_size(11.5).text_color(sourceProblem ? t.blocked : t.dim).child(sourceProblem ?? `rig up -- ${source}`))
         .child(field("Working folder", this.folder)).child(field("Host (optional)", this.host));
     } else if (step.action === "resume" && !this.result && !this.busy) {
       body = div().child(`Each seat of ${target.rig} comes back from the saved conversation where the harness allows. Any that can't is listed; none starts fresh by itself.`);

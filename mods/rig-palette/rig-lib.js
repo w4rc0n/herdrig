@@ -4322,8 +4322,26 @@ export function paletteRoute(res, top, topology = []) {
  *  mods run it with no terminal to answer in. `writeCommand` adds `--json`. Null when spec or folder is missing. */
 export function launchSpecArgs(source, folder, host) {
   const s = String(source ?? "").trim(), f = String(folder ?? "").trim(), h = String(host ?? "").trim();
-  if (!s || launchFolderProblem(f)) return null;
+  if (launchSourceProblem(s) || launchFolderProblem(f)) return null;
   return ["up", "--cwd", f, ...(h && h !== "local" ? ["--host", h] : []), "--yes", "--", s];
+}
+
+/** Why a spec source can't go to `rig up`, or null. The daemon names it, so only two shapes pass: a bare library name,
+ *  or a plain absolute `.yaml` / `.yml` path with no `..` (which the daemon reads on its own machine). A GitHub link
+ *  or a bundle would be downloaded or installed, and a relative path or anything starting with `-` misread. */
+export function launchSourceProblem(source) {
+  const s = String(source ?? "").trim();
+  if (!s) return "Nothing to launch: the spec has no name or file.";
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(s) && !/\.(rigbundle|ya?ml)$/i.test(s)) return null;
+  if (s.startsWith("/") && /\.ya?ml$/i.test(s) && !s.split(/[\\/]/).includes("..") && !/[\0\r\n]/.test(s)) return null;
+  return `Refused: "${s.slice(0, 120)}" isn't a spec name or a plain .yaml path, so it isn't launched from here.`;
+}
+
+/** The file name for a copy of a spec in a local spec folder, from its name: letters, digits, `.`, `_` and `-` only, so
+ *  a name the daemon sends can't make a path. */
+export function specCopyName(name) {
+  const base = String(name ?? "").replace(/\.ya?ml$/i, "").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+/, "").slice(0, 64);
+  return base || "spec";
 }
 
 /** Why a launch folder can't be used, or null: it must be absolute, as the TUI requires. */

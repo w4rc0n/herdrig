@@ -14,7 +14,10 @@ name), `state.json`, and the spec/slice files you open in its file viewer (`SPEC
 the folders OpenRig reports), and **writes** `<appHome>/openrig/state.json` plus the user spec file you edit and save
 in its spec editor (only files in this machine's spec folders, symlinks resolved: OpenRig's spec library
 `<OpenRig home>/specs`, where the home is `openrigHome` if set, else `OPENRIG_HOME` in Herdr's environment, else
-`~/.openrig`, and the local `rig`'s `workspace.specs_root`; never a link out of them or a path only the daemon names). It **runs the `rig` CLI, which uses the person's existing
+`~/.openrig`, and the local `rig`'s `workspace.specs_root`; never a link out of them or a path only the daemon names).
+**Copy & edit** on a built-in fetches only the daemon's YAML, ignoring local paths and cached text. It checks the new
+name in every resolved spec folder, creates the file in the first folder, and registers it with `rig specs add`;
+the CLI is never given a path the daemon named. It **runs the `rig` CLI, which uses the person's existing
 OpenRig setup** (its home, port and sign-in); it reads none of OpenRig's own files. With a click, **Start
 OpenRig** runs `rig daemon start`. It does nothing else on the network.
 

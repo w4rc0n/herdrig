@@ -76,6 +76,9 @@ The full list, with every route, is in [`RECIPE.md`](RECIPE.md) under **Built fr
 **Update now.** Earlier versions ran the daemon's attach command through a shell. This version starts `tmux` itself,
 with no shell, and attaches only to session names OpenRig makes.
 
+Earlier versions' **Copy & edit** for a spec could read a file the OpenRig daemon named on your machine and send it
+to the daemon. This version copies only the spec text OpenRig served.
+
 ## Known limitations
 
 - **The Page needs a space open in Herdr.** With no space yet, opening the Page fails and Herdr says "no space yet"; make a space first.

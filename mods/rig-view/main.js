@@ -21,7 +21,7 @@ import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED,
   rowStatusGlyph, formatHonestCount, attachToSeat,
   tierOf, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath,
-  localSpecRoots, resolveInSpecRoots, specFolderRefusal, isLoopbackDaemonUrl, isValidSessionName } from "./rig-lib.js";
+  localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, isValidSessionName } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -1452,28 +1452,14 @@ export default class RigView extends View {
     cx.notify();
   }
 
-  /** Reads a spec's YAML (its file first, else the library's copy) and makes its editor, outside render. A saved draft
+  /** Reads a spec's YAML (a user file first, otherwise the library's copy) and makes its editor, outside render. A saved draft
    *  comes back only against the text it was started from: if the file moved on since, the draft stays against its own
    *  base and the conflict says so, so Save can't overwrite the newer file unseen. */
   loadSpec(cx, s, isBuiltin, box) {
     cx.spawn(async (cx) => {
       await Promise.resolve();
       try {
-        // The file is read only inside the local spec folders, symlinks resolved; otherwise the daemon's own copy is
-        // shown, so no file of this machine's is sent anywhere because the daemon named it.
-        const file = s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
-        let text = file ? await readTextFile(file).catch(() => null) : null;
-        if (text == null && this.config) {
-          const daemonUrl = await this.resolveDaemonUrl();
-          if (daemonUrl) {
-            const r = await fetch(`${daemonUrl}/api/specs/library/${encodeURIComponent(s.id)}`);
-            const body = await r.text();
-            if (!r.ok) throw new Error(`GET /api/specs/library/${s.id} → ${r.status}`);
-            let data = null; try { data = JSON.parse(body); } catch (_) { data = body; }
-            text = typeof data === "string" ? data : data?.yaml ?? JSON.stringify(data, null, 2);
-          }
-        }
-        if (text == null) throw new Error("The spec's YAML couldn't be read.");
+        const text = await this.specText(s);
         const key = specDraftKey(s.id), raw = (shared("rig.drafts") ?? {})[key];
         const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
         let initial = text;
@@ -1589,15 +1575,62 @@ export default class RigView extends View {
     });
   }
 
-  /** A built-in's Edit (Copy & edit): `rig specs add` into the person's library, sync, re-read, and open the user copy in edit mode. */
+  /** User specs may read their file inside the local spec folders with symlinks resolved. All other entries use only
+   *  the daemon's own copy, even when their sourcePath happens to name a local spec. */
+  async specText(s) {
+    const file = s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
+    let text = file ? await readTextFile(file).catch(() => null) : null;
+    if (text == null && this.config) {
+      const daemonUrl = await this.resolveDaemonUrl();
+      if (daemonUrl) {
+        const r = await fetch(`${daemonUrl}/api/specs/library/${encodeURIComponent(s.id)}`);
+        const body = await r.text();
+        if (!r.ok) throw new Error(`GET /api/specs/library/${s.id} → ${r.status}`);
+        let data = null; try { data = JSON.parse(body); } catch (_) { data = body; }
+        text = typeof data === "string" ? data : data?.yaml ?? JSON.stringify(data, null, 2);
+      }
+    }
+    if (text == null) throw new Error("The spec's YAML couldn't be read.");
+    return text;
+  }
+
+  /** Writes `text` as a new file in the first local spec folder, under a name made from the spec's (never a path the
+   *  daemon sent), taking a name free in every local spec folder because the CLI also copies into its library.
+   *  Returns the file written. */
+  async writeSpecCopy(s, text) {
+    const root = this.specRoots?.[0];
+    if (!root) throw new Error(specFolderRefusal(this.specRoots));
+    const base = specCopyName(s.name);
+    for (let i = 0; i < 20; i++) {
+      const name = `${base}${i === 0 ? "" : i === 1 ? "-copy" : `-copy-${i}`}.yaml`;
+      const file = `${root}/${name}`;
+      const existing = await Promise.all(this.specRoots.map((r) => readTextFile(`${r}/${name}`)));
+      if (existing.some((text) => text != null)) continue;
+      // Create-only: herdr refuses if the file appeared meanwhile, and the next name is tried.
+      try { await writeTextFile(file, text, null); } catch (_) { continue; }
+      return file;
+    }
+    throw new Error(`No free file name for a copy of ${base} in ${root}.`);
+  }
+
+  /** A built-in's Edit (Copy & edit): the daemon's own YAML is written as a new file in the local spec folder,
+   *  and `rig specs add` registers that file: never a path
+   *  the daemon named, which the CLI would read on this machine and upload. Then sync, re-read, and open the user copy
+   *  in edit mode. */
   copySpec(cx, s) {
     const box = this.specBoxes?.[s.id];
     if (!box || box.copying) return;
-    const cmd = this.config ? writeCommand(this.config, ["specs", "add", s.sourcePath ?? s.name]) : null;
-    if (!cmd) { box.note = NO_PERSON; cx.notify(); return; }
+    if (!this.config?.person) { box.note = NO_PERSON; cx.notify(); return; }
     box.copying = true; box.note = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
+        const text = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s) : await this.specText(s);
+        const written = await this.writeSpecCopy(s, text);
+        // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
+        const file = await resolveInSpecRoots(written, this.specRoots, exec);
+        if (!file) { box.note = specFolderRefusal(this.specRoots); return; }
+        const cmd = writeCommand(this.config, ["specs", "add", "--", file]);
+        if (!cmd) { box.note = NO_PERSON; return; }
         const r = writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
         if (!r.ok) { box.note = r.text; return; }
         const daemonUrl = await this.resolveDaemonUrl();
