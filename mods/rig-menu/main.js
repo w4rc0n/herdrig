@@ -14,8 +14,10 @@
 // props: { target: { kind: "seat"|"rig"|"pod"|"need"|"cell"|"views"|"open-view"|"spec"|"slice", ... }, step?: dialog state }
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
+import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
+import { workerCapabilityText } from "./rig-lib.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc } from "herdr";
+import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc, settings } from "herdr";
 import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
@@ -23,7 +25,8 @@ import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli,
   SWAP_RUNTIMES, SWAP_MODELS_BY_RUNTIME, SWAP_EFFORTS_BY_RUNTIME, filterAllowedModels, changeModelPlan,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, closeRigInspection, selectWorkerView,
   currentCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, attachToSeat, resetGroupOrder, submitMissionActions, attachRelayPath, waitWith, layoutHasMod, isLoopbackDaemonUrl,
-  statusMarkElement, deleteOutcome, rigNameProblem, newRigFromSpecArgs, newRigOneSeatArgs, commandLine, NEW_RIG_RUNTIMES } from "./rig-lib.js";
+  statusMarkElement, deleteOutcome, rigNameProblem, newRigFromSpecArgs, newRigOneSeatArgs, commandLine, NEW_RIG_RUNTIMES,
+  rigSpecPreviewArgs, normalizeRigSpecPreview, singleLineText } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.menu` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.menu}`;
@@ -208,6 +211,10 @@ export default class RigMenu extends View {
     this.newRuntime = NEW_RIG_RUNTIMES[0];
     this.newSpec = null;
     this.newSpecs = null;
+    this.newSpecPreviews = new Map();
+    this.newExpandedSpec = null;
+    this.newSpecFocus = 0;
+    this.newSpecHandle = cx.focus_handle?.() ?? null;
     this.folder = InputState.new({ placeholder: "Working folder (an absolute path)", value: drafts["launch-folder"] ?? "" });
     this.rigName = InputState.new({ placeholder: "Rig name" });
     for (const field of [this.folder, this.rigName]) {
@@ -228,6 +235,62 @@ export default class RigMenu extends View {
       } catch (e) { this.newSpecs = { error: String(e?.message ?? e) }; }
       cx.notify();
     });
+  }
+
+  pickNewSpec(cx, spec, toggle = false) {
+    this.newSpec = spec; this.result = null;
+    this.newSpecFocus = this.newSpecs?.indexOf(spec) ?? 0;
+    this.newExpandedSpec = toggle && this.newExpandedSpec === spec ? null : spec;
+    if (this.newExpandedSpec) this.loadNewSpecPreview(cx, spec);
+    cx.notify();
+  }
+
+  loadNewSpecPreview(cx, spec, retry = false) {
+    if (!retry && this.newSpecPreviews.has(spec)) return;
+    this.newSpecPreviews.set(spec, { loading: true });
+    cx.spawn(async (cx) => {
+      try {
+        const args = rigSpecPreviewArgs(spec);
+        if (!args) throw new Error("This library entry has no usable spec name or id.");
+        const config = this.config ?? await configNow();
+        const cmd = readCommand(config, args, { env: ["OPENRIG_HOST_SELECTED=local"] });
+        const result = writeOutcome(await exec(cmd.command, cmd.args, { timeout: 60000 }));
+        if (!result.ok || result.json?.error) throw new Error(result.text || result.json?.error || "OpenRig could not preview this spec.");
+        this.newSpecPreviews.set(spec, { data: normalizeRigSpecPreview(result.json) });
+      } catch (e) { this.newSpecPreviews.set(spec, { error: singleLineText(e?.message ?? e).slice(0, 240) }); }
+      cx.notify();
+    });
+  }
+
+  newSpecKey(e, cx) {
+    if (e.modifiers?.control || e.modifiers?.platform || e.modifiers?.alt || !Array.isArray(this.newSpecs) || !this.newSpecs.length) return;
+    const key = String(e.key ?? "").toLowerCase();
+    if (!["up", "arrowup", "down", "arrowdown", "left", "arrowleft", "right", "arrowright", "enter", "return"].includes(key)) return;
+    cx.stop_propagation();
+    if (key === "left" || key === "arrowleft") { this.newExpandedSpec = null; cx.notify(); return; }
+    const delta = key === "up" || key === "arrowup" ? -1 : key === "down" || key === "arrowdown" ? 1 : 0;
+    this.newSpecFocus = Math.max(0, Math.min(this.newSpecs.length - 1, this.newSpecFocus + delta));
+    this.pickNewSpec(cx, this.newSpecs[this.newSpecFocus]);
+  }
+
+  newSpecPreviewView(t, spec) {
+    const got = this.newSpecPreviews?.get(spec);
+    if (!got || got.loading) return div().text_size(12).text_color(t.dim).child("Reading the spec…");
+    if (got.error) return v_flex().gap(4)
+      .child(div().text_size(12).text_color(t.blocked).child(`Couldn't read this spec: ${got.error}`))
+      .child(div().id("new-rig-spec-retry").text_size(12).text_color(t.accent).cursor_pointer()
+        .on_click((_e, cx) => this.loadNewSpecPreview(cx, spec, true)).child("Retry"));
+    const data = got.data;
+    return v_flex().gap(4)
+      .when(!!data.summary, (el) => el.child(div().truncate().text_size(11.5).text_color(t.dim).child(data.summary)))
+      .child(div().text_size(11.5).text_color(t.dim).child(`${data.pods.length} pod${data.pods.length === 1 ? "" : "s"} · ${data.seatCount} seat${data.seatCount === 1 ? "" : "s"}`))
+      .children(data.pods.map((pod) => v_flex().gap(2).pt(3)
+        .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(pod.label))
+        .children(pod.seats.map((seat) => h_flex().gap(6).pl(8).items_center()
+          .child(div().min_w(0).truncate().text_size(12).text_color(t.foreground).child(seat.lid))
+          .when(!!seat.runtime || !!seat.model, (el) => el.child(div().px(5).py(1).rounded(4).bg(t.raised).font_family("monospace").text_size(10.5).text_color(t.dim)
+            .child([seat.runtime, seat.model].filter(Boolean).join(" · "))))
+          .when(!!seat.profile, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(seat.profile)))))));
   }
 
   /** What New rig would run, and what's wrong with the fields if anything. */
@@ -638,6 +701,8 @@ export default class RigMenu extends View {
       item("rig-view", "Design worker view…", () => openDesigner({ ...target, kind: "strip-view", name: target.name, replace: target.viewId, following, focusCell: target.cellId || target.seat }), "design-view");
     }
     if (target.kind === "need") {
+      if (dismissible(target)) item("check", target.dismissed ? "Restore update" : "Dismiss update", () =>
+        requestDismissal({ shared, setShared, run, scope: this.config ? dismissalScope(this.config) : undefined }, target.dismissed ? "restore" : "dismiss", target.dismissed ? updateKey(target) : target));
       // A native seat closed outside OpenRig. Offered, never done on its own.
       if (target.native) {
         item("rig-refresh", "Relaunch fresh…", () => dialog({ ...target, reason: "native seat closed outside OpenRig" }, { action: "fresh", confirm: true }, 220));
@@ -646,6 +711,8 @@ export default class RigMenu extends View {
       if (target.reply !== "none") item("rig-reply", "Reply…", () => dialog(target, { input: true, placeholder: "Your answer, in your own words", action: "reply", multiLine: true }, 290), target.reply === "answer" ? "reply-answer" : "reply");
       item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: target.summary }));
     }
+    if (target.kind === "updates-group") item("check", "Dismiss all updates", () =>
+      requestDismissal({ shared, setShared, run, scope: this.config ? dismissalScope(this.config) : undefined }, "dismiss", target.items ?? []));
     if (target.kind === "open-view") item("rig-view", `Open ${target.view}`, () => oneClick(target, "open-view"), "open-view");
     // Sidebar rows that are places: each opens its page; a saved or rig view also opens in herdr.
     if (target.kind === "branch") item("rig-popout", `Open ${target.name} in the Rig page`, () => page({ section: target.section }));
@@ -714,7 +781,10 @@ export default class RigMenu extends View {
     if (this.pending) return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
       .child(div().id("rig-menu-pending").px(8).py(6).text_color(t.muted).child(`${this.pending}…`));
     const items = this.items(target);
-    const reasons = [...new Set(items.map((it) => it.reason).filter(Boolean))];
+    const rawReasons = [...new Set(items.map((it) => it.reason).filter(Boolean))];
+    const workerReasons = rawReasons.filter(r => workerCapabilityText(r) !== r);
+    const reasons = rawReasons.filter(r => !workerReasons.includes(r));
+    if (workerReasons.length) reasons.push(workerReasons.join("\n"));
     return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
       .child(div().px(8).py(4).text_size(11).text_color(t.dim).child(target.kind === "seat" || target.kind === "cell" ? `Seat ${target.logicalId ?? target.session} · ${target.rig}`
         : target.kind === "need" ? (target.summary ?? "Needs you") : target.kind === "tui" ? "Rig TUI" : target.kind === "spec" ? `Spec ${target.name}`
@@ -730,7 +800,7 @@ export default class RigMenu extends View {
           .on_click((_e, cx) => this.choose(it, cx))
           .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
           .child(div().flex_1().truncate().child(it.label))))
-      .when(reasons.length > 0, (el) => el.child(v_flex().id("rig-menu-reasons").px(8).py(4).gap(2).children(reasons.map((r, idx) => div().id(`rig-menu-reason-${idx}`).text_size(11).text_color(t.dim).child(r)))));
+      .when(reasons.length > 0, (el) => el.child(v_flex().id("rig-menu-reasons").px(8).py(4).gap(2).children(reasons.map((r, idx) => div().id(`rig-menu-reason-${idx}`).text_size(11).text_color(t.dim).tooltip(r).child(workerCapabilityText(r))))));
   }
 
   resultView(t, cx, target, step) {
@@ -815,6 +885,11 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
+    if (step.action === "confirm-machine") {
+      if (!step.token) return;
+      setShared("rig.machineConfirmation", step.token);
+      run("rig.confirm-machine"); this.dismiss(); return;
+    }
     if (step.action === "rebuild-space") {
       if (!step.recovery?.tiles?.length || !step.token) return;
       this.busy = "Rebuilding";
@@ -1322,10 +1397,23 @@ export default class RigMenu extends View {
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
+      : step.action === "confirm-machine" ? `Open seats on ${step.confirmation?.machine}?`
       : step.action === "rebuild-space" ? `Rebuild ${target.rig}'s tiles?` : actionTitle(target, step.action);
     const go = (cx) => this.go(cx, target, step);
     let body = null;
-    if (step.action === "rebuild-space") {
+    if (step.action === "confirm-machine") {
+      const c = step.confirmation ?? {};
+      body = v_flex().gap(10)
+        .child(div().child(`Machine: ${c.machine} · Account: ${c.user} on ${c.target}`))
+        .child(div().child("Herdr machine access gives local programs full shell access to this account: its commands, files and terminals."))
+        .child(div().child(`Confirm before opening seats or installing the Attach relay in ${c.folder}. The mod checks the file hash before use and refreshes it automatically when the mod updates.`))
+        .child(h_flex().gap(4).items_center()
+          .child(div().flex_1().min_w(0).font_family(settings().font_family).text_size(10.5).child(`SHA-256: ${c.sha256}`))
+          .child(div().id("copy-relay-hash").size(20).flex_none().rounded(4).cursor_pointer().tooltip("Copy SHA-256")
+            .hover(el => el.bg(t.hover)).on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(c.sha256); })
+            .child(svg(icon("rig-copy")).size(12).text_color(t.dim))))
+        .child(div().text_color(t.muted).child("Attach and Operator run there. Grid tiles use that machine's tmux. A failed connection never starts a local terminal."));
+    } else if (step.action === "rebuild-space") {
       body = v_flex().gap(8)
         .child(div().child("This rebuilds the grid's viewers; a viewer that can be reused stays open. The seats keep running. Anything running or typed in these shells is lost."))
         .when(step.focusedTile, (el) => el.child(div().text_color(t.blocked).child("A tile in this grid has focus. Work you are typing in its shell will be lost.")))
@@ -1375,6 +1463,7 @@ export default class RigMenu extends View {
       : null;
     const confirmLabel = step.action === "change-model"
       ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
+      : step.action === "confirm-machine" ? "Allow this machine"
       : step.action === "rebuild-space" ? `Rebuild ${step.recovery?.tiles?.length ?? 0} tiles`
       : step.action === "new-rig" ? (this.newMode === "seat" ? "Create" : "Launch")
       : step.action === "delete-rig" ? `Delete ${target.rig}`
@@ -1425,12 +1514,12 @@ export default class RigMenu extends View {
         }
       })
       .child(div().id("rig-dialog-title").flex_none().text_size(14).font_semibold().child(title))
-      .when(!!body && step.action !== "change-model", (el) => el.child(body))
+      .when(!!body && step.action !== "change-model" && step.action !== "new-rig", (el) => el.child(body))
       .when(!!this.input && !this.result, (el) => el.child(div().flex_1().border(1).border_color(t.border).rounded(6).p(6).child(Textarea.new(this.input).h(96)))
         .child(div().text_size(11).text_color(t.dim).child(`${mac ? "⌘ Return" : "Ctrl+Enter"} sends · Esc or a click outside closes; your text is kept until you send or cancel`)))
       // Long results and the model/harness form scroll; the action footer never shrinks into the body.
       .when(step.action !== "design-view" || !!this.result || !!this.busy, (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
-        .when(step.action === "change-model" && !!body, (content) => content.child(body))
+        .when((step.action === "change-model" || step.action === "new-rig") && !!body, (content) => content.child(body))
         .child(this.resultView(t, cx, target, step) ?? div())))
       .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
         .child(div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
@@ -1454,7 +1543,7 @@ export default class RigMenu extends View {
         .child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().child(s.logicalId))
         .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))));
     return v_flex().id("delete-view").gap(8)
-      .child(div().child(`This stops ${what} and deletes the rig. OpenRig takes a snapshot first, but the rig can't be brought back by name afterwards.`))
+      .child(div().child(`${this.rigRunning(target) ? `This stops ${what} and deletes the rig. OpenRig takes a snapshot first.` : `This removes the stopped rig ${target.rig}.`} The rig can't be brought back by name afterwards.`))
       .child(list)
       .child(div().id("delete-command").text_size(11.5).text_color(t.dim).child(commandLine(this.argsFor(target, "delete-rig"))))
       .child(div().text_size(11).text_color(t.dim).child("Seats joined with rig attach keep running; the result lists them."))
@@ -1476,13 +1565,16 @@ export default class RigMenu extends View {
     const specList = !specs ? div().text_color(t.muted).child("Reading the spec library…")
       : specs.error ? div().text_color(t.blocked).child(specs.error)
       : !specs.length ? div().text_color(t.muted).child("The spec library has no rig specs. Add one to the library, or make a one-seat rig.")
-      : v_flex().id("new-rig-specs").gap(2).max_h(132).overflow_y_scrollbar().children(specs.map((s, i) => {
+      : v_flex().id("new-rig-specs").gap(2).h(this.newExpandedSpec ? 360 : 132).flex_none().overflow_y_scrollbar().mode("always")
+        .when(!!this.newSpecHandle, (el) => el.track_focus(this.newSpecHandle))
+        .on_key_down((e, cx) => this.newSpecKey(e, cx)).children(specs.map((s, i) => {
         const on = this.newSpec === s;
-        return h_flex().id(`new-rig-spec-${i}`).px(6).h(24).gap(8).rounded(5).items_center().cursor_pointer()
+        return v_flex().flex_none().gap(3).child(h_flex().id(`new-rig-spec-${i}`).px(6).h(24).gap(8).rounded(5).items_center().cursor_pointer()
           .bg(on ? (t.selection ?? `${t.accent}1f`) : t.raised).hover((x) => x.bg(t.hover))
-          .on_click((_e, cx) => { this.newSpec = s; this.result = null; cx.notify(); })
+          .on_click((_e, cx) => { this.typing = false; this.newSpecHandle?.focus?.(); this.pickNewSpec(cx, s, true); })
           .child(svg(icon(on ? "check" : "rig-card")).size(12).flex_none().text_color(on ? t.accent : t.muted))
-          .child(div().flex_1().truncate().child(s.name ?? s.sourcePath));
+          .child(div().flex_1().truncate().child(s.name ?? s.id ?? "Unnamed spec")))
+          .when(this.newExpandedSpec === s, (el) => el.child(v_flex().id(`new-rig-spec-preview-${i}`).ml(14).pb(4).child(this.newSpecPreviewView(t, s))));
       }));
     return v_flex().id("new-rig-view").gap(8)
       .child(h_flex().id("new-rig-mode").gap(4)

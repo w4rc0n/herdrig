@@ -126,7 +126,7 @@ function mapNode(n) {
 }
 
 function tmuxFailureMessage(session) {
-  return `Couldn't open ${session}'s tmux session on this machine. If OpenRig runs on another machine (for example through a tunnel), Attach and rig spaces can't reach it yet.\n`;
+  return `Couldn't open ${session}'s tmux session here. Check that the seat is running (rig ps) and that this account can open OpenRig's tmux.\n`;
 }
 function main(payloadArg) {
   let cfg;
@@ -217,7 +217,7 @@ function main(payloadArg) {
   const child = spawn("tmux", argv, { stdio: "inherit", env: childEnv, shell: false });
   const cleanup = () => { clearInterval(timer); emit("clear"); };
   child.on("error", (e) => { process.stderr.write(`rig-attach-relay: tmux didn't start (${e.message})\n${tmuxFailureMessage(cfg.session)}`); cleanup(); process.exit(1); });
-  child.on("exit", (code) => { if (code) process.stderr.write(tmuxFailureMessage(cfg.session)); cleanup(); process.exit(code ?? 0); });
+  child.on("exit", (code) => { if (code) process.stderr.write("Attach viewer ended. Close this tab, then Attach again if needed.\n"); cleanup(); process.exit(code ?? 0); });
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { cleanup(); try { child.kill(sig); } catch (_) {} });
 }
 

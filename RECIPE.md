@@ -1,5 +1,14 @@
 # Herdrig
 
+Version: v0.3.0
+
+## Updating
+
+Replace the four folders `rig`, `rig-view`, `rig-palette` and `rig-menu` in `<appHome>/mods/` with this
+release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
+Restart herdr-app after all four are copied. Folds and settings are kept outside those folders.
+Check the `Version:` line in the README you copied, or **Herdrig Version** in System.
+
 Herdrig brings OpenRig into the `herdr` window: a sidebar with six collapsible branches of a rig's live topology,
 specs, scopes, terminals, needs-you items and system state. Rig rows open the rig's Herdr space; other rows open
 graphical pages. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar stays put while you read.
@@ -12,15 +21,17 @@ prevent automatic rebuilding. Closing a rig space keeps it closed across members
 explicit sidebar/menu open or Attach recreates it. Names never claim personal spaces: collisions get a numeric suffix.
 New Attach tabs use the rig space with the existing status relay; grid viewers stay plain and Needs you supplies alerts.
 Existing Rig pages and TUI tabs stay in their original spaces. Native Herdr seats use Attach instead of this grid.
-Attach and grids require tmux on Herdr's machine. A loopback HTTP tunnel to a box does not forward that box's tmux;
-it cannot be detected from the URL or daemon host ID. Failed local attaches explain this limit and use exact session
-matching only. Remote transport is not implemented.
+Attach and grids use local tmux unless a Herdr machine is explicitly configured (see below). A loopback HTTP tunnel
+does not change the selected machine. In local mode, Attach and Operator use a local rig space even when a remote
+space is active. The TUI uses a labelled local terminal too. A failed labelled start reports the failure; it never
+falls back to an unlabelled tab in the active space. A tunnel alone does not forward tmux.
+All attaches use exact session matching.
 Before creating tiles, a single exact-session tmux check verifies the first seat is reachable locally. Failure
 opens no tiles and shows one explanation. If a grid already failed or was only partly created, its sidebar notice
 offers **Close all viewer tiles**. Live argv and ownership are checked before every close; personal panes and
 restored shells survive. Background reconciliation stays paused until another explicit Open rig space.
 
-Ended or failed grid viewers retain an inert notice instead of exiting into a replacement shell. Close the pane and
+Ended or failed local grid viewers retain an inert notice instead of exiting into a replacement shell. Close the pane and
 open the rig space again to retry. Rebuilding checks the live argv as well as labels, leaving legacy replacement
 shells untouched. After a core restart, the sidebar names restored shell tiles and offers **Rebuild tiles…**.
 Opening the rig offers the same confirmation: it lists each seat and terminal, warns that shell work is lost,
@@ -32,6 +43,29 @@ opening the rig again. A reusable first viewer stays open. The confirmation has 
 explicitly when a grid pane has focus, and is checked again before mutation. The stale notice clears after rebuilding
 or closing the space.
 Space titles omit control characters and are capped; viewers do not use a daemon-supplied cwd.
+
+### Seats on another machine
+
+Use Herdr's **Add machine** to connect over SSH as OpenRig's user. The machine needs herdr-core, Node 22+, tmux
+and `rig`, curl, `printenv`, `readlink -f`, `test`, `sha256sum`, `which`, `id` and `env` on its PATH.
+Keep the loopback daemon tunnel, and set `"daemonMachine": "box"` in
+`<appHome>/openrig/config.json` to the exact Herdr machine name. The mod uses existing entries without changing them.
+
+The first Attach, Operator or rig-space open asks once, naming the machine/account, destination and file hash.
+Herdr machine access means full shell access for local programs to that account's commands, files and terminals.
+On approval, the mod copies its pinned `rig-attach-relay.cjs` to the remote user's `.local/share/herdr-openrig/`,
+checks its hash before use and refreshes it automatically with later releases. Attach and Operator run it there;
+grid tiles use plain tmux and inert padding. Changed machine/daemon mappings need fresh confirmation.
+
+The mod checks connection and layout readiness and compares the tunnel's OpenRig host ID with the daemon found
+by `rig status --json` on the machine. A mismatch or outage refuses the action with a fix such as
+`hc machine login box` or `hc machine update box`. It never starts local tmux as a fallback. A remote core restart
+can restore tiles as shells: review **Rebuild tiles…** before replacing them. Unrecognised programs stay untouched.
+If an Attach or Operator tab became a shell, save any work and close that tab before attaching again; the mod
+explains this rather than opening a duplicate. Concurrent grid and Attach refreshes wait for each machine's relay
+preparation; a recovered connection clears its temporary grid notice on the next poll.
+One daemon machine is supported; this is not per-seat routing. A local second-core simulation covers the integration,
+while real SSH login, remote PATH/account permissions and network latency need checking on the actual machine.
 
 ![Herdrig](preview.png)
 
@@ -343,6 +377,16 @@ on a currentColor fill, 16 px nominal, so they dim and tint with the theme rathe
 
 ## Watch out
 
+**Waiting on the next OpenRig release.** Basic worker-view open and close, **Show in worker view**, and saved-view
+previews turn on with an OpenRig release containing the [herdr-app provider](https://github.com/mvschwarz/openrig/pull/2744).
+It is merged upstream but not in the current release, 0.7.11. Herdrig detects support automatically after updating
+OpenRig; no Herdrig update is needed. Check `rig --version` and the control's tooltip. Attach, the TUI tab and
+Herdrig's own Seats grids already work.
+
+**Not yet in OpenRig.** Follow and auto-prune for herdr-app, custom worker-view grids (`--grid`/`--replace`), and
+cell editing (`close --cell`) are not supported on upstream main yet. They stay disabled until the required support
+is added; the provider release alone will not enable them. No release date is promised.
+
 What tripped this build up, and what a fresh build would get wrong:
 
 - **The folders must be self-contained.** An earlier shape kept `rig-lib.js` and the icons in one `_shared/` folder
@@ -381,9 +425,9 @@ What tripped this build up, and what a fresh build would get wrong:
   dialog without changing `DESIGN_SQUARE_PX` makes the drag drift from the pointer.
 - **The Page and the TUI are tabs, not modes.** There is no mode setting. If you find a `surface` key in a config,
   it is a leftover from an older build and is ignored.
-- **Capabilities are read, not assumed.** The mods disable controls from the live CLI's `--help` text. A
-  provider-only daemon (PR 2) has **no `--follow`**, so Follow and auto-prune stay disabled with their reason —
-  that is correct behaviour there, not a bug.
+- **Capabilities are read, not assumed.** The mods disable controls from the live CLI's `--help` text. Follow
+  requires both herdr-app provider support and `--follow` plus `--prune-after`. A generic `--follow` option for
+  another terminal provider does not enable it here.
 - **What this build does not do.** It does not ship a layout (a mod repo must not), so it never owns your tab tree;
   it does not start the OpenRig daemon unless you click **Start OpenRig**, and it does not install OpenRig or seats.
 

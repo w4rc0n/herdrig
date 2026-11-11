@@ -15,8 +15,10 @@
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands } from "herdr";
+import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands, machines } from "herdr";
+import { RemoteMachine } from "./rig-remote.js";
 import { RigSpaces, RebuildConfirmations } from "./rig-spaces.js";
+import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest } from "./rig-dismiss.js";
 import { NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
 import net from "net";
 import {
@@ -124,6 +126,22 @@ export default class RigSidebar extends View {
     cx.timer.every(1000, (cx) => {
       if (this.closed) return;
       if (this.config?.missing) cx.spawn(async (cx) => this.reloadConfig(cx));
+      if (this.dismissals && !this.dismissFlushing) cx.spawn(async (cx) => {
+        this.dismissFlushing = true;
+        const model = this.dismissalModel(), config = { ...this.config };
+        if (!model) { this.dismissFlushing = false; return; }
+        try { await model.flush((item) => commitDismissal(config, item, boundedDismissalRequest(async (req) => {
+          const res = await fetch(`${config.daemonUrl}${req.path}`, { method: req.method,
+            ...(req.body ? { headers: req.headers, body: JSON.stringify(req.body) } : {}) });
+          const data = await res.json().catch(() => null);
+          return { ok: res.ok, status: res.status, data };
+        }, (ms, done) => cx.timer.after(ms, done)), {
+          attentionItems: this.dismissals?.scope === model.scope ? this.data?.attentionItems ?? [] : [],
+          person: dismissalRecipient(config, this.data?.attentionPerspective),
+        }), () => this.saveDismissals(model)); }
+        catch (_) { setShared("rig.dismissSaveError", "Could not save dismissal state. No further closes will be attempted for that update; check OpenRig."); }
+        finally { this.dismissFlushing = false; this.publishDismissals(); cx.notify(); }
+      });
     });
     // rig.<command> (herdr-app do, keys.json): the sidebar is loaded whenever the Rig layout shows.
     cx.spawn(async (cx) => {
@@ -140,7 +158,13 @@ export default class RigSidebar extends View {
           const fallbackEntry = shared("rig.sel")?.entry ?? shared("rig.nav")?.stack?.at(-1) ?? { section: "topology" };
           openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, fallbackEntry);
         }
+        else if (cmdName.startsWith("update-action:")) this.updateAction(cx, cmdName.slice(14));
         else if (cmdName === "refresh") { this.forceCapabilityProbe = true; cx.spawn(async (cx) => this.refresh(cx)); }
+        else if (cmdName === "confirm-machine") {
+          const token = shared("rig.machineConfirmation"); setShared("rig.machineConfirmation", null);
+          const pending = this.machineConfirmations?.get(token);
+          if (pending) { this.machineConfirmations.delete(token); pending.resume(cx, pending.confirmation); }
+        }
         else if (cmdName === "rebuild-space") {
           const request = shared("rig.rebuildRequest"); setShared("rig.rebuildRequest", null);
           const approved = this.rebuildConfirmations?.take(request);
@@ -205,6 +229,7 @@ export default class RigSidebar extends View {
       const raw = await readTextFile(`${appHome()}/openrig/state.json`);
       if (!raw) return;
       const parsed = parseSidebarState(raw);
+      try { this.dismissalOrigins = JSON.parse(raw).dismissedUpdates ?? {}; } catch (_) {}
       if (parsed.topologyView && !shared("rig.topology.view")) setShared("rig.topology.view", parsed.topologyView);
       if (parsed.notifiedNeeds && !shared("rig.notifiedNeeds")) setShared("rig.notifiedNeeds", parsed.notifiedNeeds);
       if (Object.keys(parsed.open).length > 0) {
@@ -301,12 +326,17 @@ export default class RigSidebar extends View {
   tui(cx) {
     const config = this.config ?? parseConfig(null), inRigLayout = inRigLayoutNow();
     cx.spawn(async (cx) => {
-      await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+      const result = await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+      if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
     });
   }
 
   /** Open `operator.agent` (`rig: "kernel"`) in a Herdr tab named `Operator`. */
-  openOperator(cx) {
+  openOperator(cx, consent = null) {
+    if (!this.config?.daemonUrl) {
+      notify({ title: "Open operator", body: "OpenRig is still loading; try again in a moment", level: "warning" });
+      return;
+    }
     const config = this.config ?? parseConfig(null);
     if (config?.daemonUrl && !isLoopbackDaemonUrl(config.daemonUrl)) {
       notify({ title: "Open operator", body: REMOTE_OPERATOR_REASON, level: "warning" });
@@ -334,14 +364,13 @@ export default class RigSidebar extends View {
             });
     cx.spawn(async (cx) => {
       const res = await attachToSeat(
-        { exec, spaces, panes, terminals, hc, run, relayPath: attachRelayPath(appHome(), MOD_IDS.sidebar), wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) },
+        this.attachHost(cx, consent),
         opSeat,
         config,
         { name: "Operator", operator: true, daemonUrl: config?.daemonUrl },
       );
-      if (!res?.ok && res?.reason) {
-        notify({ title: "Open operator", body: res.reason, level: "warning" });
-      }
+      if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.openOperator(cx, approval));
+      else this.notifyResult("Open operator", res);
       cx.notify();
     });
   }
@@ -391,7 +420,11 @@ export default class RigSidebar extends View {
 
   /** `rig.attach:<session>`: a seat this sidebar knows, by its exact session name. Anything else is refused, never
    *  guessed (no stand-in seat, no command built from the name). */
-  attachSeatBySession(cx, session) {
+  attachSeatBySession(cx, session, consent = null) {
+    if (!this.config?.daemonUrl) {
+      notify({ title: "Attach", body: "OpenRig is still loading; try again in a moment", level: "warning" });
+      return;
+    }
     if (!isValidSessionName(session)) {
       notify({ title: "Attach", body: sessionNameRefusal(session), level: "warning" });
       return;
@@ -404,16 +437,41 @@ export default class RigSidebar extends View {
     }
     const config = this.config;
     cx.spawn(async (cx) => {
-      const res = await attachToSeat({ exec, spaces, panes, terminals, hc, run, relayPath: attachRelayPath(appHome(), MOD_IDS.sidebar), wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, seat, config);
-      if (!res?.ok && res?.reason) {
-        notify({ title: `Attach ${seat.logicalId ?? session}`, body: res.reason, level: "warning" });
-      }
+      const res = await attachToSeat(this.attachHost(cx, consent), seat, config);
+      if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.attachSeatBySession(cx, session, approval));
+      else this.notifyResult(`Attach ${seat.logicalId ?? session}`, res);
       cx.notify();
     });
   }
 
-  spaceController(cx) {
-    if (!this.rigSpaces) this.rigSpaces = new RigSpaces({ spaces, panes, terminals, focused, commands, hc, run, exec,
+  attachHost(cx, consent = null) {
+    const host = { exec, spaces, panes, terminals, hc, run, machines, layout,
+      relayPath: attachRelayPath(appHome(), MOD_IDS.sidebar),
+      wait: (ms) => new Promise((resolve) => cx.timer.after(ms, resolve)),
+      health: async (url) => { const r = await fetch(`${url}/healthz`); if (!r.ok) throw new Error("Cannot read the tunnel's OpenRig health."); return r.json(); },
+      readConsent: async () => { try { return JSON.parse(await readTextFile(`${appHome()}/openrig/machine-consent.json`)); } catch { return null; } },
+      writeConsent: async (value) => {
+        const path = `${appHome()}/openrig/machine-consent.json`;
+        const previous = await readTextFile(path).catch(() => null);
+        await writeTextFile(path, JSON.stringify(value), previous);
+      } };
+    const remote = new RemoteMachine(host);
+    host.prepareRemote = (config, opts = {}) => remote.prepare(config, { ...opts, consent });
+    return host;
+  }
+
+  reviewMachine(result, resume) {
+    this.machineConfirmations ??= new Map();
+    // One active first-use dialog per sidebar; a stale dialog cannot authorize a later request.
+    this.machineConfirmations.clear();
+    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    this.machineConfirmations.set(token, { confirmation: result.confirmation, resume });
+    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 540, height: 420,
+      props: { target: { kind: "machine" }, step: { action: "confirm-machine", token, confirmation: result.confirmation } } });
+  }
+
+  spaceController(cx, consent = null) {
+    if (!this.rigSpaces) this.rigSpaces = new RigSpaces({ spaces, panes, terminals, focused, commands, hc, run,
       recoveryShell: async () => {
         const node = this.config?.rig?.[0]?.match(/(?:^|\/)node$/) ? this.config.rig[0] : "node";
         const result = await exec(node, [`${appHome()}/mods/${MOD_IDS.sidebar}/rig-shell-config.cjs`]);
@@ -422,6 +480,9 @@ export default class RigSidebar extends View {
       padPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-pad.cjs`,
       viewerPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-viewer.cjs`, selfHostId: () => this.healthz?.selfHostId,
       wait: (ms) => new Promise((resolve) => cx.timer.after(ms, resolve)) });
+    const remoteHost = this.attachHost(cx, consent);
+    this.rigSpaces.host.prepareRemote = remoteHost.prepareRemote;
+    this.rigSpaces.host.exec = exec;
     return this.rigSpaces;
   }
 
@@ -440,17 +501,32 @@ export default class RigSidebar extends View {
         tileNames: result.recovery.tiles.map((tile) => this.gridSeatName(rig, tile.labels["herdr-openrig.seat"])) } } });
   }
 
-  openRigSpace(cx, id, rebuild = null) {
+  openRigSpace(cx, id, rebuild = null, consent = null) {
     const rig = this.data?.topology?.find((r) => r.id === id || r.name === id);
     if (!rig || this.error) { notify({ title: "Rig space", body: "Refresh OpenRig before opening this rig's space.", level: "warning" }); return; }
     setShared("rig.sel", { key: rigKey(rig.id), entry: { section: "topology", kind: "rig", rigId: rig.id, name: rig.name }, at: Date.now() });
     cx.spawn(async (cx) => {
-      const result = await this.spaceController(cx).sync(rig, this.config, { explicit: true, rebuild });
+      const result = await this.spaceController(cx, consent).sync(rig, this.config, { explicit: true, rebuild });
       setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
-      if (result.recovery) this.reviewRigRebuild(rig, result);
-      else if (!result.ok || result.empty) notify({ title: `${rig.name} space`, body: result.reason ?? "No running seats in this rig.", level: "warning" });
+      if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval));
+      else if (result.recovery) this.reviewRigRebuild(rig, result);
+      else this.notifyResult(`${rig.name} space`, result);
       cx.notify();
     });
+  }
+
+  notifyResult(title, result, changed = true) {
+    this.machineNotices ??= new Map();
+    if (result.ok && !result.closed) this.machineNotices.delete(this.config?.daemonMachine);
+    if (result.machineNotice) {
+      const { machine, body } = result.machineNotice;
+      if (!this.machineNotices.has(machine)) {
+        this.machineNotices.set(machine, body);
+        notify({ title: machine, body, level: "warning" });
+      }
+    } else if (changed && (!result.ok || result.empty)) {
+      notify({ title, body: result.reason ?? "No running seats in this rig.", level: "warning" });
+    }
   }
 
   syncRigSpaces(cx) {
@@ -462,7 +538,7 @@ export default class RigSidebar extends View {
           if (this.error) break;
           const result = await this.spaceController(cx).sync(rig, this.config);
           const statuses = shared("rig.spaceStatus") ?? {};
-          if (!result.ok && statuses[rig.id]?.reason !== result.reason) notify({ title: `${rig.name} space`, body: result.reason, level: "warning" });
+          this.notifyResult(`${rig.name} space`, result, statuses[rig.id]?.reason !== result.reason);
           setShared("rig.spaceStatus", { ...statuses, [rig.id]: result });
         }
       } finally {
@@ -477,7 +553,7 @@ export default class RigSidebar extends View {
     cx.spawn(async (cx) => {
       const result = await this.spaceController(cx).sync(rig, this.config, { explicit: true, closeAll: true });
       setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
-      if (!result.ok) notify({ title: `${rig.name} space`, body: result.reason, level: "warning" });
+      this.notifyResult(`${rig.name} space`, result);
       cx.notify();
     });
   }
@@ -666,6 +742,57 @@ export default class RigSidebar extends View {
 
   async close() { this.closed = true; try { this.sock?.close(); } catch (_) {} }
 
+  dismissalModel() {
+    const origin = this.config?.daemonUrl;
+    if (!origin) return null;
+    const scope = dismissalScope(this.config);
+    if (this.dismissals?.scope !== scope) {
+      this.dismissals = new DismissedUpdates(this.dismissalOrigins?.[scope]);
+      this.dismissals.origin = origin;
+      this.dismissals.scope = scope;
+    }
+    return this.dismissals;
+  }
+
+  async saveDismissals(model = this.dismissals) {
+    if (!model) return;
+    this.dismissalOrigins = { ...this.dismissalOrigins, [model.scope]: model.saved() };
+    const file = `${appHome()}/openrig/state.json`;
+    // Compare-and-write preserves other views' state changes. A failed save prevents a remote commit.
+    for (let i = 0; i < 3; i++) {
+      const prev = await readTextFile(file).catch(() => null);
+      let state = {}; try { state = JSON.parse(prev ?? "{}"); } catch (_) {}
+      const next = { ...state, dismissedUpdates: { ...state.dismissedUpdates, ...this.dismissalOrigins } };
+      try { await writeTextFile(file, JSON.stringify(next, null, 2) + "\n", prev); return; } catch (e) { if (i === 2) throw e; }
+    }
+  }
+
+  publishDismissals() {
+    const model = this.dismissalModel(); if (!model) return;
+    setShared("rig.dismissedUpdates", { ...model.saved(), receipts: model.receiptRows(), origin: model.origin, scope: model.scope });
+    if (this.data) {
+      this.data.attention = model.visible(this.data.attentionItems ?? []).length;
+      setShared("rig.data", { ...(shared("rig.data") ?? {}), attention: this.data.attention });
+    }
+  }
+
+  updateAction(cx, id) {
+    const requests = { ...(shared("rig.updateActions") ?? {}) }, req = requests[id]; delete requests[id];
+    setShared("rig.updateActions", requests);
+    const model = this.dismissalModel(); if (!req || !model || req.scope !== model.scope) return;
+    if (req.action === "dismiss") model.dismiss(liveDismissalItems(Array.isArray(req.value) ? req.value : [req.value], this.data?.attentionItems ?? [], model.records));
+    else if (req.action === "undo") model.undo(req.value);
+    else if (req.action === "restore") model.restore(req.value);
+    else if (req.action === "show") model.show = !model.show;
+    else if (req.action === "leave") model.leave();
+    this.publishDismissals();
+    cx.spawn(async (cx) => {
+      try { await this.saveDismissals(model); }
+      catch (_) { setShared("rig.dismissSaveError", "Could not save dismissed updates. They may return after restarting Herdr."); }
+      cx.notify();
+    });
+  }
+
   async get(path) {
     if (!this.config?.daemonUrl) {
       const status = await discoverDaemonFromCli(this.config, exec);
@@ -744,6 +871,11 @@ export default class RigSidebar extends View {
           if (row) queueRows[id] = row.item ?? row.qitem ?? row;
         }));
         const attentionItems = rawAttentionItems ? enrichAttentionItems(rawAttentionItems, attentionAgg, queueRows) : null;
+        if (rawAttentionItems) {
+          const model = this.dismissalModel();
+          const before = JSON.stringify(model?.saved()); model?.observe(rawAttentionItems);
+          if (model && before !== JSON.stringify(model.saved())) await this.saveDismissals(model);
+        }
         const rawPerson = this.config?.person || attention?.perspective?.personId || null;
         const personId = rawPerson ? String(rawPerson).replace(/@external$/i, "") : null;
         let quietRes = null;
@@ -878,6 +1010,7 @@ export default class RigSidebar extends View {
       versionLine: formatOpenRigVersionLine({ healthz: this.healthz, cliVersion: this.cliVersion }),
       capabilities: this.data?.capabilities ?? currentCapabilities(shared, terminals?.() ?? []),
     });
+    this.publishDismissals();
     cx.notify();
     if (!this.error && this.data) this.syncRigSpaces(cx);
     if (this.again) { this.again = false; await this.refresh(cx); }
@@ -1905,10 +2038,23 @@ export default class RigSidebar extends View {
         const match = enrichedById.get(it.id);
         return needTarget(match ? { ...it, ...match } : it);
       });
-      const rawItems = sortNeedsByTier(mergedItems);
+      const rawItems = sortNeedsByTier(this.dismissalModel()?.visible(mergedItems) ?? mergedItems);
       const orderedNeeds = orderSiblings(rawItems, "needs:items", orderMap, (n) => n.id);
       const needIds = orderedNeeds.map((n) => n.id);
+      let updatesHeader = false;
       for (const n of orderedNeeds) {
+        if (n.update && !updatesHeader) {
+          updatesHeader = true;
+          const updates = orderedNeeds.filter((it) => it.update);
+          const foldKey = "needs:updates", expanded = branchFoldOpen(folds, foldKey, true);
+          out.push(h_flex().id("needs-updates-branch").pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
+            .on_click(() => { this.fold(foldKey, !expanded); cx.notify(); })
+            .on_mouse_down("right", () => this.menu({ kind: "updates-group", name: "Updates", items: updates }))
+            .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
+            .child(div().flex_1().text_size(11.5).text_color(t.muted).child("Updates"))
+            .child(div().text_size(11).text_color(t.dim).child(String(updates.length))));
+        }
+        if (n.update && !branchFoldOpen(folds, "needs:updates", true)) continue;
         const entry = { section: "needs", id: n.id, name: n.summary };
         const tier = n.tier ?? tierOf(n);
         const rowId = `need-${n.id}`;
@@ -1981,7 +2127,7 @@ export default class RigSidebar extends View {
       const defaultOpen = section === "topology"
         ? true
         : section === "needs"
-          ? Boolean((this.data?.attention ?? 0) > 0)
+          ? Boolean((this.dismissalModel()?.visible(this.data?.attentionItems ?? []).length ?? this.data?.attention ?? 0) > 0)
           : false;
       const openBranch = branchFoldOpen(folds, bKey, defaultOpen);
 
@@ -2000,7 +2146,7 @@ export default class RigSidebar extends View {
           out.push(...(shared("rig.topology.view") === "rig" ? this.topologyRows(t, cx) : this.priorityView(t, cx)));
         }
       } else if (section === "needs") {
-        const needsCount = this.data?.attention ?? 0;
+        const needsCount = this.dismissalModel()?.visible(this.data?.attentionItems ?? []).length ?? this.data?.attention ?? 0;
         const quietChip = this.data?.quietModeChip ?? null;
         const quietChipEl = quietChip?.label
           ? h_flex().id("rig-quiet-mode-chip").px(5).h(18).gap(4).rounded(4).items_center().cursor_pointer()
@@ -2130,10 +2276,10 @@ export default class RigSidebar extends View {
       .child(v_flex().id(this.priorityReveal ? `rig-list-reveal-${this.priorityReveal}` : "rig-list").flex_1().overflow_y_scrollbar().py(4)
         .children((this.data?.topology ?? []).flatMap((rig) => {
           const status = shared("rig.spaceStatus")?.[rig.id];
-          if (status?.closeAvailable) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
+          if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}: ${status.reason}`))
-            .child(div().id(`close-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
-              .on_click((_e, cx) => this.closeRigTiles(cx, rig)).child("Close all viewer tiles"))];
+            .when(!!status.closeAvailable, el => el.child(div().id(`close-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
+              .on_click((_e, cx) => this.closeRigTiles(cx, rig)).child("Close all viewer tiles")))];
           if (!status?.stale?.length) return [];
           return [v_flex().id(`stale-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(status.recovery

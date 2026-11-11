@@ -13,16 +13,19 @@ import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea } from "gpui-base";
 import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window, notify } from "herdr";
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
-  configRows, crumbsFor, navPush, navBack, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
+  configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat,
-  tierOf, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
+  rowStatusGlyph, formatHonestCount, attachToSeat, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage,
+  tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath, waitWith,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, isValidSessionName, newRigOverlay } from "./rig-lib.js";
 import { seatActivityDetails, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
+import { dismissible, dismissalSnapshot, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
+import { HERDRIG_VERSION } from "./rig-version.js";
+import { workerCapabilityText } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -95,6 +98,7 @@ const usd = (v) => typeof v === "number" ? `$${v.toFixed(2)}` : "—";
 
 export default class RigView extends View {
   init(p, cx) {
+    this.pulseFilter = null; // Page-session only: never restore the legacy persisted shared filter.
     this.initialEntry = p?.entry ?? null;
     this.config = null;
     this.cache = {}; // path → { data, error, at }
@@ -145,7 +149,26 @@ export default class RigView extends View {
   }
 
   /** herdr's teardown: the watch loop ends with this copy; a reply typed and not sent stays as a draft. */
-  async close() { this.closed = true; for (const box of Object.values(this.replies)) this.keepDraft(box); }
+  async close() { this.closed = true; this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); }
+
+  updateAction(action, value) { requestDismissal({ shared, setShared, run, scope: dismissalScope(this.config) }, action, value); }
+  updateModel() {
+    const state = shared("rig.dismissedUpdates");
+    return dismissalSnapshot(state?.scope === dismissalScope(this.config) ? state : null);
+  }
+  updateButton(t, id, label, onClick) {
+    return h_flex().id(id).px(6).h(20).rounded(5).items_center().cursor_pointer()
+      .bg(t.raised).border_1().border_color(t.border).text_size(11).text_color(t.muted)
+      .on_click(onClick).child(label);
+  }
+  updateReceipt(t, receipt) {
+    this.ticking = true;
+    return h_flex().id(`dismiss-receipt-${receipt.id}`).px(8).py(6).gap(8).items_center()
+      .child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(receipt.keys.length === 1
+        ? `✓ Dismissed: ${receipt.summary ?? "update"}` : `✓ Dismissed ${receipt.keys.length} updates`))
+      .child(div().id(`undo-${receipt.id}`).text_size(12).text_color(t.accent).cursor_pointer()
+        .on_click(() => this.updateAction("undo", receipt.id)).child("Undo"));
+  }
 
   loadPersistedState(cx) {
     if (typeof appHome !== "function" || typeof readTextFile !== "function") return;
@@ -197,7 +220,8 @@ export default class RigView extends View {
     if (layoutHasMod(layout(), MOD_IDS.sidebar)) return run("rig.tui");
     const config = this.config, rigLayout = inRigLayout();
     cx.spawn(async (cx) => {
-      await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout: rigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+      const result = await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout: rigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+      if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
     });
   }
 
@@ -266,6 +290,15 @@ export default class RigView extends View {
           // Consume invalidation when starting, not when finishing: another update may arrive mid-read.
           ...(pending?.stale ? { stale: true } : {}),
         };
+        if (outcome.ok && typeof outcome.data?.qitemId === "string" && path.startsWith("/api/queue/")) {
+          const row = outcome.data, at = this.cache[path].at;
+          for (const [id, box] of Object.entries(this.replies ?? {})) {
+            if (box.target?.qitemId === row?.qitemId && observeNeedDecision(box, row, at)) {
+              delete this.answered[id];
+              delete this.questionChoices[id];
+            }
+          }
+        }
       };
       cx.spawn(async (cx) => {
         try {
@@ -327,6 +360,12 @@ export default class RigView extends View {
   }
   title(t, text) { return this.plain(t, text).text_size(15).font_semibold(); }
   dim(t, text) { return this.plain(t, text).text_size(12).text_color(t.dim); }
+  workerCapabilityMessage() { return workerCapabilityText(capabilitiesSummaryDetail(this.caps()).reason ?? ""); }
+  workerCapabilityNote(t, reason, id = null) {
+    return div().when(!!id, el => el.id(id)).text_size(11.5).text_color(t.dim)
+      .tooltip(`${reason}\nProvider: https://github.com/mvschwarz/openrig/pull/2744\nFollow and custom grids need additional upstream support; see the README's Waiting on the next OpenRig release section.`)
+      .child(this.workerCapabilityMessage());
+  }
   card(t, title, children, meta = null) {
     return v_flex().rounded(10).bg(t.background).border_1().border_color(t.border).p(12).gap(8)
       .when(!!title, (el) => el.child(h_flex().items_center().child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child(title))
@@ -407,7 +446,7 @@ export default class RigView extends View {
     return v_flex()
       .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).children(cols.map(([label], i) => cell(label, i, true))).child(div().w(12)))
       .children(rows.length ? rows.map((r, i) => {
-        let el = h_flex().id(`${idPrefix}-${i}`).px(8).h(30).gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover));
+        let el = h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover));
         if (r.onClick) el = el.on_click(r.onClick);
         if (r.onRight) el = el.on_mouse_down("right", r.onRight);
         return el.children(r.cells.map((c, j) => cell(c, j, false, i)))
@@ -503,6 +542,7 @@ export default class RigView extends View {
     const blocks = models.map((r) => this.rigBlock(t, cx, r, { entry, rigCount: rigs.length, attentionItems, allSeats, allowPulseFilter: true })).filter(Boolean);
     return v_flex().gap(12)
       .child(strip)
+      .when(Boolean(this.pulseFilter), el => el.child(this.pulseFilterBar(t, modelList, attentionItems, cx)))
       .child(this.topologyRecent(t, cx, rigs))
       .when(!!missingFocusRig, (el) => el.child(missingFocusRig))
       .children(blocks.length ? blocks : [this.dim(t, this.filter ? `No matches for /${this.filter}.` : "No rigs registered — run rig up <spec> to launch a team.")])
@@ -636,7 +676,7 @@ export default class RigView extends View {
   /** One-line clickable pulse status strip at top of Topology. */
   pulseStrip(t, modelList, attentionItems, updatedAt, entry = {}) {
     const counts = computePulseCounts(modelList, attentionItems);
-    const pulseFilter = shared("rig.pulseFilter") ?? null;
+    const pulseFilter = this.pulseFilter ?? null;
     const focused = shared("rig.focus") === "pulse" || entry?.focus === "pulse";
     const topoForFold = modelList.map((m) => ({
       id: m.rig.id,
@@ -644,15 +684,16 @@ export default class RigView extends View {
       pods: (m.pods ?? []).map((p) => (Array.isArray(p) ? { name: p[0], seats: p[1] } : p)),
     }));
     const toggleFilter = (key) => {
-      const cur = shared("rig.pulseFilter") ?? null;
-      setShared("rig.pulseFilter", cur === key ? null : key);
+      const cur = this.pulseFilter ?? null;
+      this.pulseFilter = cur === key ? null : key;
     };
     const seg = (id, key, label, color, mark = null) => {
       const active = key === null ? !pulseFilter : pulseFilter === key;
       return h_flex().id(id).px(8).h(22).gap(5).items_center().cursor_pointer()
         .bg(active ? t.accent : t.raised)
         .hover((s) => s.bg(active ? t.accent : t.hover))
-        .on_click(() => (key === null ? setShared("rig.pulseFilter", null) : toggleFilter(key)))
+        .on_click((_e, cx) => { if (key === null) this.pulseFilter = null; else toggleFilter(key); cx?.notify?.(); })
+        .when(key === "idle", el => el.tooltip("Idle, done, stopped or unknown"))
         .when(!!mark, (el) => el.child(this.dot(t, mark, 12)))
         .child(div().text_size(11.5).text_color(active ? (t.solid_foreground ?? t.background) : color).font_medium().child(label));
     };
@@ -675,6 +716,16 @@ export default class RigView extends View {
         .on_click(() => setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), topoForFold)))
         .child(div().text_size(11.5).text_color(t.foreground).child("Collapse all")))
       .child(div().text_size(11).text_color(t.dim).child(`updated ${ageSec}s ago`));
+  }
+
+  pulseFilterBar(t, models, attentionItems) {
+    const filter = this.pulseFilter;
+    const hidden = models.reduce((n, model) => n + model.seats.filter(seat => !matchesPulseFilter(seat, model, filter, attentionItems)).length, 0);
+    const label = { idle: "Idle", working: "Working", blocked: "Blocked", needs: "Needs you" }[filter] ?? filter;
+    return h_flex().id("pulse-filter-notice").gap(8).items_center().text_size(12).text_color(t.muted)
+      .child(`Showing ${label} · ${hidden} hidden`)
+      .child(div().id("pulse-show-all").text_color(t.accent).cursor_pointer()
+        .on_click((_e, cx) => { this.pulseFilter = null; cx.notify(); }).child("Show all"));
   }
 
   /** An entry that names its rig only by name (a cell header's, say) gets the id from the rig list; else a status view. */
@@ -724,7 +775,7 @@ export default class RigView extends View {
         : rigFoldOpen(rig, model.seats, open);
     let seats = model.seats;
     const f = this.filter?.toLowerCase();
-    const pulseFilter = allowPulseFilter ? (shared("rig.pulseFilter") ?? null) : null;
+    const pulseFilter = allowPulseFilter ? this.pulseFilter ?? null : null;
     let noMatch = false;
     if (f) {
       const has = (v) => String(v ?? "").toLowerCase().includes(f);
@@ -736,12 +787,13 @@ export default class RigView extends View {
       seats = seats.filter((s) => matchesPulseFilter(s, model, pulseFilter, attentionItems, allSeats.length ? allSeats : model.seats));
       noMatch = !seats.length;
     }
-    const counts = statusCounts(model.seats);
-    const tone = rigTone(model.seats);
+    const counts = computePulseCounts([{ rig, ...model }], attentionItems);
+    const tone = counts.needs ? "needs_input" : counts.blocked ? "blocked" : counts.working ? "working" : rigTone(model.seats);
     const target = { kind: "rig", rig: rig.name, rigId: rig.id, lifecycle };
     const viewTarget = { kind: "rig", rig: rig.name, rigId: rig.id, view: `rig:${rig.name}` };
     const dialog = (step, height) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
-    const more = this.moreButton(t, `rig-more-${rig.id}`, () => menu(target));
+    const more = () => this.moreButton(t, `rig-more-${rig.id}`, () => menu(target));
+    const showBody = expanded && (!noMatch || Boolean(pulseFilter));
     const rigRowKey = rigKey(rig.id);
     const rigEntry = { section: "topology", kind: "rig", rigId: rig.id, name: rig.name };
     this.pageRows?.push({ key: rigRowKey, foldKey: rigRowKey, expandable: true, isOpen: expanded, entry: rigEntry, target, seats: model.seats });
@@ -760,13 +812,13 @@ export default class RigView extends View {
       .child(this.dot(t, tone))
       .child(div().text_size(13).font_semibold().text_color(t.foreground).child(rig.name))
       .child(div().text_size(12).text_color(t.muted).child(`${lifecycleText} · ${model.seats.length} seat${model.seats.length === 1 ? "" : "s"}`))
-      .children([count(counts.working, "working", "working", "working"), count(counts.needs, "needs you", "blocked", "needs"), count(counts.idle, "idle", "idle", "idle")].filter(Boolean))
+      .children([count(counts.working, "working", "working", "working"), count(counts.blocked, "blocked", "blocked", "blocked"), count(counts.needs, "needs you", "blocked", "needs"), count(counts.idle, "idle", "idle", "idle")].filter(Boolean))
       .when(noMatch, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("no matching seats")))
       .child(div().flex_1())
-      .when((!expanded || noMatch) && (stoppedRig || lifecycle !== "running"), (el) => el.child(resume()))
-      .when(!expanded || noMatch, (el) => el.child(more));
+      .when(!showBody && (stoppedRig || lifecycle !== "running"), (el) => el.child(resume()))
+      .when(!showBody, (el) => el.child(more()));
     const body = [];
-    if (expanded && !noMatch) {
+    if (showBody) {
       const followed = (stripProps()?.views ?? []).find((v) => v.following?.target === `rig:${rig.name}`);
       const on = !!followed?.following?.enabled;
       const caps = this.caps();
@@ -780,10 +832,10 @@ export default class RigView extends View {
         .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => oneClick({ kind: "rig", rig: rig.name, rigId: rig.id }, "snapshot", `rig-snapshot-${rig.id}`), { small: true, iconName: "rig-snapshot", actionKey: "snapshot" }))
         .when(!stoppedRig && lifecycle !== "stopped", (el) => el.child(this.button(t, `rig-pause-${rig.id}`, "Pause…", () => dialog({ action: "pause", load: "pause" }, 360), { small: true, iconName: "rig-pause" })))
         .when(stoppedRig || lifecycle !== "running", (el) => el.child(resume()))
-        .child(div().flex_1()).child(more));
+        .child(div().flex_1()).child(more()));
       const capReasons = [...new Set([workerReason, followReason, designReason].filter(Boolean))];
       if (capReasons.length) {
-        body.push(div().id(`rig-cap-note-${rig.id}`).text_size(11.5).text_color(t.dim).child(capReasons.join(" · ")));
+        body.push(this.workerCapabilityNote(t, capReasons.join(" · "), `rig-cap-note-${rig.id}`));
       }
       if (here) {
         const activeRigTab = entry.tab ?? (entry.openRecent ? "recent" : "table");
@@ -849,7 +901,7 @@ export default class RigView extends View {
       }
       body.push(this.rigHealthEdges(t, cx, rig, { entry, rigCount, open }));
       if (nodes.data === undefined) body.push(this.status(t, cx, nodesPath, nodes));
-      else body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open }));
+      else body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter) }));
     }
     return v_flex().id(`rig-block-${rig.id}`).rounded(10).bg(t.background).border_1().border_color(focused ? t.accent : t.border).p(10).gap(6).child(head)
       .children(body.length ? [v_flex().ml(22).pl(10).gap(8).border_l(1).border_color(t.border).children(body)] : []);
@@ -950,52 +1002,56 @@ export default class RigView extends View {
   }
 
   /** Pods and seats as an indented tree (rig > pod > seat > helper) matching the sidebar grammar. */
-  rigPods(t, cx, rig, model, seats, { lifecycle, open }) {
-    if (!seats.length) return this.dim(t, this.filter ? "No matching seats." : "No seats.");
+  rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden = false }) {
+    if (!seats.length && !preserveHidden) return this.dim(t, this.filter ? "No matching seats." : "No seats.");
     const nativeSeats = this.read(cx, `/api/native-seats?rig=${encodeURIComponent(rig.name)}`).data?.seats
       ?? this.cache["/api/native-seats"]?.data?.seats
       ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
     const attentionItems = (this.cache["/api/attention"]?.data?.items ?? shared("rig.data")?.attention?.items ?? []).map(needTarget);
     const hosts = [...new Set(model.seats.map((s) => s.host ?? "local"))];
-    const groups = hosts.length > 1 ? hosts.map((h) => [h, seats.filter((s) => (s.host ?? "local") === h)]).filter(([, list]) => list.length) : [[null, seats]];
+    const sourceSeats = preserveHidden ? model.seats : seats;
+    const groups = hosts.length > 1 ? hosts.map((h) => [h, sourceSeats.filter((s) => (s.host ?? "local") === h)]).filter(([, list]) => list.length) : [[null, sourceSeats]];
     const podLines = (list, host) => {
       const pods = new Map();
       for (const s of list) { if (!pods.has(s.pod)) pods.set(s.pod, []); pods.get(s.pod).push(s); }
-      return [...pods].map(([name, podSeats]) => {
-        const all = model.seats.filter((s) => s.pod === name);
+      return [...pods].map(([name, source]) => {
+        const podSeats = preserveHidden ? source.filter(s => seats.includes(s)) : source;
+        const all = model.seats.filter((s) => s.pod === name && (!host || (s.host ?? "local") === host));
+        const countText = podSeats.length < all.length ? `${podSeats.length} of ${all.length} shown` : `${all.length} seat${all.length === 1 ? "" : "s"}`;
         const key = podKey(rig.id, name);
         // A filter that matched seats shows them, however big the pod.
         const podOpen = this.filter && open[key] === undefined ? true : podFoldOpen(rig.id, name, all, open);
         const label = name || "—";
         const podId = `${rig.id}-${host ? `${host}-` : ""}${name}`;
-        const c = statusCounts(podSeats);
+        const c = computePulseCounts([{ rig, ...model, countSeats: all }], attentionItems);
         const podEntry = { section: "topology", kind: "pod", rig: rig.name, rigId: rig.id, pod: name, name };
         this.pageRows?.push({ key, foldKey: key, expandable: true, isOpen: podOpen, parentKey: rigKey(rig.id), entry: podEntry, seats: all,
           target: { kind: "pod", rig: rig.name, rigId: rig.id, pod: name, lifecycle } });
         const podSelected = this.pageSel === key;
-        const countPills = [[c.working, "working", "working"], [c.needs, "needs you", "blocked"], [c.idle, "idle", "idle"]].filter(([n]) => n)
+        const countPills = [[c.working, "working", "working"], [c.blocked, "blocked", "blocked"], [c.needs, "needs you", "blocked"], [c.idle, "idle", "idle"]].filter(([n]) => n)
           .map(([n, word, tone]) => h_flex().gap(4).items_center().child(this.dot(t, tone)).child(div().text_size(11.5).text_color(t.muted).child(`${n} ${word}`)));
-        if (!podOpen) {
+        if (!podOpen && podSeats.length) {
           return h_flex().id(`pod-summary-${podId}`).pl(8).pr(8).h(26).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .when(podSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
             .on_click(() => toggleOpen(key, false, all))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim))
-            .child(div().text_size(12).font_medium().text_color(t.muted).child(`${label} · ${podSeats.length} seat${podSeats.length === 1 ? "" : "s"}`))
+            .child(div().text_size(12).font_medium().text_color(t.muted).child(`${label} · ${countText}`))
             .children(countPills)
             .child(div().flex_1()).child(div().text_size(11.5).text_color(t.accent).child("Show all"));
         }
         return v_flex().id(`pod-tree-${podId}`).gap(2)
           .child(h_flex().id(`topo-pod-${podId}`).pl(8).pr(8).h(26).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .when(podSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
-            .on_click(() => toggleOpen(key, true, all))
-            .child(svg(icon("chevron-down")).size(11).flex_none().text_color(t.dim))
+            .on_click(() => toggleOpen(key, podOpen, all))
+            .child(svg(icon(podOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
             .child(div().text_size(12).font_medium().text_color(t.foreground).child(label))
-            .child(div().text_size(11.5).text_color(t.dim).child(`· ${podSeats.length} seat${podSeats.length === 1 ? "" : "s"}`))
+            .child(div().text_size(11.5).text_color(t.dim).child(`· ${countText}`))
             .children(countPills)
             .child(div().flex_1())
             .when(all.length > 12, (el) => el.child(div().id(`pod-collapse-${podId}`).text_size(11.5).text_color(t.dim).cursor_pointer()
               .on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(key, true, all); }).child("Collapse"))))
+          .when(!podSeats.length && preserveHidden, el => el.child(div().text_size(12).text_color(t.dim).child(`${all.length === 1 ? "The seat is" : `All ${all.length} seats`} hidden by the filter`)))
           .child(v_flex().gap(2).children(podSeats.map((s) => {
             const ns = nativeBySession.get(s.session);
             const seatNeed = attentionItems.find((it) => !it.update && (it.session === s.session || (it.rig === rig.name && it.logicalId === s.logicalId)));
@@ -1269,7 +1325,7 @@ export default class RigView extends View {
         .child(this.button(t, "seat-act-view", "Show in worker view", () => oneClick(target, "open-seat", "seat-act-view"), { small: true, iconName: "rig-view", disabled: !!seatViewReason, tooltip: seatViewReason, actionKey: "open-seat" }))
         .when(live.kind !== "card", (el) => el.child(this.button(t, "seat-act-keyboard", "Take keyboard", () => oneClick({ ...target, kind: "cell", terminal: live.terminal }, "keyboard", "seat-act-keyboard"), { small: true, iconName: "rig-keyboard", actionKey: "keyboard" })))
         .child(div().flex_1()).child(this.button(t, "seat-act-more", "⋯", () => menu(target), { small: true })))
-      .when(!!seatViewReason, (el) => el.child(this.dim(t, seatViewReason)))
+      .when(!!seatViewReason, (el) => el.child(this.workerCapabilityNote(t, seatViewReason)))
       // 1. CONTEXT section
       .child(v_flex().id("seat-section-context").child(this.card(t, ctx != null ? `CONTEXT · ${ctx}%` : "CONTEXT", [
         h_flex().id("seat-context-bar").gap(10).items_center()
@@ -1291,7 +1347,8 @@ export default class RigView extends View {
         ]),
         stoppedSeat || seatViewReason
           ? div().id("seat-open-terminal-link").text_size(12).text_color(t.dim)
-            .child(stoppedSeat ? `terminal: not attachable (${n.attachabilitySummary ?? rawStatus})` : `terminal: ${seatViewReason}`)
+            .tooltip(seatViewReason ?? "")
+            .child(stoppedSeat ? `terminal: not attachable (${n.attachabilitySummary ?? rawStatus})` : "terminal: needs a newer OpenRig")
           : h_flex().id("seat-open-terminal-link").gap(6).items_center().cursor_pointer()
               .on_click(() => oneClick(target, "open-seat", "seat-open-terminal"))
               .child(div().w(120).text_size(12).text_color(t.dim).child("terminal:"))
@@ -2036,7 +2093,7 @@ export default class RigView extends View {
               .child(div().id(isFirstExpanded ? "follow-slice" : `follow-slice-${sKey}`).on_click((_e, cx) => { if (!followReason) doFollow(_e, cx); }).child(
                 this.button(t, `slice-follow-${sKey}`, "Follow this slice", doFollow, { primary: true, small: true, iconName: "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: "follow" }),
               ))
-              .when(!!followReason, (c) => c.child(this.dim(t, followReason))))));
+              .when(!!followReason, (c) => c.child(this.workerCapabilityNote(t, followReason))))));
       });
       return v_flex().id(`mission-card-${mKey}`).rounded(10).bg(t.background).border_1().border_color(missionFocused ? t.accent : t.border).p(12).gap(8)
         .child(h_flex().gap(8).items_center().flex_wrap()
@@ -2058,7 +2115,7 @@ export default class RigView extends View {
     const caps = this.caps();
     if (caps.probed === false) return this.dim(t, "Checking OpenRig's view-preview support…");
     const capReason = capabilityDisableReason("open-view", caps);
-    if (capReason) return this.dim(t, "This OpenRig version can't preview views for herdr-app; Open view needs the herdr-app integration.");
+    if (capReason) return this.workerCapabilityNote(t, capReason);
     const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app&appHome=${encodeURIComponent(appHome())}`;
     const preview = this.read(cx, fullPath);
     if (preview.status === 401 || /\b401\b/.test(String(preview.error ?? ""))) {
@@ -2373,7 +2430,7 @@ export default class RigView extends View {
     const wait = this.status(t, cx, attPath, att);
     if (wait) return wait;
     const rawItems = enrichAttentionItems(att.data?.items ?? [], agg.data);
-    const items = rawItems.map((raw) => {
+    const allItems = rawItems.map((raw) => {
       const qid = raw?.answer?.qitemId ?? (String(raw?.id ?? "").startsWith("queue:") ? String(raw.id).slice(6) : null);
       const cachedQueue = qid ? this.cache[`/api/queue/${encodeURIComponent(qid)}`]?.data : null;
       const merged = cachedQueue && typeof cachedQueue === "object" && !cachedQueue.error
@@ -2389,11 +2446,19 @@ export default class RigView extends View {
         : raw;
       return needTarget(merged);
     });
+    const dismissals = this.updateModel();
+    const items = dismissals.visible(allItems);
+    this.visibleUpdates = items.filter(dismissible);
     const whoseRow = this.whoseQueueRow(t, cx, att.data?.perspective, entry.id ? items.find((x) => x.id === entry.id) : null);
     if (entry.id) {
       // One item (sidebar or toast click): the full Decision Card, here; no menu or dialog between.
       const n = items.find((x) => x.id === entry.id);
       if (!n) {
+        const receipt = dismissals.receiptRows().find((r) => r.keys.some((key) => dismissals.records.find((v) => v.key === key)?.item.id === entry.id));
+        if (receipt) return this.updateReceipt(t, receipt);
+        const hidden = dismissals.hidden().find((r) => r.item.id === entry.id);
+        if (hidden) return v_flex().gap(8).child(this.dim(t, hidden.note ?? "Dismissed here."))
+          .child(this.button(t, "restore-open-update", "Restore", () => this.updateAction("restore", hidden.key), { small: true }));
         return this.dim(t, this.answered[entry.id]
           ? `${this.answered[entry.id].words} This request was already answered.`
           : "This request was already answered.");
@@ -2408,10 +2473,13 @@ export default class RigView extends View {
     const gone = Object.entries(this.answered).filter(([id, a]) => Date.now() - a.at < STATUS_MS && !items.some((n) => n.id === id));
     if (gone.length) this.ticking = true;
     // The daemon names each source it read; one that is down makes an empty list unknown, not empty.
-    const down = (att.data.sources ?? []).filter((s) => s.state !== "available");
+    const coverage = attentionCoverage(att.data.sources ?? []);
     const awayCard = this.sinceYouWereAwayCard(t, cx, items);
     const actionableItems = sortNeedsByTier(items.filter((n) => !n.update));
     const updateItems = items.filter((n) => n.update);
+    const updateDisplay = [...updateItems];
+    const receipts = dismissals.receiptRows();
+    for (const receipt of receipts.filter((r) => r.keys.length === 1)) updateDisplay.splice(Math.min(receipt.position, updateDisplay.length), 0, { receipt });
     return v_flex().gap(12)
       .when(!!whoseRow, (el) => el.child(whoseRow))
       .when(!!awayCard, (el) => el.child(awayCard))
@@ -2419,8 +2487,24 @@ export default class RigView extends View {
       .child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
         .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(`${a.words} ${a.summary}`))),
         this.needRows(t, cx, "needs", actionableItems, att.data?.perspective)]))
-      .child(this.card(t, "Updates", [this.needRows(t, cx, "updates", updateItems, att.data?.perspective)]))
-      .children(down.map((s, i) => div().id(`need-source-${i}`).text_size(11.5).text_color(t.blocked).child(`${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`)))
+      .child(this.card(t, `Updates (${updateItems.length})`, [
+        ...receipts.filter((r) => r.keys.length > 1).map((r) => this.updateReceipt(t, r)),
+        this.needRows(t, cx, "updates", updateDisplay, att.data?.perspective),
+        ...(dismissals.show && dismissals.hidden().length ? [this.dim(t, "Dismissed"),
+          this.needRows(t, cx, "dismissed", dismissals.hidden().map((r) => ({ ...r.item, dismissed: true, dismissalNote: r.note })), att.data?.perspective)] : []),
+        ...(shared("rig.dismissSaveError") ? [this.dim(t, shared("rig.dismissSaveError"))] : []),
+      ], h_flex().gap(8).items_center()
+        .when(updateItems.length > 0, (el) => el.child(this.updateButton(t, "dismiss-all-updates", "Dismiss all", () => this.updateAction("dismiss", updateItems))))
+        .when(dismissals.hidden().length > 0, (el) => el.child(div().id("show-dismissed-updates").text_size(12).text_color(t.accent).cursor_pointer()
+          .on_click(() => this.updateAction("show")).child(`${dismissals.show ? "Hide" : "Show"} dismissed (${dismissals.hidden().length})`)))))
+      .children(coverage.errors.map((s, i) => div().id(`need-source-${i}`).text_size(11.5).text_color(t.blocked).child(`${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`)))
+      .when(coverage.incomplete, (el) => el.child(v_flex().gap(4)
+        .child(h_flex().id("need-coverage-toggle").gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
+          .on_click(() => setOpen("needs:coverage", !(shared("rig.open.page") ?? {})["needs:coverage"]))
+          .child(svg(icon((shared("rig.open.page") ?? {})["needs:coverage"] ? "chevron-down" : "chevron-right")).size(11).flex_none())
+          .child("Coverage · results may be incomplete"))
+        .when(Boolean((shared("rig.open.page") ?? {})["needs:coverage"]), (fold) => fold.children(coverage.partial.map((s, i) =>
+          this.plain(t, `${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`, `need-coverage-${i}`).text_color(t.dim))))))
       .child(this.dim(t, `Read at ${att.data.readAt ?? "—"}. Viewing is not approval.`));
   }
 
@@ -2432,6 +2516,7 @@ export default class RigView extends View {
     const open = shared("rig.open.page") ?? {};
     const focusNeed = shared("rig.focusNeed");
     const toggle = (n) => {
+      this.selectedUpdate = dismissible(n) ? n : null;
       const now = shared("rig.open.page") ?? {}, next = !now[`needs:${n.id}`];
       if (next && n.reply !== "none") this.replies[n.id] ??= this.makeReply(n);
       if (!next && shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
@@ -2441,11 +2526,15 @@ export default class RigView extends View {
       .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().w(12)).child(div().flex_1().child("What")).child(div().w(140).flex_none().child("Answer")).child(div().w(150).flex_none().child("Since")))
       .children(list.length ? list.map((n, i) => {
+        if (n.receipt) return this.updateReceipt(t, n.receipt);
+        if (dismissible(n)) n = { ...n, dismissalPosition: i };
         const shown = !!open[`needs:${n.id}`];
         const focused = focusNeed === n.id;
         const tier = n.tier ?? tierOf(n);
         const isEscalation = tier === "escalation";
         const isAlert = tier === "alert";
+        const dismissedTone = this.selectedUpdate?.id === n.id ? t.muted : t.dim;
+        const rowTheme = n.dismissed ? { ...t, muted: dismissedTone, dim: dismissedTone } : t;
         const actionLabel = n.native
           ? "Relaunch / Resume…"
           : n.verb === "approve"
@@ -2454,19 +2543,24 @@ export default class RigView extends View {
               ? "Resolve"
               : n.reply === "answer"
                 ? "Answer"
-                : "no action needed";
+                : isUpdateNeed(n) ? "no action needed" : "Needs you";
         return v_flex().when(focused, (el) => el.border_1().border_color(t.accent).rounded(6))
           .child(h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover))
+            .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.bg(t.selection ?? t.raised))
             .when(isEscalation, (el) => el.border_l(2).border_color(t.blocked))
             .on_click(() => toggle(n)).on_mouse_down("right", () => menu(n))
-            .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
+            .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(rowTheme.dim))
             .when(isEscalation, (el) => el.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.blocked + "26").text_color(t.blocked).text_size(10).font_semibold().child("ESCALATION")))
             .when(!isEscalation && tier !== "update", (el) => el.child(this.plainDot(t, isAlert ? "blocked" : "accent")))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(tier === "update" ? t.muted : t.foreground).when(isEscalation || isAlert, (d) => d.font_semibold()).child(singleLineText(n.urgency ? `[${n.urgency}] ${n.summary}` : n.summary)))
-            .child(div().w(140).flex_none().truncate().text_size(12.5).text_color(t.muted).child(actionLabel))
-            .child(this.copyButton(t, n.qitemId ?? n.id, `need-id-${n.id}`, "request id"))
-            .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(t.muted).child(singleLineText(n.at))))
-          .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(this.needBody(t, cx, n, perspective))));
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(n.dismissed ? dismissedTone : tier === "update" ? t.muted : t.foreground).when(isEscalation || isAlert, (d) => d.font_semibold()).child(singleLineText(n.urgency ? `[${n.urgency}] ${n.summary}` : n.summary)))
+            .child(div().w(140).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).child(actionLabel))
+            .child(this.copyButton(rowTheme, n.qitemId ?? n.id, `need-id-${n.id}`, "request id"))
+            .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.child(this.updateButton(t, `dismiss-${idPrefix}-${i}`, n.dismissed ? "Restore" : "Dismiss", (_e, cx) => {
+              cx.stop_propagation(); this.updateAction(n.dismissed ? "restore" : "dismiss", n.dismissed ? updateKey(n) : n);
+            })))
+            .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); }))
+            .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).child(singleLineText(n.at))))
+          .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(n.dismissed ? this.dim(t, n.dismissalNote ?? "Hidden here only.") : this.needBody(t, cx, n, perspective))));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")]);
   }
 
@@ -2492,6 +2586,11 @@ export default class RigView extends View {
       ...n,
       ...(detailItem ?? {}),
       ...(queueRow ? {
+        waiting: queueRow.waiting,
+        destinationSession: queueRow.destinationSession,
+        state: queueRow.state,
+        blockedOn: queueRow.blockedOn,
+        body: queueRow.body,
         tags: queueRow.tags ?? detailItem?.tags ?? n.tags,
         ownerNotificationLevel: queueRow.ownerNotificationLevel ?? n.ownerNotificationLevel,
         priority: queueRow.priority ?? n.priority,
@@ -2503,9 +2602,14 @@ export default class RigView extends View {
       qitemId: n.qitemId ?? detailItem?.answer?.qitemId ?? queueRow?.id ?? null,
     };
 
+    const box = n.reply !== "none" && !n.update ? this.replyFor(cx, mergedItem) : null;
+    if (box && queueRow && observeNeedDecision(box, queueRow, queueRes.at)) {
+      delete this.answered[n.id];
+      delete this.questionChoices[n.id];
+    }
     const strip = tierStripFor(mergedItem);
     const stripColor = strip.tone === "blocked" ? t.blocked : strip.tone === "accent" ? t.accent : t.dim;
-    const lines = needDetailLines(detail);
+    const detailLines = needDetailLines(detail);
     const recordedLines = needRecordedLines(detail);
     const evidenceFiles = Array.isArray(detail?.files) ? detail.files : [];
     const qState = questionsState(mergedItem, queueRow);
@@ -2513,7 +2617,7 @@ export default class RigView extends View {
 
     const asker = mergedItem.asker ?? mergedItem.sourceSession ?? queueRow?.sourceSession ?? (n.native && n.logicalId && n.rig ? `${n.logicalId}@${n.rig}` : null);
     const recipient = mergedItem.recipient ?? queueRow?.destinationSession ?? null;
-    const scope = mergedItem.scope ?? n.scope ?? null;
+    const scope = String(mergedItem.scope ?? n.scope ?? "").replace(/\bproject unknown\b/g, "Not linked to a project") || null;
     const since = mergedItem.at ?? n.at ?? null;
     const unblocks = mergedItem.unblocks ?? n.unblocks ?? null;
     const askerNote = this.askerNotes[n.id] ?? null;
@@ -2539,11 +2643,13 @@ export default class RigView extends View {
       cx?.notify?.();
     };
 
-    const box = n.reply !== "none" && !n.update ? this.replyFor(cx, mergedItem) : null;
     const isBusy = Boolean(box?.busy);
     const verb = mergedItem.answer?.verb ?? mergedItem.verb ?? (n.reply === "resolve" ? "resolve" : n.reply === "answer" ? "answer" : null);
     const isResolve = n.reply === "resolve" || verb === "resolve";
-    const isUpdate = Boolean(n.update || mergedItem.kind === "update" || n.reply === "none");
+    const isUpdate = isUpdateNeed(mergedItem);
+    // The public queue-update detail starts with this informational preamble. The card supplies its own note.
+    const lines = isUpdate && detailLines[0] === "Informational update; no action needed. Viewing is not approval or proof of delivery."
+      ? detailLines.slice(1) : detailLines;
     const isNoQuestionAsk = !isUpdate && !isResolve && !n.native && qState.totalCount === 0 && (verb === "approve" || n.reply === "answer");
     const isQuestionsOpen = !isUpdate && !isResolve && !n.native && qState.totalCount > 0 && qState.openCount > 0;
     const isNeedsResume = !isUpdate && !isResolve && !n.native && qState.needsResume;
@@ -2575,7 +2681,9 @@ export default class RigView extends View {
           .when(!!strip.text, (el) => el.child(div().text_size(11.5).font_semibold().text_color(stripColor).child(strip.text))),
       ] : []),
       ...(standalone ? [
-        div().text_size(12.5).font_semibold().text_color(t.foreground).child(isUpdate ? "Update" : "Request"),
+        h_flex().gap(6).items_center()
+          .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child(isUpdate ? "Update" : "Request"))
+          .when(!isUpdate && lines.length > 0, (el) => el.child(this.copyButton(t, lines.join("\n\n"), `need-body-${n.id}`, "request body source"))),
         this.kv(t, [["Urgency", n.urgency], ["Scope", scope], ["Since", since], n.native ? ["Seat", `${n.logicalId}@${n.rig}`] : null]),
       ] : []),
 
@@ -2597,8 +2705,14 @@ export default class RigView extends View {
       ...(askerNote ? [div().id(`need-asker-note-${n.id}`).text_size(11.5).text_color(t.muted).child(askerNote)] : []),
 
       // 3. Body + Unblocks
+      ...(!standalone && !isUpdate && lines.length ? [h_flex().gap(6).items_center()
+        .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child("Request"))
+        .child(this.copyButton(t, lines.join("\n\n"), `need-body-${n.id}`, "request body source"))] : []),
       lines.length
-        ? this.plain(t, lines.join("\n"), `need-body-${n.id}`)
+        ? isUpdate ? v_flex().id(`need-body-${n.id}`).gap(6).children(lines.flatMap((line) => line.split(/\r?\n/)).filter((line) => line.trim())
+          .map((line, i) => this.plain(t, line, `need-body-line-${n.id}-${i}`)))
+        : v_flex().id(`need-body-${n.id}`).gap(6)
+          .child(requestMarkdownView(lines.join("\n\n"), { TextView, div, v_flex, id: `need-body-text-${n.id}` }).text_size(12.5).text_color(t.foreground))
         : got.error
           ? div().text_size(12).text_color(t.blocked).child(got.error)
           : got.data === undefined
@@ -2656,6 +2770,12 @@ export default class RigView extends View {
       ] : []),
       ...(isUpdate ? [
         div().id(`need-update-note-${n.id}`).text_size(12).text_color(t.dim).child("No action needed. Viewing isn't approval or proof of delivery."),
+        ...(dismissible(n) ? [h_flex().child(this.updateButton(t, `dismiss-open-${n.id}`, "Dismiss", () => this.updateAction("dismiss", n)))] : []),
+        ...(this.updateModel().records.find((r) => r.key === updateKey(n) && r.restored && r.status === "closed")
+          ? [this.dim(t, "Restored here; OpenRig still has it closed.")] : []),
+      ] : []),
+      ...(!isUpdate && !n.native && n.reply === "none" && !verb ? [
+        this.dim(t, "This request still needs you. No response action was provided here; use Open in TUI to respond."),
       ] : []),
       ...(isNoQuestionAsk ? [
         v_flex().id(`need-act-approve-row-${n.id}`).gap(6)
@@ -2725,15 +2845,17 @@ export default class RigView extends View {
           .child(this.dim(t, "Your answers are recorded but the asking seat hasn't had them yet.")),
       ] : []),
       ...(isResolve ? [
-        this.dim(t, `Resolve unparks it for ${asker ?? queueRow?.ownerSession ?? "the owning seat"}, with your words. It doesn't close it, and it isn't approval.`),
+        this.dim(t, `Resolve unparks it for ${parkedWorkOwner(queueRow ?? mergedItem)}, with your words. It doesn't close it, and it isn't approval.`),
       ] : []),
 
       // 7. Own-words box
       ...(n.reply !== "none" && !isUpdate ? [this.replyBox(t, cx, mergedItem, { detailItem, queueRow, isNoQuestionAsk, onSomeoneAskText })] : []),
 
       // 8. Record line (11 px `t.dim`, always present; swaps when Approve is hovered/focused)
-      v_flex().id(`need-record-line-${n.id}`).gap(2)
-        .child(div().text_size(11).text_color(t.dim).child(recordSentence)),
+      ...(!isUpdate && !n.native && (n.reply === "answer" || n.reply === "resolve" || verb) ? [
+        v_flex().id(`need-record-line-${n.id}`).gap(2)
+          .child(div().text_size(11).text_color(t.dim).child(recordSentence)),
+      ] : []),
       ...(!n.native && !isUpdate && !hasDecisionRevision ? [
         div().id(`need-no-revision-note-${n.id}`).text_size(11).text_color(t.dim).child("OpenRig < 0.7.9 (no decisionRevision): a changed request won't be caught before sending."),
       ] : []),
@@ -2848,6 +2970,8 @@ export default class RigView extends View {
         const itemForAction = {
           ...n,
           ...(detailItem ?? {}),
+          waiting: queueRow?.waiting ?? n.waiting,
+          destinationSession: queueRow?.destinationSession ?? n.destinationSession,
           qitemId: qid,
           decisionRevision: latestRevision ?? undefined,
         };
@@ -2905,6 +3029,8 @@ export default class RigView extends View {
                 : "Answered:";
           this.answered[n.id] = { summary: n.summary, words: wordPrefix, at: Date.now() };
           box.result = { ok: true, text: outcome.text };
+          box.receipt = { at: Date.now(), revision: outcome.decisionRevision, body: queueRow?.body,
+            state: act.mode === "resolve" || n.reply === "resolve" ? "in-progress" : null };
           run("rig.refresh");
           const viewParam = shared("rig.needsView") ?? null;
           this.read(cx, viewParam ? `/api/attention?view=${encodeURIComponent(viewParam)}` : "/api/attention", true);
@@ -3545,10 +3671,11 @@ export default class RigView extends View {
       (health.data.records ?? []).map((r) => ({ cells: [r.summary, sev(r.severity), r.status] })))]);
     const connectionsCard = this.card(t, "Connections", [
       this.kv(t, [
+        ["Herdrig Version", `herdrig v${HERDRIG_VERSION}`],
         ["OpenRig Version", versionLine],
         ["OpenRig Capabilities", capDetail.line],
-        ...(capDetail.reason ? [["Capability Note", capDetail.reason]] : []),
-      ]),
+        ...(capDetail.reason ? [["Capability Note", this.workerCapabilityMessage()]] : []),
+      ]).tooltip(capDetail.reason ?? ""),
       ...(capDetail.suggestedUpgrade ? [div().id("system-suggested-upgrade").text_size(11).text_color(t.dim).child(capDetail.suggestedUpgrade)] : []),
       this.status(t, cx, "/api/gateway/connections", conn) ?? this.kv(t, [["Slack", `${conn.data.state ?? ""}${conn.data.nextAction ? ` · ${conn.data.nextAction}` : ""}`],
         ["People registered", `${(conn.data.humans ?? []).length}${(conn.data.humans ?? []).length ? ` · ${(conn.data.humans ?? []).map((h) => h.address).join(", ")}` : ""}`]]),
@@ -3723,6 +3850,10 @@ export default class RigView extends View {
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
     const entry = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null);
+    if (this.previousSection === "needs" && entry?.section !== "needs") this.updateAction("leave");
+    if (this.previousUpdateEntry !== navKey(entry)) this.selectedUpdate = null;
+    this.previousUpdateEntry = navKey(entry);
+    this.previousSection = entry?.section;
     this.filter = entry?.filter ?? null;
     let body;
     if (!this.config) body = this.dim(t, "Reading OpenRig's settings…");
@@ -3747,7 +3878,11 @@ export default class RigView extends View {
         if (e.key === "left" && e.modifiers?.alt) this.back();
         // Alt+1..6: the sections, in the switch's order.
         else if (e.modifiers?.alt && /^[1-6]$/.test(e.key)) this.goSection(RIG_SECTIONS[Number(e.key) - 1]);
+        else if (e.key === "escape" && entry?.section === "topology" && !entry.kind && this.pulseFilter) { this.pulseFilter = null; cx.notify(); }
         else if (e.key === "escape") closeInspection();
+        else if (e.key === "delete" && entry?.section === "needs" && !entry.id && dismissible(this.selectedUpdate) && !this.selectedUpdate.dismissed
+          && this.visibleUpdates?.some((n) => updateKey(n) === updateKey(this.selectedUpdate)))
+          this.updateAction("dismiss", this.selectedUpdate);
         // `/` filters a page's tables; a file page has none, so it does nothing there, as Filter… isn't offered.
         else if (e.key === "/" && entry?.section !== "file" && !e.modifiers?.control && !e.modifiers?.platform && !e.modifiers?.alt) palette(entry?.filter ? `/${entry.filter}` : "/");
         // Otherwise the rows' keys: ↑/↓, ←/→, Home/End, Enter, S, Q, the Menu key or Shift+F10.

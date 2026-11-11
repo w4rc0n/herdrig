@@ -2,12 +2,86 @@
 // byte-identical inside each of those mod folders, so every
 // folder works after a plain copy. Pure: no `herdr` import, so tests import it directly. Everything a mod
 // needs from the host (fetch, exec, terminals) is passed in.
+import { attachRemoteSeat } from "./rig-remote-attach.js";
 
 /**
  * The folder names the Rig mods open each other by. A person's installer that renamed a folder because the name was
  * taken changes the matching value here, in every mod folder's copy of this file; nothing else names another mod.
  */
 export const MOD_IDS = Object.freeze({ sidebar: "rig", view: "rig-view", palette: "rig-palette", menu: "rig-menu" });
+
+/** Small request-detail Markdown view. Host constructors are injected to keep this library host-independent.
+ * Daemon text is escaped FIRST. Only our p/br/strong/code/ul/ol/li tags can enter TextView.html;
+ * links, images, raw HTML and entities never become active content. TextView paragraphs stay selectable;
+ * standalone bold headings use native semibold rows because TextView's strong loses weight with Geist on this
+ * Linux build. Inline strong remains native. Callers' Copy body control retains the complete original source. */
+export function requestMarkdownView(text, { TextView, div, v_flex, id = "request-markdown" }) {
+  const escaped = String(text ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const inline = (s) => s.split(/(`[^`\n]+`)/g).map((part) => part.startsWith("`") && part.endsWith("`")
+    ? `<code>${part.slice(1, -1)}</code>` : part.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")).join("");
+  let html = "", paragraph = [], list = null;
+  const blocks = [];
+  const flushHtml = () => { if (html) { blocks.push({ html }); html = ""; } };
+  const flushParagraph = () => { if (paragraph.length) { html += `<p>${paragraph.map(inline).join("<br>")}</p>`; paragraph = []; flushHtml(); } };
+  const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
+  for (const line of escaped.replace(/\r\n?/g, "\n").split("\n")) {
+    if (!line.trim()) { flushParagraph(); closeList(); flushHtml(); continue; }
+    const heading = /^\s*(?:\*\*([^*]+)\*\*\s*|#{1,6}\s+(.+?))\s*$/.exec(line);
+    if (heading) {
+      flushParagraph(); closeList(); flushHtml();
+      // Decode only the entities we introduced, once; div.child is plain text, never HTML.
+      const plain = (heading[1] ?? heading[2]).replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+      blocks.push({ heading: plain, size: /^\s*#\s/.test(line) ? 15 : 14 }); continue;
+    }
+    const bullet = /^\s*(?:([-*])\s+|(\d+)\.\s+)(.*)$/.exec(line);
+    if (bullet) {
+      flushParagraph(); const kind = bullet[1] ? "ul" : "ol";
+      if (list !== kind) { closeList(); html += kind === "ol" ? `<ol start="${Number(bullet[2]) || 1}">` : "<ul>"; list = kind; }
+      html += `<li>${inline(bullet[3])}</li>`;
+    } else { closeList(); flushHtml(); paragraph.push(line); }
+  }
+  flushParagraph(); closeList(); flushHtml();
+  return v_flex().id(id).gap(6).children(blocks.map((block, i) => block.heading !== undefined
+    ? div().id(`${id}-${i}`).font_semibold().text_size(block.size).pt(8).pb(2).child(block.heading)
+    : TextView.html(`${id}-${i}`, block.html).selectable(true).scrollable(false)));
+}
+
+/** The current parked work belongs to its destination, independently of who asked or answers. */
+export function parkedWorkOwner(item) {
+  return item?.waiting?.owner ?? item?.destinationSession ?? "the owning seat";
+}
+
+/** An authoritative queue decision/park identity, not just its durable qitem id. */
+export function needDecisionIdentity(item) {
+  return JSON.stringify([item?.decisionRevision ?? null, item?.state ?? null, item?.blockedOn ?? null,
+    item?.body ?? null, item?.summary ?? null]);
+}
+
+/** Observe a completed read, retaining only the immediate receipt of our own resulting revision.
+ * Cached pre-action data is not a new authoritative decision. A new park can arrive before the first poll. */
+export function observeNeedDecision(box, row, readAt = 0) {
+  if (!row || box.busy) return false;
+  const identity = needDecisionIdentity(row);
+  const receipt = box.receipt;
+  if (receipt && readAt <= receipt.at) return false;
+  const changed = receipt
+    ? (row.decisionRevision !== receipt.revision || (receipt.state && row.state !== receipt.state)
+      || (receipt.body !== undefined && row.body !== receipt.body))
+    : Boolean(box.observedIdentity && box.observedIdentity !== identity);
+  box.observedIdentity = identity;
+  if (!changed) return false;
+  box.result = null; box.receipt = null; box.confirmResolve = false;
+  box.recordedChoiceByQuestion = {};
+  return true;
+}
+
+/** Partial bounded scans are incomplete coverage; unavailable/unknown sources remain clear errors. */
+export function attentionCoverage(sources = []) {
+  const partial = sources.filter((s) => s.state === "partial");
+  const errors = sources.filter((s) => s.state !== "available" && s.state !== "partial");
+  return { partial, errors, incomplete: partial.length > 0 || errors.length > 0 };
+}
 
 /** UTF-8 bytes to text (the mod runtime has no TextDecoder). A sequence split across reads is carried to the next. */
 export function utf8(bytes, carry = new Uint8Array(0)) {
@@ -138,6 +212,7 @@ export function parseConfig(text) {
   const capabilities = raw.capabilities && typeof raw.capabilities === "object" && !Array.isArray(raw.capabilities) ? raw.capabilities : undefined;
   return {
     person, daemonUrl, rig, openrigHome, missing: false,
+    ...(raw.daemonMachine !== undefined && raw.daemonMachine !== "" ? { daemonMachine: raw.daemonMachine } : {}),
     ...(daemonUrlSource ? { daemonUrlSource } : {}),
     ...(daemonState ? { daemonState } : {}),
     ...(daemonMessage ? { daemonMessage } : {}),
@@ -1634,6 +1709,40 @@ export function readCommand(config, args, { env = [] } = {}) {
   return { command: "env", args: [...cliEnv(config), ...env, ...(config.rig ?? ["rig"]), ...args] };
 }
 
+/** Library identity only: preview never receives sourcePath or a daemon-selected file. Options precede --. */
+export function rigSpecPreviewArgs(spec) {
+  const identity = [spec?.id, spec?.name].find((s) => typeof s === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$/.test(s));
+  return identity ? ["specs", "preview", "--json", "--", identity] : null;
+}
+
+/** Public specs preview JSON -> {summary,pods:[{id,label,seats:[{lid,runtime,model,profile}]}],edges:[{from,to,kind}],seatCount}.
+ * Shared by the New rig accordion and rig graph. Only pod-local bare member refs are qualified; qualified refs and
+ * pod:<id> refs retain their meaning. Source paths, raw YAML, agentRef and startup instructions are never projected.
+ */
+export function normalizeRigSpecPreview(data) {
+  if (!data || !Array.isArray(data.pods)) throw new Error("OpenRig returned no rig pods in the spec preview.");
+  const edges = [];
+  const edge = (e, pod = null) => {
+    if (!e || typeof e.from !== "string" || typeof e.to !== "string") throw new Error("OpenRig returned an invalid spec edge.");
+    const qualify = (ref) => pod && !ref.includes(".") && !ref.startsWith("pod:") ? `${pod}.${ref}` : ref;
+    return { from: qualify(e.from), to: qualify(e.to), kind: singleLineText(e.kind) };
+  };
+  const pods = data.pods.map((p) => {
+    if (!p || typeof p.id !== "string" || !Array.isArray(p.members)) throw new Error("OpenRig returned an invalid spec pod.");
+    const id = singleLineText(p.id);
+    const seats = p.members.map((m) => {
+      if (!m || typeof m.id !== "string") throw new Error("OpenRig returned an invalid spec member.");
+      return { lid: `${id}.${singleLineText(m.id)}`, runtime: singleLineText(m.runtime) || null,
+        model: typeof m.model === "string" ? singleLineText(m.model) || null : null,
+        profile: m.profile && !["default", "none"].includes(m.profile) ? singleLineText(m.profile) || null : null };
+    });
+    edges.push(...(Array.isArray(p.edges) ? p.edges.map((e) => edge(e, id)) : []));
+    return { id, label: singleLineText(p.label) || id, seats };
+  });
+  edges.push(...(Array.isArray(data.edges) ? data.edges.map((e) => edge(e)) : []));
+  return { summary: singleLineText(data.summary), pods, edges, seatCount: pods.reduce((n, p) => n + p.seats.length, 0) };
+}
+
 /** A terminal seat (`nodeKind: "infrastructure"` or `runtime: "terminal"`), such as the kernel's operator.human: a plain
  *  shell, not an agent. OpenRig samples its window for motion, so a redrawing screen reads as "working"; that isn't an
  *  agent at work. */
@@ -2433,7 +2542,7 @@ export function deleteOutcome(json, rig) {
   const left = Array.isArray(json?.leftRunning) ? json.leftRunning : [];
   const n = Number(json?.sessionsKilled ?? 0);
   const deleted = json?.deleted === true;
-  const headline = deleted ? `Deleted ${rig} · ${n} agent${n === 1 ? "" : "s"} stopped`
+  const headline = deleted ? (json?.alreadyStopped ? `Removed stopped rig ${rig}` : n > 0 ? `Deleted ${rig} · ${n} agent${n === 1 ? "" : "s"} stopped` : `Deleted ${rig}`)
     : json?.deleteBlocked ? `${rig} wasn't deleted: some sessions couldn't be stopped`
     : `${rig} wasn't deleted`;
   const notes = [
@@ -2474,7 +2583,7 @@ export function commandLine(args) {
 
 /** The New rig dialog, for `openOverlay`: from the sidebar's `+` and from the Topology page. */
 export function newRigOverlay() {
-  return { mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 480, height: 540, props: { target: { kind: "new-rig" }, step: { action: "new-rig" } } };
+  return { mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 480, height: 700, props: { target: { kind: "new-rig" }, step: { action: "new-rig" } } };
 }
 
 /** The runtimes the New rig dialog offers for one seat; `rig create --runtime` takes any OpenRig knows. */
@@ -2515,13 +2624,18 @@ export function resumeOutcome(json, commandOk = true) {
  * - `"routine"`: other actionable `kind: "action"` rows
  * - `"update"`: `kind === "update"` or `update === true`
  */
+/** A missing response verb is not an informational update. Normalized tiers retain their meaning. */
+export function isUpdateNeed(row) {
+  if (!row || typeof row !== "object") return false;
+  if (row.tier) return row.tier === "update";
+  if (row.kind === "update" || row.update === true) return true;
+  return ["queue-update:", "human-update:", "proof:", "workflow:", "health:"].some((prefix) => String(row.id ?? "").startsWith(prefix));
+}
+
 export function tierOf(row) {
   if (!row || typeof row !== "object") return "routine";
-  if (row.kind === "update" || row.update === true || row.reply === "none") return "update";
-  const id = String(row.id ?? "");
-  if (id.startsWith("queue-update:") || id.startsWith("human-update:") || id.startsWith("proof:") || id.startsWith("workflow:") || id.startsWith("health:")) {
-    return "update";
-  }
+  if (["routine", "alert", "escalation", "update"].includes(row.tier)) return row.tier;
+  if (isUpdateNeed(row)) return "update";
   const tags = Array.isArray(row.tags) ? row.tags : [];
   const notifLevel = String(row.ownerNotificationLevel ?? "").toLowerCase();
   if (tags.includes("escalation") || tags.includes("wake-escalation") || notifLevel === "escalation") {
@@ -3079,7 +3193,7 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
     return `Recorded as ${actorLabel}: denied, with your reason. Closed as denied.`;
   }
   if (verb === "resolve") {
-    const owner = item?.asker ?? item?.sourceSession ?? item?.destinationSession ?? resData?.closedQitem?.destinationSession ?? "the owning seat";
+    const owner = parkedWorkOwner(item?.waiting?.owner || item?.destinationSession ? item : resData?.closedQitem);
     return `Recorded as ${actorLabel}. Unparked; ${owner} still owns it.`;
   }
   if (verb === "answer") {
@@ -3821,9 +3935,14 @@ export function layoutHasMod(node, mod) {
 /** "Open in TUI" / "Open Rig TUI tab": the active space's TUI is shown and focused;
  *  only when it has none is one opened, never a second one. A new one is started by herdr-core into a new tab of the
  *  active space (core adoption: labels `herdr.space`, `herdr.tab`, `herdr-openrig.role=tui`), with the recorded CLI and no
- *  shell around it, so the tab ends with the TUI; it is named "Rig TUI", then shown and focused. Where core can't start
- *  it (another machine's space, an error), a named tab runs it instead. */
+ *  shell around it, so the tab ends with the TUI; it is named "Rig TUI", then shown and focused.
+ *  The TUI uses the local CLI. Remote focus never changes that; failed labelled starts are refused. */
 export async function openOrFocusTui(host, config) {
+  const originalHost = host;
+  const localSpaces = () => (originalHost.spaces() ?? []).filter(s => !s.machine && !String(s.id ?? "").includes("/"));
+  host = { ...host, spaces: localSpaces,
+    panes: () => (originalHost.panes() ?? []).filter(p => !String(p.terminal ?? "").includes("/")),
+    terminals: () => (originalHost.terminals?.() ?? []).filter(t => !String(t.address ?? "").includes("/")) };
   const tui = await findTuiNow(host, config);
   const layoutTree = typeof host.layout === "function" ? host.layout() : host.layout;
   const shouldSelectMain = layoutTree !== undefined && layoutTree !== null
@@ -3835,7 +3954,9 @@ export async function openOrFocusTui(host, config) {
     host.run("pane.focus", { terminal: tui.terminal });
     return { reused: true, ...tui };
   }
-  const space = (host.spaces() ?? []).find((s) => s.active);
+  if (typeof host.hc !== "function") return { ok: false, reason: "Open the Rig sidebar to start a labelled local TUI terminal." };
+  const local = host.spaces();
+  const space = local.find((s) => s.active) ?? local[0] ?? { id: `sp-openrig-tui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` };
   if (space && !space.machine) {
     const tab = `tb-rig-tui-${Date.now().toString(36)}`;
     // --no-parent: the TUI is no one's sub-agent, whatever terminal started herdr-app.
@@ -3843,19 +3964,17 @@ export async function openOrFocusTui(host, config) {
       "--label", `herdr.space=${space.id}`, "--label", `herdr.tab=${tab}`, "--label", "herdr-openrig.role=tui", "--", ...tuiArgv(config)]).catch(() => null);
     let address = null;
     try { address = JSON.parse(started?.stdout ?? "null")?.address ?? null; } catch (_) { address = null; }
-    if (address) {
+    if (address && !String(address).includes("/") && (started?.code === undefined || started.code === 0)) {
       // herdr-app adopts the terminal into the new tab on its next read: wait for the tab (a few seconds at most).
       for (let i = 0; i < 30 && host.wait && !(host.spaces() ?? []).some((s) => (s.tabs ?? []).some((t) => t.id === tab)); i++) await host.wait(100);
       host.run("tab.rename", { id: tab, name: "Rig TUI" });
+      if (!space.active) host.run("space.select", { id: space.id });
       host.run("tab.select", { id: tab });
       host.run("pane.focus", { terminal: address });
       return { reused: false, terminal: address, tab };
     }
   }
-  // With no space open, the TUI is the new space's first tab (tab.new would be refused).
-  if (!hasSpace(host.spaces())) host.run("space.new", { tab: "Rig TUI", argv: tuiArgv(config) });
-  else host.run("tab.new", { name: "Rig TUI", argv: tuiArgv(config) });
-  return { reused: false };
+  return { ok: false, reason: "Herdr could not confirm a labelled local TUI terminal. No fallback tab was opened; check the local core and try again." };
 }
 
 /** The rig page's tabs (matching TUI `tab table | recent | overview | graph | health`). */
@@ -4197,7 +4316,8 @@ export function computePulseCounts(models, attentionItems = []) {
   let working = 0, blocked = 0, needs = 0, idle = 0;
   for (const m of modelList) {
     const rigObj = { ...(m?.rig ?? {}), ...m, name: m?.name ?? m?.rig?.name ?? m?.id ?? "" };
-    for (const s of m?.seats ?? []) {
+    // Pod headers may count a subset while retaining the whole rig for ask attribution/fallback.
+    for (const s of m?.countSeats ?? m?.seats ?? []) {
       if (matchesPulseFilter(s, rigObj, "working", attentionItems, allSeats)) working++;
       if (matchesPulseFilter(s, rigObj, "blocked", attentionItems, allSeats)) blocked++;
       if (matchesPulseFilter(s, rigObj, "needs", attentionItems, allSeats)) needs++;
@@ -4207,16 +4327,19 @@ export function computePulseCounts(models, attentionItems = []) {
   return { working, blocked, needs, idle };
 }
 
-/** Whether a seat matches the active `shared("rig.pulseFilter")` (`"working" | "blocked" | "needs" | "idle"`). */
+/** Whether a seat matches the page-session pulse filter. Buckets partition seats; neutral states live in Idle. */
 export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], _allSeats = []) {
   if (!pulseFilter) return true;
+  // Neutral lifecycle states have a home in Idle; their individual row marks stay unchanged.
+  if (seat.terminal || ["terminal", "detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
   const actionableNeeds = (Array.isArray(attentionItems) ? attentionItems : []).filter((i) => i && !i.update && i.kind !== "update");
   const rigName = rig?.name ?? rig?.id ?? "";
   if (pulseFilter === "working") {
-    return seat.tone === "working" || seat.status === "active" || seat.word === "working";
+    return !matchesPulseFilter(seat, rig, "needs", attentionItems) && !isPulseBlockedSeat(seat)
+      && (seat.tone === "working" || seat.status === "active" || seat.word === "working");
   }
   if (pulseFilter === "blocked") {
-    return isPulseBlockedSeat(seat);
+    return !matchesPulseFilter(seat, rig, "needs", attentionItems) && isPulseBlockedSeat(seat);
   }
   if (pulseFilter === "needs") {
     if (isSeatNeedsYou(seat, rigName, actionableNeeds)) return true;
@@ -4231,7 +4354,7 @@ export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], 
     return false;
   }
   if (pulseFilter === "idle") {
-    return seat.tone === "idle" && seat.status !== "blocked" && seat.word !== "blocked";
+    return !["working", "blocked", "needs"].some(key => matchesPulseFilter(seat, rig, key, attentionItems));
   }
   return true;
 }
@@ -4697,13 +4820,20 @@ export function configRows(browser, { category = null, settingKey = null } = {})
 export const RIG_DELETE_REASON = "Your OpenRig's `rig down` can't delete a rig (no --delete). Update OpenRig to delete one here.";
 export const RIG_ARCHIVE_REASON = "Your OpenRig has no `rig archive`. Update OpenRig to archive a rig here.";
 export const RIG_CREATE_REASON = "Your OpenRig has no `rig create`. Start a rig from a spec instead, or update OpenRig.";
-export const STOCK_PROVIDER_REASON = "Your OpenRig can't open views inside Herdr yet. Attach, the TUI tab and every other control still work.";
+export const STOCK_PROVIDER_REASON = "Needs an OpenRig release with the herdr-app provider (merged upstream, not yet released). Attach and the TUI tab still work.";
 
 /** One-line reason shown when `herdr-app` provider is present without `--follow` / `--prune-after`. */
-export const FOLLOW_PRUNE_REASON = "Your OpenRig doesn't have auto-follow yet (needs rig terminal open --follow).";
+export const FOLLOW_PRUNE_REASON = "Follow and auto-prune for herdr-app are not yet available in upstream OpenRig (need --follow and --prune-after support).";
 
 /** One-line reason shown when `herdr-app` provider is present without saved-view grid geometry (`--grid`/`--replace`/`--cell`). */
-export const GRID_GEOMETRY_REASON = "Your OpenRig doesn't have custom view grids yet (needs rig terminal open --grid).";
+export const GRID_GEOMETRY_REASON = "Custom worker-view grids and cell editing are not yet available in upstream OpenRig (need --grid/--replace and close --cell support).";
+
+/** Compact copy shared by page notes and popup footers; original reasons remain available in tooltips. */
+export function workerCapabilityText(reason = "") {
+  if (reason.includes(STOCK_PROVIDER_REASON)) return "Worker views need a newer OpenRig.";
+  if (reason.includes(FOLLOW_PRUNE_REASON) || reason.includes(GRID_GEOMETRY_REASON)) return "These worker-view controls need more OpenRig support.";
+  return reason;
+}
 
 /** One-line reason shown when a palette command requires `rig tui resolve` on stock OpenRig. */
 export const TUI_RESOLVE_REASON = "Your OpenRig doesn't have rig tui resolve yet.";
@@ -4844,6 +4974,7 @@ export function currentCapabilities(sharedOrData, terminals = []) {
  * Return the one-line disable reason for an action under `caps`, or `null` when the action is supported.
  * - Stock OpenRig (`herdrAppProvider === false`): disables `open-view`, `open-seat`, `follow`, `unfollow`, `prune`,
  *   `close-view`, `design-view`, `open-designed-view`, `close-cell`, `cell-swap`, `cell-split`, `cell-zoom`.
+ *   Reasons distinguish the merged provider from follow/grid/cell support still absent upstream.
  * - Provider-only OpenRig (`herdrAppProvider === true`, `followPrune === false`): disables `follow`, `unfollow`, `prune`
  *   with `FOLLOW_PRUNE_REASON`.
  * - Provider-only OpenRig (`herdrAppProvider === true`, `gridGeometry === false` / `cellClose === false`):
@@ -4861,7 +4992,11 @@ export function capabilityDisableReason(action, caps = DEFAULT_CAPABILITIES) {
     "design-view", "open-designed-view", "close-cell", "cell-swap", "cell-split",
     "cell-zoom",
   ]);
-  if (!c.herdrAppProvider && providerActions.has(action)) return STOCK_PROVIDER_REASON;
+  if (!c.herdrAppProvider && providerActions.has(action)) {
+    if (["follow", "unfollow", "prune"].includes(action)) return FOLLOW_PRUNE_REASON;
+    if (["design-view", "open-designed-view", "close-cell", "cell-swap", "cell-split"].includes(action)) return GRID_GEOMETRY_REASON;
+    return STOCK_PROVIDER_REASON;
+  }
   if (c.herdrAppProvider && !c.followPrune && (action === "follow" || action === "unfollow" || action === "prune")) {
     return FOLLOW_PRUNE_REASON;
   }
@@ -5525,10 +5660,23 @@ export function waitWith(cx) {
  *   via `hc run` with labels `herdr-openrig.role=attach`, `herdr-openrig.attach=<session>`, `herdr-openrig.rig=<rig>`,
  *   `herdr-openrig.seat=<session>`, running `buildAttachRelayArgv(config, seat)`.
  */
+// Serialize complete opens, including terminal adoption. A later caller must see the first caller's viewer;
+// each still performs its own validation and consent checks, rather than inheriting another request's result.
+const seatAttachQueue = new Map();
 export async function attachToSeat(first = {}, second = {}, config = null, options = {}) {
   const isFirstHost = Boolean(typeof first?.run === "function" || typeof first?.hc === "function" || typeof first?.spaces === "function" || Array.isArray(first?.spaces));
   const host = isFirstHost ? first : second;
-  const seat = isFirstHost ? second : first;
+  const seat = { ...(isFirstHost ? second : first) };
+  config = config ? { ...config, ...(Array.isArray(config.rig) ? { rig: [...config.rig] } : {}) } : config;
+  options = { ...options };
+  const key = JSON.stringify([config?.daemonMachine ?? "", config?.daemonUrl ?? options?.daemonUrl ?? "", config?.openrigHome ?? "", seat?.session ?? seat?.canonicalSessionName ?? ""]);
+  const job = (seatAttachQueue.get(key) ?? Promise.resolve()).catch(() => {}).then(() => attachSeatOnce(host, seat, config, options));
+  seatAttachQueue.set(key, job);
+  return job.finally(() => { if (seatAttachQueue.get(key) === job) seatAttachQueue.delete(key); });
+}
+
+async function attachSeatOnce(host, seat, config, options) {
+  if (config?.daemonMachine !== undefined && config.daemonMachine !== "") return attachRemoteSeat(host, seat, config, options);
   const session = String(seat?.session ?? seat?.canonicalSessionName ?? "").trim();
   const logicalId = String(seat?.logicalId ?? seat?.name ?? (session.includes("@") ? session.split("@")[0].replace(/-/g, ".") : session) ?? "seat");
   const rigName = String(seat?.rig ?? (session.includes("@") ? session.slice(session.lastIndexOf("@") + 1) : ""));
@@ -5540,16 +5688,18 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   if (isOperator && effectiveDaemonUrl && !isLoopbackDaemonUrl(effectiveDaemonUrl)) {
     return { ok: false, disabled: true, reason: REMOTE_OPERATOR_REASON };
   }
-  const sp = typeof host.spaces === "function" ? host.spaces() : (host.spaces ?? []);
-  const pn = typeof host.panes === "function" ? host.panes() : (host.panes ?? []);
-  const tm = typeof host.terminals === "function" ? host.terminals() : (host.terminals ?? []);
+  const live = (key) => (typeof host[key] === "function" ? host[key]() : host[key] ?? []).filter((item) =>
+    key === "spaces" ? !item.machine && !String(item.id ?? "").includes("/")
+      : key === "terminals" ? !String(item.address ?? "").includes("/") : !String(item.terminal ?? "").includes("/"));
+  const sp = live("spaces"), pn = live("panes"), tm = live("terminals");
 
-  const existing = findAttachedSeat(tm, sp, session, pn, { logicalId, rig: rigName });
-  if (existing) {
+  const reuse = (existing) => {
     if (existing.tab) host.run?.("tab.select", { id: existing.tab });
     host.run?.("pane.focus", { terminal: existing.terminal });
     return { ok: true, reused: true, ...existing };
-  }
+  };
+  const existing = findAttachedSeat(tm, sp, session, pn, { logicalId, rig: rigName });
+  if (existing) return reuse(existing);
 
   const isRunning = Boolean(
     seat?.sessionAlive ||
@@ -5585,13 +5735,16 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   } catch (e) {
     return { ok: false, disabled: true, reason: String(e?.message ?? e) };
   }
+  const appeared = findAttachedSeat(live("terminals"), live("spaces"), session, live("panes"), { logicalId, rig: rigName });
+  if (appeared) return reuse(appeared);
+  if (typeof host.hc !== "function") return { ok: false, reason: "Attach needs Herdr's labelled terminal start. Open the Rig sidebar and try again; no terminal was started." };
   const rigSpaceIds = new Set(tm.filter((t) => t.labels?.["herdr-openrig.space"] === "1"
     && t.labels?.["herdr-openrig.rig"] === rigName && t.labels?.["herdr-openrig.origin"] === effectiveDaemonUrl)
     .map((t) => t.labels?.["herdr.space"]));
-  const rigSpace = !isOperator && rigName ? sp.find((s) => !s.machine && rigSpaceIds.has(s.id)) : null;
-  const newRigSpace = !isOperator && rigName && !rigSpace && typeof host.hc === "function";
-  const activeSpace = rigSpace ?? (newRigSpace ? { id: `sp-openrig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` }
-    : (Array.isArray(sp) ? sp : []).find((s) => s?.active) ?? sp?.[0] ?? null);
+  const rigSpace = rigName ? sp.find((s) => rigSpaceIds.has(s.id)) : null;
+  const newRigSpace = !rigSpace;
+  // Local mode never derives a machine or destination from focus, including Operator.
+  const activeSpace = rigSpace ?? { id: `sp-openrig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` };
   if (activeSpace && !activeSpace.machine && typeof host.hc === "function") {
     const slug = (isOperator ? "operator" : logicalId).replace(/[^a-zA-Z0-9_-]/g, "-");
     const tab = `tb-rig-attach-${slug}-${Date.now().toString(36)}`;
@@ -5601,7 +5754,7 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
       "--label", `herdr.space=${activeSpace.id}`,
       "--label", `herdr.tab=${tab}`,
       "--label", "herdr-openrig.role=attach",
-      ...(!isOperator && rigName ? ["--label", "herdr-openrig.space=1", "--label", `herdr-openrig.origin=${effectiveDaemonUrl}`] : []),
+      "--label", "herdr-openrig.space=1", "--label", `herdr-openrig.origin=${effectiveDaemonUrl}`,
       "--label", `herdr-openrig.attach=${session}`,
       ...(rigName ? ["--label", `herdr-openrig.rig=${rigName}`] : []),
       ...(session ? ["--label", `herdr-openrig.seat=${session}`] : []),
@@ -5611,13 +5764,13 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
     const started = await Promise.resolve(host.hc(hcArgs)).catch(() => null);
     let address = null;
     try { address = JSON.parse(started?.stdout ?? "null")?.address ?? null; } catch (_) { address = null; }
-    if (address) {
+    if (address && !String(address).includes("/") && (started?.code === undefined || started.code === 0)) {
       for (let i = 0; i < 30 && host.wait && !((typeof host.spaces === "function" ? host.spaces() : sp) ?? []).some((s) => (s.tabs ?? []).some((t) => t.id === tab)); i++) {
         await host.wait(100);
       }
       host.run?.("tab.rename", { id: tab, name: tabDisplayName });
       if (newRigSpace) {
-        let name = rigName, suffix = 2;
+        let name = rigName || "OpenRig", suffix = 2;
         const currentSpaces = typeof host.spaces === "function" ? host.spaces() : sp;
         while (currentSpaces.some((s) => s.id !== activeSpace.id && s.name === name)) name = `${rigName} ${suffix++}`;
         host.run?.("space.rename", { id: activeSpace.id, name });
@@ -5628,10 +5781,7 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
       return { ok: true, reused: false, terminal: address, tab };
     }
   }
-  // With no space open, the attached seat is the new space's first tab (tab.new would be refused).
-  if (!hasSpace(typeof host.spaces === "function" ? host.spaces() : host.spaces)) host.run?.("space.new", { tab: tabDisplayName, argv });
-  else host.run?.("tab.new", { name: tabDisplayName, argv });
-  return { ok: true, reused: false, tab: null, terminal: null };
+  return { ok: false, reason: "Herdr could not confirm a labelled local Attach terminal. No fallback tab was opened; check the local core and try again." };
 }
 
 /**

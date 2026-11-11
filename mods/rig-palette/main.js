@@ -117,7 +117,10 @@ export default class RigPalette extends View {
       const config = this.config ?? parseConfig(null);
       this.busy = true; cx.notify();
       cx.spawn(async (cx) => {
-        try { await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config); }
+        try {
+          const result = await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+          if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
+        }
         finally { this.dismiss(); }
       });
       return true;

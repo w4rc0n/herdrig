@@ -1,5 +1,7 @@
 # Herdrig
 
+Version: v0.3.0
+
 **OpenRig Mod for Herdr**
 
 > **EARLY DEVELOPMENT** — This mod is in early development. Contributions are welcome.
@@ -40,6 +42,13 @@ you.
 
 Herdr doesn't review mods: check what your agent runs and which keys it changes.
 
+## Updating
+
+Replace the four folders `rig`, `rig-view`, `rig-palette` and `rig-menu` in `<appHome>/mods/` with the new
+release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
+Restart herdr-app after all four are copied. Your folds and settings are kept outside those folders.
+Check the `Version:` line in the README you copied, or open System and read **Herdrig Version**.
+
 ## Requirements
 
 - **Herdr:** `herdr-app` and `hc`.
@@ -79,13 +88,25 @@ with no shell, and attaches only to session names OpenRig makes.
 Earlier versions' **Copy & edit** for a spec could read a file the OpenRig daemon named on your machine and send it
 to the daemon. This version copies only the spec text OpenRig served.
 
+## Waiting on the next OpenRig release
+
+**Turns on with the next OpenRig release:** basic worker-view open and close, **Show in worker view**, and saved-view
+previews need the herdr-app provider. It is [merged upstream](https://github.com/mvschwarz/openrig/pull/2744) but is
+not in the current OpenRig release, 0.7.11. Update to a release that includes it and these controls turn on
+automatically: Herdrig detects support, so no Herdrig update is needed. Check `rig --version` and the control's tooltip.
+Attach, the TUI tab and Herdrig's own Seats grids already work.
+
+**Not yet in OpenRig:** Follow and auto-prune for herdr-app, custom worker-view grids (`--grid`/`--replace`), and
+cell editing (`close --cell`) are not supported on upstream main yet. Those controls stay greyed out until OpenRig
+adds the required support. The provider release alone will not enable them; no release date is promised.
+
 ## Known limitations
 
 - **OpenRig and Herdr on one machine.** The mod talks to OpenRig's local address and runs the local `rig`. A Herdr
   window on another machine than its OpenRig isn't supported.
 - **With upstream OpenRig's own `herdr-app` provider** serving the window, the four mods work with less chrome: no
   cell-level seat identity, follow countdown or per-view row.
-- **Follow and auto-prune** stay disabled on an OpenRig whose `rig terminal open` has no `--follow`.
+- **Follow and auto-prune** require herdr-app support plus both `--follow` and `--prune-after` in `rig terminal open`.
 - **Some actions need your OpenRig name.** Sending, queueing, changing a seat's model, and editing quiet hours or
   modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
 - **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.
