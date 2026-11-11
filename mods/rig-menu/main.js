@@ -16,13 +16,14 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc } from "herdr";
-import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath,
+import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
   SWAP_RUNTIMES, SWAP_MODELS_BY_RUNTIME, SWAP_EFFORTS_BY_RUNTIME, filterAllowedModels, changeModelPlan,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, closeRigInspection, selectWorkerView,
-  currentCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, attachToSeat, resetGroupOrder, submitMissionActions, attachRelayPath, layoutHasMod, isLoopbackDaemonUrl } from "./rig-lib.js";
+  currentCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, attachToSeat, resetGroupOrder, submitMissionActions, attachRelayPath, waitWith, layoutHasMod, isLoopbackDaemonUrl,
+  statusMarkElement, deleteOutcome, rigNameProblem, newRigFromSpecArgs, newRigOneSeatArgs, commandLine, NEW_RIG_RUNTIMES } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.menu` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.menu}`;
@@ -36,7 +37,7 @@ const page = (entry) => {
 /** A one-click action's dialog: the title, a two-line error and its hint, Retry and the footer fit unclipped. */
 const RESULT_HEIGHT = 240;
 /** Writes that may have arrived even when they failed (a timeout), or whose form stays on screen: never resent via Retry. */
-const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-model"]);
+const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-model", "new-rig"]);
 /** Reopens this mod as a dialog for a step (input, confirm, result). A click beside it closes it. */
 const dialog = (target, step, height = 260) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
 const configNow = async () => {
@@ -149,7 +150,9 @@ export default class RigMenu extends View {
     this.typing = false;
     const step = props()?.step;
     cx.spawn(async (cx) => {
-      this.config = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
+      // The daemon's address as the other mods find it (config.json, a loopback address in shared state, then the CLI),
+      // so Attach and Retry work without the sidebar too.
+      this.config = await configNow();
       cx.notify();
       // A one-click action that failed in the sidebar arrives with its failure, for Retry; without the sidebar one starts
       // once, here: never from render, where notify isn't allowed.
@@ -169,6 +172,7 @@ export default class RigMenu extends View {
       this.folder.focus();
       this.typing = true;
     }
+    if (step?.action === "new-rig") this.initNewRig(cx);
     if (step?.action === "design-view") {
       this.initDesigner(complete(props().target));
       this.handle?.focus?.();
@@ -195,6 +199,87 @@ export default class RigMenu extends View {
       cx.timer.after(400, () => this.input.focus());
     }
     if (step?.load === "pause") this.loadPause(cx);
+  }
+
+  /** New rig: from a spec in the library (`rig up`) or one seat (`rig create`); the folder is the last one launched in. */
+  initNewRig(cx) {
+    const drafts = shared("rig.drafts") ?? {};
+    this.newMode = "spec";
+    this.newRuntime = NEW_RIG_RUNTIMES[0];
+    this.newSpec = null;
+    this.newSpecs = null;
+    this.folder = InputState.new({ placeholder: "Working folder (an absolute path)", value: drafts["launch-folder"] ?? "" });
+    this.rigName = InputState.new({ placeholder: "Rig name" });
+    for (const field of [this.folder, this.rigName]) {
+      field.on("focus", () => { this.typing = true; });
+      field.on("blur", () => { this.typing = false; });
+      field.on("change", (_e, cx) => cx.notify());
+      field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, props().target, props().step); });
+    }
+    cx.spawn(async (cx) => {
+      const config = await configNow();
+      if (!config.daemonUrl) { this.newSpecs = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start')." }; cx.notify(); return; }
+      try {
+        const r = await fetch(`${config.daemonUrl}/api/specs/library`);
+        const body = await r.json();
+        const list = Array.isArray(body) ? body : Array.isArray(body?.specs) ? body.specs : [];
+        // Rig specs only: an agent spec isn't a `rig up` source.
+        this.newSpecs = list.filter((s) => s && (s.name || s.sourcePath) && (!s.kind || s.kind === "rig"));
+      } catch (e) { this.newSpecs = { error: String(e?.message ?? e) }; }
+      cx.notify();
+    });
+  }
+
+  /** What New rig would run, and what's wrong with the fields if anything. */
+  newRigArgs() {
+    const folder = this.folder?.value() ?? "", name = this.rigName?.value() ?? "";
+    if (this.newMode === "spec") {
+      const problem = !this.newSpec ? "Pick a spec from the library." : launchSourceProblem(this.newSpec.sourcePath ?? this.newSpec.name) ?? launchFolderProblem(folder) ?? rigNameProblem(name, { optional: true });
+      return { problem, args: problem ? null : newRigFromSpecArgs(this.newSpec.sourcePath ?? this.newSpec.name, folder, name) };
+    }
+    const problem = rigNameProblem(name) ?? launchFolderProblem(folder);
+    return { problem, args: problem ? null : newRigOneSeatArgs(name, this.newRuntime, folder) };
+  }
+
+  /** The command New rig shows before it runs, with placeholders for what isn't filled in yet. */
+  newRigPreview() {
+    const folder = (this.folder?.value() ?? "").trim() || "<folder>";
+    const name = (this.rigName?.value() ?? "").trim();
+    if (this.newMode === "spec") return ["up", "--cwd", folder, ...(name ? ["--name", name] : []), "--yes", "--", this.newSpec ? (this.newSpec.sourcePath ?? this.newSpec.name) : "<spec>"];
+    return ["create", "--runtime", this.newRuntime, "--cwd", folder, "--", name || "<name>"];
+  }
+
+  /** Whether the rig has seats running, so Archive pauses it first (OpenRig refuses to archive a running rig). */
+  rigRunning(target) {
+    return !(isRigStopped(target.lifecycle, this.rigSeats(target)) || target.lifecycle === "stopped");
+  }
+
+  /** Archive, the reversible choice beside Delete: a running rig is paused first (`rig down`), then `rig archive`. */
+  archive(cx, target) {
+    if (this.busy || target.rig === "kernel") return;
+    const reason = capabilityDisableReason("archive-rig", this.caps());
+    if (reason) { this.result = { ok: false, kind: "archive", text: reason }; cx.notify(); return; }
+    const running = this.rigRunning(target);
+    this.run(cx, running ? `Pausing and archiving ${target.rig}` : `Archiving ${target.rig}`, async () => {
+      let paused = null;
+      if (running) {
+        const d = await this.write(this.argsFor(target, "pause"));
+        paused = d.json && "sessionsKilled" in d.json ? pauseOutcome(d.json) : null;
+        if (!d.ok && !paused?.ok) return { ok: false, kind: "archive", paused, text: `${target.rig} wasn't paused, so it wasn't archived: ${d.text || "the CLI gave no reason."}` };
+      }
+      const a = await this.write(this.argsFor(target, "archive-rig"));
+      if (a.ok) run("rig.refresh");
+      return { ...a, kind: "archive", paused };
+    });
+  }
+
+  /** Undo an archive: `rig unarchive`. */
+  unarchive(cx, target) {
+    this.run(cx, `Bringing ${target.rig} back`, async () => {
+      const r = await this.write(this.argsFor(target, "unarchive-rig"));
+      if (r.ok) run("rig.refresh");
+      return { ...r, kind: "unarchive", text: r.ok ? `${target.rig} is back in the rig list. Resume starts its seats.` : r.text };
+    });
   }
 
   /** The designer's state: the grid, the seat picked or dragged, the shape of what is saved. */
@@ -300,6 +385,17 @@ export default class RigMenu extends View {
   }
 
   /** Closes this popup or dialog. A typed draft is kept unless `discard` (Cancel) says otherwise. */
+  /** Runs a menu item. One that returns a promise (Open slice, Open mission, Attach without the sidebar) finishes before the
+   *  popup closes: herdr drops a closed popup's runtime, which would cut the work off half done. */
+  choose(it, cx) {
+    if (it.disabled || this.pending) return;
+    const r = it.act(cx);
+    if (!r || typeof r.then !== "function") { this.dismiss(); return; }
+    this.pending = it.label;
+    cx?.notify?.();
+    Promise.resolve(r).catch(() => {}).then(() => { this.pending = null; this.dismiss(); });
+  }
+
   dismiss(discard = false) {
     if (discard) this.dropDraft(); else this.keepDraft();
     const id = props()?.overlay; if (id) closeOverlay(id);
@@ -377,19 +473,36 @@ export default class RigMenu extends View {
     };
     if (target.kind === "seat" || target.kind === "cell") {
       const stoppedSeat = isStopped(target);
+      // The row's own actions first: ⋯, the right-click and the Menu key open this same list.
+      // A terminal seat is a person's shell, not an agent: no message, work or model to give it.
+      if (!(target.terminal === true || isTerminalSeat(target))) {
+        item("rig-send", "Send message…", () => dialog(target, { input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }), "send");
+        item("rig-queue", "Queue work…", () => dialog(target, { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), "queue");
+        item("rig-swap", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), "change-model");
+      }
+      item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, name: target.logicalId, session: target.session }));
+      if (target.session) item("rig-copy", "Copy session address", (cx) => cx.write_to_clipboard(target.session));
       out.push({
         icon: "terminal",
         label: "Attach",
-        // The sidebar outlives this popup and holds the config: hand it Attach (rig.attach). Without it, Attach runs here
-        // with the config and this folder's relay.
-        act: () => {
-          if (layoutHasMod(layout(), MOD_IDS.sidebar)) { run(`rig.attach:${target.session}`); return; }
-          void attachToSeat({ run, hc, spaces, panes, terminals, layout, notify, relayPath: attachRelayPath(appHome(), MOD_IDS.menu) }, target, this.config)
-            .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); });
+        // The sidebar outlives this popup and has the config: hand it Attach (rig.attach), so closing the popup can't
+        // cut it short. Without the sidebar, Attach runs here with the config and this folder's relay, and finishes
+        // before the popup closes; a refusal says why. It runs as a task: the click's cx goes stale at the first await,
+        // and the wait for herdr to adopt the tab needs a cx that doesn't.
+        act: (cx) => {
+          if (layoutHasMod(layout(), MOD_IDS.sidebar)) { run(`rig.attach:${target.session}`); return null; }
+          const config = this.config;
+          const attach = (wait) => attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, notify, wait, relayPath: attachRelayPath(appHome(), MOD_IDS.menu) }, target, config)
+            .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); return res; });
+          if (typeof cx?.spawn !== "function") return attach(undefined);
+          return new Promise((resolve) => { cx.spawn(async (cx) => { resolve(await attach(waitWith(cx)).catch(() => null)); }); });
         },
         disabled: stoppedSeat,
         reason: stoppedSeat ? "Stopped: seat has no running session to attach" : null,
       });
+      // Focusing a pane the seat already has needs nothing from OpenRig; with none, Focus pane opens a view, which needs
+      // OpenRig's herdr provider ("open-seat"), as on the seat page.
+      const live = seatClickTarget(viewsPropsFromLayout(layout(), shared), null, target.session, panes?.() ?? [], terminals?.() ?? []);
       item("rig-target", "Focus pane", () => {
         const hit = seatClickTarget(viewsPropsFromLayout(layout(), shared), null, target.session, panes?.() ?? [], terminals?.() ?? []);
         if (hit.kind === "focus") {
@@ -399,15 +512,17 @@ export default class RigMenu extends View {
           else if (hit.terminal) run("pane.focus", { terminal: hit.terminal });
           return;
         }
+        // A pane in another worker view: select that view's tab, then the seat's pane.
+        if (hit.kind === "select-then-focus") {
+          if (hit.tab) run("tab.select", { id: hit.tab });
+          run("pane.focus", { terminal: hit.terminal });
+          return;
+        }
         oneClick(target, "open-seat");
-      });
-      item("rig-send", "Send message…", () => dialog(target, { input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }), "send");
-      item("rig-queue", "Queue work…", () => dialog(target, { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), "queue");
-      item("rig-target", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), "change-model");
-      item("rig-card", "Open seat card", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, name: target.logicalId, session: target.session }));
-      item("rig-target", "Open slice", () => { openSlice(target); });
+      }, live.kind === "focus" || live.kind === "select-then-focus" ? null : "open-seat");
+      item("rig-target", "Open slice", () => openSlice(target));
       // Files open in the Files-look-alike viewer.
-      item("file-text", "Open slice SPEC.md", () => { openSlice(target, "SPEC.md"); });
+      item("file-text", "Open slice SPEC.md", () => openSlice(target, "SPEC.md"));
       const transcript = transcriptPath(this.config, target.rig, target.session);
       if (transcript) item("file-text", "Open transcript", () => page(fileEntry(transcript, `Transcript · ${target.logicalId ?? target.session}`)));
       if (target.kind === "cell") item("rig-keyboard", "Take keyboard", () => oneClick(target, "keyboard"));
@@ -417,9 +532,14 @@ export default class RigMenu extends View {
       if (children.length) out.push({ divider: "Helpers (hc run)" });
       for (const child of children) item("rig-helper", `Peek ${child.label}`, () => run("terminal.peek", { terminal: child.address }));
     }
+    if (target.kind === "pod") {
+      item("rig-card", "Show pod card", () => page({ section: "topology", kind: "pod", rig: target.rig, rigId: target.rigId, pod: target.pod, name: target.pod }));
+    }
     if (target.kind === "rig" || target.kind === "pod" || target.kind === "seat") {
-      // The popup's header already names a rig target; a seat's rig actions get their own label.
-      out.push({ divider: target.kind === "seat" ? `Rig ${target.rig}` : "" });
+      // The popup's header already names a rig target; a seat's or a pod's rig actions get their own label.
+      out.push({ divider: target.kind === "seat" || target.kind === "pod" ? `Rig ${target.rig}` : "" });
+      if (target.rigId) item("rig-copy", "Copy rig id", (cx) => cx.write_to_clipboard(target.rigId));
+      item("rig-view", "Open rig space", () => run(`rig.space:${target.rigId ?? target.rig}`));
       item("rig-view", "New worker view", () => oneClick({ ...target, view: `rig:${target.rig}` }, "open-view"), "open-view");
       item("rig-view", "Design worker view…", () => openDesigner(target), "design-view");
       // One Following view per rig in this window; the toggle turns its following on or off.
@@ -428,12 +548,14 @@ export default class RigMenu extends View {
       const followReason = capabilityDisableReason(on ? "unfollow" : "follow", caps);
       out.push({ icon: on ? "check" : "rig-follow", label: "Follow active workers", act: () => oneClick({ ...target, view: `rig:${target.rig}` }, on ? "unfollow" : "follow"), disabled: !!followReason, reason: followReason });
       item("rig-snapshot", "Snapshot now", () => oneClick(target, "snapshot"));
-      item("rig-target", "Open mission…", () => { openMission(target); });
+      item("rig-target", "Open mission…", () => openMission(target));
       out.push({ divider: "" });
       // Resume when paused, Pause when not; with the state unknown or mixed, both.
       const stoppedRig = isRigStopped(target.lifecycle, this.rigSeats(target));
       if (!stoppedRig && target.lifecycle !== "stopped") item("rig-pause", "Pause rig…", () => dialog(target, { action: "pause", load: "pause" }, 360));
       if (stoppedRig || target.lifecycle !== "running") item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
+      // Delete, with Archive beside it as the reversible choice. Never for the kernel: it's the daemon's own rig.
+      if (target.rig !== "kernel") item("rig-trash", "Delete rig…", () => dialog(target, { action: "delete-rig", load: "pause" }, 540), "delete-rig");
     }
     if (target.kind === "tui") {
       // Strip's TUI pill right-click menu — Focus TUI, Restart TUI, Close TUI.
@@ -525,13 +647,27 @@ export default class RigMenu extends View {
       item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: target.summary }));
     }
     if (target.kind === "open-view") item("rig-view", `Open ${target.view}`, () => oneClick(target, "open-view"), "open-view");
-    const customOrder = target.orderGroupKey ? (shared("rig.order") ?? {})[target.orderGroupKey] : null;
-    if (target.orderGroupKey && (target.hasCustomOrder || (Array.isArray(customOrder) && customOrder.length > 0))) {
+    // Sidebar rows that are places: each opens its page; a saved or rig view also opens in herdr.
+    if (target.kind === "branch") item("rig-popout", `Open ${target.name} in the Rig page`, () => page({ section: target.section }));
+    if (target.kind === "host") item("rig-card", "Show host card", () => page({ section: "topology", kind: "host", hostId: target.hostId, name: target.name }));
+    if (target.kind === "mission") item("rig-card", "Show mission card", () => page({ section: "scopes", mission: target.mission, name: target.name }));
+    if (target.kind === "specs-group") item("rig-popout", `Open ${target.name} specs in the Rig page`, () => page({ section: "specs", kindFilter: target.specKind, name: target.name }));
+    if (target.kind === "system-config") item("rig-popout", "Open Configuration", () => page({ section: "system", subview: "config", name: "Configuration" }));
+    if (target.kind === "system" && target.entry) item("rig-popout", `Open ${target.name}`, () => page(target.entry));
+    if (target.kind === "saved-view" || target.kind === "terminal") {
+      item("rig-card", "Show view", () => page({ section: "terminals", view: target.view, name: target.name }));
+      item("rig-view", "Open in herdr", () => oneClick({ kind: "open-view", view: target.view, rig: target.rig }, "open-view"), "open-view");
+    }
+    // A group's order can live under several keys (Specs: one per namespace): Reset clears every one that has an order.
+    const orderKeys = target.orderGroupKeys ?? (target.orderGroupKey ? [target.orderGroupKey] : []);
+    const ordered = orderKeys.filter((k) => { const o = (shared("rig.order") ?? {})[k]; return Array.isArray(o) && o.length > 0; });
+    if (orderKeys.length && (target.hasCustomOrder || ordered.length)) {
       if (out.length > 0) out.push({ divider: "" });
       item("rig-refresh", "Reset order", () => {
-        const next = resetGroupOrder(shared("rig.order") ?? {}, target.orderGroupKey);
+        let next = shared("rig.order") ?? {};
+        for (const k of target.hasCustomOrder ? orderKeys : ordered) next = resetGroupOrder(next, k);
         setShared("rig.order", next);
-        run(`rig.reset-order:${target.orderGroupKey}`);
+        for (const k of target.hasCustomOrder ? orderKeys : ordered) run(`rig.reset-order:${k}`);
       });
     }
     return out;
@@ -575,18 +711,23 @@ export default class RigMenu extends View {
 
   // ---- views --------------------------------------------------------------------------------------------------------
   popup(t, target) {
+    if (this.pending) return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
+      .child(div().id("rig-menu-pending").px(8).py(6).text_color(t.muted).child(`${this.pending}…`));
     const items = this.items(target);
     const reasons = [...new Set(items.map((it) => it.reason).filter(Boolean))];
     return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
       .child(div().px(8).py(4).text_size(11).text_color(t.dim).child(target.kind === "seat" || target.kind === "cell" ? `Seat ${target.logicalId ?? target.session} · ${target.rig}`
         : target.kind === "need" ? (target.summary ?? "Needs you") : target.kind === "tui" ? "Rig TUI" : target.kind === "spec" ? `Spec ${target.name}`
         : target.kind === "slice" ? `Slice ${target.name}` : target.kind === "strip-view" || target.kind === "following" ? `View ${target.name ?? target.viewId}`
-        : target.kind === "cell-split" ? `Split ${target.logicalId ?? target.seat}` : `Rig ${target.rig ?? ""}`))
+        : target.kind === "cell-split" ? `Split ${target.logicalId ?? target.seat}` : target.kind === "pod" ? `Pod ${target.pod} · ${target.rig}`
+        : target.kind === "host" ? `Host ${target.name}` : target.kind === "mission" ? `Mission ${target.name}` : target.kind === "branch" ? target.name
+        : target.kind === "specs-group" ? `${target.name} specs` : target.kind === "system-config" || target.kind === "system" ? target.name
+        : target.kind === "saved-view" || target.kind === "terminal" ? `View ${target.name ?? target.view}` : `Rig ${target.rig ?? ""}`))
       .children(items.map((it, i) => it.divider !== undefined
         ? v_flex().child(div().h(1).bg(t.border).my(3)).when(!!it.divider, (el) => el.child(div().px(8).py(2).text_size(11).text_color(t.dim).child(it.divider)))
         : h_flex().id(`rig-menu-${i}`).px(8).h(26).gap(8).rounded(5).items_center().text_color(it.disabled ? t.dim : t.foreground).hover((s) => s.bg(it.disabled ? t.raised : t.hover))
           .when(!!it.reason, (el) => el.tooltip(it.reason))
-          .on_click(() => { if (!it.disabled) { it.act(); this.dismiss(); } })
+          .on_click((_e, cx) => this.choose(it, cx))
           .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
           .child(div().flex_1().truncate().child(it.label))))
       .when(reasons.length > 0, (el) => el.child(v_flex().id("rig-menu-reasons").px(8).py(4).gap(2).children(reasons.map((r, idx) => div().id(`rig-menu-reason-${idx}`).text_size(11).text_color(t.dim).child(r)))));
@@ -596,6 +737,24 @@ export default class RigMenu extends View {
     const r = this.result;
     if (this.busy) return div().text_size(12.5).text_color(t.muted).child(`${this.busy}…`);
     if (!r) return null;
+    if (step.action === "delete-rig" && r.kind === "delete" && r.json && "sessionsKilled" in r.json) {
+      const out = deleteOutcome(r.json, target.rig);
+      return v_flex().id("delete-result").gap(4)
+        .child(div().text_size(13).font_semibold().text_color(out.ok ? t.foreground : t.blocked).child(out.headline))
+        .children(out.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note)));
+    }
+    if (step.action === "delete-rig" && r.kind === "archive") {
+      const paused = r.paused;
+      return v_flex().id("archive-result").gap(4)
+        .child(div().text_size(13).font_semibold().text_color(r.ok ? t.foreground : t.blocked).child(r.ok ? `Archived ${target.rig}` : `${target.rig} wasn't archived`))
+        .when(!!paused, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(paused.headline))
+          .children(paused.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note))))
+        .child(div().text_size(11.5).text_color(r.ok ? t.dim : t.blocked).child(r.ok
+          ? `It's hidden from the rig list, with its record, topology and snapshots kept. Undo brings it back now; later, run rig unarchive ${target.rig}.`
+          : r.text || "It didn't work, and the CLI gave no reason."))
+        .when(r.ok, (el) => el.child(h_flex().child(div().id("rig-unarchive").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.unarchive(cx, target)).child("Undo"))));
+    }
     // A teardown result (even with a non-zero exit, as for a rig already stopped) reads as what it says.
     if (step.action === "pause" && r.json && "sessionsKilled" in r.json) {
       const out = pauseOutcome(r.json);
@@ -625,6 +784,8 @@ export default class RigMenu extends View {
         ? "It may still have been delivered: check the seat or `rig queue` before trying again."
         : step.action === "reply" ? "It may still have arrived: check the request in Needs-You before answering again."
         : step.action === "launch-spec" ? "Fix the fields above and press Launch, or check the rig list if Launch timed out."
+        : step.action === "new-rig" ? "Fix the fields above and press again, or check the rig list if it timed out."
+        : step.action === "delete-rig" ? "Check the rig list before trying again; Retry runs the delete again."
         : step.action === "pause" || step.action === "resume" ? "Check the current state before trying again; Retry re-reads it first." : "Retry runs it again.")))
       // A message or an answer is never resent from here: it may have arrived. Anything else runs again.
       .when(!r.ok && !RESEND_UNSAFE.has(step.action), (el) => el.child(div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
@@ -660,6 +821,39 @@ export default class RigMenu extends View {
       if (step.action === "design-view") this.designError = disableReason;
       else this.result = { ok: false, text: disableReason };
       cx.notify();
+      return;
+    }
+    if (step.action === "delete-rig") {
+      if (target.rig === "kernel") { this.result = { ok: false, text: "The kernel is OpenRig's own rig: it isn't deleted or archived from here." }; cx.notify(); return; }
+      this.run(cx, `Deleting ${target.rig}`, async () => {
+        const r = await this.write(this.argsFor(target, "delete-rig"));
+        if (r.json?.deleted) {
+          // A deleted rig's inspection cannot refresh. Remove its history entries while keeping other pages.
+          const nav = shared("rig.nav");
+          if (nav?.stack) {
+            const stack = nav.stack.filter((entry) => entry.rig !== target.rig &&
+              !(target.rigId && entry.rigId === target.rigId) &&
+              !(entry.kind === "rig" && entry.name === target.rig));
+            setShared("rig.nav", { ...nav, stack: stack.length ? stack : [{ section: "topology" }] });
+          }
+          run("rig.refresh");
+        }
+        return { ...r, kind: "delete" };
+      });
+      return;
+    }
+    if (step.action === "new-rig") {
+      const createReason = this.newMode === "seat" ? capabilityDisableReason("create-rig", this.caps()) : null;
+      const { problem, args } = this.newRigArgs();
+      if (createReason || problem || !args) { this.result = { ok: false, text: createReason ?? problem ?? "Nothing to run." }; cx.notify(); return; }
+      const folder = (this.folder?.value() ?? "").trim(), name = (this.rigName?.value() ?? "").trim();
+      setShared("rig.drafts", { ...(shared("rig.drafts") ?? {}), "launch-folder": folder });
+      const fromSpec = this.newMode === "spec", spec = this.newSpec?.name ?? this.newSpec?.sourcePath, runtime = this.newRuntime;
+      this.run(cx, fromSpec ? "Launching" : "Creating", async () => {
+        const r = await this.write(args, fromSpec ? { env: launchSpecEnv("") } : undefined);
+        if (r.ok) run("rig.refresh");
+        return r.ok && !r.text ? { ...r, text: fromSpec ? `${spec} launched${name ? ` as ${name}` : ""}.` : `${name} created, with one ${runtime} seat.` } : r;
+      });
       return;
     }
     if (step.action === "launch-spec") {
@@ -1116,7 +1310,13 @@ export default class RigMenu extends View {
   }
 
   dialogView(t, cx, target, step) {
-    const title = actionTitle(target, step.action);
+    const result = this.result;
+    const title = step.action === "delete-rig" && result
+      ? result.kind === "archive" ? (result.ok ? `${target.rig} archived` : `Couldn't archive ${target.rig}`)
+        : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
+        : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
+          ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
+      : actionTitle(target, step.action);
     const go = (cx) => this.go(cx, target, step);
     let body = null;
     if (step.action === "design-view") {
@@ -1132,9 +1332,13 @@ export default class RigMenu extends View {
       body = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? div().text_color(t.blocked).child(p.error)
         : v_flex().gap(3)
           .child(div().child(`This stops all ${p.total} agents. Work in progress stops with them:`))
-          .children(p.busy.map((s) => h_flex().gap(8).child(div().size(7).flex_none().rounded(4).bg(t[s.tone] ?? t.dim)).child(div().w(130).truncate().child(s.logicalId))
+          .children(p.busy.map((s) => h_flex().gap(8).child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().child(s.logicalId))
             .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))))
           .child(div().text_color(t.dim).child("OpenRig snapshots first (best effort). Resume brings back each conversation where the harness allows."));
+    } else if (step.action === "delete-rig" && !this.result && !this.busy) {
+      body = this.deleteView(t, target);
+    } else if (step.action === "new-rig" && !this.result?.ok && !this.busy) {
+      body = this.newRigView(t);
     } else if (step.action === "fresh" && !this.result && !this.busy) {
       body = div().child(`${target.logicalId} starts a new conversation; the old one is not resumed.`);
     } else if (step.action === "launch-spec" && !this.result?.ok && !this.busy) {
@@ -1159,10 +1363,13 @@ export default class RigMenu extends View {
       : null;
     const confirmLabel = step.action === "change-model"
       ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
+      : step.action === "new-rig" ? (this.newMode === "seat" ? "Create" : "Launch")
+      : step.action === "delete-rig" ? `Delete ${target.rig}`
       : { pause: "Pause rig", resume: "Resume rig", fresh: "Start fresh", "design-view": "Open", send: "Send", queue: "Queue", reply: "Reply", "launch-spec": "Launch" }[step.action];
     const done = !!this.result?.ok;
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
-    const canConfirm = !!confirmLabel && (step.action === "launch-spec" || step.action === "design-view" || step.action === "change-model" ? !this.result?.ok : !this.result) && !this.busy && !step.run;
+    const canConfirm = !!confirmLabel && (step.action === "launch-spec" || step.action === "new-rig" || step.action === "design-view" || step.action === "change-model" ? !this.result?.ok : !this.result) && !this.busy && !step.run;
+    const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps()) : null;
     const mac = window()?.platform === "macos";
     return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).size_full().p(14).gap(10).bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).text_size(12.5)
       .on_mouse_move((e, cx) => { if (step.action === "design-view" && this.draggingDivider) this.moveDividerDrag(e, cx); })
@@ -1181,7 +1388,8 @@ export default class RigMenu extends View {
           }
           this.dismiss();
         }
-        else if ((key === "enter" || key === "return") && (e.modifiers?.control || e.modifiers?.platform) && canConfirm) {
+        // Ctrl+Enter confirms, except Delete: a rig is only deleted by its own button.
+        else if ((key === "enter" || key === "return") && (e.modifiers?.control || e.modifiers?.platform) && canConfirm && step.action !== "delete-rig") {
           cx.stop_propagation();
           go(cx);
         }
@@ -1203,18 +1411,78 @@ export default class RigMenu extends View {
           }
         }
       })
-      .child(div().text_size(14).font_semibold().child(title))
-      .when(!!body, (el) => el.child(body))
+      .child(div().id("rig-dialog-title").flex_none().text_size(14).font_semibold().child(title))
+      .when(!!body && step.action !== "change-model", (el) => el.child(body))
       .when(!!this.input && !this.result, (el) => el.child(div().flex_1().border(1).border_color(t.border).rounded(6).p(6).child(Textarea.new(this.input).h(96)))
         .child(div().text_size(11).text_color(t.dim).child(`${mac ? "⌘ Return" : "Ctrl+Enter"} sends · Esc or a click outside closes; your text is kept until you send or cancel`)))
-      // A long result (a Resume list) scrolls inside the dialog; the buttons stay in view.
-      .when(step.action !== "design-view" || !!this.result || !!this.busy, (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar().child(this.resultView(t, cx, target, step) ?? div())))
-      .child(h_flex().gap(8).justify_end()
+      // Long results and the model/harness form scroll; the action footer never shrinks into the body.
+      .when(step.action !== "design-view" || !!this.result || !!this.busy, (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
+        .when(step.action === "change-model" && !!body, (content) => content.child(body))
+        .child(this.resultView(t, cx, target, step) ?? div())))
+      .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
         .child(div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
           .on_click(() => this.dismiss(!done)).child(done ? "Close" : "Cancel"))
+        .when(canConfirm && step.action === "delete-rig", (el) => el.child(div().id("rig-archive").px(12).h(26).rounded(6).bg(t.raised).border_1().border_color(t.border)
+          .flex().items_center().hover((s) => s.bg(t.hover)).when(!!archiveReason, (b) => b.opacity(0.45).tooltip(archiveReason))
+          .on_click((_e, cx) => { if (!archiveReason) this.archive(cx, target); }).child(this.rigRunning(target) ? "Pause and archive" : "Archive")))
         .when(canConfirm, (el) => el.child(div().id("rig-confirm").px(12).h(26).rounded(6)
-          .bg(step.action === "pause" || step.action === "fresh" ? t.blocked : t.accent).text_color(t.background ?? "#fff").flex().items_center()
+          .bg(step.action === "pause" || step.action === "fresh" || step.action === "delete-rig" ? t.blocked : t.accent)
+          .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center()
           .on_click((_e, cx) => go(cx)).child(confirmLabel))));
+  }
+
+  /** Delete's confirmation: what stops (every seat, with its state and owned work), the command, and Archive instead. */
+  deleteView(t, target) {
+    const p = this.pause;
+    const seats = p?.seats ?? [];
+    const what = p && !p.error ? `${target.rig}'s ${seats.length} seat${seats.length === 1 ? "" : "s"}` : `every seat of ${target.rig}`;
+    const list = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? div().text_color(t.blocked).child(p.error)
+      : v_flex().id("delete-seats").gap(3).children(seats.map((s, i) => h_flex().id(`delete-seat-${i}`).gap(8).items_center()
+        .child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().child(s.logicalId))
+        .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))));
+    return v_flex().id("delete-view").gap(8)
+      .child(div().child(`This stops ${what} and deletes the rig. OpenRig takes a snapshot first, but the rig can't be brought back by name afterwards.`))
+      .child(list)
+      .child(div().id("delete-command").text_size(11.5).text_color(t.dim).child(commandLine(this.argsFor(target, "delete-rig"))))
+      .child(div().text_size(11).text_color(t.dim).child("Seats joined with rig attach keep running; the result lists them."))
+      .child(v_flex().id("delete-archive-box").gap(2).p(8).rounded(6).bg(t.raised).border_1().border_color(t.border)
+        .child(div().font_semibold().child("Want it back later?"))
+        .child(div().text_color(t.muted).child("Archive hides the rig and keeps everything. A running rig is paused first.")));
+  }
+
+  /** New rig: a two-choice control (from a spec, or one seat), its fields, and the command it will run. */
+  newRigView(t) {
+    const pill = (id, label, active, onClick) => div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
+      .bg(active ? t.accent : t.raised).text_color(active ? (t.solid_foreground ?? t.background) : t.muted).border_1().border_color(active ? t.accent : t.border)
+      .hover((s) => s.bg(active ? t.accent : t.hover)).on_click((_e, cx) => { onClick(); cx.notify(); }).child(label);
+    const label = (text) => div().text_size(11.5).text_color(t.dim).child(text);
+    const field = (text, state) => v_flex().gap(3).child(label(text)).child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(Input.new(state)));
+    const seat = this.newMode === "seat";
+    const createReason = seat ? capabilityDisableReason("create-rig", this.caps()) : null;
+    const specs = this.newSpecs;
+    const specList = !specs ? div().text_color(t.muted).child("Reading the spec library…")
+      : specs.error ? div().text_color(t.blocked).child(specs.error)
+      : !specs.length ? div().text_color(t.muted).child("The spec library has no rig specs. Add one to the library, or make a one-seat rig.")
+      : v_flex().id("new-rig-specs").gap(2).max_h(132).overflow_y_scrollbar().children(specs.map((s, i) => {
+        const on = this.newSpec === s;
+        return h_flex().id(`new-rig-spec-${i}`).px(6).h(24).gap(8).rounded(5).items_center().cursor_pointer()
+          .bg(on ? (t.selection ?? `${t.accent}1f`) : t.raised).hover((x) => x.bg(t.hover))
+          .on_click((_e, cx) => { this.newSpec = s; this.result = null; cx.notify(); })
+          .child(svg(icon(on ? "check" : "rig-card")).size(12).flex_none().text_color(on ? t.accent : t.muted))
+          .child(div().flex_1().truncate().child(s.name ?? s.sourcePath));
+      }));
+    return v_flex().id("new-rig-view").gap(8)
+      .child(h_flex().id("new-rig-mode").gap(4)
+        .child(pill("new-rig-mode-spec", "From a spec", !seat, () => { this.newMode = "spec"; this.result = null; }))
+        .child(pill("new-rig-mode-seat", "One seat", seat, () => { this.newMode = "seat"; this.result = null; })))
+      .when(!seat, (el) => el.child(v_flex().gap(3).child(label("Spec")).child(specList))
+        .child(field("Working folder", this.folder)).child(field("Name (optional: run a spec twice under another name)", this.rigName)))
+      .when(seat, (el) => el.child(field("Name", this.rigName))
+        .child(v_flex().gap(3).child(label("Runtime")).child(h_flex().id("new-rig-runtimes").gap(4)
+          .children(NEW_RIG_RUNTIMES.map((r) => pill(`new-rig-runtime-${r}`, r, this.newRuntime === r, () => { this.newRuntime = r; })))))
+        .child(field("Working folder", this.folder))
+        .when(!!createReason, (x) => x.child(div().text_size(11.5).text_color(t.blocked).child(createReason))))
+      .child(div().id("new-rig-command").text_size(11.5).text_color(t.dim).child(commandLine(this.newRigPreview())));
   }
 
   render(cx) {

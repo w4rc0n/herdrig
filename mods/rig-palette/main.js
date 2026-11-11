@@ -8,7 +8,7 @@
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, theme, run, exec, shared, setShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout, notify } from "herdr";
-import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath } from "./rig-lib.js";
+import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
 
 /** The palette's own commands, offered first when they match what is typed. */
 export { LOCAL_COMMANDS };
@@ -123,13 +123,13 @@ export default class RigPalette extends View {
       return true;
     }
     if ((verb === "expand-all" || verb === ":expand-all") && !arg) {
-      setShared("rig.open", expandAllTopology(shared("rig.open"), shared("rig.data")?.topology ?? []));
+      setShared("rig.open.page", expandAllTopology(shared("rig.open.page"), shared("rig.data")?.topology ?? []));
       openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" });
       this.dismiss();
       return true;
     }
     if ((verb === "collapse-all" || verb === ":collapse-all") && !arg) {
-      setShared("rig.open", collapseAllTopology(shared("rig.open"), shared("rig.data")?.topology ?? []));
+      setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), shared("rig.data")?.topology ?? []));
       openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" });
       this.dismiss();
       return true;
@@ -257,7 +257,7 @@ export default class RigPalette extends View {
   }
 
   applyRoute(route) {
-    if (route.open) setShared("rig.open", { ...(shared("rig.open") ?? {}), ...route.open });
+    if (route.open) setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), ...route.open });
     if (route.focus) setShared("rig.focus", route.focus);
     if (route.entry?.focusRig) setShared("rig.focusRig", route.entry.focusRig);
     if (route.project) {
@@ -306,9 +306,9 @@ export default class RigPalette extends View {
       attachable: true,
     };
     this.busy = true; cx.notify();
-    cx.spawn(async () => {
+    cx.spawn(async (cx) => {
       try {
-        const res = await attachToSeat({ run, hc, spaces, panes, terminals: () => terminals?.() ?? [], layout, relayPath: attachRelayPath(appHome(), MOD_IDS.palette) }, target, { ...config, daemonUrl }, { name: "Operator" });
+        const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals: () => terminals?.() ?? [], layout, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.palette) }, target, { ...config, daemonUrl }, { name: "Operator" });
         if (res && res.ok === false && res.reason) notify({ title: "Open operator", body: res.reason, level: "warning" });
       } finally {
         this.dismiss();
@@ -396,7 +396,7 @@ export default class RigPalette extends View {
         // The words fill the request's inline reply box, opened and focused on the Rig page, to confirm with Answer or
         // Resolve there: the Needs list when it is shown, else the request's own page.
         setShared("rig.drafts", { ...(shared("rig.drafts") ?? {}), [draftKey(target, "reply")]: route.text });
-        setShared("rig.open", { ...(shared("rig.open") ?? {}), [`needs:${target.id}`]: true });
+        setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [`needs:${target.id}`]: true });
         setShared("rig.replyFocus", { id: target.id, at: Date.now() });
         if (top.section === "needs" && (top.id === target.id || !top.id)) { openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" }); return this.dismiss(); }
         return this.show({ section: "needs", id: target.id, name: target.summary });

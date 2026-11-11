@@ -194,7 +194,13 @@ export function parseDaemonStatusJson(stdout, host = "127.0.0.1") {
   const reachable = d.reachable === true && healthy;
   const portNum = Number(d.port);
   const port = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? portNum : null;
-  const cleanHost = typeof host === "string" && host.trim() ? host.trim() : "127.0.0.1";
+  const hostText = typeof host === "string" && host.trim() ? host.trim() : "127.0.0.1";
+  const cleanHost = /^[0-9a-f]*:[0-9a-f:]+$/i.test(hostText) ? `[${hostText}]` : hostText;
+  // A host is not a URL: reject port/path/userinfo/query fragments before adding the discovered port.
+  if (!/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?|\[[0-9a-f:]+\])$/i.test(cleanHost)) {
+    return { reachable: false, state: "unreachable", port, daemonUrl: null, kernel, rigs,
+      message: "OpenRig returned an invalid daemon host; daemon.host must be a hostname or IP address, without a port or path." };
+  }
   const msg = typeof d.message === "string" && d.message
     ? d.message
     : (typeof d.reason === "string" && d.reason ? d.reason : null);
@@ -1550,6 +1556,9 @@ export function actionArgs(target, action, text, home) {
       ...(target.follow ? ["--follow"] : target.noFollow ? ["--no-follow"] : []), "--json", "--", target.view ?? `rig:${target.rig}`];
     case "pause": return ["down", "--yes", "--", target.rig];
     case "resume": return ["up", "--existing", "--", target.rig];
+    case "delete-rig": return ["down", "--delete", "--yes", "--", target.rig];
+    case "archive-rig": return ["archive", "--", target.rig];
+    case "unarchive-rig": return ["unarchive", "--", target.rig];
     case "fresh": return freshArgs(target.logicalId, target.rig, target.reason ?? "fresh-prime after restore");
     default: return null;
   }
@@ -1572,7 +1581,7 @@ export function actionTitle(target, action) {
     "change-model": `${target.logicalId ?? target.session} · ${target.rig ?? ""}`.replace(/ · $/, ""),
     // The request answered is always named: who asked, else its id.
     reply: `Reply to ${target.asker || target.qitemId || target.id}`, pause: `Pause ${target.rig}?`,
-    resume: `Resume ${target.rig}?`, fresh: `Start ${target.logicalId} fresh?`, "open-view": `Open ${target.view}`, "open-seat": `Show ${target.logicalId}`,
+    resume: `Resume ${target.rig}?`, "delete-rig": `Delete ${target.rig}?`, "new-rig": "New rig", fresh: `Start ${target.logicalId} fresh?`, "open-view": `Open ${target.view}`, "open-seat": `Show ${target.logicalId}`,
     snapshot: `Snapshot ${target.rig}`, keyboard: "Take keyboard", info: "Open slice", follow: `Follow ${followName(target.view)}`, unfollow: `Stop following ${followName(target.view)}`,
     prune: `Prune after ${target.prune}`, "close-view": `Close ${target.name ?? target.viewId}`,
     "design-view": target.replace ? `Edit layout · ${target.name ?? target.replace}` : `Design worker view · ${target.rig}`,
@@ -1625,7 +1634,15 @@ export function readCommand(config, args, { env = [] } = {}) {
   return { command: "env", args: [...cliEnv(config), ...env, ...(config.rig ?? ["rig"]), ...args] };
 }
 
-/** The TUI's seat status (tui/src/hydrate.ts, the maintained web projection), from one `/api/rigs/:id/nodes` row. */
+/** A terminal seat (`nodeKind: "infrastructure"` or `runtime: "terminal"`), such as the kernel's operator.human: a plain
+ *  shell, not an agent. OpenRig samples its window for motion, so a redrawing screen reads as "working"; that isn't an
+ *  agent at work. */
+export function isTerminalSeat(node) {
+  return node?.nodeKind === "infrastructure" || node?.runtime === "terminal";
+}
+
+/** The TUI's seat status (tui/src/hydrate.ts, the maintained web projection), from one `/api/rigs/:id/nodes` row. A
+ *  running terminal seat is `terminal`, never `active`: its attention and lifecycle states still show. */
 export function seatStatus(node) {
   const act = node.activityState ?? {};
   if (node.identityVerdict?.reason === "session_missing" && node.sessionStatus === "detached" && node.lifecycleState !== "attention_required") return "detached";
@@ -1633,6 +1650,7 @@ export function seatStatus(node) {
   if (node.needsAttention == null && (node.lifecycleState === "attention_required" || node.startupStatus === "attention_required")) return "attention_required";
   if (node.needsAttention === true) return (node.arbitratedNeedsInput ?? node.agentActivity?.state === "needs_input") ? "needs_input" : "attention_required";
   if (node.needsAttention == null && (act.display === "needs-input" || node.agentActivity?.state === "needs_input")) return "needs_input";
+  if (isTerminalSeat(node)) return node.sessionStatus === "running" || node.sessionStatus === "ready" ? "terminal" : (node.sessionStatus ?? "unknown");
   if (node.sessionStatus === "running" || node.sessionStatus === "ready") {
     if (act.display === "blocked") return "blocked";
     if (act.display === "working") return "active";
@@ -1652,6 +1670,8 @@ export function statusLook(status) {
     case "blocked": return { tone: "blocked", word: "blocked" };
     case "active": return { tone: "working", word: "working" };
     case "idle": return { tone: "idle", word: "idle" };
+    // Neutral: not counted as working, needs you or idle, and never raises a rig's dot.
+    case "terminal": return { tone: "done", word: "terminal" };
     case "detached": return { tone: "done", word: "detached" };
     case "stopped": return { tone: "done", word: "stopped" };
     case "exited": return { tone: "done", word: "exited" };
@@ -1680,6 +1700,51 @@ export function rowStatusGlyph(status) {
       return { glyph: "●", tone: "idle" };
     default:
       return { glyph: "○", tone: "done" };
+  }
+}
+
+/**
+ * The mark the sidebar and the page draw for a status (from seatStatus) or a tone (statusLook's, for counts and a rig's dot), told
+ * apart by shape as well as colour. `color` and `word` name theme() tokens:
+ * - `glow` working: an 8 px dot on a 14 px halo that glows natively; the theme's green (`ansi2`)
+ * - `diamond` needs you, attention, blocked; `cross` failed (its ✕)
+ * - `ring` idle; `check` done; `square` stopped, detached, exited (and a rig with nothing running)
+ * - `prompt` a terminal seat, never animated
+ */
+export function statusMark(key) {
+  switch (key) {
+    case "active": case "working": return { shape: "glow", color: "ansi2", word: "ansi2" };
+    case "needs_input": case "attention_required": case "blocked": return { shape: "diamond", color: "blocked", word: "blocked" };
+    case "failed": return { shape: "cross", color: "blocked", word: "blocked" };
+    case "completed": return { shape: "check", color: "done", word: "done" };
+    // The tone "done" is statusLook's for every seat that isn't running, so as a tone it reads stopped, not finished.
+    case "done": case "stopped": case "detached": case "exited": return { shape: "square", color: "muted", word: "muted" };
+    case "terminal": return { shape: "prompt", color: "muted", word: "muted" };
+    default: return { shape: "ring", color: "muted", word: "muted" };
+  }
+}
+
+/**
+ * Draw `statusMark(key)` in a fixed `cell` (so names line up), with the mod's own `div` and `svg` (`ui`) and icon paths
+ * (`iconOf`). The working halo glows with herdr's native `.loop`, so nothing redraws on a timer and it stops when hidden.
+ */
+export function statusMarkElement(ui, t, key, { cell = 14, iconOf } = {}) {
+  const { div, svg } = ui;
+  const m = statusMark(key);
+  const c = t[m.color] ?? t.muted;
+  const box = div().size(cell).flex_none().flex().items_center().justify_center();
+  const dot = Math.round(cell * 8 / 14);
+  switch (m.shape) {
+    case "glow":
+      return box.relative()
+        .child(div().absolute().inset_0().rounded(cell).bg(c).loop("opacity", { from: 0.10, to: 0.45, period: 1600 }))
+        .child(div().size(dot).rounded(dot).bg(c));
+    case "diamond": return box.child(svg(iconOf("rig-diamond")).size(Math.round(cell * 0.64)).text_color(c));
+    case "cross": return box.child(div().text_size(Math.round(cell * 0.75)).text_color(c).child("✕"));
+    case "check": return box.child(svg(iconOf("check")).size(Math.round(cell * 0.8)).text_color(c));
+    case "square": return box.child(div().size(Math.round(cell / 2)).rounded(1).border(1.5).border_color(c));
+    case "prompt": return box.child(svg(iconOf("rig-terminal-prompt")).size(Math.round(cell * 0.8)).text_color(c));
+    default: return box.child(div().size(dot).rounded(dot).border(1.5).border_color(c));
   }
 }
 
@@ -1717,6 +1782,15 @@ export function worstTone(tones) {
   return tones.reduce((worst, t) => (rank[t] ?? 0) > (rank[worst] ?? -1) ? t : worst, "done");
 }
 
+/** A rig's dot from its seats' tones: the worst agent's. A rig whose running seats are all terminals reads `terminal`
+ *  (it runs, though no agent counts); the square ("done") stays for a rig with nothing running. */
+export function rigTone(seats) {
+  const list = seats ?? [];
+  const agents = list.filter((s) => !s.terminal);
+  const worst = agents.length ? worstTone(agents.map((s) => s.tone)) : "done";
+  return worst === "done" && list.some((s) => s.terminal && s.status === "terminal") ? "terminal" : worst;
+}
+
 /** A node's host: `/api/ps` entries carry `hostSelfId`; older shapes `host` or `hostId`. */
 export const hostOf = (n) => n?.host ?? n?.hostSelfId ?? n?.hostId ?? null;
 
@@ -1737,7 +1811,9 @@ export function buildTopology(summary, nodesByRig, nativeSeats = []) {
         logicalId: n.logicalId,
         member: n.logicalId.includes(".") ? n.logicalId.slice(n.logicalId.indexOf(".") + 1) : n.logicalId,
         session: n.canonicalSessionName,
+        sessionStatus: n.sessionStatus ?? null,
         runtime: n.runtime ?? null,
+        terminal: isTerminalSeat(n),
         model: n.model ?? null,
         effort: n.effort ?? null,
         role: n.role ?? null,
@@ -1764,6 +1840,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = []) {
         context: n.contextUsage?.usedPercentage ?? null,
         contextUsage: n.contextUsage ?? null,
         agentActivity: n.agentActivity ?? null,
+        activityState: n.activityState ?? null,
         needsAttention: n.needsAttention ?? null,
         arbitratedNeedsInput: n.arbitratedNeedsInput ?? null,
         needsInputEvidence: n.needsInputEvidence ?? null,
@@ -1779,7 +1856,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = []) {
       host: rigHost,
       lifecycle: rig.lifecycleState,
       seatCount: seats.length,
-      tone: seats.length ? worstTone(seats.map((s) => s.tone)) : "done",
+      tone: rigTone(seats),
       pods: [...pods].map(([name, podSeats]) => ({ name, seats: podSeats })),
     };
   });
@@ -1808,6 +1885,7 @@ export function rigModel(rig, nodes, nativeSeats = []) {
       member: n.logicalId?.includes(".") ? n.logicalId.slice(n.logicalId.indexOf(".") + 1) : n.logicalId,
       session: n.canonicalSessionName,
       runtime: n.runtime ?? null,
+      terminal: isTerminalSeat(n),
       model: n.model ?? null,
       effort: n.effort ?? null,
       role: n.role ?? null,
@@ -1829,6 +1907,7 @@ export function rigModel(rig, nodes, nativeSeats = []) {
       context: n.contextUsage?.usedPercentage ?? null,
       contextUsage: n.contextUsage ?? null,
       agentActivity: n.agentActivity ?? null,
+      activityState: n.activityState ?? null,
       needsAttention: n.needsAttention ?? null,
       arbitratedNeedsInput: n.arbitratedNeedsInput ?? null,
       needsInputEvidence: n.needsInputEvidence ?? null,
@@ -1860,13 +1939,26 @@ export const POD_FOLD_AT = 12;
 export function podOpenDefault(seats = []) {
   return seats.length <= POD_FOLD_AT || seats.some((s) => s.tone === "blocked");
 }
-/** The fold keys in `shared("rig.open")`, one model for the sidebar tree and the Topology page. */
+/** The fold keys: one model, two states. The sidebar keeps `shared("rig.open.sidebar")` (persisted), the page
+ *  `shared("rig.open.page")` (in memory), so folding on one never folds the other. */
 export const branchKey = (section) => `branch:${section}`;
 export const hostKey = (host) => `host:${host}`;
 export const rigKey = (rigId) => `rig:${rigId}`;
 export const viewsKey = (rigId) => `views:${rigId}`;
 export const podKey = (rigId, pod) => `pod:${rigId}/${pod}`;
 const blockedCount = (seats) => seats.filter((s) => s.tone === "blocked").length;
+
+/** The page folds to open so a target opened from the sidebar shows: its rig, and for a seat or pod its pod. Only the
+ *  page's state changes; the sidebar's folds are its own. */
+export function pageRevealOpen(open, entry) {
+  const next = { ...(open ?? {}) };
+  const rigId = entry?.rigId;
+  if (!rigId || (entry.kind !== "rig" && entry.kind !== "pod" && entry.kind !== "seat")) return next;
+  next[rigKey(rigId)] = true;
+  const pod = entry.kind === "pod" ? entry.pod ?? entry.name : entry.pod;
+  if (pod) next[podKey(rigId, pod)] = true;
+  return next;
+}
 /** Whether a fold is open: a stored choice wins, except that a collapse never hides a seat that started needing the
  *  person after it was made (the count of blocked seats at collapse time is kept beside it). */
 function foldOpen(stored, key, openMap, seats, fallback) {
@@ -2171,8 +2263,16 @@ export function openOrFocusRigTab(host = {}, entry = null) {
     return { kind: "layout.select", child: "rig-page" };
   }
   const props = entry ? { section: entry.section ?? "topology", ...(entry.id ? { id: entry.id } : {}) } : { section: "topology" };
+  // herdr refuses tab.new with no space open ("no space yet: make one first"), and space.new takes no mod: make the space
+  // first; herdr runs the two in order, so the tab lands in it.
+  if (!hasSpace(sp)) host.run?.("space.new", {});
   host.run?.("tab.new", { mod: MOD_IDS.view, name: "Rig", props });
   return { kind: "tab.new", mod: MOD_IDS.view, props };
+}
+
+/** Whether herdr has a space open: `tab.new` needs one, and `space.new` makes one (with its first tab, when given). */
+export function hasSpace(spaces) {
+  return Array.isArray(spaces) && spaces.length > 0;
 }
 
 /**
@@ -2300,14 +2400,16 @@ export function asOf(date) {
   return `as of ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-/** The Pause confirmation's list: every seat that would stop, with what it is doing and owns. */
+/** The Pause confirmation's list: every seat that would stop, with what it is doing and owns. A terminal seat is listed as
+ *  a terminal (rig down stops it too), never as a busy agent. */
 export function pauseSummary(nodes) {
   const seats = (nodes ?? []).filter((n) => n.nodeKind !== "service").map((n) => {
     const status = seatStatus(n);
-    return { logicalId: n.logicalId, word: statusLook(status).word, tone: statusLook(status).tone, owned: n.assignedWorkCount ?? 0 };
+    return { logicalId: n.logicalId, status, word: statusLook(status).word, tone: statusLook(status).tone, owned: n.assignedWorkCount ?? 0,
+      terminal: isTerminalSeat(n) };
   });
-  const busy = seats.filter((s) => s.tone !== "idle" && s.tone !== "done" || s.owned > 0);
-  return { total: seats.length, busy };
+  const busy = seats.filter((s) => s.terminal || s.tone !== "idle" && s.tone !== "done" || s.owned > 0);
+  return { total: seats.length, busy, seats };
 }
 
 /** `rig down <rig> --yes --json` (`TeardownResult`) in the person's words, with what didn't stop. */
@@ -2324,6 +2426,59 @@ export function pauseOutcome(json) {
   ];
   return { ok: errors.length === 0, headline, notes };
 }
+
+/** `rig down <rig> --delete --yes --json` (`TeardownResult` with `deleted` / `deleteBlocked`) in the person's words. */
+export function deleteOutcome(json, rig) {
+  const errors = Array.isArray(json?.errors) ? json.errors : [];
+  const left = Array.isArray(json?.leftRunning) ? json.leftRunning : [];
+  const n = Number(json?.sessionsKilled ?? 0);
+  const deleted = json?.deleted === true;
+  const headline = deleted ? `Deleted ${rig} · ${n} agent${n === 1 ? "" : "s"} stopped`
+    : json?.deleteBlocked ? `${rig} wasn't deleted: some sessions couldn't be stopped`
+    : `${rig} wasn't deleted`;
+  const notes = [
+    json?.snapshotId ? `Snapshot ${json.snapshotId} taken first.` : "No snapshot was taken.",
+    ...(left.length ? [`Still running (joined with rig attach, which OpenRig doesn't stop): ${left.join(", ")}`] : []),
+    ...errors.map((e) => `Error: ${e}`),
+  ];
+  return { ok: deleted && errors.length === 0, headline, notes };
+}
+
+/** A rig name OpenRig can make (it goes into every seat's session name, `<member>@<rig>`): letters, digits, `.`, `_`
+ *  and `-`, starting with a letter or digit, at most 64. Returns the problem, or null. */
+export function rigNameProblem(name, { optional = false } = {}) {
+  const n = String(name ?? "").trim();
+  if (!n) return optional ? null : "Give the rig a name.";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(n)) return "A rig name is letters, digits, '.', '_' and '-', starting with a letter or digit (at most 64).";
+  return null;
+}
+
+/** New rig from a spec: `rig up --cwd <folder> [--name <rig>] --yes -- <spec>`. */
+export function newRigFromSpecArgs(spec, folder, name = "") {
+  const source = String(spec ?? "").trim();
+  if (launchSourceProblem(source) || launchFolderProblem(folder) || rigNameProblem(name, { optional: true })) return null;
+  return ["up", "--cwd", String(folder).trim(), ...(String(name ?? "").trim() ? ["--name", String(name).trim()] : []), "--yes", "--", source];
+}
+
+/** New one-seat rig: `rig create --runtime <runtime> --cwd <folder> -- <name>`. */
+export function newRigOneSeatArgs(name, runtime, folder) {
+  const rt = String(runtime ?? "").trim() || "claude-code";
+  if (rigNameProblem(name) || launchFolderProblem(folder) || !/^[A-Za-z0-9._-]{1,32}$/.test(rt)) return null;
+  return ["create", "--runtime", rt, "--cwd", String(folder).trim(), "--", String(name).trim()];
+}
+
+/** A command as the person would type it, for a dialog to show before it runs (display only, never executed). */
+export function commandLine(args) {
+  return ["rig", ...(args ?? [])].map((a) => (/^[A-Za-z0-9_./:=@,+-]+$/.test(a) ? a : `'${String(a).replace(/'/g, "'\\''")}'`)).join(" ");
+}
+
+/** The New rig dialog, for `openOverlay`: from the sidebar's `+` and from the Topology page. */
+export function newRigOverlay() {
+  return { mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 480, height: 540, props: { target: { kind: "new-rig" }, step: { action: "new-rig" } } };
+}
+
+/** The runtimes the New rig dialog offers for one seat; `rig create --runtime` takes any OpenRig knows. */
+export const NEW_RIG_RUNTIMES = Object.freeze(["claude-code", "codex", "terminal"]);
 
 /**
  * `rig up <rig> --existing --json` (`RestoreResult`: `rigResult` and `nodes[].status`),
@@ -2598,7 +2753,7 @@ export function needsToastFor(rawItem) {
  * - When `quiet === true`: routine and alert toasts are held (`seen` updates silently), while `escalation` (`tier === "escalation"`) bypasses quiet and still toasts with `level: "error"`.
  * - Batch cap (`maxToasts = 3`): if >3 items qualify in one refresh, emits first 2 individual toasts (escalation/urgent first) + 1 summary toast.
  */
-export function diffNeedsNotifications(items, prevState = null, { quiet = false, needsVisible = false, notificationsEnabled = true, maxToasts = 3, maxSeen = 200, sources = null } = {}) {
+export function diffNeedsNotifications(items, prevState = null, { quiet = false, needsVisible = false, notificationsEnabled = true, maxToasts = 3, maxSeen = 200, sources = null, candidates: suppliedCandidates = null, transitionOnly = false } = {}) {
   if (!Array.isArray(items)) {
     return { toasts: [], nextState: prevState };
   }
@@ -2610,7 +2765,7 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
   const prevSeen = isSeeded ? (prevState.seen ?? prevState ?? {}) : {};
   const hasDegradedSource = Array.isArray(sources) && sources.some((s) => s && s.state && s.state !== "available");
 
-  const actionable = items.map(needsToastFor).filter(Boolean);
+  const actionable = suppliedCandidates ?? items.map(needsToastFor).filter(Boolean);
   const mergedMap = Object.assign(Object.create(null), hasDegradedSource ? prevSeen : {});
   for (const c of actionable) mergedMap[c.id] = c.at;
 
@@ -2631,12 +2786,12 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
   const rawCandidates = actionable.filter((c) => {
     if (!Object.prototype.hasOwnProperty.call(prevSeen, c.id)) return true;
     const prevAt = prevSeen[c.id];
-    return Boolean(c.at && prevAt && c.at > prevAt);
+    return !transitionOnly && Boolean(c.at && prevAt && c.at > prevAt);
   });
   if (!notificationsEnabled || needsVisible || rawCandidates.length === 0) {
     return { toasts: [], nextState };
   }
-  const candidates = quiet ? rawCandidates.filter((c) => c.isEscalation) : rawCandidates;
+  const candidates = rawCandidates.filter((c) => !c.silent && (!quiet || c.isEscalation));
   if (candidates.length === 0) {
     return { toasts: [], nextState };
   }
@@ -2670,7 +2825,7 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
 
 /**
  * Handle `rig.open-need`:
- * - Expands `shared("rig.open")["needs:" + id] = true`
+ * - Expands `shared("rig.open.page")["needs:" + id] = true` (the page's own folds)
  * - Sets `shared("rig.focusNeed", id)`
  * - Pushes `{ section: "needs", id, name }` onto `shared("rig.nav")` and selects `rig-page` in `rig-work`
  * - If `id` is absent (summary toast), opens `:needs` without expanding a specific row
@@ -2701,7 +2856,7 @@ export function openNeed(id, { shared, setShared, run, items = null, layout = un
   }
   const hit = Array.isArray(items) ? items.find((x) => String(x?.id ?? "") === targetId) : null;
   const name = hit?.summary ?? hit?.title ?? targetId;
-  setShared?.("rig.open", { ...(shared?.("rig.open") ?? {}), [`needs:${targetId}`]: true });
+  setShared?.("rig.open.page", { ...(shared?.("rig.open.page") ?? {}), [`needs:${targetId}`]: true });
   setShared?.("rig.focusNeed", targetId);
   setShared?.("rig.nav", navPush(nav, { section: "needs", id: targetId, name }));
   activateRigPage();
@@ -3538,7 +3693,7 @@ export function crumbsFor(entry) {
     if (e.kind === "host") return [section("topology"), { text: e.name ?? e.hostId ?? e.host, entry: e }];
     if (e.kind === "rig") return [section("topology"), { text: e.name ?? e.rigId, entry: e }];
     if (e.kind === "pod") return [section("topology"), { text: e.rig ?? e.rigId, entry: { section: "topology", kind: "rig", rigId: e.rigId, name: e.rig ?? e.rigId } }, { text: e.name ?? e.pod, entry: e }];
-    if (e.kind === "seat") return [section("topology"), { text: e.rig, entry: { section: "topology", kind: "rig", rigId: e.rigId, name: e.rig } }, { text: e.name, entry: e }];
+    if (e.kind === "seat") return [section("topology"), { text: e.rig, entry: { section: "topology", kind: "rig", rigId: e.rigId, name: e.rig } }, { text: e.name, entry: e, icon: "rig-seat" }];
     if (e.focus === "pulse" || e.subview === "pulse") return [section("topology"), { text: "Pulse", entry: e }];
     return [section("topology")];
   }
@@ -3583,6 +3738,20 @@ export function navPush(nav, entry) {
   if (entry?.section === "file" && !entry.from && top) next = { ...entry, from: top.section === "file" ? top.from ?? null : top };
   if (top && navKey(top) === navKey(next)) return { stack: [...stack.slice(0, -1), next] };
   return { stack: [...stack.slice(-29), next] };
+}
+
+/** Where Back goes: the page before, else the shown page's breadcrumb parent; null when there's
+ *  nowhere to go, and then Back isn't drawn. The same target `navBack` moves to. */
+export function backTarget(nav) {
+  const stack = nav?.stack ?? [];
+  if (stack.length > 1) return stack[stack.length - 2];
+  return crumbsFor(stack[0]).slice(0, -1).reverse().find((c) => c.entry)?.entry ?? null;
+}
+
+/** A page's title, as its last breadcrumb names it. */
+export function entryTitle(entry) {
+  const crumbs = crumbsFor(entry ?? { section: "topology" });
+  return String(crumbs[crumbs.length - 1]?.text ?? SECTION_TITLES[entry?.section] ?? "");
 }
 
 /** `‹` and `back`: the page before, else the shown page's parent (its breadcrumb before it), else nothing changes. */
@@ -3682,7 +3851,9 @@ export async function openOrFocusTui(host, config) {
       return { reused: false, terminal: address, tab };
     }
   }
-  host.run("tab.new", { name: "Rig TUI", argv: tuiArgv(config) });
+  // With no space open, the TUI is the new space's first tab (tab.new would be refused).
+  if (!hasSpace(host.spaces())) host.run("space.new", { tab: "Rig TUI", argv: tuiArgv(config) });
+  else host.run("tab.new", { name: "Rig TUI", argv: tuiArgv(config) });
   return { reused: false };
 }
 
@@ -4516,6 +4687,9 @@ export function configRows(browser, { category = null, settingKey = null } = {})
 }
 
 /** One-line reason shown when the connected OpenRig CLI lacks the `herdr-app` terminal provider (stock OpenRig 0.7.7). */
+export const RIG_DELETE_REASON = "Your OpenRig's `rig down` can't delete a rig (no --delete). Update OpenRig to delete one here.";
+export const RIG_ARCHIVE_REASON = "Your OpenRig has no `rig archive`. Update OpenRig to archive a rig here.";
+export const RIG_CREATE_REASON = "Your OpenRig has no `rig create`. Start a rig from a spec instead, or update OpenRig.";
 export const STOCK_PROVIDER_REASON = "Your OpenRig can't open views inside Herdr yet. Attach, the TUI tab and every other control still work.";
 
 /** One-line reason shown when `herdr-app` provider is present without `--follow` / `--prune-after`. */
@@ -4536,6 +4710,9 @@ export const DEFAULT_CAPABILITIES = Object.freeze({
   nativeSeats: true,
   mcpTerminalTools: true,
   tuiResolve: true,
+  rigDelete: true,
+  rigArchive: true,
+  rigCreate: true,
 });
 
 const capabilitiesCache = new Map();
@@ -4564,6 +4741,9 @@ export function rigCapabilities({
   nativeSeatsSupported = null,
   hasLiveSeat = null,
   terminals = [],
+  downHelp = "",
+  archiveHelp = "",
+  createHelp = "",
 } = {}) {
   const open = String(openHelp ?? "");
   const close = String(closeHelp ?? "");
@@ -4580,7 +4760,14 @@ export function rigCapabilities({
   const nativeSeats = Boolean(herdrAppProvider && (liveSeat || (endpointFlag !== null && endpointFlag !== undefined ? endpointFlag : gridGeometry && cellClose)));
   const mcpTerminalTools = Boolean(herdrAppProvider || /\brig_terminal_(open|prune)\b/.test(mcp));
   const tuiResolve = tui.trim() && tui.trim() !== "{}" ? /\bresolve\b/.test(tui) : herdrAppProvider;
-  return { herdrAppProvider, followPrune, gridGeometry, cellClose, nativeSeats, mcpTerminalTools, tuiResolve };
+  // The rig lifecycle verbs, from their own help: a help that answered and lacks the verb or flag turns it off; no answer
+  // leaves it on, and the CLI's own error says why if it fails.
+  const answered = (h) => { const s = String(h ?? "").trim(); return s && s !== "{}"; };
+  const missing = (h) => answered(h) && /\bunknown command\b/i.test(String(h));
+  const rigDelete = !answered(downHelp) || (!missing(downHelp) && String(downHelp).includes("--delete"));
+  const rigArchive = !missing(archiveHelp);
+  const rigCreate = !missing(createHelp);
+  return { herdrAppProvider, followPrune, gridGeometry, cellClose, nativeSeats, mcpTerminalTools, tuiResolve, rigDelete, rigArchive, rigCreate };
 }
 
 /**
@@ -4609,11 +4796,15 @@ export async function probeCapabilities(config, { exec, terminals = [], hasNativ
   const openCmd = readCommand(config, ["terminal", "open", "--help"]);
   const closeCmd = readCommand(config, ["terminal", "close", "--help"]);
   const tuiCmd = readCommand(config, ["tui", "--help"]);
-  const [openRes, closeRes, tuiRes] = await Promise.all([
+  const [openRes, closeRes, tuiRes, downRes, archiveRes, createRes] = await Promise.all([
     probeExec(openCmd),
     probeExec(closeCmd),
     probeExec(tuiCmd),
+    probeExec(readCommand(config, ["down", "--help"])),
+    probeExec(readCommand(config, ["archive", "--help"])),
+    probeExec(readCommand(config, ["create", "--help"])),
   ]);
+  const helpOf = (res) => `${res?.stdout ?? ""}\n${res?.stderr ?? ""}`.trim();
   const openHelp = `${openRes?.stdout ?? ""}\n${openRes?.stderr ?? ""}`.trim();
   const closeHelp = `${closeRes?.stdout ?? ""}\n${closeRes?.stderr ?? ""}`.trim();
   const tuiHelp = `${tuiRes?.stdout ?? ""}\n${tuiRes?.stderr ?? ""}`.trim();
@@ -4621,7 +4812,8 @@ export async function probeCapabilities(config, { exec, terminals = [], hasNativ
   if ((!openHelp || openHelp === "{}") && (!closeHelp || closeHelp === "{}") && endpointFlag !== false) {
     return { ...DEFAULT_CAPABILITIES };
   }
-  const caps = rigCapabilities({ openHelp, closeHelp, tuiHelp, hasNativeSeatsEndpoint: endpointFlag, terminals });
+  const caps = rigCapabilities({ openHelp, closeHelp, tuiHelp, hasNativeSeatsEndpoint: endpointFlag, terminals,
+    downHelp: helpOf(downRes), archiveHelp: helpOf(archiveRes), createHelp: helpOf(createRes) });
   capabilitiesCache.set(key, caps);
   return caps;
 }
@@ -4672,6 +4864,9 @@ export function capabilityDisableReason(action, caps = DEFAULT_CAPABILITIES) {
   if (c.herdrAppProvider && !c.cellClose && (action === "close-cell" || action === "cell-close")) {
     return GRID_GEOMETRY_REASON;
   }
+  if (action === "delete-rig" && c.rigDelete === false) return RIG_DELETE_REASON;
+  if ((action === "archive-rig" || action === "unarchive-rig") && c.rigArchive === false) return RIG_ARCHIVE_REASON;
+  if (action === "create-rig" && c.rigCreate === false) return RIG_CREATE_REASON;
   return null;
 }
 
@@ -4956,6 +5151,8 @@ export function parseSidebarState(text) {
       }
     }
     const out = { open, order };
+    if (["priority", "rig"].includes(raw.topologyView)) out.topologyView = raw.topologyView;
+    if (raw.notifiedNeeds && typeof raw.notifiedNeeds === "object") out.notifiedNeeds = raw.notifiedNeeds;
     if (typeof raw.lastSeenNeedsAt === "string" && raw.lastSeenNeedsAt) out.lastSeenNeedsAt = raw.lastSeenNeedsAt;
     if (typeof raw.needsView === "string" && raw.needsView) out.needsView = raw.needsView;
     if (typeof raw.lastEndedModeApplicationId === "string" && raw.lastEndedModeApplicationId) out.lastEndedModeApplicationId = raw.lastEndedModeApplicationId;
@@ -4967,7 +5164,7 @@ export function parseSidebarState(text) {
 }
 
 /** Serialize `{ open, order, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId }` into `<appHome>/openrig/state.json`, preserving any unrelated keys in `prevText`. */
-export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId } = {}) {
+export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, notifiedNeeds } = {}) {
   let base = {};
   try {
     const parsed = JSON.parse(String(prevText ?? "{}"));
@@ -4988,6 +5185,8 @@ export function serializeSidebarState(prevText, { open = {}, order = {}, lastSee
     }
   }
   const next = { ...base, open: cleanOpen, order: cleanOrder };
+  if (["priority", "rig"].includes(topologyView)) next.topologyView = topologyView;
+  if (notifiedNeeds !== undefined) next.notifiedNeeds = notifiedNeeds;
   if (lastSeenNeedsAt !== undefined) {
     if (lastSeenNeedsAt) next.lastSeenNeedsAt = String(lastSeenNeedsAt);
     else delete next.lastSeenNeedsAt;
@@ -5014,8 +5213,12 @@ export function serializeSidebarState(prevText, { open = {}, order = {}, lastSee
  * - `right` / `ArrowRight`: expand closed foldable row, or move to its first child when already open
  * - `left` / `ArrowLeft`: collapse open foldable row, or move selection to its parent row when already closed/leaf
  * - `enter` / `Enter`: activate the selected row (`selectSidebarNode` or row action)
+ * - `home` / `end`: the first / last visible row
+ * - `s` / `q`: the selected row's Send… / Queue… (`{ type: "action" }`; the page offers them, the sidebar ignores them)
+ * - the Menu key or Shift+F10: the selected row's menu (`{ type: "menu" }`)
+ * The WAI-ARIA Authoring Practices "Tree View" keys, with S, Q and the menu added.
  */
-export function treeKeyNav(visibleRows = [], selectedKey = null, key = "", { openMap = {} } = {}) {
+export function treeKeyNav(visibleRows = [], selectedKey = null, key = "", { openMap = {}, shift = false } = {}) {
   const rows = Array.isArray(visibleRows) ? visibleRows : [];
   if (!rows.length) return null;
   const k = String(key ?? "").toLowerCase();
@@ -5074,6 +5277,10 @@ export function treeKeyNav(visibleRows = [], selectedKey = null, key = "", { ope
     if (!cur) return null;
     return { type: "activate", key: cur.key, entry: cur.entry ?? null, row: cur };
   }
+  if (k === "home") return { type: "move", key: rows[0].key, row: rows[0] };
+  if (k === "end") return { type: "move", key: rows[rows.length - 1].key, row: rows[rows.length - 1] };
+  if ((k === "s" || k === "q") && !shift && idx >= 0) return { type: "action", action: k === "s" ? "send" : "queue", key: cur.key, row: cur };
+  if (k === "menu" || k === "contextmenu" || k === "apps" || (k === "f10" && shift)) return idx >= 0 ? { type: "menu", key: cur.key, row: cur } : null;
   return null;
 }
 
@@ -5111,9 +5318,11 @@ export function base64EncodeUtf8(str) {
 }
 
 /**
- * Map an OpenRig seat node or status string to Herdr's OSC 7501 `state` (`"working" | "blocked" | "idle" | "done"`).
+ * Map an OpenRig seat node or status string to Herdr's OSC 7501 `state` (`"working" | "blocked" | "idle" | "done"`), or
+ * `"clear"` for a terminal seat: it isn't an agent, so herdr shows no agent status for it.
  */
 export function mapSeatStateToOsc7501(nodeOrStatus) {
+  if (nodeOrStatus === "terminal" || (nodeOrStatus && typeof nodeOrStatus === "object" && (isTerminalSeat(nodeOrStatus) || nodeOrStatus.terminal === true))) return "clear";
   const status = typeof nodeOrStatus === "string"
     ? nodeOrStatus
     : (nodeOrStatus?.status && typeof nodeOrStatus.status === "string" && !("sessionAlive" in nodeOrStatus) && !("lifecycleState" in nodeOrStatus))
@@ -5273,11 +5482,30 @@ export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", 
   };
 }
 
-/** True when `daemonUrl` is a loopback URL (or empty/null). */
+/** Canonical local HTTP(S) origin. Kept in parity with the standalone relay parser by boundary tests.
+ * Plain JS only: the mod runtime need not provide a browser's URL global. */
+export function localDaemonOrigin(value) {
+  if (typeof value !== "string") return "";
+  const m = /^(https?):\/\/(localhost|\[::1\]|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?\/?$/i.exec(value.trim());
+  if (!m) return "";
+  const scheme = m[1].toLowerCase(), host = m[2].toLowerCase(), port = m[3] == null ? null : Number(m[3]);
+  if (host.startsWith("127.") && host.split(".").some((part) => Number(part) > 255 || String(Number(part)) !== part)) return "";
+  if (port !== null && (port < 1 || port > 65535)) return "";
+  return `${scheme}://${host}${port !== null && port !== (scheme === "https" ? 443 : 80) ? `:${port}` : ""}`;
+}
+
+/** True when `daemonUrl` is a local HTTP(S) origin (or absent, pending discovery). */
 export function isLoopbackDaemonUrl(daemonUrl) {
-  if (!daemonUrl) return true;
-  const s = String(daemonUrl).trim();
-  return /^https?:\/\/(127\.\d+\.\d+\.\d+|localhost|\[::1\]|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(s);
+  return daemonUrl == null || daemonUrl === "" || Boolean(localDaemonOrigin(daemonUrl));
+}
+
+/**
+ * The `wait` attachToSeat polls with until herdr has adopted the new tab, built on a context that outlives one host
+ * call: the `cx` that `cx.spawn` (or `init`) hands over. A click's own `cx` is valid only for that call and goes stale at
+ * its first `await`, so a wait built on it throws and the tab is never named, selected or focused.
+ */
+export function waitWith(cx) {
+  return (ms) => (typeof cx?.sleep === "function" ? cx.sleep(ms) : new Promise((r) => (cx?.timer ? cx.timer.after(ms, () => r()) : r())));
 }
 
 /**
@@ -5301,7 +5529,7 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   if (!isValidSessionName(session)) return { ok: false, disabled: true, reason: sessionNameRefusal(session) };
   const isOperator = logicalId === "operator.agent" || session === "operator-agent@kernel" || options?.operator === true;
   const tabDisplayName = String(options?.name ?? seat?.tabName ?? (isOperator ? "Operator" : logicalId));
-  const effectiveDaemonUrl = config?.daemonUrl ?? options?.daemonUrl ?? null;
+  let effectiveDaemonUrl = config?.daemonUrl ?? options?.daemonUrl ?? null;
   if (isOperator && effectiveDaemonUrl && !isLoopbackDaemonUrl(effectiveDaemonUrl)) {
     return { ok: false, disabled: true, reason: REMOTE_OPERATOR_REASON };
   }
@@ -5336,11 +5564,27 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
 
   let argv;
   try {
-    argv = buildAttachRelayArgv(config, { ...seat, session, logicalId, rig: rigName }, host.relayPath ?? options?.relayPath ?? null);
+    if (!effectiveDaemonUrl) {
+      if (typeof host.exec !== "function") return { ok: false, disabled: true, reason: "Attach cannot determine the local daemon URL: configure daemonUrl or provide CLI discovery." };
+      const found = await discoverDaemonFromCli(config, host.exec);
+      if (!found.daemonUrl) return { ok: false, disabled: true, reason: found.message };
+      effectiveDaemonUrl = found.daemonUrl;
+    }
+    effectiveDaemonUrl = localDaemonOrigin(effectiveDaemonUrl);
+    if (!effectiveDaemonUrl) {
+      return { ok: false, disabled: true, reason: "Attach needs a local HTTP(S) daemon origin on this machine, without a path, query or fragment." };
+    }
+    argv = buildAttachRelayArgv({ ...config, daemonUrl: effectiveDaemonUrl }, { ...seat, session, logicalId, rig: rigName }, host.relayPath ?? options?.relayPath ?? null);
   } catch (e) {
     return { ok: false, disabled: true, reason: String(e?.message ?? e) };
   }
-  const activeSpace = (Array.isArray(sp) ? sp : []).find((s) => s?.active) ?? sp?.[0] ?? null;
+  const rigSpaceIds = new Set(tm.filter((t) => t.labels?.["herdr-openrig.space"] === "1"
+    && t.labels?.["herdr-openrig.rig"] === rigName && t.labels?.["herdr-openrig.origin"] === effectiveDaemonUrl)
+    .map((t) => t.labels?.["herdr.space"]));
+  const rigSpace = !isOperator && rigName ? sp.find((s) => !s.machine && rigSpaceIds.has(s.id)) : null;
+  const newRigSpace = !isOperator && rigName && !rigSpace && typeof host.hc === "function";
+  const activeSpace = rigSpace ?? (newRigSpace ? { id: `sp-openrig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` }
+    : (Array.isArray(sp) ? sp : []).find((s) => s?.active) ?? sp?.[0] ?? null);
   if (activeSpace && !activeSpace.machine && typeof host.hc === "function") {
     const slug = (isOperator ? "operator" : logicalId).replace(/[^a-zA-Z0-9_-]/g, "-");
     const tab = `tb-rig-attach-${slug}-${Date.now().toString(36)}`;
@@ -5350,6 +5594,7 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
       "--label", `herdr.space=${activeSpace.id}`,
       "--label", `herdr.tab=${tab}`,
       "--label", "herdr-openrig.role=attach",
+      ...(!isOperator && rigName ? ["--label", "herdr-openrig.space=1", "--label", `herdr-openrig.origin=${effectiveDaemonUrl}`] : []),
       "--label", `herdr-openrig.attach=${session}`,
       ...(rigName ? ["--label", `herdr-openrig.rig=${rigName}`] : []),
       ...(session ? ["--label", `herdr-openrig.seat=${session}`] : []),
@@ -5364,12 +5609,21 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
         await host.wait(100);
       }
       host.run?.("tab.rename", { id: tab, name: tabDisplayName });
+      if (newRigSpace) {
+        let name = rigName, suffix = 2;
+        const currentSpaces = typeof host.spaces === "function" ? host.spaces() : sp;
+        while (currentSpaces.some((s) => s.id !== activeSpace.id && s.name === name)) name = `${rigName} ${suffix++}`;
+        host.run?.("space.rename", { id: activeSpace.id, name });
+      }
+      if (rigSpace || newRigSpace) host.run?.("space.select", { id: activeSpace.id });
       host.run?.("tab.select", { id: tab });
       host.run?.("pane.focus", { terminal: address });
       return { ok: true, reused: false, terminal: address, tab };
     }
   }
-  host.run?.("tab.new", { name: tabDisplayName, argv });
+  // With no space open, the attached seat is the new space's first tab (tab.new would be refused).
+  if (!hasSpace(typeof host.spaces === "function" ? host.spaces() : host.spaces)) host.run?.("space.new", { tab: tabDisplayName, argv });
+  else host.run?.("tab.new", { name: tabDisplayName, argv });
   return { ok: true, reused: false, tab: null, terminal: null };
 }
 
@@ -5400,9 +5654,12 @@ export function rigViewsBranch(rig, stripProps = null, terminalViewsData = null)
   }));
   const openIds = new Set(openViews.map((v) => v.id));
   const openNames = new Set(openViews.map((v) => v.name));
-  const rawSaved = Array.isArray(terminalViewsData?.views)
-    ? terminalViewsData.views
-    : (Array.isArray(terminalViewsData) ? terminalViewsData : []);
+  // GET /api/terminal/views answers { following, saved, rigs }; `views` and a bare list are older shapes.
+  const rawSaved = Array.isArray(terminalViewsData?.saved)
+    ? terminalViewsData.saved
+    : Array.isArray(terminalViewsData?.views)
+      ? terminalViewsData.views
+      : (Array.isArray(terminalViewsData) ? terminalViewsData : []);
   const savedViews = rawSaved
     .filter((sv) => {
       if (!sv || typeof sv !== "object") return false;

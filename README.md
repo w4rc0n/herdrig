@@ -81,7 +81,6 @@ to the daemon. This version copies only the spec text OpenRig served.
 
 ## Known limitations
 
-- **The Page needs a space open in Herdr.** With no space yet, opening the Page fails and Herdr says "no space yet"; make a space first.
 - **OpenRig and Herdr on one machine.** The mod talks to OpenRig's local address and runs the local `rig`. A Herdr
   window on another machine than its OpenRig isn't supported.
 - **With upstream OpenRig's own `herdr-app` provider** serving the window, the four mods work with less chrome: no
@@ -98,6 +97,15 @@ to the daemon. This version copies only the spec text OpenRig served.
 
 Issues and pull requests are welcome.
 
+## Colors
+
+The Rig panes draw a working seat in your theme's green (`ansi2`). herdr's own lists (its Agents section and tab dots) use herdr's `working` color, yellow in the shipped themes. To make them match, add `"colors": { "working": "ansi2" }` to your layout's root node. It names a theme color, so it works in light and dark.
+
 ## License
 
-[MIT](LICENSE) — Copyright (c) 2026 w4rc0n.
+[MIT](LICENSE) — Copyright (c) 2026 w4rc0n, except the Apache-2.0 derived file below.
+
+## Third-party code
+
+Part of the sidebar's priority view is derived from herdr-app (Apache-2.0), see
+[LICENSES/herdr-app-Apache-2.0.txt](LICENSES/herdr-app-Apache-2.0.txt). Its modified code is in `rig-needs-view.js`.

@@ -87,19 +87,33 @@ function termFor(term, { exists = fs.existsSync, dirs = terminfoDirs(process.env
 const cleanApp = (v) => String(v || "").replace(/[^A-Za-z0-9_.+\-,/=]/g, "").slice(0, 32);
 const cleanB64 = (v) => String(v || "").replace(/[^A-Za-z0-9+/=]/g, "");
 
+/** Only a local HTTP(S) origin may supply relay state; validate again at the process boundary. */
+function relayDaemonUrl(value) {
+  if (typeof value !== "string") return "";
+  const m = /^(https?):\/\/(localhost|\[::1\]|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?\/?$/i.exec(value.trim());
+  if (!m) return "";
+  const scheme = m[1].toLowerCase(), host = m[2].toLowerCase(), port = m[3] == null ? null : Number(m[3]);
+  if (host.startsWith("127.") && host.split(".").some((part) => Number(part) > 255 || String(Number(part)) !== part)) return "";
+  if (port !== null && (port < 1 || port > 65535)) return "";
+  return `${scheme}://${host}${port !== null && port !== (scheme === "https" ? 443 : 80) ? `:${port}` : ""}`;
+}
+
 /** The OSC 7501 state for one daemon node (`/api/rigs/:id/nodes`), or clear when there is none. */
 function mapNode(n) {
   if (!n) return { state: "clear" };
   const running = n.sessionStatus ? (n.sessionStatus === "running" || n.sessionStatus === "ready" || n.sessionStatus === "starting") : n.sessionAlive !== false;
   if (!running || n.sessionAlive === false) return { state: "done", clearAfter: true };
   if (n.nodeKind === "infrastructure" || n.runtime === "terminal") return { state: "clear" };
-  const act = n.agentActivity?.state ?? n.activityState?.state;
+  const act = n.activityState?.activity ?? n.activityState?.state ?? (n.needsAttention !== false ? n.agentActivity?.state : null);
   const disp = n.activityState?.display;
   const arb = n.arbitratedNeedsInput ?? n.activityState?.needsInput;
-  const hasLiveActivity = Boolean(n.activityState && typeof n.activityState === "object");
-  const needs = hasLiveActivity
-    ? Boolean(act === "needs_input" || disp === "needs-input" || disp === "needs_input" || disp === "blocked" || (arb && (arb.count > 0 || arb.needed)))
-    : Boolean(n.needsAttention || act === "needs_input" || (arb !== undefined && arb !== null ? (typeof arb === "object" ? (arb.count > 0 || Boolean(arb.needed)) : Boolean(arb)) : false) || n.lifecycleState === "attention_required" || n.lifecycleState === "failed" || n.blockedWorkCount > 0);
+  const arbitrated = arb != null ? (typeof arb === "object" ? arb.count > 0 || Boolean(arb.needed) : Boolean(arb)) : null;
+  const needs = n.startupStatus === "failed" || n.needsAttention === true ||
+    (n.needsAttention == null && (n.startupStatus === "attention_required" || n.lifecycleState === "attention_required" || n.lifecycleState === "failed")) ||
+    disp === "blocked" ||
+    (n.needsAttention !== false && arbitrated !== false &&
+      (arbitrated || act === "needs_input" || disp === "needs-input" || disp === "needs_input" ||
+        (!n.activityState && n.blockedWorkCount > 0)));
   if (needs) {
     const ev = String(arb?.kind ?? arb?.reason ?? n.needsInputEvidence?.kind ?? n.agentActivity?.reason ?? "").toLowerCase();
     const kind = ev.includes("perm") ? "permission" : ev.includes("auth") ? "auth" : "question";
@@ -111,6 +125,9 @@ function mapNode(n) {
   return { state: n.inProgressWorkCount > 0 ? "working" : "idle" };
 }
 
+function tmuxFailureMessage(session) {
+  return `Couldn't open ${session}'s tmux session on this machine. If OpenRig runs on another machine (for example through a tunnel), Attach and rig spaces can't reach it yet.\n`;
+}
 function main(payloadArg) {
   let cfg;
   try {
@@ -131,8 +148,12 @@ function main(payloadArg) {
     process.stderr.write(`rig-attach-relay: ${e.message}\n`);
     return process.exit(2);
   }
-  // A daemon URL is only ever fetched from, for state; a non-http(s) one is dropped.
-  const daemonUrl = /^https?:\/\/[^\s/]+$/i.test(String(cfg.daemonUrl || "").replace(/\/+$/, "")) ? String(cfg.daemonUrl).replace(/\/+$/, "") : "";
+  const daemonUrl = relayDaemonUrl(cfg.daemonUrl);
+  // Some tmux versions exit zero when the parent directory of -S is missing.
+  if (argv[0] === "-S" && !fs.existsSync(argv[1])) {
+    process.stderr.write(tmuxFailureMessage(cfg.session));
+    return process.exit(1);
+  }
 
   let lastSeq = "";
   const write = (seq) => {
@@ -195,10 +216,10 @@ function main(payloadArg) {
   childEnv.TERM = termFor(childEnv.TERM);
   const child = spawn("tmux", argv, { stdio: "inherit", env: childEnv, shell: false });
   const cleanup = () => { clearInterval(timer); emit("clear"); };
-  child.on("error", (e) => { process.stderr.write(`rig-attach-relay: tmux didn't start (${e.message})\n`); cleanup(); process.exit(1); });
-  child.on("exit", (code) => { cleanup(); process.exit(code ?? 0); });
+  child.on("error", (e) => { process.stderr.write(`rig-attach-relay: tmux didn't start (${e.message})\n${tmuxFailureMessage(cfg.session)}`); cleanup(); process.exit(1); });
+  child.on("exit", (code) => { if (code) process.stderr.write(tmuxFailureMessage(cfg.session)); cleanup(); process.exit(code ?? 0); });
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { cleanup(); try { child.kill(sig); } catch (_) {} });
 }
 
-module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs };
+module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage };
 if (require.main === module) main(process.argv[2]);

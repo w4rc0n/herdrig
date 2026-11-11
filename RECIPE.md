@@ -1,10 +1,29 @@
 # Herdrig
 
 Herdrig brings OpenRig into the `herdr` window: a sidebar with six collapsible branches of a rig's live topology,
-specs, scopes, terminals, needs-you items and system state, where every row opens a full graphical page in its own
-tab. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar always stays put while you read.
+specs, scopes, terminals, needs-you items and system state. Rig rows open the rig's Herdr space; other rows open
+graphical pages. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar stays put while you read.
+
+Each rig space has a **Seats** tab with an equal grid of local tmux viewers (equal columns first, then equal rows).
+Joining, leaving and restarting rebuild only mod-labelled viewer panes, leaving seat sessions alive. Background
+updates never select a space, tab or pane, and defer rebuilding while the grid tab or any of its panes has focus.
+Leave the grid or explicitly open it again to apply the change. Personal panes in that tab are left untouched and
+prevent automatic rebuilding. Closing a rig space keeps it closed across membership changes and restarts; only an
+explicit sidebar/menu open or Attach recreates it. Names never claim personal spaces: collisions get a numeric suffix.
+New Attach tabs use the rig space with the existing status relay; grid viewers stay plain and Needs you supplies alerts.
+Existing Rig pages and TUI tabs stay in their original spaces. Native Herdr seats use Attach instead of this grid.
+Attach and grids require tmux on Herdr's machine. A loopback HTTP tunnel to a box does not forward that box's tmux;
+it cannot be detected from the URL or daemon host ID. Failed local attaches explain this limit and use exact session
+matching only. Remote transport is not implemented.
+Ended or failed grid viewers retain an inert notice instead of exiting into a replacement shell. Close the pane and
+open the rig space again to retry. Rebuilding checks the live argv as well as labels, leaving legacy replacement
+shells untouched. Space titles omit control characters and are capped; viewers do not use a daemon-supplied cwd.
 
 ![Herdrig](preview.png)
+
+Priority's Done group requires at least 10 seconds of working or an explicit non-window activity source from
+OpenRig. Brief window-sampling activity from attaching a viewer returns to Idle. Unknown activity sources also
+use the duration threshold. Working evidence survives an app restart; separate short blips do not accumulate.
 
 Before you install it: this mod **reaches OpenRig's local address** (`127.0.0.1:7433` unless that OpenRig uses another
 port) over HTTP and SSE (reads live state and, when you click an action, posts to OpenRig: Decision Card acts, a usage
@@ -276,8 +295,9 @@ keeps working when it does not.
 `terminals()`, `theme()`, `openOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`.
 
 **Programs it runs.** `rig` (the OpenRig CLI — `rig ps`, `rig queue`, `rig gateway human quiet|mode …`, `rig terminal …`,
-`rig snapshot`, `rig seat …`, `rig specs …`, the rest of the one-click actions, and, with your yes, **Start OpenRig**
-runs `rig daemon start`), `tmux` for Attach, started directly by the mod's relay (`node rig-attach-relay.cjs`) as
+`rig snapshot`, `rig seat …`, `rig specs …`, the rest of the one-click actions; after a confirmation, `rig down` to
+pause a rig or, with `--delete`, delete it, `rig archive` / `rig unarchive`, and `rig up` / `rig create` for a new rig;
+and, with your yes, **Start OpenRig** runs `rig daemon start`), `tmux` for Attach, started directly by the mod's relay (`node rig-attach-relay.cjs`) as
 `tmux [-L name | -S path] attach-session -t =<session>` with no shell. The session must be a name OpenRig makes, and
 the `-L`/`-S` flag is only what OpenRig's recorded `tmuxAttachCommand` names, parsed and checked; nothing in that string
 is run. A daemon can still name a session on such a server, so Attach can open a session of yours by its exact name,
