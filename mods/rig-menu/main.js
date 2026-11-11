@@ -763,7 +763,7 @@ export default class RigMenu extends View {
         .children(out.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note)));
     }
     if (step.action === "resume" && r.json) {
-      const out = resumeOutcome(r.json);
+      const out = resumeOutcome(r.json, r.ok);
       const headline = out.ok ? `Resumed ${target.rig}` : out.partial ? `Resumed ${target.rig} · partially` : `${target.rig} wasn't resumed`;
       return v_flex().gap(6)
         .child(div().text_size(13).font_semibold().child(headline))
@@ -815,6 +815,12 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
+    if (step.action === "rebuild-space") {
+      if (!step.recovery?.tiles?.length || !step.token) return;
+      this.busy = "Rebuilding";
+      setShared("rig.rebuildRequest", { rigId: target.rigId, token: step.token });
+      run("rig.rebuild-space"); this.dismiss(); return;
+    }
     const capAction = step.action === "design-view" ? "open-designed-view" : (step.action === "reply" && target?.reply === "answer" ? "reply-answer" : step.action);
     const disableReason = capabilityDisableReason(capAction, this.caps()) ?? (this.config ? personDisableReason(step.action, this.config) : null);
     if (disableReason) {
@@ -1316,10 +1322,16 @@ export default class RigMenu extends View {
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
-      : actionTitle(target, step.action);
+      : step.action === "rebuild-space" ? `Rebuild ${target.rig}'s tiles?` : actionTitle(target, step.action);
     const go = (cx) => this.go(cx, target, step);
     let body = null;
-    if (step.action === "design-view") {
+    if (step.action === "rebuild-space") {
+      body = v_flex().gap(8)
+        .child(div().child("This rebuilds the grid's viewers; a viewer that can be reused stays open. The seats keep running. Anything running or typed in these shells is lost."))
+        .when(step.focusedTile, (el) => el.child(div().text_color(t.blocked).child("A tile in this grid has focus. Work you are typing in its shell will be lost.")))
+        .child(v_flex().max_h(160).overflow_y_scrollbar().children((step.recovery?.tiles ?? []).map((tile, i) => div().text_size(12).child(`${step.tileNames?.[i] || tile.labels["herdr-openrig.seat"] || "Empty tile"} · ${tile.terminal}`))))
+        .child(div().text_color(t.muted).child("Cancel to keep working in these shells. Changed tiles are left alone."));
+    } else if (step.action === "design-view") {
       body = this.designView(t, cx, target);
     } else if (step.action === "change-model" && !this.result?.ok && !this.busy) {
       body = this.changeModelView(t, cx, target);
@@ -1363,6 +1375,7 @@ export default class RigMenu extends View {
       : null;
     const confirmLabel = step.action === "change-model"
       ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
+      : step.action === "rebuild-space" ? `Rebuild ${step.recovery?.tiles?.length ?? 0} tiles`
       : step.action === "new-rig" ? (this.newMode === "seat" ? "Create" : "Launch")
       : step.action === "delete-rig" ? `Delete ${target.rig}`
       : { pause: "Pause rig", resume: "Resume rig", fresh: "Start fresh", "design-view": "Open", send: "Send", queue: "Queue", reply: "Reply", "launch-spec": "Launch" }[step.action];

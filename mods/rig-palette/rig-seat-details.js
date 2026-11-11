@@ -1,0 +1,37 @@
+/** The public /api/rigs/:id/nodes activity contract (captured from OpenRig 0.7.11). */
+export function seatActivityDetails(node, now = Date.now()) {
+  const activity = node?.activityState ?? {}, agent = node?.agentActivity ?? {};
+  const text = (value) => typeof value === "string" && value ? value : null;
+  const changedAt = text(agent.eventAt) ?? text(node?.lastActivityAt);
+  const stamp = changedAt ? new Date(changedAt) : null;
+  const elapsed = stamp && Number.isFinite(stamp.getTime()) ? Math.max(0, now - stamp.getTime()) : null;
+  const ago = elapsed === null ? null : elapsed < 60000 ? "<1m ago" : elapsed < 3600000
+    ? `${Math.floor(elapsed / 60000)}m ago` : elapsed < 86400000 ? `${Math.floor(elapsed / 3600000)}h ago` : `${Math.floor(elapsed / 86400000)}d ago`;
+  return {
+    state: text(activity.display) ?? text(activity.activity) ?? text(agent.state) ?? "—",
+    evidence: [text(agent.evidenceSource), text(agent.evidence)].filter(Boolean).join(" · ") || "—",
+    reason: text(agent.reason) ?? text(activity.needsInput?.reason) ?? "—",
+    decidedBy: text(activity.decidedBy) ?? "—",
+    signal: [text(agent.rawEvent), text(agent.rawSubtype)].filter(Boolean).join(" · ") || "—",
+    changed: ago ? `${stamp.toLocaleString()} · ${ago}` : "—",
+    flags: [agent.stale === true ? "stale" : null, agent.fallback === true ? "fallback" : null].filter(Boolean),
+  };
+}
+
+export function seatQueuePaths(session) {
+  const base = `/api/queue/list?destinationSession=${encodeURIComponent(session)}`;
+  return { open: `${base}&state=pending,in-progress,blocked&limit=100`,
+    finished: `${base}&state=done,handed-off&sort=updated&limit=3` };
+}
+export function seatQueueDetails(openData, finishedData) {
+  const rows = Array.isArray(openData) ? openData : null;
+  const finished = Array.isArray(finishedData) ? finishedData : null;
+  return {
+    current: (rows ?? []).filter((r) => r.state === "in-progress"),
+    pending: (rows ?? []).filter((r) => r.state === "pending"),
+    blocked: (rows ?? []).filter((r) => r.state === "blocked"),
+    finished: (finished ?? []).filter((r) => ["done", "handed-off"].includes(r.state)),
+    count: rows?.length ?? null, partial: (rows?.length ?? 0) >= 100,
+    available: !!rows, finishedAvailable: !!finished,
+  };
+}

@@ -16,7 +16,7 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands } from "herdr";
-import { RigSpaces } from "./rig-spaces.js";
+import { RigSpaces, RebuildConfirmations } from "./rig-spaces.js";
 import { NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
 import net from "net";
 import {
@@ -141,6 +141,11 @@ export default class RigSidebar extends View {
           openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, fallbackEntry);
         }
         else if (cmdName === "refresh") { this.forceCapabilityProbe = true; cx.spawn(async (cx) => this.refresh(cx)); }
+        else if (cmdName === "rebuild-space") {
+          const request = shared("rig.rebuildRequest"); setShared("rig.rebuildRequest", null);
+          const approved = this.rebuildConfirmations?.take(request);
+          if (approved) this.openRigSpace(cx, approved.rigId, approved.recovery);
+        }
         else if (cmdName.startsWith("space:")) this.openRigSpace(cx, cmdName.slice(6));
         else if (cmdName === "space" || cmdName === "rig.space") this.openRigSpace(cx, cmdArgs?.rigId ?? cmdArgs?.rig ?? shared("rig.sel")?.entry?.rigId);
         else if (cmdName === "oneclick") this.oneClicks(cx);
@@ -408,20 +413,42 @@ export default class RigSidebar extends View {
   }
 
   spaceController(cx) {
-    if (!this.rigSpaces) this.rigSpaces = new RigSpaces({ spaces, panes, terminals, focused, commands, hc, run,
+    if (!this.rigSpaces) this.rigSpaces = new RigSpaces({ spaces, panes, terminals, focused, commands, hc, run, exec,
+      recoveryShell: async () => {
+        const node = this.config?.rig?.[0]?.match(/(?:^|\/)node$/) ? this.config.rig[0] : "node";
+        const result = await exec(node, [`${appHome()}/mods/${MOD_IDS.sidebar}/rig-shell-config.cjs`]);
+        return result.code === 0 ? JSON.parse(result.stdout) : null;
+      },
       padPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-pad.cjs`,
       viewerPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-viewer.cjs`, selfHostId: () => this.healthz?.selfHostId,
       wait: (ms) => new Promise((resolve) => cx.timer.after(ms, resolve)) });
     return this.rigSpaces;
   }
 
-  openRigSpace(cx, id) {
+  gridSeatName(rig, session) {
+    return (rig.pods ?? []).flatMap((p) => p.seats ?? []).find((s) => s.session === session)?.logicalId ?? (session || "Empty tile");
+  }
+
+  reviewRigRebuild(rig, result) {
+    this.rebuildConfirmations ??= new RebuildConfirmations();
+    const token = this.rebuildConfirmations.issue(rig.id, result.recovery);
+    const focusedTile = panes().some((p) => result.recovery.tiles.some((tile) => tile.pane === p.pane)
+      && (p.focused || p.terminal === focused()?.terminal));
+    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 480, height: Math.min(440, 250 + result.recovery.tiles.length * 20),
+      props: { target: { kind: "rig", rig: rig.name, rigId: rig.id }, step: { action: "rebuild-space", recovery: result.recovery,
+        token, focusedTile,
+        tileNames: result.recovery.tiles.map((tile) => this.gridSeatName(rig, tile.labels["herdr-openrig.seat"])) } } });
+  }
+
+  openRigSpace(cx, id, rebuild = null) {
     const rig = this.data?.topology?.find((r) => r.id === id || r.name === id);
     if (!rig || this.error) { notify({ title: "Rig space", body: "Refresh OpenRig before opening this rig's space.", level: "warning" }); return; }
     setShared("rig.sel", { key: rigKey(rig.id), entry: { section: "topology", kind: "rig", rigId: rig.id, name: rig.name }, at: Date.now() });
     cx.spawn(async (cx) => {
-      const result = await this.spaceController(cx).sync(rig, this.config, { explicit: true });
-      if (!result.ok || result.empty) notify({ title: `${rig.name} space`, body: result.reason ?? "No running seats in this rig.", level: "warning" });
+      const result = await this.spaceController(cx).sync(rig, this.config, { explicit: true, rebuild });
+      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
+      if (result.recovery) this.reviewRigRebuild(rig, result);
+      else if (!result.ok || result.empty) notify({ title: `${rig.name} space`, body: result.reason ?? "No running seats in this rig.", level: "warning" });
       cx.notify();
     });
   }
@@ -443,6 +470,15 @@ export default class RigSidebar extends View {
         if (this.spaceAgain) { this.spaceAgain = false; if (!this.error) this.syncRigSpaces(cx); }
         cx.notify();
       }
+    });
+  }
+
+  closeRigTiles(cx, rig) {
+    cx.spawn(async (cx) => {
+      const result = await this.spaceController(cx).sync(rig, this.config, { explicit: true, closeAll: true });
+      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
+      if (!result.ok) notify({ title: `${rig.name} space`, body: result.reason, level: "warning" });
+      cx.notify();
     });
   }
 
@@ -2091,6 +2127,21 @@ export default class RigSidebar extends View {
     return root
       .child(this.header(t))
       .child(div().h(1).bg(t.border).mx(8))
-      .child(v_flex().id(this.priorityReveal ? `rig-list-reveal-${this.priorityReveal}` : "rig-list").flex_1().overflow_y_scrollbar().py(4).children(state ? [state] : this.treeRows(t, cx)));
+      .child(v_flex().id(this.priorityReveal ? `rig-list-reveal-${this.priorityReveal}` : "rig-list").flex_1().overflow_y_scrollbar().py(4)
+        .children((this.data?.topology ?? []).flatMap((rig) => {
+          const status = shared("rig.spaceStatus")?.[rig.id];
+          if (status?.closeAvailable) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
+            .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}: ${status.reason}`))
+            .child(div().id(`close-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
+              .on_click((_e, cx) => this.closeRigTiles(cx, rig)).child("Close all viewer tiles"))];
+          if (!status?.stale?.length) return [];
+          return [v_flex().id(`stale-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
+            .child(div().text_size(11.5).text_color(t.muted).child(status.recovery
+              ? `${rig.name}'s grid lost ${status.stale.length} viewer${status.stale.length === 1 ? "" : "s"} when Herdr restarted (${status.stale.map((s) => this.gridSeatName(rig, s.seat)).join(", ")}); ${status.stale.length === 1 ? "that tile is a shell" : "those tiles are shells"} now.`
+              : `${rig.name}: ${status.stale.map((s) => this.gridSeatName(rig, s.seat)).join(", ")} no longer runs the expected viewer. Save your work, close those panes yourself, then open the rig space again.`))
+            .when(!!status.recovery, (el) => el.child(div().id(`rebuild-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
+              .on_click(() => this.reviewRigRebuild(rig, status)).child("Rebuild tiles…")))];
+        }))
+        .children(state ? [state] : this.treeRows(t, cx)));
   }
 }

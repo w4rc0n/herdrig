@@ -16,12 +16,13 @@ import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED,
   configRows, crumbsFor, navPush, navBack, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
-  usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, computePulseCounts, matchesPulseFilter,
+  usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
   rowStatusGlyph, formatHonestCount, attachToSeat,
   tierOf, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath, waitWith,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, isValidSessionName, newRigOverlay } from "./rig-lib.js";
+import { seatActivityDetails, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -935,7 +936,7 @@ export default class RigView extends View {
     const rows = recentTransitionRows(got.data, topo, { missions, attentionItems });
     if (!rows.length) return this.dim(t, "Nothing yet.");
     return v_flex().id(`${idPrefix}-list`).gap(2).children(rows.map((r, i) => {
-      let el = h_flex().id(`${idPrefix}-row-${i}`).px(6).h(26).gap(8).items_center().rounded(6).text_size(12);
+      let el = h_flex().id(`${idPrefix}-row-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).text_size(12);
       if (r.navEntry) {
         el = el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => push(r.navEntry));
       }
@@ -1155,9 +1156,9 @@ export default class RigView extends View {
     const rawCtx = n.contextUsage?.usedPercentage;
     const ctx = typeof rawCtx === "number" && Number.isFinite(rawCtx) ? Math.round(rawCtx) : null;
     const ctxWarn = typeof rawCtx === "number" && Number.isFinite(rawCtx) && rawCtx > 85;
-    const usedTokens = n.contextUsage?.usedTokens ?? null;
-    const contextWindow = n.contextUsage?.contextWindow ?? n.contextUsage?.windowTokens ?? null;
-    const remainingTokens = n.contextUsage?.remainingTokens ?? (usedTokens != null && contextWindow != null ? Math.max(0, contextWindow - usedTokens) : null);
+    const inputTokens = n.contextUsage?.totalInputTokens ?? null;
+    const outputTokens = n.contextUsage?.totalOutputTokens ?? null;
+    const contextWindow = n.contextUsage?.contextWindowSize ?? null;
     const fmtTok = (v) => typeof v === "number" ? (v >= 1000 ? `${Math.round(v / 1000)}k` : String(v)) : String(v ?? "");
 
     const inlineEffort = n.effort ?? n.reasoningEffort ?? null;
@@ -1177,34 +1178,16 @@ export default class RigView extends View {
       r.scope?.session === n.canonicalSessionName,
     );
 
-    const qPath = `/api/queue/list?destinationSession=${encodeURIComponent(n.canonicalSessionName)}`;
-    const qGot = this.read(cx, qPath);
-    const qRaw = qGot.data;
-    const queueItems = Array.isArray(qRaw) ? qRaw : (Array.isArray(qRaw?.items) ? qRaw.items : []);
-    const currentWork = Array.isArray(n.currentWork)
-      ? n.currentWork
-      : queueItems.filter((it) => ["claimed", "in_progress", "active", "working"].includes(String(it.status ?? it.state ?? "").toLowerCase()));
-    const upNext = Array.isArray(n.upNext)
-      ? n.upNext
-      : queueItems.filter((it) => ["pending", "queued", "ready", "open"].includes(String(it.status ?? it.state ?? "").toLowerCase()));
-    const recentlyFinished = Array.isArray(n.recentlyFinished)
-      ? n.recentlyFinished
-      : queueItems.filter((it) => ["done", "completed", "closed", "resolved"].includes(String(it.status ?? it.state ?? "").toLowerCase()));
-    const queueWarnings = Array.isArray(n.queueWarnings) ? n.queueWarnings : (Array.isArray(qRaw?.warnings) ? qRaw.warnings : []);
-    const depthInput = n.queueDepth ?? qRaw?.depth ?? (
-      n.assignedWorkCount != null && !qGot.data && !qGot.error
-        ? { count: n.assignedWorkCount, state: "exact" }
-        : { count: currentWork.length + upNext.length, state: qGot.error && qGot.data === undefined ? "unavailable" : qGot.loading && qGot.data === undefined ? "unknown" : "exact" }
-    );
-    const depthText = depthInput && typeof depthInput === "object"
-      ? formatHonestCount(depthInput.count, {
-          incomplete: depthInput.state === "partial" || depthInput.state === "incomplete",
-          unknown: depthInput.state === "unknown" || depthInput.state === "unavailable",
-        })
-      : formatHonestCount(depthInput);
-    const ownedCount = n.assignedWorkCount ?? (qGot.data ? currentWork.length + upNext.length : null);
-    const ownedText = formatHonestCount(ownedCount, { unknown: ownedCount == null });
-    const basisText = n.queueBasis ?? qRaw?.basis ?? (qGot.error && qGot.data === undefined ? "unavailable" : "live queue");
+    const queuePaths = seatQueuePaths(n.canonicalSessionName);
+    const qGot = this.read(cx, queuePaths.open), finishedGot = this.read(cx, queuePaths.finished);
+    const queue = seatQueueDetails(qGot.data, finishedGot.data);
+    const currentWork = queue.current, upNext = queue.pending, blockedWork = queue.blocked, recentlyFinished = queue.finished;
+    const queueWarnings = [qGot.error, finishedGot.error].filter(Boolean);
+    const depthText = queue.partial ? `at least ${queue.count}` : formatHonestCount(queue.count, { unknown: !queue.available });
+    const ownedText = depthText;
+    const basisText = qGot.error ? (queue.available ? `last successful read · ${asOf(qGot.at)}` : "unavailable") : queue.available ? "live queue" : "reading…";
+    const queueEmpty = (text) => queue.available ? text : qGot.error ? "Queue unavailable." : "Reading queue…";
+    const activity = seatActivityDetails(n);
 
     const attGot = this.read(cx, "/api/attention");
     const allNeeds = (attGot.data?.items ?? shared("rig.data")?.attention?.items ?? []).map(needTarget);
@@ -1292,13 +1275,13 @@ export default class RigView extends View {
         h_flex().id("seat-context-bar").gap(10).items_center()
           .child(div().w(120).text_size(12).text_color(t.dim).child("Context"))
           .child(ctx == null
-            ? div().text_size(12.5).child(`unknown${n.contextUsage?.unknownReason ? ` (${n.contextUsage.unknownReason})` : ""}`)
+            ? div().text_size(12.5).child(`unknown${n.contextUsage?.reason ? ` (${n.contextUsage.reason})` : ""}`)
             : h_flex().gap(8).items_center()
                 .child(div().w(160).h(6).rounded(3).bg(t.raised).child(div().h_full().rounded(3).w(Math.max(2, Math.min(160, 1.6 * rawCtx))).bg(ctxWarn ? t.blocked : t.accent)))
                 .child(div().id("seat-context-pct").text_size(12).text_color(ctxWarn ? t.blocked : t.muted).when(ctxWarn, (d) => d.font_semibold()).child(`${ctx}%`))
                 // One bar: the token counts sit on its row.
-                .when(usedTokens != null && contextWindow != null, (el) => el.child(div().id("seat-context-tokens").text_size(12).text_color(t.muted).child(
-                  `${fmtTok(usedTokens)} of ${fmtTok(contextWindow)} tokens${remainingTokens != null ? ` · ${fmtTok(remainingTokens)} left` : ""}`)))),
+                .when(contextWindow != null, (el) => el.child(div().id("seat-context-tokens").text_size(12).text_color(t.muted).child(
+                  `${fmtTok(contextWindow)} token window${inputTokens != null ? ` · ${fmtTok(inputTokens)} input` : ""}${outputTokens != null ? ` · ${fmtTok(outputTokens)} output` : ""}`)))),
         this.kv(t, [
           ["Runtime", n.runtime],
           ["Model", n.model ?? n.resolvedModel ?? "default"],
@@ -1317,33 +1300,33 @@ export default class RigView extends View {
       // 2. CURRENT ACTIVITY section
       .child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
         h_flex().gap(10).items_center().child(this.chip(t, look, rawStatus))
-          .child(this.dim(t, [n.activityState?.reason, n.activityState?.since ? `since ${String(n.activityState.since).slice(11, 16)}` : null].filter(Boolean).join(" · "))),
+          .child(this.dim(t, [activity.reason === "—" ? null : activity.reason, ...activity.flags].filter(Boolean).join(" · "))),
         this.kv(t, [
-          ["state", n.activityState?.state ?? rawStatus],
-          ["evidence", n.activityState?.evidenceKind ?? n.activityState?.evidence ?? "—"],
-          ["reason", n.activityState?.reason ?? "—"],
-          ["decided by", n.activityState?.decidedBy ?? "—"],
-          ["signal", n.activityState?.rawSignal ?? n.activityState?.signal ?? "—"],
-          ["changed", n.activityState?.changedAt ?? n.activityState?.since ?? "—"],
+          ["state", activity.state],
+          ["evidence", activity.evidence],
+          ["reason", activity.reason],
+          ["decided by", activity.decidedBy],
+          ["signal", activity.signal],
+          ["changed", activity.changed],
         ]),
       ])))
       // 3. HEALTH section
       .child(v_flex().id("seat-section-health").child(this.card(t, "HEALTH", seatFindings.length
-        ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).px(6).h(26).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+        ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => push({ section: "system", subview: "health" }))
             .child(div().text_size(12).text_color(t.blocked).child(`[${f.severity ?? "warn"}]`))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(f.summary ?? f.id ?? "finding"))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(singleLineText(f.summary ?? f.id ?? "finding")))
             .child(div().text_size(11.5).text_color(t.dim).child(f.status ?? "open"))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim)))
         : [this.dim(t, "No health findings for this seat.")])))
       // 4. CURRENT WORK section
       .child(v_flex().id("seat-section-current-work").child(this.card(t, `CURRENT WORK · ${currentWork.length}`, currentWork.length
         ? currentWork.map((it, i) => h_flex().id(`seat-work-current-${i}`).gap(8).items_center().text_size(12.5)
-            .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.id ?? `work-${i}`)))
-            .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(String(it.summary ?? it.title ?? "—")))
-            .when(!!(it.sender ?? it.from), (el) => el.child(div().text_size(11.5).text_color(t.muted).child(`from ${it.sender ?? it.from}`)))
+            .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `work-${i}`)))
+            .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(singleLineText(it.summary ?? it.title ?? "—")))
+            .when(!!it.sourceSession, (el) => el.child(div().text_size(11.5).text_color(t.muted).child(singleLineText(`from ${it.sourceSession}`))))
             .when(!!it.priority, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(String(it.priority)))))
-        : [this.dim(t, "No active claimed work.")])))
+        : [this.dim(t, queueEmpty("No active claimed work."))])))
       // 5. QUEUE section (warnings, depth, basis, UP NEXT, NEEDS YOU, RECENTLY FINISHED)
       .child(v_flex().id("seat-section-queue").child(this.card(t, "QUEUE", [
         ...queueWarnings.map((w, i) => div().id(`seat-queue-warn-${i}`).text_size(12).text_color(t.blocked).child(String(w))),
@@ -1357,19 +1340,25 @@ export default class RigView extends View {
           .children(upNext.length
             ? [
                 ...upNext.slice(0, 3).map((it, i) => h_flex().id(`seat-up-next-${i}`).gap(8).items_center().text_size(12)
-                  .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.id ?? `q-${i}`)))
-                  .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(String(it.summary ?? it.title ?? "—")))),
+                  .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `q-${i}`)))
+                  .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(singleLineText(it.summary ?? it.title ?? "—")))),
                 ...(upNext.length > 3 ? [div().id("seat-up-next-more").text_size(11.5).text_color(t.dim).child(`+${upNext.length - 3} more`)] : []),
               ]
-            : [this.dim(t, "None queued.")]),
+            : [this.dim(t, queueEmpty("None queued."))]),
+        v_flex().id("seat-section-blocked").gap(4).pt(4).border_t(1).border_color(t.border)
+          .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(`BLOCKED · ${blockedWork.length}`))
+          .children(blockedWork.length ? blockedWork.map((it, i) => v_flex().id(`seat-blocked-${i}`).gap(2)
+            .child(div().text_size(12).text_color(t.foreground).child(it.summary ?? it.qitemId))
+            .when(!!it.blockedOn, (el) => el.child(div().text_size(11).text_color(t.dim).child(`Waiting on ${it.blockedOn}`))))
+            : [this.dim(t, queueEmpty("None blocked."))]),
         v_flex().id("seat-section-needs-you").gap(4).pt(4).border_t(1).border_color(t.border)
           .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(`NEEDS YOU · ${seatNeeds.length}`))
           .children(seatNeeds.length
             ? [
-                ...seatNeeds.slice(0, 3).map((it, i) => h_flex().id(`seat-need-item-${i}`).px(6).h(24).gap(8).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+                ...seatNeeds.slice(0, 3).map((it, i) => h_flex().id(`seat-need-item-${i}`).px(6).h(24).overflow_hidden().gap(8).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
                   .on_click(() => push({ section: "needs", id: it.id, name: it.summary }))
                   .child(div().text_size(11.5).text_color(t.blocked).child(`[${it.urgency ?? "normal"}]`))
-                  .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(it.summary ?? it.id))),
+                  .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(singleLineText(it.summary ?? it.id)))),
                 ...(seatNeeds.length > 3 ? [div().id("seat-needs-more").text_size(11.5).text_color(t.dim).child(`+${seatNeeds.length - 3} more`)] : []),
               ]
             : [this.dim(t, "None pending.")]),
@@ -1377,9 +1366,9 @@ export default class RigView extends View {
           .child(div().text_size(11.5).font_semibold().text_color(t.muted).child("RECENTLY FINISHED"))
           .children(recentlyFinished.length
             ? recentlyFinished.slice(0, 3).map((it, i) => h_flex().id(`seat-finished-${i}`).gap(8).items_center().text_size(12)
-                .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.id ?? `done-${i}`)))
-                .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(String(it.summary ?? it.title ?? "—"))))
-            : [this.dim(t, "None recent.")]),
+                .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `done-${i}`)))
+                .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(singleLineText(it.summary ?? it.title ?? "—"))))
+            : [this.dim(t, queue.finishedAvailable ? "None recent." : finishedGot.error ? "Finished work unavailable." : "Reading finished work…")]),
       ])))
       // 6. SEAT section (host, rig, pod, cwd + placement)
       .child(v_flex().id("seat-section-seat").child(this.card(t, "SEAT", [
@@ -2467,16 +2456,16 @@ export default class RigView extends View {
                 ? "Answer"
                 : "no action needed";
         return v_flex().when(focused, (el) => el.border_1().border_color(t.accent).rounded(6))
-          .child(h_flex().id(`${idPrefix}-${i}`).px(8).h(30).gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover))
+          .child(h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover))
             .when(isEscalation, (el) => el.border_l(2).border_color(t.blocked))
             .on_click(() => toggle(n)).on_mouse_down("right", () => menu(n))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .when(isEscalation, (el) => el.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.blocked + "26").text_color(t.blocked).text_size(10).font_semibold().child("ESCALATION")))
             .when(!isEscalation && tier !== "update", (el) => el.child(this.plainDot(t, isAlert ? "blocked" : "accent")))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(tier === "update" ? t.muted : t.foreground).when(isEscalation || isAlert, (d) => d.font_semibold()).child(n.urgency ? `[${n.urgency}] ${n.summary}` : n.summary))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(tier === "update" ? t.muted : t.foreground).when(isEscalation || isAlert, (d) => d.font_semibold()).child(singleLineText(n.urgency ? `[${n.urgency}] ${n.summary}` : n.summary)))
             .child(div().w(140).flex_none().truncate().text_size(12.5).text_color(t.muted).child(actionLabel))
             .child(this.copyButton(t, n.qitemId ?? n.id, `need-id-${n.id}`, "request id"))
-            .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(t.muted).child(n.at ?? "")))
+            .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(t.muted).child(singleLineText(n.at))))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(this.needBody(t, cx, n, perspective))));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")]);
   }

@@ -8,10 +8,33 @@ const addr = (t) => t?.address ?? t?.terminal;
 const origin = (config) => String(config?.daemonUrl ?? "").replace(/\/$/, "");
 const belongs = (t, rig, url) => labels(t)["herdr-openrig.space"] === "1"
   && labels(t)["herdr-openrig.rig"] === rig.name && labels(t)["herdr-openrig.origin"] === url;
+const shell = (t, configured) => Array.isArray(t.argv) && (
+  Array.isArray(configured) && configured.length > 0 && JSON.stringify(t.argv) === JSON.stringify(configured)
+  || t.argv.length === 1 && /(?:^|\/)(?:sh|bash|dash|zsh|fish|ksh)$/.test(t.argv[0]));
+// Exclude volatile presentation labels, but bind consent to every ownership/location label,
+// the program, terminal incarnation and pane. A changed tile needs a new confirmation.
+const tileSnapshot = (t, p) => ({ terminal: addr(t), pane: p.pane, tab: p.tab,
+  argv: [...(t.argv ?? [])], pid: t.pid, created: t.created_ms,
+  labels: Object.fromEntries(Object.entries(labels(t)).filter(([k]) => k.startsWith("herdr-openrig.") || k === "herdr.space" || k === "herdr.tab").sort(([a], [b]) => a.localeCompare(b))) });
 
 export function ownedRigSpace(host, rig, config) {
   const ids = new Set(get(host, "terminals").filter((t) => belongs(t, rig, origin(config))).map((t) => labels(t)["herdr.space"]));
   return get(host, "spaces").find((s) => !s.machine && ids.has(s.id)) ?? null;
+}
+
+/** The sidebar issues consent for one exact dialog; shared-state callers cannot supply their own snapshot. */
+export class RebuildConfirmations {
+  constructor() { this.requests = new Map(); }
+  issue(rigId, recovery) {
+    for (const [token, value] of this.requests) if (value.rigId === rigId) this.requests.delete(token);
+    const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    this.requests.set(token, { rigId, recovery: JSON.parse(JSON.stringify(recovery)) }); return token;
+  }
+  take(request) {
+    const value = this.requests.get(request?.token);
+    if (!value || value.rigId !== request.rigId) return null;
+    this.requests.delete(request.token); return value;
+  }
 }
 
 export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome } = {}) {
@@ -29,7 +52,7 @@ export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome 
     if (!flags || !s.tmuxAttachCommand) throw new Error(serverArgsRefusal(s.tmuxAttachCommand, s.session));
     const argv = viewerPath ? ["node", viewerPath, base64EncodeUtf8(JSON.stringify({ session: s.session, serverArgs: flags, openrigHome }))]
       : ["env", "-u", "TMUX", "TERM=xterm-256color", "tmux", ...flags, "attach-session", "-t", `=${s.session}`];
-    return { session: s.session, argv };
+    return { session: s.session, serverArgs: flags, argv };
   });
   const cols = tiles.length ? Math.ceil(Math.sqrt(tiles.length)) : 0, rows = cols ? Math.ceil(tiles.length / cols) : 0;
   if (tiles.length < cols * rows && !padPath) throw new Error("The installed grid padding program is missing.");
@@ -37,16 +60,61 @@ export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome 
   return { tiles, cols, rows, signature: JSON.stringify(tiles) };
 }
 
+/** A loopback URL may be a tunnel. Check the actual local server before creating viewers. */
+export async function localGridPreflight(host, plan) {
+  const first = plan.tiles.find((tile) => tile.session);
+  if (!first) return { ok: true };
+  try {
+    const result = await host.exec("tmux", [...first.serverArgs, "has-session", "-t", `=${first.session}`]);
+    if (result?.code === 0) return { ok: true };
+  } catch {}
+  return { ok: false, reason: "Couldn't reach this rig's tmux sessions on this machine. If the seats run on another machine, Rig spaces and Attach need a remote connection." };
+}
+
 export class RigSpaces {
-  constructor(host) { this.host = host; this.done = new Map(); this.pending = new Map(); }
-  sync(rig, config, { explicit = false } = {}) {
+  constructor(host) { this.host = host; this.done = new Map(); this.pending = new Map(); this.closed = new Set(); this.failures = new Map(); }
+  sync(rig, config, { explicit = false, rebuild = null, closeAll = false } = {}) {
     const key = `${origin(config)}|${rig.name}`;
-    const job = (this.pending.get(key) ?? Promise.resolve()).catch(() => {}).then(() => this.update(rig, config, explicit, key));
+    const job = (this.pending.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      const changedProgram = get(this.host, "terminals").some((t) => belongs(t, rig, origin(config))
+        && labels(t)["herdr-openrig.role"] === ROLE && labels(t)["herdr-openrig.viewer-argv"] !== JSON.stringify(t.argv));
+      if (!explicit && !closeAll && !changedProgram && this.failures.has(key) && this.ownedPanes(rig, config).length) return this.failures.get(key);
+      this.failures.delete(key);
+      const result = await (closeAll ? this.closeAll(rig, config, key) : this.update(rig, config, explicit, key, rebuild));
+      if (result.closeAvailable) this.failures.set(key, result);
+      return result;
+    });
     this.pending.set(key, job);
     return job.finally(() => { if (this.pending.get(key) === job) this.pending.delete(key); });
   }
-  async update(rig, config, explicit, key) {
+  ownedPanes(rig, config) {
+    const ts = get(this.host, "terminals");
+    return get(this.host, "panes").filter((p) => ts.some((t) => addr(t) === p.terminal
+      && belongs(t, rig, origin(config)) && labels(t)["herdr-openrig.role"] === ROLE
+      && labels(t)["herdr.tab"] === p.tab
+      && get(this.host, "spaces").some((s) => !s.machine && s.id === labels(t)["herdr.space"] && s.tabs?.some((tab) => tab.id === p.tab))
+      && labels(t)["herdr-openrig.viewer-argv"] === JSON.stringify(t.argv)));
+  }
+  async closeAll(rig, config, key) {
+    let closed = 0;
+    this.closed.add(key);
+    this.done.delete(key);
+    for (const pane of this.ownedPanes(rig, config)) {
+      if (!this.ownedPanes(rig, config).some((p) => p.pane === pane.pane && p.terminal === pane.terminal && p.tab === pane.tab)) continue;
+      this.host.run("pane.close", { pane: pane.pane });
+      for (let n = 0; n < 60 && get(this.host, "panes").some((p) => p.pane === pane.pane); n++) {
+        if (!this.host.wait) break;
+        await this.host.wait(100);
+      }
+      if (get(this.host, "panes").some((p) => p.pane === pane.pane)) return { ok: false, closeAvailable: true, reason: "Herdr did not confirm a tile closed. The remaining tiles were left alone." };
+      closed++;
+    }
+    return { ok: true, closed: true, count: closed };
+  }
+  async update(rig, config, explicit, key, rebuild) {
     const host = this.host, url = origin(config);
+    if (this.closed.has(key) && !explicit) return { ok: true, closed: true };
+    if (explicit) this.closed.delete(key);
     let space = ownedRigSpace(host, rig, config);
     // A closed space is never recreated by polling, even when membership changes.
     if (!space && !explicit) { this.done.delete(key); return { ok: true, closed: true }; }
@@ -61,13 +129,30 @@ export class RigSpaces {
     }
     let plan;
     try { plan = rigGridPlan(rig, host.padPath, { selfHostId: host.selfHostId?.(), viewerPath: host.viewerPath, openrigHome: config.openrigHome }); } catch (e) { return { ok: false, reason: e.message }; }
-    const own = (t) => belongs(t, rig, url) && labels(t)["herdr-openrig.role"] === ROLE
+    const claimed = (t) => belongs(t, rig, url) && labels(t)["herdr-openrig.role"] === ROLE && !!labels(t)["herdr-openrig.viewer-argv"];
+    const own = (t) => claimed(t)
       && labels(t)["herdr-openrig.viewer-argv"] === JSON.stringify(t.argv);
     const terms = () => get(host, "terminals");
     const panes = () => get(host, "panes");
-    const gridTerms = () => terms().filter((t) => own(t) && labels(t)["herdr.space"] === space?.id);
+    const gridTerms = () => terms().filter((t) => claimed(t) && labels(t)["herdr.space"] === space?.id);
     let tab = gridTerms().map((t) => labels(t)["herdr.tab"]).find((id) => space?.tabs?.some((t) => t.id === id));
     const tabPanes = () => panes().filter((p) => p.tab === tab);
+    const snapshot = () => tabPanes().map((p) => tileSnapshot(terms().find((t) => addr(t) === p.terminal), p));
+    let stale = gridTerms().filter((t) => labels(t)["herdr.tab"] === tab && !own(t));
+    const configured = stale.length ? await Promise.resolve().then(() => host.recoveryShell?.()).catch(() => null) : null;
+    stale = gridTerms().filter((t) => labels(t)["herdr.tab"] === tab && !own(t));
+    const isShell = (t) => shell(t, configured);
+    const recovery = stale.length && stale.every(isShell) && tabPanes().length && tabPanes().every((p) => terms().some((t) => addr(t) === p.terminal && claimed(t) && (own(t) || isShell(t))))
+      ? { space: space.id, tab, tiles: snapshot() } : null;
+    if (rebuild && (!explicit || !recovery || JSON.stringify(rebuild) !== JSON.stringify(recovery))) {
+      return { ok: false, reason: "The grid changed since confirmation. Nothing was rebuilt; open the rig space and review its tiles again." };
+    }
+    if (stale.length && !rebuild) return { ok: false, recovery,
+      reason: recovery ? "These tiles were restored as shells after a Herdr restart. Review them before rebuilding."
+        : "A grid tile is running an unrecognised program; it was left alone. Save any work, close the affected panes yourself, then open the rig space again.",
+      stale: stale.map((t) => ({ seat: labels(t)["herdr-openrig.seat"] || "Empty tile", shell: isShell(t) })) };
+    const confirmed = (t, p) => !!rebuild && claimed(t) && isShell(t)
+      && rebuild.tiles.some((s) => JSON.stringify(s) === JSON.stringify(tileSnapshot(t, p)));
     const focused = () => get(host, "spaces").some((s) => s.active && s.tabs?.some((t) => t.id === tab && t.active))
       || tabPanes().some((p) => p.focused || (p.terminal && p.terminal === host.focused?.()?.terminal));
     const guard = () => { if (!explicit && focused()) throw new Error("deferred-focus"); };
@@ -86,22 +171,31 @@ export class RigSpaces {
     const close = async (p) => {
       guard();
       // Re-check ownership against live labels immediately before every destructive operation.
-      if (!terms().some((t) => addr(t) === p.terminal && own(t))) throw new Error("A grid pane is no longer owned by this mod; it was left alone.");
+      const livePane = panes().find((n) => n.pane === p.pane && n.terminal === p.terminal && n.tab === p.tab);
+      if (rebuild && !terms().some((t) => addr(t) === p.terminal && livePane && rebuild.tiles.some((s) => JSON.stringify(s) === JSON.stringify(tileSnapshot(t, livePane))))) throw new Error("A confirmed tile changed; it was left alone. Review the remaining tiles again.");
+      if (!livePane || !terms().some((t) => addr(t) === p.terminal && (own(t) || confirmed(t, livePane)))) throw new Error("A grid pane changed or is no longer owned by this mod; it was left alone.");
       host.run("pane.close", { pane: p.pane });
       await waitFor(() => !panes().some((n) => n.pane === p.pane), "pane close");
     };
     try {
-      if (tabPanes().some((p) => !terms().some((t) => addr(t) === p.terminal && own(t)))) throw new Error("The grid tab contains a personal pane; it was left alone.");
+      if (tabPanes().some((p) => !terms().some((t) => addr(t) === p.terminal && (own(t) || confirmed(t, p))))) throw new Error("The grid tab contains a personal pane; it was left alone.");
       if (!plan.tiles.length) {
         for (const p of tabPanes()) await close(p);
         this.done.delete(key);
         return { ok: true, empty: true };
       }
       const stamp = () => `${plan.signature}|${tabPanes().map((p) => p.pane).sort().join(",")}`;
-      if (tab && this.done.get(key) === stamp()) {
+      if (!rebuild && tab && this.done.get(key) === stamp()) {
+        if (explicit) {
+          const preflight = await localGridPreflight(host, plan);
+          if (!preflight.ok) return { ...preflight, closeAvailable: this.ownedPanes(rig, config).length > 0 };
+        }
         if (explicit) { host.run("space.select", { id: space.id }); host.run("tab.select", { id: tab }); }
         return { ok: true, reused: true, space: space.id, tab };
       }
+      guard();
+      const preflight = await localGridPreflight(host, plan);
+      if (!preflight.ok) return { ...preflight, closeAvailable: this.ownedPanes(rig, config).length > 0 };
       guard();
       const first = plan.tiles[0];
       const sameViewer = (t) => {
@@ -165,7 +259,7 @@ export class RigSpaces {
       return { ok: true, space: space.id, tab, cols: plan.cols, rows: plan.rows };
     } catch (e) {
       this.done.delete(key);
-      return e.message === "deferred-focus" ? { ok: true, deferred: true } : { ok: false, reason: e.message };
+      return e.message === "deferred-focus" ? { ok: true, deferred: true } : { ok: false, reason: e.message, closeAvailable: this.ownedPanes(rig, config).length > 0 };
     }
   }
 }

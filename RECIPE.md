@@ -15,9 +15,23 @@ Existing Rig pages and TUI tabs stay in their original spaces. Native Herdr seat
 Attach and grids require tmux on Herdr's machine. A loopback HTTP tunnel to a box does not forward that box's tmux;
 it cannot be detected from the URL or daemon host ID. Failed local attaches explain this limit and use exact session
 matching only. Remote transport is not implemented.
+Before creating tiles, a single exact-session tmux check verifies the first seat is reachable locally. Failure
+opens no tiles and shows one explanation. If a grid already failed or was only partly created, its sidebar notice
+offers **Close all viewer tiles**. Live argv and ownership are checked before every close; personal panes and
+restored shells survive. Background reconciliation stays paused until another explicit Open rig space.
+
 Ended or failed grid viewers retain an inert notice instead of exiting into a replacement shell. Close the pane and
 open the rig space again to retry. Rebuilding checks the live argv as well as labels, leaving legacy replacement
-shells untouched. Space titles omit control characters and are capped; viewers do not use a daemon-supplied cwd.
+shells untouched. After a core restart, the sidebar names restored shell tiles and offers **Rebuild tiles…**.
+Opening the rig offers the same confirmation: it lists each seat and terminal, warns that shell work is lost,
+and leaves the seat's tmux session running. Cancel preserves the shells. Only confirmed tiles whose pane identity,
+ownership labels and program still match are replaced; added personal panes or changed tiles require a fresh review.
+No automatic recovery closes a shell. The person's documented herdr-core shell setting (including its arguments)
+is recognised alongside common shells; unknown programs require saving work and closing the panes by hand before
+opening the rig again. A reusable first viewer stays open. The confirmation has a one-use sidebar token, warns
+explicitly when a grid pane has focus, and is checked again before mutation. The stale notice clears after rebuilding
+or closing the space.
+Space titles omit control characters and are capped; viewers do not use a daemon-supplied cwd.
 
 ![Herdrig](preview.png)
 

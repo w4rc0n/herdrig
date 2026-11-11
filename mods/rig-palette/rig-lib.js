@@ -2488,7 +2488,7 @@ export const NEW_RIG_RUNTIMES = Object.freeze(["claude-code", "codex", "terminal
  * - Couldn't resume: `awaiting-decision` and `failed` offer the explicit Start fresh.
  * - `attention_required` is a live session waiting on a prompt: it is answered in its pane, never replaced.
  */
-export function resumeOutcome(json) {
+export function resumeOutcome(json, commandOk = true) {
   const nodes = Array.isArray(json?.nodes) ? json.nodes : [];
   const LABEL = { resumed: "resumed", rebuilt: "rebuilt", operator_recovered: "recovered", fresh: "started fresh (seat policy)",
     "fresh-primed": "started fresh (seat policy)", left_attached: "left attached (joined with rig attach)" };
@@ -2502,7 +2502,8 @@ export function resumeOutcome(json) {
   });
   const failed = seats.filter((s) => !s.ok).length;
   const rigResult = typeof json?.rigResult === "string" ? json.rigResult : null;
-  const ok = rigResult ? rigResult === "fully_restored" : json?.ok !== false && failed === 0;
+  const ok = commandOk && !json?.error && json?.ok !== false
+    && (rigResult ? rigResult === "fully_restored" : seats.length > 0 && failed === 0);
   const partial = rigResult ? rigResult === "partially_restored" : failed > 0 && failed < seats.length;
   return { ok, partial, rigResult, seats, error: json?.error ?? null };
 }
@@ -2664,7 +2665,7 @@ export function needTarget(item) {
     humanAnswers: item?.humanAnswers ?? null,
     tags: Array.isArray(item?.tags) ? item.tags : [],
     ownerNotificationLevel: item?.ownerNotificationLevel ?? null,
-    summary: item?.summary ?? item?.title ?? id,
+    summary: singleLineText(item?.summary) || singleLineText(item?.title) || id,
     urgency: item?.urgency ?? null,
     asker: typeof item?.asker === "string" ? item.asker : (typeof item?.sourceSession === "string" ? item.sourceSession : null),
     rig: item?.rig ?? null,
@@ -4141,14 +4142,20 @@ export function recentTransitionTarget(tr, topologyOrOpts = [], extraOpts = {}) 
 }
 
 /** Normalize `/api/queue/recent-transitions` payload into display rows. */
+/** Display text for one-line rows; retain full source text for detail views and copying. */
+export function singleLineText(value) {
+  return String(value ?? "").replace(/[\s\u0000-\u001f\u007f]+/g, " ").trim();
+}
+
 export function recentTransitionRows(data, topologyOrOpts = [], extraOpts = {}) {
   const list = Array.isArray(data) ? data : (data?.transitions ?? data?.entries ?? data?.items ?? []);
   return (Array.isArray(list) ? list : []).slice(0, 10).map((tr) => {
-    const rawTs = String(tr?.ts ?? tr?.at ?? "");
+    const rawTs = singleLineText(tr?.ts ?? tr?.at ?? "");
     const ts = rawTs.includes("T") ? rawTs.slice(11, 19) : (rawTs || "—");
-    const actor = String(tr?.actorSession ?? tr?.actor ?? "—");
-    const change = String(tr?.change ?? (tr?.fromState && tr?.toState ? `${tr.fromState} → ${tr.toState}` : (tr?.toState ?? tr?.state ?? "")));
-    const label = String(tr?.summary || tr?.bodyPreview || tr?.qitemId || tr?.transitionId || "—");
+    const actor = singleLineText(tr?.actorSession ?? tr?.actor ?? "—");
+    const change = singleLineText(tr?.change ?? (tr?.fromState && tr?.toState ? `${tr.fromState} → ${tr.toState}` : (tr?.toState ?? tr?.state ?? "")));
+    const bodyLine = String(tr?.bodyPreview ?? "").split(/\r\n|[\n\r\u2028\u2029]/).map(singleLineText).find(Boolean);
+    const label = singleLineText(tr?.summary) || bodyLine || singleLineText(tr?.qitemId || tr?.transitionId || "—");
     return {
       transitionId: tr?.transitionId ?? null,
       qitemId: tr?.qitemId ?? null,
