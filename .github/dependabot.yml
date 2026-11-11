@@ -1,28 +1,17 @@
 # Dependabot version updates for herdrig.
-# The mods have no package dependencies today; these entries start working
-# as soon as a workflow or a package.json is added.
+# The workflows pin each action by commit SHA with its version in a comment; Dependabot updates both.
+# There is no npm entry: herdrig ships no package.json (the mods have no dependencies). Add one with the first manifest.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
     groups:
       actions:
         patterns:
           - "*"
-
-  - package-ecosystem: "npm"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "deps"
-    groups:
-      minor-and-patch:
-        update-types:
-          - "minor"
-          - "patch"
