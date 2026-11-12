@@ -4,6 +4,7 @@
 // needs from the host (fetch, exec, terminals) is passed in.
 import { attachRemoteSeat } from "./rig-remote-attach.js";
 import { routeOpen } from "./rig-routing.js";
+import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin } from "./rig-space-context.js";
 
 /** The single space-routing entry point for pages, the TUI, Attach and rig grids. */
@@ -2356,19 +2357,9 @@ export function worstHealthChip(records, { loading = false, error = null } = {})
   if (error) return { label: "unavailable", tone: "dim", count: 0, tooltip: error };
   if (records === null) return { label: "?", tone: "dim", count: 0, tooltip: "OpenRig didn't report its health." };
   if (!Array.isArray(records)) return { label: null, tone: "dim", count: 0 };
-  const list = records.filter((r) => {
-    if (!r || typeof r !== "object") return false;
-    if (r.resolved === true) return false;
-    const st = String(r.status ?? "").toLowerCase();
-    if (st === "resolved" || st === "closed" || st === "ok" || st === "healthy") return false;
-    return true;
-  });
-  const crit = list.filter((r) => /crit|error|fatal/i.test(String(r?.severity ?? ""))).length;
-  const warn = list.filter((r) => /warn|high|medium|degraded/i.test(String(r?.severity ?? ""))).length;
-  const label = `${list.length} issue${list.length === 1 ? "" : "s"}`;
-  if (crit > 0) return { label, tone: "danger", count: list.length };
-  if (warn > 0) return { label, tone: "warning", count: list.length };
-  if (list.length > 0) return { label, tone: "dim", count: list.length };
+  const { problems, worst } = healthCounts(records);
+  const label = `${problems} issue${problems === 1 ? "" : "s"}`;
+  if (problems > 0) return { label, tone: worst === 2 ? "danger" : "warning", count: problems };
   return { label: "ok", tone: "dim", count: 0 };
 }
 
@@ -2620,6 +2611,18 @@ export function viewsForRig(stripProps, sessions, rigName = null) {
 export function asOf(date) {
   const d = new Date(date);
   return `as of ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Relative UI time with the exact source timestamp retained by the caller's tooltip. */
+export function relativeTimeText(at, now = Date.now()) {
+  const stamp = typeof at === "number" ? at : Date.parse(at ?? "");
+  if (!Number.isFinite(stamp) || !Number.isFinite(now)) return "time not reported";
+  const seconds = (now - stamp) / 1000, elapsed = Math.abs(seconds);
+  if (elapsed < 60) return "just now";
+  const [n, unit] = elapsed < 3600 ? [Math.floor(elapsed / 60), "min"] : elapsed < 86400
+    ? [Math.floor(elapsed / 3600), "hr"] : [Math.floor(elapsed / 86400), "day"];
+  const label = `${n} ${unit}${unit === "day" && n !== 1 ? "s" : ""}`;
+  return seconds < 0 ? `in ${label}` : `${label} ago`;
 }
 
 /** The Pause confirmation's list: every seat that would stop, with what it is doing and owns. A terminal seat is listed as
@@ -4477,6 +4480,9 @@ export function resolveTuiLineFallback(line) {
   const space = s.search(/\s/);
   const verb = (space < 0 ? s : s.slice(0, space)).toLowerCase();
   const rest = space < 0 ? "" : s.slice(space + 1).trim();
+  const pages = { terminals: "terminals", attention: "needs", system: "system" };
+  if (!rest && Object.hasOwn(pages, verb)) return { kind: "nav", line: s, area: pages[verb], action: { type: "jump" } };
+  if (verb === "config" && !rest) return { kind: "nav", line: s, area: "system", action: { type: "config-open" } };
   if ((verb === "view-design" || verb === "design-view")) {
     return { kind: "action", line: s, action: { type: "design-view", rig: rest || null } };
   }
@@ -4692,6 +4698,7 @@ export function paletteRoute(res, top, topology = []) {
       if (unsafeReadPath(a.target?.path)) return { error: "Path must stay inside the readable root." };
       return { act: "read", target: a.target ?? {} };
     // Narrow the Configuration card only, never the page's other tables.
+    case "config-open": return { entry: { section: "system", subview: "config" } };
     case "config-category":
       if (!CONFIG_CATEGORIES.includes(a.category)) return { error: `config takes a category: ${CONFIG_CATEGORIES.join(", ")}.` };
       return { entry: { section: "system", category: a.category } };
@@ -4819,9 +4826,19 @@ export function outsideSpecRoots(sourcePath, roots) {
 
 /** Why the spec editor refused a file, with what to do: no folder resolved at all (no `realpath`, which macOS has from
  *  13 on, or no spec folder yet), or the file is elsewhere (a home outside the default needs `openrigHome`). */
-export function specFolderRefusal(roots) {
+export async function specRealpathAvailable(execFn) {
+  try {
+    const result = await execFn("realpath", ["--", "/"]);
+    return result?.code === 0 ? true : result?.code === 127 ? false : null;
+  } catch (error) { return /ENOENT|not found/i.test(String(error?.message ?? error)) ? false : null; }
+}
+export function specFolderRefusal(roots, { machine = null, realpathAvailable = null } = {}) {
+  if (typeof machine === "string" && /^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine)) {
+    return `OpenRig's spec library is on ${machine}. Herdr can't edit files there yet; edit them on ${machine}.`;
+  }
+  if (realpathAvailable === false) return "The spec editor can't check paths on this computer: realpath is missing (available on macOS 13 or later).";
   if (!Array.isArray(roots) || roots.length === 0) {
-    return "Refused: no spec folder could be resolved on this machine. The spec editor needs `realpath` (macOS 13 or later) and an existing OpenRig spec folder.";
+    return "No OpenRig spec folder was found on this computer. If OpenRig runs on another machine, edit specs there, or add daemonMachine to openrig/config.json.";
   }
   return "Refused: the spec file isn't in this machine's spec folders. If your OpenRig home is somewhere other than the default, set openrigHome in <appHome>/openrig/config.json.";
 }
@@ -4902,7 +4919,9 @@ export function configRows(browser, { category = null, settingKey = null } = {})
 export const RIG_DELETE_REASON = "Your OpenRig's `rig down` can't delete a rig (no --delete). Update OpenRig to delete one here.";
 export const RIG_ARCHIVE_REASON = "Your OpenRig has no `rig archive`. Update OpenRig to archive a rig here.";
 export const RIG_CREATE_REASON = "Your OpenRig has no `rig create`. Start a rig from a spec instead, or update OpenRig.";
-export const STOCK_PROVIDER_REASON = "Needs an OpenRig release with the herdr-app provider (merged upstream, not yet released). Attach and the TUI tab still work.";
+export const STOCK_PROVIDER_REASON = "Your OpenRig does not include the herdr-app provider. Update OpenRig to open worker views. Attach and the TUI tab still work.";
+export const HERDR_APP_UNAVAILABLE_REASON = "Worker views open in a Herdr window on OpenRig's machine, and none is running there. Attach and the TUI tab still work.";
+export const HERDR_APP_UNCONFIRMED_REASON = "Couldn't check for a Herdr window on OpenRig's machine. Refresh to try again; Attach and the TUI tab still work.";
 
 /** One-line reason shown when `herdr-app` provider is present without `--follow` / `--prune-after`. */
 export const FOLLOW_PRUNE_REASON = "Follow and auto-prune for herdr-app are not yet available in upstream OpenRig (need --follow and --prune-after support).";
@@ -4911,8 +4930,12 @@ export const FOLLOW_PRUNE_REASON = "Follow and auto-prune for herdr-app are not 
 export const GRID_GEOMETRY_REASON = "Custom worker-view grids and cell editing are not yet available in upstream OpenRig (need --grid/--replace and close --cell support).";
 
 /** Compact copy shared by page notes and popup footers; original reasons remain available in tooltips. */
-export function workerCapabilityText(reason = "") {
+export function workerCapabilityText(reason = "", caps = null) {
   if (reason.includes(STOCK_PROVIDER_REASON)) return "Worker views need a newer OpenRig.";
+  if (caps?.herdrAppProvider && (reason.includes(FOLLOW_PRUNE_REASON) || reason.includes(GRID_GEOMETRY_REASON))) {
+    const names = [!caps.followPrune && "Follow", (!caps.gridGeometry || !caps.cellClose) && "Design view"].filter(Boolean);
+    if (names.length) return `${names.join(" and ")} ${names.length === 1 ? "isn't" : "aren't"} in this OpenRig yet.`;
+  }
   if (reason.includes(FOLLOW_PRUNE_REASON) || reason.includes(GRID_GEOMETRY_REASON)) return "These worker-view controls need more OpenRig support.";
   return reason;
 }
@@ -4940,6 +4963,18 @@ const capabilitiesCache = new Map();
 /** Clear cached CLI capability probe results (used on manual refresh, daemon reconnect, and tests). */
 export function clearCapabilitiesCache() {
   capabilitiesCache.clear();
+}
+
+/** Public `terminal status --provider herdr-app` reply. Plain status omits this provider even when available. */
+export function herdrAppAvailability(status, machine = null) {
+  const place = typeof machine === "string" && /^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine) ? machine : "OpenRig's machine";
+  const matches = Array.isArray(status?.providers) ? status.providers.filter(p => p?.name === "herdr-app") : [];
+  const value = matches.length === 1 ? matches[0] : null;
+  if (value?.status?.provider !== "herdr-app" || typeof value.status.available !== "boolean") {
+    return { herdrAppAvailable: null, herdrAppAvailabilityReason: HERDR_APP_UNCONFIRMED_REASON };
+  }
+  const available = value.status.available && value.liveness?.alive !== false;
+  return { herdrAppAvailable: available, herdrAppAvailabilityReason: available ? null : HERDR_APP_UNAVAILABLE_REASON.replace("OpenRig's machine",place) };
 }
 
 /**
@@ -4996,24 +5031,35 @@ export function rigCapabilities({
  * Probe and cache capabilities per resolved CLI binary + daemon endpoint.
  * Refreshes when `force: true` is passed (e.g. on `rig.refresh` or daemon reconnect).
  */
-export async function probeCapabilities(config, { exec, terminals = [], hasNativeSeatsEndpoint = null, nativeSeatsSupported = null, force = false } = {}) {
+export async function probeCapabilities(config, { exec, terminals = [], hasNativeSeatsEndpoint = null, nativeSeatsSupported = null, force = false, providerAppHome = null } = {}) {
+  // Help capabilities are cached; provider availability is live and must recover when the window starts/stops.
+  const availableNow = async caps => {
+    if (!caps.herdrAppProvider || typeof providerAppHome !== "string" || !providerAppHome) return caps;
+    let status = null;
+    try {
+      const cmd = readCommand(config, ["terminal", "status", "--provider", "herdr-app", "--app-home", providerAppHome, "--json"]);
+      const result = await exec(cmd.command, cmd.args, { timeout: 15000 });
+      if (result?.code === 0) status = JSON.parse(result.stdout);
+    } catch (_) { /* An unavailable read is unconfirmed, never permission to open a view. */ }
+    return { ...caps, ...herdrAppAvailability(status, config?.daemonMachine) };
+  };
   const endpointFlag = hasNativeSeatsEndpoint !== null && hasNativeSeatsEndpoint !== undefined ? hasNativeSeatsEndpoint : nativeSeatsSupported;
   if (config?.capabilities && typeof config.capabilities === "object") {
     const hasLiveSeat = (terminals ?? []).some((t) => t?.labels?.["openrig.role"] === "seat");
     const merged = { ...DEFAULT_CAPABILITIES, ...config.capabilities };
-    return merged.herdrAppProvider && hasLiveSeat && !merged.nativeSeats ? { ...merged, nativeSeats: true } : merged;
+    return availableNow(merged.herdrAppProvider && hasLiveSeat && !merged.nativeSeats ? { ...merged, nativeSeats: true } : merged);
   }
   const rigCmd = Array.isArray(config?.rig) && config.rig.length ? config.rig.join("\0") : "rig";
   const key = `${rigCmd}::${config?.daemonUrl ?? ""}`;
   if (!force && capabilitiesCache.has(key)) {
     const cached = capabilitiesCache.get(key);
     const hasLiveSeat = (terminals ?? []).some((t) => t?.labels?.["openrig.role"] === "seat");
-    return {
+    return availableNow({
       ...cached,
       nativeSeats: Boolean(cached.herdrAppProvider && (cached.nativeSeats || hasLiveSeat || endpointFlag)),
-    };
+    });
   }
-  if (typeof exec !== "function") return { ...DEFAULT_CAPABILITIES };
+  if (typeof exec !== "function") return availableNow({ ...DEFAULT_CAPABILITIES });
   const probeExec = (cmd) => Promise.resolve(exec(cmd.command, cmd.args, { timeout: 15000 })).catch(() => null);
   const openCmd = readCommand(config, ["terminal", "open", "--help"]);
   const closeCmd = readCommand(config, ["terminal", "close", "--help"]);
@@ -5033,16 +5079,16 @@ export async function probeCapabilities(config, { exec, terminals = [], hasNativ
   const tuiHelp = `${tuiRes?.stdout ?? ""}\n${tuiRes?.stderr ?? ""}`.trim();
   // In unit tests with an unconfigured fake exec (`stdout: "{}"`), keep full capabilities unless `/api/native-seats` was absent.
   if ((!openHelp || openHelp === "{}") && (!closeHelp || closeHelp === "{}") && endpointFlag !== false) {
-    return { ...DEFAULT_CAPABILITIES };
+    return availableNow({ ...DEFAULT_CAPABILITIES });
   }
   const caps = rigCapabilities({ openHelp, closeHelp, tuiHelp, hasNativeSeatsEndpoint: endpointFlag, terminals,
     downHelp: helpOf(downRes), archiveHelp: helpOf(archiveRes), rigHelp: helpOf(rigRes), createHelp: helpOf(createRes) });
   capabilitiesCache.set(key, caps);
-  return caps;
+  return availableNow(caps);
 }
 
 /** Resolve the active capability flags from `shared` (or a capabilities/data object) and live `terminals()`. */
-export function currentCapabilities(sharedOrData, terminals = []) {
+export function currentCapabilities(sharedOrData, terminals = [], measured = null) {
   const raw = typeof sharedOrData === "function"
     ? (sharedOrData("rig.capabilities") ?? sharedOrData("rig.data")?.capabilities)
     : (sharedOrData?.capabilities ?? sharedOrData);
@@ -5052,6 +5098,11 @@ export function currentCapabilities(sharedOrData, terminals = []) {
   const base = raw && typeof raw === "object" && "herdrAppProvider" in raw
     ? { ...DEFAULT_CAPABILITIES, ...raw }
     : { ...DEFAULT_CAPABILITIES };
+  // Configured verb flags cannot override the live availability of the provider's target window.
+  if (Object.hasOwn(measured ?? {}, "herdrAppAvailable")) {
+    base.herdrAppAvailable = measured.herdrAppAvailable;
+    base.herdrAppAvailabilityReason = measured.herdrAppAvailabilityReason;
+  }
   const hasLiveSeat = (terminals ?? []).some((t) => t?.labels?.["openrig.role"] === "seat");
   return base.herdrAppProvider && hasLiveSeat && !base.nativeSeats ? { ...base, nativeSeats: true } : base;
 }
@@ -5092,6 +5143,9 @@ export function capabilityDisableReason(action, caps = DEFAULT_CAPABILITIES) {
   if (c.herdrAppProvider && !c.cellClose && (action === "close-cell" || action === "cell-close")) {
     return GRID_GEOMETRY_REASON;
   }
+  if (c.herdrAppProvider && Object.hasOwn(c, "herdrAppAvailable") && c.herdrAppAvailable !== true && providerActions.has(action)) {
+    return c.herdrAppAvailabilityReason ?? HERDR_APP_UNCONFIRMED_REASON;
+  }
   if (action === "delete-rig" && c.rigDelete === false) return RIG_DELETE_REASON;
   if (action === "archive-rig" && c.rigArchive === false) return RIG_ARCHIVE_REASON;
   if (action === "unarchive-rig" && c.rigUnarchive === false) return "Your OpenRig has no `rig unarchive`. Update OpenRig to restore an archived rig here.";
@@ -5117,6 +5171,8 @@ export function capabilitiesSummaryDetail(caps = DEFAULT_CAPABILITIES) {
   ].join(" · ");
   const reason = !c.herdrAppProvider
     ? STOCK_PROVIDER_REASON
+    : Object.hasOwn(c, "herdrAppAvailable") && c.herdrAppAvailable !== true
+      ? c.herdrAppAvailabilityReason ?? HERDR_APP_UNCONFIRMED_REASON
     : !c.followPrune
       ? FOLLOW_PRUNE_REASON
       : (!c.gridGeometry || !c.cellClose)
@@ -5976,9 +6032,7 @@ export function filterAttentionHealth(items = [], records = null) {
       try { const fromSource = decodeURIComponent(source.slice(12)); if (id && id !== fromSource) return []; id ??= fromSource; } catch { return []; }
     }
     const record = records === null && item.criticalHealth === true ? item.healthFinding : byId.get(id);
-    if (!record || record.id !== id || record.severity !== "critical" || record.resolved === true
-      || record.status !== "active"
-      || /^context[.-]pressure(?:[.-]|$)/i.test(String(record.detector ?? "")) || !record.detector) return [];
+    if (!record || record.id !== id || record.severity !== "critical" || !classifyHealth(record).actionable || !record.detector) return [];
     return [{ ...item, kind: "action", update: false, tier: "alert", urgency: "critical", criticalHealth: true,
       healthFinding: record, summary: record.summary ?? item.summary }];
   });

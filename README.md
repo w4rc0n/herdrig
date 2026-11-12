@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.0
+Version: v0.4.1
 
 **OpenRig Mod for Herdr**
 
@@ -101,13 +101,26 @@ with no shell, and attaches only to session names OpenRig makes.
 Earlier versions' **Copy & edit** for a spec could read a file the OpenRig daemon named on your machine and send it
 to the daemon. This version copies only the spec text OpenRig served.
 
-## Waiting on the next OpenRig release
+## Worker views (OpenRig 0.7.12 and later)
 
-**Turns on with the next OpenRig release:** basic worker-view open and close, **Show in worker view**, and saved-view
-previews need the herdr-app provider. It is [merged upstream](https://github.com/mvschwarz/openrig/pull/2744) but is
-not in the current OpenRig release, 0.7.11. Update to a release that includes it and these controls turn on
-automatically: Herdrig detects support, so no Herdrig update is needed. Check `rig --version` and the control's tooltip.
-Attach, the TUI tab and Herdrig's own Seats grids already work.
+[The herdr-app provider](https://github.com/mvschwarz/openrig/pull/2744) opens worker
+views in the Herdr window on the **same machine as OpenRig**. Worker view, **Show in worker view**, and saved-view
+preview + Open turn on when that provider reports the window available. Herdrig checks availability and supported
+verbs, not the version number alone. If Herdr runs on your computer and OpenRig runs on a box through a tunnel,
+these worker views cannot reach your window: **Herdr must run on the same machine as OpenRig**.
+Herdrig can't close those provider views yet: close one with `rig terminal close <view-id>` or close its Herdr tab.
+With a custom app home, give the close command the same `--app-home` as the open command.
+Opening a worker view can leave a progress spinner visible after the view has opened. Inspect the opened view
+before retrying: another Open creates another view.
+Attach, the TUI tab and Herdrig's own Seats grids use their separate connection paths.
+
+The same release includes [pull-mode relay delivery](https://github.com/mvschwarz/openrig/pull/2844),
+[unsetting a person's gateway binding](https://github.com/mvschwarz/openrig/pull/2812), and
+[typing into writable tiles on older tmux](https://github.com/mvschwarz/openrig/pull/2821).
+[Quoting session names in attach commands](https://github.com/mvschwarz/openrig/pull/2971) is not included.
+Local Seats tiles fit their panes when alone and yield sizing to Attach when it is open (tmux 3.2+).
+Sizing settles within about five seconds; a quicker Seats revisit can briefly resize Attach.
+Remote Seats still use plain tmux sizing; visiting them can resize an Attach view until it receives input.
 
 **Not yet in OpenRig:** Follow and auto-prune for herdr-app, custom worker-view grids (`--grid`/`--replace`), and
 cell editing (`close --cell`) are not supported on upstream main yet. Those controls stay greyed out until OpenRig
@@ -115,8 +128,8 @@ adds the required support. The provider release alone will not enable them; no r
 
 ## Known limitations
 
-- **OpenRig and Herdr on one machine.** The mod talks to OpenRig's local address and runs the local `rig`. A Herdr
-  window on another machine than its OpenRig isn't supported.
+- **Provider worker views need one machine.** OpenRig's own provider must reach a Herdr window on its machine.
+  Herdrig's configured remote-machine Attach and Seats grids are separate features.
 - **With upstream OpenRig's own `herdr-app` provider** serving the window, the four mods work with less chrome: no
   cell-level seat identity, follow countdown or per-view row.
 - **Follow and auto-prune** require herdr-app support plus both `--follow` and `--prune-after` in `rig terminal open`.

@@ -115,22 +115,37 @@ export class RemoteMachine {
     preparations.set(machine, job);
     return job.finally(() => { if (preparations.get(machine) === job) preparations.delete(machine); });
   }
+  /** Read-only identity check shared by detection and home TUI opens. No relay installation or consent writes. */
+  async readIdentity(config) {
+    const host=this.host,machine=config.daemonMachine,record=await this.ready(machine);
+    if(!config.daemonUrl||!isLoopbackDaemonUrl(config.daemonUrl))throw new Error("Remote seats need the configured OpenRig loopback tunnel URL.");
+    const remoteExec=(cmd,args)=>host.exec(cmd,args,{on:machine,timeout:15000});
+    const info=await remoteMetadata(remoteExec);
+    const statusResult=await remoteExec("env",["-i",`HOME=${info.home}`,`PATH=${info.searchPath}`,"rig","status","--json"]);
+    parse(statusResult,`Read OpenRig status on ${machine}`);
+    const status=parseDaemonStatusJson(statusResult.stdout);
+    if(!status.reachable||!status.daemonUrl||!isLoopbackDaemonUrl(status.daemonUrl))throw new Error(`OpenRig is not reachable on ${machine}. Check rig status on that machine.`);
+    const localHealth=await host.health(config.daemonUrl);
+    const remoteHealthResult=await remoteExec("curl",["--disable","--noproxy","*","--fail","--silent","--show-error","--max-time","5","--max-redirs","0",`${status.daemonUrl}/healthz`]);
+    if(remoteHealthResult?.code!==0)throw Object.assign(new Error(`OpenRig isn't answering on ${machine}. Check rig status on that machine and the daemon tunnel, then retry. No local terminal was started.`),
+      {machineNotice:{machine,body:`Check rig status on ${machine}. OpenRig isn't answering on ${machine}.`}});
+    const remoteHealth=parse(remoteHealthResult,`Check OpenRig on ${machine}`);
+    const current=await this.ready(machine);
+    if(JSON.stringify([current.target,current.id,current.via,current.session])!==JSON.stringify([record.target,record.id,record.via,record.session]))throw new Error("The Herdr machine changed during preparation. Retry and review it again.");
+    return {record,info,status,localHealth,remoteHealth,remoteExec};
+  }
+  async home(config) {
+    try {
+      const {record,info,status,localHealth,remoteHealth}=await this.readIdentity(config);
+      if(!localHealth?.selfHostId||localHealth.selfHostId!==remoteHealth.selfHostId)throw new Error("The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.");
+      return {ok:true,machine:config.daemonMachine,profileId:record.id??record.name,home:info.home,searchPath:info.searchPath,daemonUrl:status.daemonUrl,selfHostId:localHealth.selfHostId};
+    }catch(error){return remoteFailure(error,config.daemonMachine);}
+  }
   async prepareExclusive(config, { consent = null, install = true } = {}) {
     try {
-      const host = this.host, machine = config.daemonMachine, record = await this.ready(machine);
-      if (!isLoopbackDaemonUrl(config.daemonUrl)) throw new Error("Remote seats need the configured OpenRig loopback tunnel URL.");
-      const remoteExec = (cmd, args) => host.exec(cmd, args, { on: machine, timeout: 15000 });
-      const info = await remoteMetadata(remoteExec);
-      const statusResult = await remoteExec("env", ["-i", `HOME=${info.home}`, `PATH=${info.searchPath}`, "rig", "status", "--json"]);
-      parse(statusResult, `Read OpenRig status on ${machine}`);
-      const status = parseDaemonStatusJson(statusResult.stdout);
-      if (!status.reachable || !status.daemonUrl || !isLoopbackDaemonUrl(status.daemonUrl)) throw new Error(`OpenRig is not reachable on ${machine}. Check rig status on that machine.`);
-      const localHealth = await host.health(config.daemonUrl);
-      const remoteHealthResult = await remoteExec("curl", ["--disable", "--noproxy", "*", "--fail", "--silent", "--show-error", "--max-time", "5", "--max-redirs", "0", `${status.daemonUrl}/healthz`]);
-      if (remoteHealthResult?.code !== 0) throw Object.assign(new Error(`OpenRig isn't answering on ${machine}. Check rig status on that machine and the daemon tunnel, then retry. No local terminal was started.`),
-        { machineNotice: { machine, body: `Check rig status on ${machine}. OpenRig isn't answering on ${machine}.` } });
-      const remoteHealth = parse(remoteHealthResult, `Check OpenRig on ${machine}`);
-      if (!localHealth?.selfHostId || localHealth.selfHostId !== remoteHealth.selfHostId) throw new Error("The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.");
+      const host=this.host,machine=config.daemonMachine;
+      const {record,info,status,localHealth,remoteHealth,remoteExec}=await this.readIdentity(config);
+      if(!localHealth?.selfHostId||localHealth.selfHostId!==remoteHealth.selfHostId)throw new Error("The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.");
       const localNode = config.rig?.[0]?.match(/(?:^|\/)node$/) ? config.rig[0] : "node";
       const fileHelper = host.relayPath.replace(/rig-attach-relay\.cjs$/, "rig-remote-files.cjs");
       const shipped = parse(await host.exec(localNode, [fileHelper, "inspect"]), "Verify shipped relay");
@@ -159,4 +174,18 @@ export class RemoteMachine {
       return { ok: true, machine, node: info.node, relayPath: info.path, daemonUrl: status.daemonUrl, selfHostId: localHealth.selfHostId };
     } catch (e) { return remoteFailure(e, config.daemonMachine); }
   }
+}
+
+/** A read-only offer, never an implicit routing decision. Only connected persistent profiles are probed. */
+export async function detectDaemonMachine(host,config) {
+  if(config?.daemonMachine||!config?.daemonUrl||!isLoopbackDaemonUrl(config.daemonUrl))return null;
+  const body=parse(await host.hc(["machine","ls","--json"]),"Read Herdr machines");
+  const rows=Array.isArray(body)?body:body.machines,matches=[];
+  for(const record of rows??[]){
+    if(record.temporary!==false||record.state!=="connected"||!MACHINE.test(record.name??""))continue;
+    const checked=await new RemoteMachine(host).home({...config,daemonMachine:record.name});
+    if(checked.ok)matches.push({machine:record.name,profileId:checked.profileId,selfHostId:checked.selfHostId,
+      key:JSON.stringify([checked.profileId,checked.selfHostId])});
+  }
+  return matches.length===1?matches[0]:null;
 }

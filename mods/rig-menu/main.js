@@ -530,7 +530,7 @@ export default class RigMenu extends View {
     });
   }
 
-  caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? []); }
+  caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
 
   /** The actions offered for a target. Each has a vector icon (no font-dependent glyphs). */
   items(target) {
@@ -813,7 +813,7 @@ export default class RigMenu extends View {
           .on_click((_e, cx) => this.choose(it, cx))
           .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
           .child(div().flex_1().truncate().child(it.label))))
-      .when(reasons.length > 0, (el) => el.child(v_flex().id("rig-menu-reasons").px(8).py(4).gap(2).children(reasons.map((r, idx) => div().id(`rig-menu-reason-${idx}`).text_size(11).text_color(t.dim).tooltip(r).child(workerCapabilityText(r))))));
+      .when(reasons.length > 0, (el) => el.child(v_flex().id("rig-menu-reasons").px(8).py(4).gap(2).children(reasons.map((r, idx) => div().id(`rig-menu-reason-${idx}`).text_size(11).text_color(t.dim).tooltip(r).child(workerCapabilityText(r,this.caps()))))));
   }
 
   resultView(t, cx, target, step) {
@@ -1478,7 +1478,9 @@ export default class RigMenu extends View {
       body = v_flex().gap(8)
         .child(div().text_color(t.muted).child(`${target.name}: the seats start in the folder below and run until paused.`))
         .child(div().id("launch-source").text_size(11.5).text_color(sourceProblem ? t.blocked : t.dim).child(sourceProblem ?? `rig up -- ${source}`))
-        .child(field("Working folder", this.folder)).child(field("Host (optional)", this.host));
+        .child(field("Working folder", this.folder))
+        .child(div().id("launch-folder-machine").text_size(11.5).text_color(t.dim).child(`This folder must exist on ${this.config?.daemonMachine || "the machine running OpenRig"}.`))
+        .child(field("Host (optional)", this.host));
     } else if (step.action === "resume" && !this.result && !this.busy) {
       body = div().child(`Each seat of ${target.rig} comes back from the saved conversation where the harness allows. Any that can't is listed; none starts fresh by itself.`);
     }

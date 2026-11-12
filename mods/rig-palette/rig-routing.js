@@ -1,6 +1,7 @@
 // All explicit opens and background grid reconciliation pass through this coordinator.
 import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat } from "./rig-lib.js";
 import { openRigSpaceContext, resolveRigSpace, rigOrigin } from "./rig-space-context.js";
+import { machineId, machineLocalId } from "./rig-remote.js";
 
 const jobs = new Map(), homeJobs = new Map(), pageJobs = new Map();
 const list = (host, key) => (typeof host[key] === "function" ? host[key]() : host[key]) ?? [];
@@ -8,6 +9,24 @@ const active = host => list(host, "spaces").find(s => s.active)?.id ?? null;
 const state = host => host.routeState?.() ?? host.shared?.("rig.spaceState") ?? {};
 const contexts = host => openRigSpaceContext(list(host,"spaces"),list(host,"terminals"),list(host,"panes"),state(host),MOD_IDS.view);
 const origin = config => String(config?.daemonUrl ?? "").replace(/\/$/,"");
+const spaceMachine = space => space?.machine??(String(space?.id??"").includes("/")?space.id.split("/")[0]:null);
+const homeKey = config => JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine||null]);
+const configIdentity = config => JSON.stringify([homeKey(config),config?.rig??["rig"],config?.openrigHome??null]);
+const configUnchanged = (host,config) => !host.currentConfig||configIdentity(host.currentConfig())===configIdentity(config);
+export const needsTabMigration = (context,config) => !!context && (context.legacy || context.home && spaceMachine(context.space)!==(config?.daemonMachine||null));
+export const migrationChoice = (saved,config,spaceId) => saved?.tabMigration?.[JSON.stringify([spaceId,homeKey(config)])]
+  ?? (!config?.daemonMachine?saved?.tabMigration?.[spaceId]:null);
+export function migrationChoices(saved,config,spaceId,choice) {
+  return {...(saved?.tabMigration??{}),...(!config?.daemonMachine?{[spaceId]:choice}:{}),[JSON.stringify([spaceId,homeKey(config)])]:choice};
+}
+async function recordMigrationComplete(host,config,source,destination) {
+  const saved=state(host),patch={tabMigration:migrationChoices(saved,config,source.id,"move")};
+  if(source.home&&spaceMachine(source.space)!==(config?.daemonMachine||null)){
+    patch.homeSpaces=Object.fromEntries(Object.entries(saved.homeSpaces??{}).filter(([,id])=>id!==source.id));
+    if(saved.homeSpace===source.id)patch.homeSpace=destination;
+  }
+  await save(host,patch);
+}
 const fail = reason => ({ ok:false, reason });
 const nonce = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
 const wait = (host, ms) => host.wait ? host.wait(ms) : new Promise(resolve => setTimeout(resolve,ms));
@@ -66,41 +85,110 @@ export function acceptRigOpen(host, id) {
   return envelope.request;
 }
 
-/** Only the explicit Move button calls this; mixed tabs and replaced TUI shells are never closed. */
+const paneIdentity = panes => JSON.stringify(panes.map(p=>[p.pane,p.mod,p.terminal]));
+const shellArgv = argv => Array.isArray(argv) && argv.length===1 && /^(?:-)?(?:ba|z|da|k|c|tc|fi)?sh$/.test(String(argv[0]).split("/").at(-1));
+
+/** Read each actual core, including machine-qualified addresses; a label alone never proves a live TUI. */
+export async function inspectMigrationTab(host,config,spaceId,tabId) {
+  const tab=list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.find(t=>t.id===tabId);
+  const panes=list(host,"panes").filter(p=>p.tab===tabId);
+  const result={spaceId,tabId,name:tab?.name||tabId,replaceable:false};
+  const left=reason=>({...result,ok:false,reason});
+  if(!configUnchanged(host,config))return left("OpenRig's connection changed; review the tab again");
+  if(!tab||!panes.length)return left("the tab is no longer open");
+  const expected=paneIdentity(panes),records=[];let stale=false;
+  for(const pane of panes){
+    if(pane.mod===MOD_IDS.view)continue;
+    const terminal=list(host,"terminals").find(t=>t.address===pane.terminal);
+    if(!terminal||!host.hc)return left("it includes a personal pane OpenRig didn't open");
+    let record;
+    try{const response=await host.hc(["get","--json","--",terminal.address]);if(response.code!==0)return left("Herdr could not read its terminal");record=JSON.parse(response.stdout);}catch{return left("Herdr could not read its terminal");}
+    const labelled=terminal.labels?.["herdr-openrig.role"]==="tui"&&record?.labels?.["herdr-openrig.role"]==="tui";
+    const machine=terminal.address.includes("/")?terminal.address.split("/")[0]:null;
+    const rawSpace=machine&&spaceId.startsWith(machine+"/")?spaceId.slice(machine.length+1):spaceId;
+    const rawTab=machine&&tabId.startsWith(machine+"/")?tabId.slice(machine.length+1):tabId;
+    if(record?.labels&&(record.labels["herdr.space"]!==rawSpace||record.labels["herdr.tab"]!==rawTab))return left("its terminal moved or its labels changed");
+    const labelOrigin=terminal.labels?.["herdr-openrig.origin"];
+    if(labelOrigin&&rigOrigin(labelOrigin)!==rigOrigin(config?.daemonUrl))return left("its TUI belongs to another OpenRig connection");
+    const argv=record?.foreground?.argv??record?.argv;
+    if(!record||record.state&&!['live','running'].includes(record.state))return left("its TUI isn't running");
+    // Older tab.new fallback TUIs had no role label; recognise only the actual TUI argv, never its tab name.
+    if(!isTuiArgv(argv,config)){
+      if(labelled&&record.keep===true&&shellArgv(argv)){stale=true;}
+      else return left(labelled?"its TUI command changed or isn't running":"it includes a personal pane OpenRig didn't open");
+    }
+    records.push([terminal.address,terminal.labels,record.labels,record.state,record.pid,record.created_ms,record.argv,record.foreground?.pid,record.foreground?.argv??null]);
+  }
+  if(paneIdentity(list(host,"panes").filter(p=>p.tab===tabId))!==expected)return left("the tab changed while Herdr checked it");
+  const fingerprint=JSON.stringify([expected,records,rigOrigin(config?.daemonUrl),config?.daemonMachine??null]);
+  return {...result,ok:!stale,replaceable:stale,reason:stale?"its TUI isn't running (restored shell)":null,panes,fingerprint};
+}
+
+/** Only explicit Move calls this; one refused tab never prevents another safe tab from moving. */
 export async function migrateRigTabs(host, config, spaceId) {
   const source=contexts(host).find(c=>c.id===spaceId);
-  if(!source?.legacy) return fail("Those OpenRig tabs have changed. Refresh before moving them.");
+  if(!needsTabMigration(source,config))return fail("Those OpenRig tabs have changed. Refresh before moving them.");
   const candidates=[...new Set([...source.pages.map(p=>p.tab),...source.tuis.map(t=>list(host,"panes").find(p=>p.terminal===t.address)?.tab)].filter(Boolean))];
-  const validate=async tab=>{
-    const space=list(host,"spaces").find(s=>s.id===spaceId);
-    if(!space?.tabs?.some(t=>t.id===tab)) return null;
-    const panes=list(host,"panes").filter(p=>p.tab===tab);
-    if(!panes.length) return null;
-    const expected=JSON.stringify(panes.map(p=>[p.pane,p.mod,p.terminal]));
-    for(const pane of panes){
-      if(pane.mod===MOD_IDS.view) continue;
-      const terminal=list(host,"terminals").find(t=>t.address===pane.terminal && t.labels?.["herdr-openrig.role"]==="tui");
-      if(!terminal || !host.hc) return null;
-      let record;try{record=JSON.parse((await host.hc(["get","--json","--",terminal.address])).stdout);}catch{return null;}
-      if(!record || (record.state && !["live","running"].includes(record.state)) || !isTuiArgv(record.foreground?.argv??record.argv,config)) return null;
-    }
-    // Re-read after async checks; compare identities, not a cached tabs array.
-    const now=list(host,"panes").filter(p=>p.tab===tab);
-    if(JSON.stringify(now.map(p=>[p.pane,p.mod,p.terminal]))!==expected) return null;
-    return panes;
-  };
-  for(const tab of candidates){
-    const panes=await validate(tab);
-    if(!panes) return fail("This tab includes a personal pane or a changed TUI. It was left where it is.");
-    const entry=host.shared?.("rig.pageRoutes")?.[tab] ?? host.shared?.("rig.nav")?.stack?.at(-1) ?? {section:"topology"};
-    const result=await routeOpen({...host,routeOwner:true},config,panes.some(p=>p.mod===MOD_IDS.view)
-      ? {kind:"page",entry,home:true,newPage:true} : {kind:"tui"});
-    if(!result.ok) return result;
-    if(!await validate(tab)) return fail("The original tab changed while opening its replacement. It was left where it is.");
-    host.run("tab.close",{id:tab});
+  // v0.2.x's tab.new fallback carried only Herdr's adoption labels. Discover it by real argv on explicit Move,
+  // inside the already-recognised legacy space; never infer ownership from a display name.
+  for(const tab of source.space.tabs??[]){
+    if(candidates.includes(tab.id))continue;
+    const checked=await inspectMigrationTab(host,config,spaceId,tab.id);
+    if(checked.ok)candidates.push(tab.id);
   }
-  await save(host,{tabMigration:{...(state(host).tabMigration??{}),[spaceId]:"move"}});
-  return {ok:true};
+  const moved=[],left=[];
+  for(const tab of candidates){
+    try {
+      const checked=await inspectMigrationTab(host,config,spaceId,tab);
+      if(!checked.ok){left.push(checked);continue;}
+      const entry=host.shared?.("rig.pageRoutes")?.[tab]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+      const result=await routeOpen({...host,routeOwner:true},config,checked.panes.some(p=>p.mod===MOD_IDS.view)
+        ?{kind:"page",entry,home:true}:{kind:"tui"});
+      if(!result.ok){left.push({...checked,ok:false,replaceable:false,reason:result.reason});continue;}
+      const current=await inspectMigrationTab(host,config,spaceId,tab);
+      if(!current.ok||current.fingerprint!==checked.fingerprint){left.push({...checked,ok:false,replaceable:false,reason:"the original tab changed while opening its destination"});continue;}
+      host.run("tab.close",{id:tab});
+      if(!await adopted(host,()=>!list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.some(t=>t.id===tab))){
+        left.push({...checked,ok:false,replaceable:false,reason:"its destination opened, but closing the original tab was not confirmed"});continue;
+      }
+      moved.push({...checked,destination:result.space});
+    }catch(error){left.push({tabId:tab,name:list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.find(t=>t.id===tab)?.name||tab,replaceable:false,reason:String(error?.message??error)});}
+  }
+  let error=null;
+  if(!left.length)try{
+    await recordMigrationComplete(host,config,source,moved.at(-1)?.destination);
+  }catch(failure){error=`Tabs moved, but the migration choice could not be saved: ${failure.message}`;}
+  return {ok:moved.length>0||!left.length,moved,left,error,reason:left.map(item=>`Left ${item.name} here: ${item.reason}.`).join("\n")};
+}
+
+/** Call only after consuming a builder-owned confirmation. A fresh destination is verified before any close. */
+export async function replaceMigrationTab(host,config,request) {
+  const source=contexts(host).find(c=>c.id===request.spaceId);
+  const checked=await inspectMigrationTab(host,config,request.spaceId,request.tabId);
+  if(!checked.replaceable||checked.fingerprint!==request.fingerprint)return fail("The original tab changed. Review it again before replacing it.");
+  if(checked.panes.some(p=>p.mod===MOD_IDS.view)){
+    const entry=host.shared?.("rig.pageRoutes")?.[request.tabId]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+    const page=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
+    if(!page.ok)return page;
+  }
+  const opened=await routeOpen({...host,routeOwner:true},config,{kind:"tui"});
+  if(!opened.ok)return opened;
+  try{
+    const response=await host.hc(["get","--json","--",opened.terminal]);
+    const fresh=JSON.parse(response.stdout);
+    if(response.code!==0||!fresh||fresh.state&&!['live','running'].includes(fresh.state)||!isTuiArgv(fresh.foreground?.argv??fresh.argv,config))
+      return fail("The fresh TUI didn't stay running. The original tab was left here.");
+  }catch{return fail("Herdr could not verify the fresh TUI. The original tab was left here.");}
+  const current=await inspectMigrationTab(host,config,request.spaceId,request.tabId);
+  if(!current.replaceable||current.fingerprint!==checked.fingerprint)return fail("The original tab changed while its replacement opened. It was left here.");
+  host.run("tab.close",{id:request.tabId,confirmed:true});
+  if(!await adopted(host,()=>!list(host,"spaces").find(s=>s.id===request.spaceId)?.tabs?.some(t=>t.id===request.tabId)))
+    return fail("The fresh TUI opened, but closing the original tab was not confirmed. Check the original before retrying.");
+  const remaining=contexts(host).find(c=>c.id===request.spaceId);
+  let error=null;
+  if(source&&!remaining?.pages.length&&!remaining?.tuis.length)
+    try{await recordMigrationComplete(host,config,source,opened.space);}catch(failure){error=`TUI replaced, but the migration choice could not be saved: ${failure.message}`;}
+  return {ok:true,...opened,error};
 }
 
 function requestRig(host, request) {
@@ -122,7 +210,7 @@ async function save(host,patch){
 }
 
 async function home(host,config,needTui=true){
-  const key=origin(config);
+  const key=homeKey(config),machine=config?.daemonMachine||null;
   if(homeJobs.has(key)) {
     const pending=homeJobs.get(key),result=await pending;
     if(result.ok && needTui && !result.tab) {
@@ -132,12 +220,20 @@ async function home(host,config,needTui=true){
     return result;
   }
   const task=(async()=>{
-    let known=contexts(host).find(c=>c.home), space=known?.space;
+    let remote=null;
+    if(machine){
+      if(typeof host.prepareHome!=="function")return fail("Open the Rig sidebar to check the configured Herdr machine. No local terminal was started.");
+      remote=await host.prepareHome(config);if(!remote.ok)return remote;
+      if(remote.machine!==machine)return fail("The configured Herdr machine changed. No terminal was started.");
+    }
+    const scoped=state(host).homeSpaces?.[key];
+    let known=contexts(host).find(c=>c.home&&spaceMachine(c.space)===machine
+      &&(!scoped||c.id===scoped)&&(!c.tuis.length||c.tuis.some(t=>!t.labels?.["herdr-openrig.origin"]||rigOrigin(t.labels["herdr-openrig.origin"])===rigOrigin(config.daemonUrl)))), space=known?.space;
     if(space && !needTui) return {ok:true,space:space.id};
     if(space){
       // Reuse only a live TUI still represented by a pane in this home, never retained terminal history.
       for(const terminal of known.tuis){
-        if(terminal.labels?.["herdr-openrig.origin"] && terminal.labels["herdr-openrig.origin"].replace(/\/$/,"")!==key) continue;
+        if(terminal.labels?.["herdr-openrig.origin"] && rigOrigin(terminal.labels["herdr-openrig.origin"])!==rigOrigin(config.daemonUrl)) continue;
         const pane=list(host,"panes").find(p=>p.terminal===terminal.address && space.tabs?.some(t=>t.id===p.tab));
         if(!pane) continue;
         let record=null;
@@ -148,20 +244,26 @@ async function home(host,config,needTui=true){
       }
     }
     if(typeof host.hc!=="function") return fail("Open the Rig sidebar to create OpenRig's home space.");
-    const id=space?.id ?? "sp-openrig-home-"+nonce(), tab="tb-openrig-home-"+nonce();
-    const started=await host.hc(["run","--bg","--json","--no-parent",
-      "--label",`herdr.space=${id}`,"--label",`herdr.tab=${tab}`,
+    const id=space?.id ?? machineId("sp-openrig-home-"+nonce(),machine), tab=machineId("tb-openrig-home-"+nonce(),machine);
+    const argv=remote?["env","-i","--",`HOME=${remote.home}`,`PATH=${remote.searchPath}`,`OPENRIG_URL=${remote.daemonUrl}`,"rig","tui"]:tuiArgv(config);
+    if(!configUnchanged(host,config))return fail("OpenRig's connection changed. No terminal was started.");
+    if(remote){
+      const checked=await host.prepareHome(config);if(!checked.ok)return checked;
+      if(JSON.stringify(checked)!==JSON.stringify(remote))return fail("The remote machine changed while opening the TUI. No terminal was started.");
+    }
+    const started=await host.hc(["run",...(machine?["--on",machine]:[]),"--bg","--json","--no-parent",
+      "--label",`herdr.space=${machineLocalId(id,machine)}`,"--label",`herdr.tab=${machineLocalId(tab,machine)}`,
       "--label","herdr-openrig.role=tui","--label","herdr-openrig.home=1",
-      "--label",`herdr-openrig.origin=${key}`,"--",...tuiArgv(config)]);
+      "--label",`herdr-openrig.origin=${origin(config)}`,"--",...argv]);
     let address;try{address=JSON.parse(started?.stdout??"null")?.address;}catch{}
-    if(!address || String(address).includes("/") || (started.code!==undefined && started.code!==0))
-      return fail("Herdr could not start OpenRig's local TUI. No fallback tab was opened.");
+    if(!address || (machine?!String(address).startsWith(machine+"/"):String(address).includes("/")) || (started.code!==undefined && started.code!==0))
+      return fail(`Herdr could not start OpenRig's TUI${machine?" on "+machine:" locally"}. No fallback tab was opened.`);
     const adoptedSpace=await adopted(host,()=>list(host,"spaces").find(s=>s.id===id
       && s.tabs?.some(t=>t.id===tab) && list(host,"panes").some(p=>p.tab===tab && p.terminal===address)));
     if(!adoptedSpace) return fail("Herdr has not adopted OpenRig's home terminal yet; check the local core before retrying.");
     if(!space) host.run("space.rename",{id,name:"OpenRig"});
     host.run("tab.rename",{id:tab,name:"Rig TUI"});
-    await save(host,{homeSpace:id});
+    await save(host,{homeSpace:id,homeSpaces:{...(state(host).homeSpaces??{}),[key]:id}});
     return {ok:true,reused:false,space:id,tab,terminal:address};
   })();
   homeJobs.set(key,task);
@@ -196,7 +298,7 @@ async function perform(host,config,request,rig,key){
   }
   if(request.kind!=="page") return fail("Unknown OpenRig open request.");
   const source=contexts(host).find(c=>c.id===request.sourceSpace);
-  let destination=request.home ? null : key ? rigSpace(host,config,rig,key) : source?.owned ? source.space : null;
+  let destination=request.home ? null : key ? rigSpace(host,config,rig,key) : source?.owned&&spaceMachine(source.space)===(config?.daemonMachine||null) ? source.space : null;
   if(!destination){
     const result=await home(host,config,false); if(!result.ok) return result;
     destination=list(host,"spaces").find(s=>s.id===result.space);
@@ -223,6 +325,9 @@ async function perform(host,config,request,rig,key){
 }
 
 export async function routeOpen(host,config,request={}){
+  if(config?.daemonMachine!==undefined&&config.daemonMachine!==""&&
+    (typeof config.daemonMachine!=="string"||!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(config.daemonMachine)))
+    return fail("daemonMachine must name a Herdr machine. No local terminal was started.");
   const selected={...request,sourceSpace:request.sourceSpace??active(host)};
   if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology"}));
   const tree=typeof host.layout==="function"?host.layout():host.layout;

@@ -69,9 +69,10 @@ export function openRigSpaceContext(spaces = [], terminals = [], panes = [], sta
         }
       }
     }
-    const local = !space.machine && !String(space.id).includes("/");
-    const home = local && (state.homeSpace === space.id || terms.some(t => t.labels?.["herdr-openrig.home"] === "1"));
-    const tuis = terms.filter(t => t.labels?.["herdr-openrig.role"] === "tui");
+    const currentTerminal = t => panes.some(p=>p.terminal===t.address&&tabs.has(p.tab));
+    const home = state.homeSpace === space.id || Object.values(state.homeSpaces??{}).includes(space.id)
+      || terms.some(t => t.labels?.["herdr-openrig.home"] === "1"&&currentTerminal(t));
+    const tuis = terms.filter(t => t.labels?.["herdr-openrig.role"] === "tui"&&currentTerminal(t));
     const legacy = !home && !rigOwned && (pages.length > 0 || tuis.length > 0);
     return { space, id: space.id, owned: Boolean(home || rigOwned || legacy), home, rigs: home ? [] : [...rigs], rigLinks, markedRigLinks, pages, tuis, legacy };
   });
@@ -80,6 +81,7 @@ export function openRigSpaceContext(spaces = [], terminals = [], panes = [], sta
 const validSize = size => size && Number.isFinite(size.px) && size.px > 0 ? { px: size.px }
   : size && Number.isFinite(size.weight) && size.weight > 0 ? { weight: size.weight } : null;
 const isHeaderSize = size => size?.px === 30;
+const sameSize = (a,b) => !!a&&!!b&&a.px===b.px&&a.weight===b.weight;
 
 /** Layout mutations run only from scheduled callbacks. Each transition cancels older pending switches. */
 export class SidebarSpaceFold {
@@ -89,7 +91,6 @@ export class SidebarSpaceFold {
     this.manualSpace = null;
     this.folded = false;
     this.applied = false;
-    this.token = 0;
     this.warned = false;
   }
   expand(spaceId) { this.manualSpace = spaceId; }
@@ -97,8 +98,12 @@ export class SidebarSpaceFold {
     const id = context?.id ?? null;
     if (id !== this.spaceId) { this.spaceId = id; this.manualSpace = null; }
     const measured = validSize(block?.size);
-    // A drag after our 30px resize is the person's new size, not another automatic fold.
-    if (this.applied && measured && !isHeaderSize(measured)) {
+    // A command and its layout snapshot arrive on different turns. Never read our old size as a drag.
+    if(this.awaiting&&sameSize(measured,this.awaiting.size)){
+      this.awaiting=null;this.acknowledged=true;this.resizeFailed=false;
+    }
+    if (this.applied && this.acknowledged && !this.awaiting && measured && !isHeaderSize(measured)
+      && !sameSize(measured,this.savedSize) && !sameSize(measured,this.lastRequested)) {
       this.manualSpace = id;
       this.savedSize = measured;
       this.applied = false;
@@ -109,30 +114,53 @@ export class SidebarSpaceFold {
     const wasFolded = this.folded;
     this.folded = folded;
     this.scheduledSpace = id;
-    if (folded && !wasFolded && !this.applied && measured && !isHeaderSize(measured)) {
+    if (folded && !wasFolded && !this.applied && !this.awaiting && measured && !isHeaderSize(measured)) {
       this.savedSize = measured;
       save?.(measured);
     }
-    const token = ++this.token;
-    after(0, () => after(150, () => {
-      if (token !== this.token) return;
+    this.pending={folded,block,measured,wasFolded};
+    const schedule=()=>{
+      if(this.queued||this.cooldown)return;
+      this.queued=true;
+      after(0,()=>{
+      this.queued=false;
+      const pending=this.pending;this.pending=null;if(!pending)return;
+      const {folded,block,measured}=pending;
       if (!block?.id) {
         if (folded && !this.warned) { this.warned = true; warn?.("Add an id to the rig block to let OpenRig fold it."); }
         notify?.();
         return;
       }
+      if(this.resizeFailed){notify?.();return;}
       try {
-        if (folded) { this.applied = true; run("layout.resize", { id: block.id, px: 30 }); }
-        else if (wasFolded || this.applied) {
-          this.applied = false;
-          run("layout.resize", { id: block.id, ...(this.savedSize ?? { weight: 2 }) });
+        const target=folded?{px:30}:(this.savedSize??{weight:2});
+        const needsResize=folded||this.applied||pending.wasFolded||isHeaderSize(measured);
+        this.applied=folded;
+        if(needsResize&&(!sameSize(measured,target)||this.awaiting&&!sameSize(this.awaiting.size,target))){
+          const acknowledgement={size:target};this.awaiting=acknowledgement;this.acknowledged=false;
+          this.lastRequested=target;
+          run("layout.resize",{id:block.id,...target});
+          after(1000,()=>{
+            if(this.awaiting!==acknowledgement)return;
+            this.resizeFailed=true;
+            if(!this.warned){this.warned=true;warn?.("Herdr did not confirm the sidebar resize; OpenRig will keep its header without resizing again.");}
+            notify?.();
+          });
+        }else if(needsResize){
+          this.acknowledged=true;this.lastRequested=target;
         }
       } catch {
         this.applied = false;
+        this.resizeFailed = true;
         if (!this.warned) { this.warned = true; warn?.("OpenRig could not resize this sidebar block; its header still works."); }
       }
+      // Leading edge is immediate; only changes inside this window wait and collapse to the latest state.
+      this.cooldown=true;
+      after(150,()=>{this.cooldown=false;if(this.pending)schedule();});
       notify?.();
-    }));
+      });
+    };
+    schedule();
     return folded;
   }
 }

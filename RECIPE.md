@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.0
+Version: v0.4.1
 
 ## Updating
 

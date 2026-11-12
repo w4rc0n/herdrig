@@ -53,7 +53,7 @@ export default class RigPalette extends View {
   }
 
   cli(args) { const c = readCommand(this.config ?? parseConfig(null), args); return [c.command, c.args, { timeout: 30000 }]; }
-  caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? []); }
+  caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
   /** Closes the palette (named apart from close(), which herdr calls at teardown). */
   dismiss() { const id = props()?.overlay; if (id) closeOverlay(id); else run("mod.open", { name: MOD_IDS.palette }); }
 
@@ -64,8 +64,8 @@ export default class RigPalette extends View {
     const data = shared("rig.data") ?? {};
     const names = [];
     for (const rig of data.topology ?? []) {
-      names.push({ line: `rig ${rig.name}`, hint: "Rig card" });
-      for (const pod of rig.pods) for (const s of pod.seats) names.push({ line: `agent ${s.logicalId}`, hint: `Seat card · ${rig.name}` });
+      names.push({ line: `rig ${rig.name}`, hint: "Rig card", navigation: true });
+      for (const pod of rig.pods) for (const s of pod.seats) names.push({ line: `agent ${s.logicalId}`, hint: `Seat card · ${rig.name}`, navigation: true });
     }
     const verbs = this.registry.filter((e) => !q || e.name.startsWith(verb) || e.aliases.some((a) => a.startsWith(verb)) || e.name === "attention" && ["need", "needs"].some(a => a.startsWith(verb)))
       .map((e) => ({ line: e.sample || `${e.name} ${e.args}`.trim(), label: e.name === "attention" ? "Needs: requests and updates for you" : null, hint: e.name === "attention" ? "" : e.description, verb: e.name, args: e.args ?? "" }));
@@ -86,7 +86,8 @@ export default class RigPalette extends View {
   /** Enter and Ctrl+Enter alike: the row Up/Down chose, else what is typed. A chosen verb that needs an
    *  argument fills the input with the verb to type it after, rather than running its sample. */
   choose(cx) {
-    const row = this.selected >= 0 ? this.rows()[this.selected] : null;
+    const rows = this.rows(), index = this.selectionIndex(rows);
+    const row = index >= 0 ? rows[index] : null;
     if (row?.verb && row.args && !row.args.startsWith("[")) {
       this.input.set_value(`${row.verb} `);
       this.selected = -1;
@@ -96,10 +97,20 @@ export default class RigPalette extends View {
     this.submit(cx, row ? row.line : this.input.value());
   }
 
+  /** A plain live-name search selects its first local navigation result; typed grammar keeps its own semantics. */
+  selectionIndex(rows = this.rows()) {
+    if (this.selected >= 0) return this.selected;
+    const line = this.input.value().trim();
+    return line && !resolveTuiLineFallback(line) && rows[0]?.navigation ? 0 : -1;
+  }
+
   /** Local palette commands (`operator`, `open-page`, `open-tui`, `tui`, `refresh`, `expand-all`, `collapse-all`, `view-design`, `change-model`, `notifications`). */
   own(cx, line) {
     const [verbRaw, arg] = line.trim().split(/\s+/);
     const verb = (verbRaw ?? "").toLowerCase();
+    if ((verb === "help" || verb === "?") && !arg) {
+      this.input.set_value(""); this.selected = -1; this.error = null; this.note = null; this.input.focus(); cx.notify(); return true;
+    }
     if ((verb === "operator" || verb === ":operator" || verb === "open-operator") && !arg) {
       return this.openOperator(cx);
     }
@@ -449,7 +460,7 @@ export default class RigPalette extends View {
       .when(!!this.error, (el) => el.child(div().px(6).text_size(12).text_color(t.blocked).child(this.error)))
       .when(!this.error && !!this.note, (el) => el.child(div().px(6).text_size(12).text_color(t.muted).child(this.note)))
       .child(v_flex().id("rig-palette-rows").flex_1().overflow_y_scrollbar().children(rows.map((r, i) => h_flex().id(`row-${i}`).px(6).h(24).gap(10).items_center()
-        .rounded(5).when(i === this.selected, (el) => el.bg(t.selected).text_color(t.foreground)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.selected = i; this.choose(cx); })
+        .rounded(5).when(i === this.selectionIndex(rows), (el) => el.bg(t.selected).text_color(t.foreground)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.selected = i; this.choose(cx); })
         .child(div().w(r.label ? 280 : 200).truncate().text_size(12.5).tooltip(r.label ?? r.line).child(r.label ?? r.line))
         .child(div().flex_1().truncate().text_size(11.5).text_color(t.dim).child(r.hint ?? "")))))
       .when(!rows.length && !!this.input.value().trim(), el => el.child(v_flex().id("palette-no-matches").px(6).gap(4)

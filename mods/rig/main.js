@@ -15,16 +15,18 @@
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
 import { View, div, svg } from "gpui-kit";
+import { healthCounts } from "./rig-health.js";
+
 import { filterAttentionHealth } from "./rig-lib.js";
 import { h_flex, v_flex } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands, machines } from "herdr";
-import { RemoteMachine } from "./rig-remote.js";
+import { RemoteMachine, detectDaemonMachine } from "./rig-remote.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { RigSpaces, RebuildConfirmations } from "./rig-spaces.js";
-import { acceptRigOpen, migrateRigTabs } from "./rig-routing.js";
-import { openRigSpaceContext, SidebarSpaceFold } from "./rig-space-context.js";
+import { acceptRigOpen, migrateRigTabs, replaceMigrationTab, needsTabMigration, migrationChoice, migrationChoices } from "./rig-routing.js";
+import { openRigSpaceContext, SidebarSpaceFold, rigOrigin } from "./rig-space-context.js";
 import { publishGraphActivity } from "./rig-graph-state.js";
-import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest } from "./rig-dismiss.js";
+import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest, requestDismissal, dismissible } from "./rig-dismiss.js";
 import { NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
 import net from "net";
 import {
@@ -252,7 +254,8 @@ export default class RigSidebar extends View {
       const parsed = parseSidebarState(raw);
       try {
         const saved = JSON.parse(raw);
-        const spaceState = { homeSpace: saved.homeSpace, sidebarSize: saved.sidebarSize, tabMigration: saved.tabMigration };
+        const spaceState = { homeSpace: saved.homeSpace, homeSpaces:saved.homeSpaces, machineDeclined:saved.machineDeclined,machineSearchDeclined:saved.machineSearchDeclined,
+          sidebarSize: saved.sidebarSize, tabMigration: saved.tabMigration };
         setShared("rig.spaceState", { ...spaceState, ...(shared("rig.spaceState") ?? {}) });
         if (this.spaceFold && !this.spaceFold.savedSize) this.spaceFold.savedSize = spaceState.sidebarSize;
       } catch (_) {}
@@ -480,11 +483,12 @@ export default class RigSidebar extends View {
       } };
     const remote = new RemoteMachine(host);
     host.prepareRemote = (config, opts = {}) => remote.prepare(config, { ...opts, consent });
+    host.prepareHome = config => remote.home(config);
     return host;
   }
 
   routeHost(cx, consent = null) {
-    return { ...this.attachHost(cx, consent), topology: () => this.data?.topology ?? [],
+    return { ...this.attachHost(cx, consent), currentConfig:()=>this.config, topology: () => this.data?.topology ?? [],
       saveRouteState: patch => this.saveSpaceState(patch),
       syncGrid: (rig, options) => this.spaceController(cx, consent).sync(rig, this.config, options) };
   }
@@ -508,27 +512,186 @@ export default class RigSidebar extends View {
     cx.notify();
   }
 
+  showMachineOffer(cx) {
+    this.showSidebarHere(cx);
+    cx.timer.after(0,nextCx=>{this.machineOfferHandle?.focus?.();nextCx.notify();});
+  }
+
+  migrationResultHere() {
+    const result=this.migrationResult,id=this.activeSpaceContext?.id;
+    return !!result&&!!id&&(result.spaceId===id||result.moved?.some(item=>item.destination===id));
+  }
+
   migrationCard(t) {
+    if(this.migrationResultHere())return this.migrationReport(t);
     const context=this.activeSpaceContext;
-    if(!context?.legacy || shared("rig.spaceState")?.tabMigration?.[context.id]) return null;
+    if(!needsTabMigration(context,this.config) || migrationChoice(shared("rig.spaceState"),this.config,context.id)) return null;
     const choose=(choice,cx)=>{
       if(this.migratingTabs) return;
+      this.migrationReplace=null;
       this.migratingTabs=context.id;
       cx.spawn(async cx=>{
       try {
         if(choice==="move") {
           const result=await migrateRigTabs(this.routeHost(cx),this.config,context.id);
-          this.notifyResult("Move OpenRig tabs",result);
-        } else await this.saveSpaceState({tabMigration:{...(shared("rig.spaceState")?.tabMigration??{}),[context.id]:"keep"}});
-      } catch(error) { this.notifyResult("Move OpenRig tabs",{ok:false,reason:String(error?.message??error)}); }
+          this.migrationResult={...result,spaceId:context.id};
+        } else await this.saveSpaceState({tabMigration:migrationChoices(shared("rig.spaceState"),this.config,context.id,"keep")});
+      } catch(error) { this.migrationResult={spaceId:context.id,left:[],moved:[],reason:String(error?.message??error)}; }
       finally { this.migratingTabs=null; cx.notify(); }
       });
     };
     return v_flex().id("rig-move-card").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
-      .child(div().text_size(11.5).text_color(t.muted).child("This space has OpenRig tabs. Move them to OpenRig's space?"))
+      .child(div().text_size(11.5).text_color(t.muted).child(this.config?.daemonMachine
+        ? `This space has OpenRig tabs. Move them to OpenRig's space on ${this.config.daemonMachine}?`
+        : "This space has OpenRig tabs. Move them to OpenRig's space?"))
       .child(h_flex().gap(12)
         .child(div().id("rig-move-tabs").px(8).py(4).rounded(4).bg(t.hover).text_size(12).font_semibold().text_color(t.accent).cursor_pointer().hover(s=>s.bg(t.raised)).on_click((_e,cx)=>choose("move",cx)).child("Move"))
         .child(div().id("rig-keep-tabs").px(8).py(4).rounded(4).text_size(12).text_color(t.muted).cursor_pointer().hover(s=>s.bg(t.hover)).on_click((_e,cx)=>choose("keep",cx)).child("Keep here")));
+  }
+
+  observeDaemonMachines(cx) {
+    if(!this.config?.daemonUrl||this.config?.daemonMachine){this.machineChoiceAvailable=false;this.daemonMachineOffer=null;return;}
+    if(this.machineObservedOrigin!==this.config.daemonUrl){
+      this.machineObservedOrigin=this.config.daemonUrl;this.daemonMachineOffer=null;this.machineSearchComplete=false;
+    }
+    this.machineChoiceAvailable=machines().some(m=>m.name&&m.layout==="ready")
+      &&!shared("rig.spaceState")?.machineSearchDeclined?.[rigOrigin(this.config.daemonUrl)];
+    if(!this.machineChoiceAvailable){this.daemonMachineOffer=null;return;}
+    if(this.machineAutoChecked)return;
+    // One automatic decision per sidebar lifetime, not per refresh or machine-list revision.
+    this.machineAutoChecked=true;
+    const config={...this.config};
+    cx.timer.after(0,nextCx=>nextCx.spawn(async cx=>{
+      try{
+        const local=await discoverDaemonFromCli(config,exec);
+        if(this.closed||this.config?.daemonMachine||this.config?.daemonUrl!==config.daemonUrl)return;
+        if(!local.reachable||rigOrigin(local.daemonUrl)!==rigOrigin(config.daemonUrl))await this.findDaemonMachine(cx,config);
+      }catch(error){this.machineDetectionError=String(error?.message??error);}
+      this.machineOfferHandle??=cx.focus_handle?.();this.machineHintHandle??=cx.focus_handle?.();this.machineFindHandle??=cx.focus_handle?.();
+      cx.notify();
+    }));
+  }
+
+  async findDaemonMachine(cx,config={...this.config}) {
+    if(this.machineFinding||config.daemonMachine)return;
+    this.machineFinding=true;this.machineDetectionError=null;
+    try{
+      const offer=await detectDaemonMachine(this.attachHost(cx),config);
+      if(this.closed||this.config?.daemonMachine||this.config?.daemonUrl!==config.daemonUrl)return;
+      this.daemonMachineOffer=offer&&!shared("rig.spaceState")?.machineDeclined?.[offer.key]?{...offer,origin:config.daemonUrl}:null;
+      this.machineSearchComplete=true;
+      this.machineOfferHandle??=cx.focus_handle?.();this.machineHintHandle??=cx.focus_handle?.();
+      this.machineUseHandle??=cx.focus_handle?.();this.machineDeclineHandle??=cx.focus_handle?.();
+    }catch(error){this.machineDetectionError=String(error?.message??error);}
+    finally{this.machineFinding=false;cx.notify();}
+  }
+
+  machineOfferCard(t) {
+    const offer=this.daemonMachineOffer;
+    if(!offer)return v_flex().id("rig-daemon-machine-search").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
+      .when(!!this.machineOfferHandle,el=>el.track_focus(this.machineOfferHandle).tab_stop(true).tab_index(0))
+      .child(div().text_size(11.5).text_color(t.muted).child(this.machineDetectionError??(this.machineSearchComplete
+        ? "No single machine matched. To choose one, add the key below to openrig/config.json." : "Choose where OpenRig's spaces open.")))
+      .when(!!this.machineSearchComplete,el=>el.child(h_flex().gap(5).items_center()
+        .child(div().font_family(settings()?.font_family??"monospace").text_size(11.5).text_color(t.muted).child("daemonMachine"))
+        .child(div().id("rig-copy-machine-key").size(18).cursor_pointer().tooltip("Copy daemonMachine")
+          .on_click((_e,cx)=>this.copyToClipboard(cx,"daemonMachine","machine-key"))
+          .child(svg(icon("copy")).size(12).text_color(t.muted)))))
+      .child(div().id("rig-find-daemon-machine").px(6).py(3).text_size(11.5).text_color(t.accent).cursor_pointer()
+        .when(!!this.machineFindHandle,el=>el.track_focus(this.machineFindHandle).tab_stop(true).tab_index(0))
+        .on_click((_e,cx)=>cx.spawn(cx=>this.findDaemonMachine(cx)))
+        .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.spawn(cx=>this.findDaemonMachine(cx));}})
+        .child(this.machineFinding?"Finding…":"Find where OpenRig runs"));
+    const act=(use,cx)=>{
+      if(this.machineOfferBusy)return;this.machineOfferBusy=true;
+      cx.spawn(async cx=>{
+        try{
+          if(!use){
+            await this.saveSpaceState({machineDeclined:{...(shared("rig.spaceState")?.machineDeclined??{}),[offer.key]:true},
+              machineSearchDeclined:{...(shared("rig.spaceState")?.machineSearchDeclined??{}),[rigOrigin(this.config.daemonUrl)]:true}});
+            this.daemonMachineOffer=null;this.machineChoiceAvailable=false;
+          }else{
+            const remote=await new RemoteMachine(this.attachHost(cx)).home({...this.config,daemonMachine:offer.machine});
+            if(!remote.ok)throw new Error(remote.reason);
+            if(this.config?.daemonMachine||this.config?.daemonUrl!==offer.origin||remote.selfHostId!==offer.selfHostId||remote.profileId!==offer.profileId)
+              throw new Error("OpenRig or the Herdr machine changed. Check the connection again.");
+            const path=`${appHome()}/openrig/config.json`,prev=await readTextFile(path);
+            const raw=JSON.parse(prev??"{}");
+            const fileOrigin=raw?.daemonUrl==null?this.config.daemonUrl:parseConfig(prev).daemonUrl;
+            if(!raw||typeof raw!=="object"||Array.isArray(raw)||raw.daemonMachine||fileOrigin!==offer.origin)
+              throw new Error("OpenRig's configuration changed. Refresh before choosing a machine.");
+            await writeTextFile(path,JSON.stringify({...raw,daemonMachine:offer.machine},null,2)+"\n",prev);
+            this.daemonMachineOffer=null;this.machineChoiceAvailable=false;await this.reloadConfig(cx);
+          }
+        }catch(error){this.machineOfferError=String(error?.message??error);}
+        finally{this.machineOfferBusy=false;cx.notify();}
+      });
+    };
+    return v_flex().id("rig-daemon-machine-offer").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
+      .when(!!this.machineOfferHandle,el=>el.track_focus(this.machineOfferHandle).tab_stop(true).tab_index(0))
+      .when(!!this.machineOfferHandle?.is_focused?.(),el=>el.border_1().border_color(t.accent))
+      .child(div().text_size(11.5).text_color(t.muted).child(`OpenRig runs on ${offer.machine}. Put OpenRig's spaces and Attach there?`))
+      .child(h_flex().gap(8)
+        .child(div().id("rig-use-daemon-machine").px(6).py(3).rounded(4).text_size(11.5).text_color(t.accent).cursor_pointer()
+          .when(!!this.machineUseHandle,el=>el.track_focus(this.machineUseHandle).tab_stop(true).tab_index(0))
+          .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();act(true,cx);}})
+          .on_click((_e,cx)=>act(true,cx)).child(`Use ${offer.machine}`))
+        .child(div().id("rig-decline-daemon-machine").px(6).py(3).text_size(11.5).text_color(t.muted).cursor_pointer()
+          .when(!!this.machineDeclineHandle,el=>el.track_focus(this.machineDeclineHandle).tab_stop(true).tab_index(0))
+          .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();act(false,cx);}})
+          .on_click((_e,cx)=>act(false,cx)).child("Not now")))
+      .when(!!this.machineOfferError,el=>el.child(div().text_size(11.5).text_color(t.blocked).child(this.machineOfferError)));
+  }
+
+  migrationReport(t) {
+    const result=this.migrationResult;
+    const quiet=(id,label,click)=>div().id(id).px(6).py(3).rounded(4).text_size(11.5).text_color(t.accent)
+      .cursor_pointer().hover(s=>s.bg(t.hover)).on_click(click).child(label);
+    const report=v_flex().id("rig-move-result").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
+      .child(div().text_size(12).font_semibold().text_color(t.foreground).child("Move OpenRig tabs"));
+    const movedNames=new Map();
+    for(const item of result.moved??[])movedNames.set(item.name,(movedNames.get(item.name)??0)+1);
+    for(const [name,count] of movedNames)report.child(div().text_size(11.5).text_color(t.muted).child(count>1?`Moved ${count} ${name} tabs.`:`Moved ${name}.`));
+    for(const item of result.left??[])report.child(v_flex().gap(3)
+      .child(div().text_size(11.5).text_color(t.muted).child(`Left ${item.name} here: ${item.reason}.`))
+      .child(h_flex().gap(6)
+        .child(quiet(`rig-show-left-${item.tabId}`,"Show tab",()=>{
+          run("space.select",{id:result.spaceId});run("tab.select",{id:item.tabId});
+        }))
+        .when(!!item.replaceable,el=>el.child(quiet(`rig-replace-left-${item.tabId}`,"Replace…",(_e,cx)=>{
+          this.migrationConfirmations??=new RebuildConfirmations();
+          const recovery={...item,origin:this.config?.daemonUrl,machine:this.config?.daemonMachine??null};
+          const token=this.migrationConfirmations.issue(result.spaceId,recovery);
+          this.migrationReplace={rigId:result.spaceId,token,name:item.name};cx.notify();
+        })))));
+    if(result.reason&&!(result.left?.length))report.child(div().text_size(11.5).text_color(t.blocked).child(result.reason));
+    if(result.error)report.child(div().text_size(11.5).text_color(t.blocked).child(result.error));
+    if(this.migrationReplace){
+      const request=this.migrationReplace;
+      report.child(div().text_size(12).font_semibold().text_color(t.foreground).child(`Replace ${request.name}?`))
+        .child(div().text_size(11.5).text_color(t.muted).child("Open a fresh TUI in OpenRig's space, then close this restored shell. Anything running or typed in this shell is lost. If this is its space's last tab, that space closes too."))
+        .child(h_flex().gap(6)
+          .child(quiet("rig-replace-cancel","Cancel",(_e,cx)=>{this.migrationConfirmations.take(request);this.migrationReplace=null;cx.notify();}))
+          .child(quiet("rig-replace-confirm","Replace TUI",(_e,cx)=>{
+            const approved=this.migrationConfirmations.take(request);this.migrationReplace=null;
+            if(!approved||this.migratingTabs)return;
+            if(approved.recovery.origin!==this.config?.daemonUrl||approved.recovery.machine!==(this.config?.daemonMachine??null)){
+              this.migrationResult={...result,reason:"OpenRig's connection changed. Review the tab again.",left:[]};cx.notify();return;
+            }
+            this.migratingTabs=result.spaceId;
+            cx.spawn(async cx=>{
+              try{
+                const opened=await replaceMigrationTab(this.routeHost(cx),this.config,{...approved.recovery,spaceId:result.spaceId});
+                this.migrationResult=opened.ok?{...result,reason:null,error:opened.error,left:result.left.filter(row=>row.tabId!==approved.recovery.tabId),
+                  moved:[...(result.moved??[]),{...approved.recovery,destination:opened.space,name:`${approved.recovery.name} (fresh TUI)`}]}:
+                  {...result,left:result.left.map(row=>row.tabId===approved.recovery.tabId?{...row,reason:opened.reason,replaceable:false}:row)};
+              }catch(error){this.migrationResult={...result,error:String(error?.message??error)};}
+              finally{this.migratingTabs=null;cx.notify();}
+            });
+          })));
+    }
+    report.child(quiet("rig-move-result-dismiss","Dismiss",(_e,cx)=>{this.migrationResult=null;this.migrationReplace=null;cx.notify();}));
+    return report;
   }
 
   foldedHeader(t) {
@@ -540,6 +703,13 @@ export default class RigSidebar extends View {
       .child(h_flex().gap(6).items_center()
         .child(div().text_color(t.muted).child("›"))
         .child(div().text_size(12).font_medium().text_color(t.muted).child("OpenRig"))
+        .when(!!this.machineChoiceAvailable&&(find(layout(),n=>n.id==="sidebar")?.size?.px??Infinity)>=260,el=>el.child(
+          div().id("rig-choose-machine-hint").px(5).h(18).rounded(4).border_1().border_color(t.border).text_size(10.5).text_color(t.muted)
+            .when(!!this.machineHintHandle,node=>node.track_focus(this.machineHintHandle).tab_stop(true).tab_index(0))
+            .tooltip(this.daemonMachineOffer?`OpenRig runs on ${this.daemonMachineOffer.machine}. Choose where its spaces open.`:"Choose where OpenRig's spaces open.")
+            .on_click((_e,cx)=>{cx.stop_propagation();this.showMachineOffer(cx);})
+            .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();this.showMachineOffer(cx);}})
+            .child("Choose machine")))
         .when(needs > 0, el => el.child(h_flex().id("rig-folded-needs").px(5).h(18).gap(4).rounded(4).items_center()
           .bg(`${t.blocked}26`).text_color(t.blocked).hover(s => s.bg(t.hover))
           .on_click((_e, cx) => { cx.stop_propagation(); this.revealPriorityNeeds(cx); })
@@ -899,7 +1069,10 @@ export default class RigSidebar extends View {
     const requests = { ...(shared("rig.updateActions") ?? {}) }, req = requests[id]; delete requests[id];
     setShared("rig.updateActions", requests);
     const model = this.dismissalModel(); if (!req || !model || req.scope !== model.scope) return;
-    if (req.action === "dismiss") model.dismiss(liveDismissalItems(Array.isArray(req.value) ? req.value : [req.value], this.data?.attentionItems ?? [], model.records));
+    if (req.action === "dismiss") {
+      const items = liveDismissalItems(Array.isArray(req.value) ? req.value : [req.value], this.data?.attentionItems ?? [], model.records);
+      if (model.dismiss(items).length) model.receipts = model.receipts.slice(-1);
+    }
     else if (req.action === "undo") model.undo(req.value);
     else if (req.action === "restore") model.restore(req.value);
     else if (req.action === "show") model.show = !model.show;
@@ -1032,11 +1205,11 @@ export default class RigSidebar extends View {
             hasNativeSeatsEndpoint: native !== null,
             force: forceProbe,
           });
-          setShared("rig.capabilities", capabilities);
         } else {
           capabilities = currentCapabilities(shared, terminals?.() ?? []);
-          if (!shared("rig.capabilities")) setShared("rig.capabilities", capabilities);
         }
+        capabilities = await probeCapabilities({ ...this.config, capabilities }, { exec, providerAppHome: appHome() });
+        setShared("rig.capabilities", capabilities);
         const topology = buildTopology(summary, nodesByRig, native?.seats);
         if (attentionItems !== null) {
           const needsVisible = isNeedsVisible({
@@ -1298,6 +1471,7 @@ export default class RigSidebar extends View {
   /** Header with `OpenRig` title, Needs-you badge, New rig (+), search/palette, Talk to the operator (S4 only), Page pop-out, TUI pop-out, expand/collapse all, and refresh. */
   header(t) {
     const compact = (this.headerWidth ?? 268) < 220;
+    const showTitle = !(this.activeSpaceContext?.rigs?.length && (this.headerWidth ?? 268) < 340);
     const key = paletteKey(keys(), window()?.platform);
     const needs = needsRequestCount(this.data?.topology, this.data?.attentionItems);
     const showOperatorIcon = Boolean(this.sidebarState?.id === "S4");
@@ -1307,7 +1481,7 @@ export default class RigSidebar extends View {
     return h_flex().id("rig-header").px(compact ? 6 : 10).h(30).items_center().justify_between().flex_none()
       .on_size_change((size, cx) => { if (this.headerWidth !== size.width) { this.headerWidth = size.width; cx.notify(); } })
       .child(h_flex().flex_1().min_w(0).overflow_hidden().gap(6).items_center()
-        .child(div().id("rig-header-title").flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.muted).child("OpenRig"))
+        .when(showTitle, el => el.child(div().id("rig-header-title").flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.muted).child("OpenRig")))
         .when((this.activeSpaceContext?.rigs?.length ?? 0) > 0, el => el.child(div().id("rig-space-context").max_w(88).truncate()
           .px(4).h(18).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted)
           .tooltip(this.activeSpaceContext.rigs.join(", ")+(!this.live ? " · updates every 5 s" : "")).child(this.activeSpaceContext.rigs.join(", "))))
@@ -1446,6 +1620,10 @@ export default class RigSidebar extends View {
 
   /** Toggle a fold key in `shared("rig.open.sidebar")` and persist to `<appHome>/openrig/state.json`. */
   fold(key, open, seats = []) {
+    if (!open && [branchKey("needs"), "needs:updates"].includes(key)) {
+      this.dismissalModel()?.leave();
+      this.publishDismissals();
+    }
     const nextOpen = foldChoice(shared("rig.open.sidebar"), key, open, seats);
     setShared("rig.open.sidebar", nextOpen);
     this.persistSidebarState(nextOpen, shared("rig.order"));
@@ -1459,6 +1637,7 @@ export default class RigSidebar extends View {
     groupKey = null,
     itemId = null,
     siblingIds = null,
+    showElsewhere = true,
   } = {}) {
     const sel = shared("rig.sel");
     const nav = shared("rig.nav");
@@ -1528,7 +1707,7 @@ export default class RigSidebar extends View {
       out = out.on_mouse_down("left", (e, cx) => { openOnDouble(e, cx); });
     }
 
-    if (elsewhere) {
+    if (elsewhere && showElsewhere) {
       out = out.child(div().id(`elsewhere-${rowKey}`).text_size(11).text_color(t.muted).child("·"));
     }
     return out;
@@ -1931,6 +2110,78 @@ export default class RigSidebar extends View {
     });
   }
 
+  requestRowMark(t, tier) {
+    const urgent = ["escalation", "alert"].includes(tier);
+    // Match the 14 px status cell and 9 px diamond; align to the headline,
+    // rather than centring a font glyph between the row's two text lines.
+    return div().h(40).flex_none().pt(4).child(div().size(14).flex().items_center().justify_center()
+      .child(urgent ? svg(icon("rig-diamond")).size(9).text_color(t.blocked)
+        : div().size(6).rounded(3).bg(t.accent)));
+  }
+
+  sidebarUpdateAction(action, value) {
+    requestDismissal({ shared, setShared, run, scope: dismissalScope(this.config) }, action, value);
+  }
+
+  sidebarUpdates(t, cx, updates) {
+    const model = this.dismissalModel(), hidden = model?.hidden() ?? [], receipts = model?.receiptRows() ?? [];
+    if (!updates.length && !hidden.length && !receipts.length) return [];
+    const key = "needs:updates", expanded = branchFoldOpen(shared("rig.open.sidebar") ?? {}, key, true);
+    const selected = shared("rig.sel")?.key;
+    const hovered = (id) => this.hoveredUpdate === id || selected === id;
+    const hover = (id) => (over, ctx) => { this.hoveredUpdate = over ? id : null; (ctx ?? cx).notify(); };
+    const action = (verb, value) => (_e, ctx) => {
+      (ctx ?? cx).stop_propagation(); this.sidebarUpdateAction(verb, value); (ctx ?? cx).notify();
+    };
+    this.visibleTreeRows.push({ key, foldKey: key, expandable: true, isOpen: expanded, parentKey: branchKey("needs") });
+    const head = h_flex().id("needs-updates-branch").pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
+      .on_hover(hover(key)).hover(s => s.bg(t.hover))
+      .on_click(() => { setShared("rig.sel", { key }); this.fold(key, !expanded); cx.notify(); })
+      .on_mouse_down("right", () => this.menu({ kind: "updates-group", name: "Updates", items: updates }))
+      .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
+      .child(div().flex_1().text_size(11.5).text_color(t.muted).child("Updates"));
+    if (updates.length && hovered(key)) head.child(div().id("sidebar-dismiss-all").text_size(11).text_color(t.dim)
+      .hover(s => s.text_color(t.foreground)).cursor_pointer().on_click(action("dismiss", updates)).child("Dismiss all"));
+    else head.child(div().text_size(11).text_color(t.dim).child(String(updates.length)));
+    const out = [head];
+    if (!expanded) return out;
+    const row = (n, record, position) => {
+      const rowKey = record ? `dismissed:${record.key}` : `need:${n.id}`;
+      const entry = { section: "needs", id: n.id, name: n.summary };
+      this.visibleTreeRows.push({ key: rowKey, expandable: false, parentKey: key, entry, update: record ? null : { ...n, dismissalPosition: position } });
+      const el = h_flex().id(record ? `sidebar-hidden-${n.id}` : `need-${n.id}`).pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
+        .on_hover(hover(rowKey)).hover(s => s.bg(t.hover))
+        .on_click(() => { selectRow(entry, rowKey); cx.notify(); })
+        .on_mouse_down("right", () => this.menu({ ...n, dismissed: !!record }))
+        .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(12).text_color(hovered(rowKey) ? t.foreground : t.dim).child(n.summary));
+      if (hovered(rowKey) && dismissible(n)) {
+        el.child(div().id(`sidebar-${record ? "restore" : "dismiss"}-${n.id}`).size(16).flex_none().items_center().justify_center()
+          .cursor_pointer().text_color(t.dim).hover(s => s.text_color(t.foreground))
+          .tooltip(record ? "Restore update" : "Dismiss update (Delete)")
+          .on_click(action(record ? "restore" : "dismiss", record ? record.key : { ...n, dismissalPosition: position }))
+          .child(svg(icon(record ? "rig-restore" : "x")).size(12)));
+      } else {
+        const mins = Math.max(0, Math.floor((Date.now() - (Date.parse(n.at ?? "") || Date.now())) / 60000));
+        el.child(div().text_size(10.5).text_color(t.dim).child(mins < 1 ? "<1m" : `${mins}m`));
+      }
+      return this.decorateRow(t, el, { rowKey, entry, groupKey: record ? null : "needs:items",
+        itemId: n.id, siblingIds: updates.map(item => item.id), showElsewhere: !hovered(rowKey) });
+    };
+    // Receipts retain the dismissed row's position, including when the last update goes away.
+    const rows = updates.map((n, index) => row(n, null, index));
+    for (const receipt of receipts) rows.splice(Math.min(receipt.position, rows.length), 0,
+      h_flex().id(`sidebar-receipt-${receipt.id}`).pl(treeIndent(1)).pr(8).h(24).gap(4).items_center().text_size(11.5)
+        .child(div().truncate().text_color(t.muted).child(receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`))
+        .child(div().id(`sidebar-undo-${receipt.id}`).text_color(t.accent).cursor_pointer().on_click(action("undo", receipt.id)).child("Undo")));
+    out.push(...rows);
+    if (hidden.length) {
+      out.push(div().id("sidebar-show-dismissed").pl(treeIndent(1)).h(24).text_size(11).text_color(t.dim).cursor_pointer()
+        .on_click(action("show")).child(`${model.show ? "Hide" : "Show"} dismissed (${hidden.length})`));
+      if (model.show) out.push(...hidden.map(record => row(record.item, record)));
+    }
+    return out;
+  }
+
   /** Render the children of `Specs`, `Scopes`, `Terminals`, `Needs`, or `System` when expanded. */
   sectionBranchChildren(t, cx, section) {
     const folds = shared("rig.open.sidebar") ?? {};
@@ -1938,8 +2189,10 @@ export default class RigSidebar extends View {
     const parentBranchKey = branchKey(section);
 
     if (section === "system") {
+      const health = this.list(cx, "/api/health");
+      const counts = healthCounts(health.data?.records);
       const sysItems = [
-        { id: "health", label: "Health", entry: { section: "system", subview: "health", name: "Health" } },
+        { id: "health", label: `Health${counts.notes ? ` · ${counts.notes} notes` : ""}`, entry: { section: "system", subview: "health", name: "Health" } },
         { id: "config", label: "Configuration", expandable: true, foldKey: "system:config", entry: { section: "system", subview: "config", name: "Configuration" } },
         { id: "connections", label: "Connections", entry: { section: "system", subview: "connections", name: "Connections" } },
         { id: "people", label: "People", entry: { section: "system", subview: "people", name: "People" } },
@@ -2193,7 +2446,6 @@ export default class RigSidebar extends View {
       const rawItems = sortNeedsByTier(this.dismissalModel()?.visible(mergedItems) ?? mergedItems);
       const orderedNeeds = orderSiblings(rawItems, "needs:items", orderMap, (n) => n.id);
       const needIds = orderedNeeds.map((n) => n.id);
-      let updatesHeader = false;
       for (const n of orderedNeeds) {
         if (n.criticalHealth) {
           const entry = { section: "system", subview: "health" };
@@ -2201,18 +2453,7 @@ export default class RigSidebar extends View {
             entry, indent: treeIndent(1), parentKey: parentBranchKey }));
           continue;
         }
-        if (n.update && !updatesHeader) {
-          updatesHeader = true;
-          const updates = orderedNeeds.filter((it) => it.update);
-          const foldKey = "needs:updates", expanded = branchFoldOpen(folds, foldKey, true);
-          out.push(h_flex().id("needs-updates-branch").pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
-            .on_click(() => { this.fold(foldKey, !expanded); cx.notify(); })
-            .on_mouse_down("right", () => this.menu({ kind: "updates-group", name: "Updates", items: updates }))
-            .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
-            .child(div().flex_1().text_size(11.5).text_color(t.muted).child("Updates"))
-            .child(div().text_size(11).text_color(t.dim).child(String(updates.length))));
-        }
-        if (n.update && !branchFoldOpen(folds, "needs:updates", true)) continue;
+        if (n.update) continue;
         const entry = { section: "needs", id: n.id, name: n.summary };
         const tier = n.tier ?? tierOf(n);
         const rowId = `need-${n.id}`;
@@ -2224,47 +2465,16 @@ export default class RigSidebar extends View {
           const mins = Math.max(0, Math.floor((Date.now() - (Date.parse(n.at ?? "") || Date.now())) / 60000));
           const rowEl = h_flex().id(rowId).pl(treeIndent(1)).pr(8).h(40).gap(6).items_center().hover(s => s.bg(t.hover))
             .on_click(() => openPage({ ...entry, name: headline }, rowKey)).on_mouse_down("right", () => this.menu(n))
-            .child(div().w(10).text_color(["escalation", "alert"].includes(tier) ? t.blocked : t.accent).child(["escalation", "alert"].includes(tier) ? "◆" : "●"))
+            .child(this.requestRowMark(t, tier))
             .child(v_flex().flex_1().min_w(0).gap(2)
               .child(div().truncate().text_size(12).text_color(t.foreground).tooltip(headline).child(headline))
               .child(div().truncate().text_size(11).text_color(t.dim).child(`${owner ?? "OpenRig"} · ${mins < 1 ? "<1m" : `${mins}m`}`)));
           out.push(this.decorateRow(t, rowEl, { rowKey, entry: { ...entry, name: headline }, popoutId: `popout-${rowId}`, groupKey: "needs:items", itemId: n.id, siblingIds: needIds }));
           continue;
         }
-        let rowEl = h_flex().id(rowId).pl(treeIndent(1)).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
-          .on_click(() => selectRow(entry, rowKey))
-          .on_mouse_down("right", () => this.menu({ ...n, orderGroupKey: "needs:items" }))
-          .child(leafCell());
-        if (tier === "escalation") {
-          rowEl = rowEl.border_l_2().border_color(t.blocked)
-            .child(div().px(4).py(1).rounded(3).bg(`${t.blocked}26`).text_size(9.5).font_semibold().text_color(t.blocked).child("ESCALATION"))
-            .child(div().flex_1().truncate().text_size(12).font_semibold().text_color(t.foreground).child(n.summary));
-        } else if (tier === "alert") {
-          rowEl = rowEl
-            .child(div().size(6).flex_none().rounded(3).bg(t.blocked))
-            .child(div().flex_1().truncate().text_size(12).font_semibold().text_color(t.foreground).child(n.summary));
-        } else if (tier === "update") {
-          rowEl = rowEl
-            .child(div().flex_1().truncate().text_size(12).text_color(t.dim).child(n.summary))
-            .child(div().text_size(10.5).text_color(t.dim).child("update"));
-        } else {
-          rowEl = rowEl
-            .child(div().size(6).flex_none().rounded(3).bg(t.accent))
-            .child(div().flex_1().truncate().text_size(12).text_color(t.foreground).child(n.summary));
-        }
-        if (tier !== "update" && n.urgency) {
-          rowEl = rowEl.child(div().text_size(10.5).text_color(t.dim).child(String(n.urgency)));
-        }
-        out.push(this.decorateRow(t, rowEl, {
-          rowKey,
-          entry,
-          popoutId: `popout-${rowId}`,
-          groupKey: "needs:items",
-          itemId: n.id,
-          siblingIds: needIds,
-        }));
       }
-      if (!orderedNeeds.length) {
+      out.push(...this.sidebarUpdates(t, cx, orderedNeeds.filter((n) => n.update)));
+      if (!orderedNeeds.length && !this.dismissalModel()?.hidden().length) {
         out.push(div().px(18).py(4).text_size(12).text_color(t.dim).child("No pending Needs-You requests."));
       }
     }
@@ -2394,6 +2604,13 @@ export default class RigSidebar extends View {
   handleTreeKeyDown(e, cx) {
     const key = e?.key ?? "";
     const sel = shared("rig.sel");
+    const selectedUpdate = this.visibleTreeRows.find((row) => row.key === sel?.key)?.update;
+    if (key.toLowerCase() === "delete" && dismissible(selectedUpdate)) {
+      cx?.stop_propagation?.();
+      this.sidebarUpdateAction("dismiss", selectedUpdate);
+      cx?.notify?.();
+      return;
+    }
     const act = treeKeyNav(this.visibleTreeRows, sel?.key ?? null, key, { openMap: shared("rig.open.sidebar") ?? {} });
     if (!act) return;
     if (act.type === "move") {
@@ -2435,6 +2652,7 @@ export default class RigSidebar extends View {
 
   render(cx) {
     const t = theme();
+    this.observeDaemonMachines(cx);
     this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,shared("rig.topology.view"),narrow()]),cx,{attention:this.data?.attentionItems});
     this.spaceFold ??= new SidebarSpaceFold(shared("rig.spaceState")?.sidebarSize);
     const active = spaces().find(s => s.active);
@@ -2451,29 +2669,45 @@ export default class RigSidebar extends View {
       })),
       warn: body => notify({ title: "OpenRig", body, level: "warning" }), notify: () => foldCx.notify(),
     });
-    if (folded) {
+    if (folded && narrow()) {
       let root=v_flex().id("rig-sidebar-folded").size_full().bg(t.chrome)
         .on_mouse_down("left",()=>this.focusHandle?.focus?.())
         .on_key_down((event,cx)=>{if(String(event?.key??"").toLowerCase()==="enter")this.showSidebarHere(cx);});
-      if(narrow()) root=root.child(h_flex().id("rig-folded-rail").h(30).gap(3).items_center().justify_center()
+      root=root.child(h_flex().id("rig-folded-rail").h(30).gap(3).items_center().justify_center()
         .tooltip("Not a rig space · click to show it here").on_click((_e,cx)=>this.showSidebarHere(cx))
         .child(svg(icon("rig-popout")).size(14).text_color(t.dim))
         .when(this.priorityRows().some(r=>r.rank===4),el=>el.child(div().size(5).rounded(3).bg(t.blocked))));
-      else root=root.child(this.foldedHeader(t));
       if(this.focusHandle) root=root.track_focus(this.focusHandle);
       return root;
     }
     if (narrow()) return this.rail(t);
-    const state = this.states(t);
+    const state = folded?null:this.states(t);
+    if(folded&&!this.listWasFolded)this.foldedContentHeight=this.listContentHeight;
+    if(!folded&&this.listWasFolded)this.pendingScrollClamp=this.foldedContentHeight;
+    this.listWasFolded=folded;
+    const listId=(this.priorityReveal?`rig-list-reveal-${this.priorityReveal}`:"rig-list")
+      +(this.listScrollVersion?`-resize-${this.listScrollVersion}`:"");
     let root = v_flex().id("rig-sidebar-root").size_full().bg(t.chrome).text_color(t.foreground)
       .on_mouse_down("left", () => this.focusHandle?.focus?.())
-      .on_key_down((e, cx) => this.handleTreeKeyDown(e, cx));
+      .on_key_down((e, cx) => {
+        if(folded){if(String(e?.key??"").toLowerCase()==="enter")this.showSidebarHere(cx);}
+        else this.handleTreeKeyDown(e,cx);
+      });
     if (this.focusHandle) root = root.track_focus(this.focusHandle);
     return root
-      .child(this.header(t))
-      .child(div().h(1).bg(t.border).mx(8))
-      .child(v_flex().id(this.priorityReveal ? `rig-list-reveal-${this.priorityReveal}` : "rig-list").flex_1().overflow_y_scrollbar().py(4)
-        .when(!!this.activeSpaceContext?.legacy && !shared("rig.spaceState")?.tabMigration?.[this.activeSpaceContext.id], el=>el.child(this.migrationCard(t)))
+      .child(folded?this.foldedHeader(t):this.header(t))
+      .child(div().h(folded?0:1).bg(t.border).mx(8))
+      .child(v_flex().id(listId).flex_1().overflow_y_scrollbar().py(4)
+        .when(folded,el=>el.h(0).min_h(0).flex_none().py(0))
+        .child(folded?div().h(this.listContentHeight??0).flex_none():v_flex().id("rig-list-content").flex_none()
+        .on_size_change((size,cx)=>{
+          const previous=this.pendingScrollClamp;this.pendingScrollClamp=null;
+          this.listContentHeight=size.height;
+          // Plain scroll areas expose no offset setter. A folded content shrink can strand the old offset.
+          if(Number.isFinite(previous)&&size.height<previous){this.listScrollVersion=(this.listScrollVersion??0)+1;cx.notify();}
+        })
+        .when(!!this.machineChoiceAvailable,el=>el.child(this.machineOfferCard(t)))
+        .when(this.migrationResultHere() || needsTabMigration(this.activeSpaceContext,this.config) && !migrationChoice(shared("rig.spaceState"),this.config,this.activeSpaceContext.id), el=>el.child(this.migrationCard(t)))
         .children((this.data?.topology ?? []).flatMap((rig) => {
           const status = shared("rig.spaceStatus")?.[rig.id];
           if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
@@ -2488,6 +2722,6 @@ export default class RigSidebar extends View {
             .when(!!status.recovery, (el) => el.child(div().id(`rebuild-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
               .on_click(() => this.reviewRigRebuild(rig, status)).child("Rebuild tiles…")))];
         }))
-        .children(state ? [state] : this.treeRows(t, cx)));
+        .children(state ? [state] : this.treeRows(t, cx))));
   }
 }

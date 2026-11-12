@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+## v0.4.1
+
+- Move OpenRig tabs handles each tab separately, reuses the destination Rig page, and names anything left behind. A restored TUI offers an explicit replacement.
+- OpenRig can put its spaces, pages and TUI on the machine where it runs, with a one-click choice.
+- The sidebar folds and returns reliably when you switch spaces, keeping your scroll position.
+- Attach keeps its normal terminal size while worker tiles on this computer are open. Tiles on a remote machine get the same fix in the next release.
+- Cleared health notes stay out of warnings. System → Health explains problems and keeps cleared history folded.
+- Rig and pod status counts use plain coloured text, leaving status marks on the seats and rig itself.
+- Dismiss updates directly from the sidebar, with Undo and Show dismissed.
+- Press Enter in the palette to open the top match.
+- Specs explains where to edit files, offers Copy & edit for built-ins, and names the machine for launch folders.
+- With OpenRig 0.7.12 or later, Worker view and Show in worker view turn on when herdr-app runs on the same machine as OpenRig; otherwise they say why.
+
 ## v0.4.0
 
 - **Security:** Safer handling of shell configuration and Attach relay files.
