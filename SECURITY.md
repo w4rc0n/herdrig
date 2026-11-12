@@ -8,10 +8,10 @@ Only the latest release line gets security fixes. Fixes ship as a new release; t
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.2.x   | :white_check_mark: |
-| < 0.2   | :x:                |
+| 0.4.x   | :white_check_mark: |
+| < 0.4   | :x:                |
 
-Versions before 0.1.3 have known, fixed vulnerabilities (see [Past security fixes](#past-security-fixes)). If you are on one, update first.
+Versions before 0.3.0 have known, fixed vulnerabilities (see [Past security fixes](#past-security-fixes)). If you are on one, update first.
 
 ## Reporting a vulnerability
 
@@ -57,12 +57,13 @@ Out of scope:
 
 - Vulnerabilities in OpenRig itself (the `rig` CLI or its daemon): report them to OpenRig
 - Vulnerabilities in Herdr (`herdr-app`, `hc`) or its mod system: report them to Herdr
-- Setups the README lists as unsupported, such as Herdr and OpenRig on different machines
+- Setups the README lists as unsupported
 - Attacks that need an attacker who already controls your user account
 
 ## Past security fixes
 
 | Version | Fix |
 | ------- | --- |
+| 0.3.0 | With another Herdr machine's space focused, local Attach, Operator or the TUI could start on that machine. They now refuse, and failed starts never open an unlabelled fallback tab. |
 | 0.1.3 | Copy & edit for a spec could read a file the OpenRig daemon named and send it to the daemon. It now copies only the spec text OpenRig served. |
 | 0.1.2 | Attach ran the daemon's attach command through a shell. Attach and Operator now start tmux directly and attach only to session names OpenRig makes. |
