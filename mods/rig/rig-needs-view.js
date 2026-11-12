@@ -2,7 +2,7 @@
 // (https://github.com/herdrdev/herdr-app), licensed under the Apache License, Version 2.0.
 // Modified for herdrig: OpenRig seats and asks instead of herdr agents; see Third-party code in README.md.
 // This file is licensed under the Apache License, Version 2.0 (LICENSES/herdr-app-Apache-2.0.txt).
-import { needsToastFor, diffNeedsNotifications, findAttachedSeat, statusMarkElement } from "./rig-lib.js";
+import { needsToastFor, diffNeedsNotifications, findAttachedSeat, statusMarkElement, isUpdateNeed, requestCardText, statusNeedHalo } from "./rig-lib.js";
 
 export const PRIORITY_GROUPS = [
   { rank: 4, label: "Needs you", tone: "blocked" }, { rank: 3, label: "Done", tone: "ansi4" },
@@ -51,15 +51,15 @@ export class NeedsTracker {
     }))));
     const bySession = new Map(rows.map((r) => [r.seat.session, r]));
     for (const ask of attention ?? []) {
-      if (!needsToastFor(ask) || ["done", "closed", "canceled"].includes(ask.state)) continue;
-      const session = ask.answer?.verb === "resolve" ? ask.destinationSession : ask.asker;
+      if (!ask?.id || isUpdateNeed(ask) || ["done", "closed", "denied", "canceled", "handed-off"].includes(ask.state)) continue;
+      const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
       const owner = bySession.get(session);
       if (owner && !excluded(owner.seat)) owner.asks.push(ask);
-      else rows.push({ key: `ask:${ask.id}`, kind: "ask", ask, name: ask.summary ?? ask.title ?? ask.id, helpers: [], asks: [ask] });
+      else rows.push({ key: `ask:${ask.id}`, kind: "ask", ask, name: requestCardText(ask).headline, helpers: [], asks: [ask] });
     }
     for (const row of rows) {
       if (row.kind === "ask") {
-        row.rank = 4; row.mark = "needs_input"; row.since = Date.parse(row.ask.at ?? row.ask.tsCreated ?? "") || now;
+        row.rank = 4; row.mark = "needs_input"; row.since = Date.parse((row.ask.criticalHealth ? row.ask.healthFinding?.startedAt : row.ask.at) ?? row.ask.tsCreated ?? "") || now;
         continue;
       }
       const s = row.seat;
@@ -115,14 +115,15 @@ export function diffPriorityNotifications(topology, attention, previous, options
 }
 
 /** Herdr's compact exclamation and pill; other statuses use round-six marks. */
-export function needsMark(ui, t, key, compact, iconOf) {
-  if (key !== "needs_input") return statusMarkElement(ui, t, key, { iconOf });
+export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
+  if (key !== "needs_input") return statusMarkElement(ui, t, key, { iconOf, pulse });
   const { div } = ui;
-  if (compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
+  if (compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center()
+    .when(pulse?.kind==="need",e=>e.relative().child(statusNeedHalo(ui,t,pulse))).child("!");
   return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
 }
 
-export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, now = Date.now() }) {
+export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, now = Date.now() }) {
   const { div, svg, h_flex } = ui;
   const out = [];
   const many = rows.filter((r) => r.kind === "seat").length > 12;
@@ -134,7 +135,7 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
     out.push(h_flex().id(key).px(16).h(30).pt(8).gap(6).items_center().text_size(11).font_medium().cursor_pointer()
       .on_click((_e, cx) => fold(key, !expanded, cx))
       .child(div().text_color(t[group.tone] ?? t.dim).child(group.label))
-      .child(div().text_color(t.dim).child(String(members.length)))
+      .child(div().id(`priority-count-${group.rank}`).text_color(t.dim).child(String(group.rank === 4 && requestCount !== null ? requestCount : members.length)))
       .child(div().flex_1()).child(svg(iconOf(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim)));
     if (!expanded) continue;
     for (const row of members) {
@@ -144,17 +145,17 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
         .when(row.focused || selected === row.key, (el) => el.bg(t.selected ?? t.selection ?? t.raised))
         .hover((el) => el.bg(t.hover))
         .on_hover((on, cx) => hover(on ? row.key : null, cx))
-        .on_click(() => open(row)).on_mouse_down("right", () => menu(row))
+        .on_click((event,cx) => open(row,event,cx)).on_mouse_down("right", () => menu(row))
         .child(svg(iconOf(row.kind === "ask" ? "rig-bell" : row.seat.terminal ? "rig-terminal-prompt" : "rig-seat")).size(13).flex_none().text_color(t.muted))
         .child(h_flex().flex_1().min_w(0).gap(4).text_size(12.5)
           .child(div().min_w(0).max_w(130).truncate().text_color(row.rank === 1 ? t.muted : t.foreground).child(row.name))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`· ${row.rig?.name ?? "no seat"}`)))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`· ${row.ask?.criticalHealth ? "health" : row.rig?.name ?? "no seat"}`)))
         .when(row.helpers.length > 0, (el) => el.child(div().id(`priority-fold-${row.key}`).px(3).h(18).text_color(t.dim)
           .on_click((_e, cx) => { cx.stop_propagation(); fold(helperKey, !helpersOpen, cx); })
           .child(svg(iconOf(helpersOpen ? "chevron-down" : "chevron-right")).size(11))
           .when(!helpersOpen, (el) => el.child(div().text_size(11).child(String(row.helpers.length))))))
         .when(hovered !== row.key, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(priorityDuration(now - row.since))))
-        .child(needsMark(ui, t, row.mark, true, iconOf)));
+        .child(mark?mark(row):needsMark(ui, t, row.mark, true, iconOf)));
       if (helpersOpen) for (const [i, child] of row.helpers.entries()) {
         const childKey = `priority-helper:${child.address}`;
         register({ key: childKey, expandable: false, parentKey: row.key, helper: child });

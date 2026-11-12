@@ -52,17 +52,18 @@ function localServerArgs(openrigHome, { uid = process.getuid?.() } = {}) {
   if (typeof uid !== "number") return [];
   const dir = path.join(path.dirname(openrigHome), `tmux-${uid}`);
   const sock = path.join(dir, "default");
+  let fd;
   try {
-    const st = fs.lstatSync(dir);
+    fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    const st = fs.fstatSync(fd);
     if (!st.isDirectory() || st.uid !== uid) return [];
+    if ((st.mode & 0o077) !== 0) fs.fchmodSync(fd, 0o700);
     const ss = fs.lstatSync(sock);
     if (!ss.isSocket() || ss.uid !== uid) return [];
-    if ((st.mode & 0o077) !== 0) {
-      const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-      try { fs.fchmodSync(fd, 0o700); } finally { fs.closeSync(fd); }
-    }
   } catch (_) {
     return [];
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
   return SOCKET_PATH_RE.test(sock) ? ["-S", sock] : [];
 }

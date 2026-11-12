@@ -11,6 +11,7 @@ import { appHome, readTextFile, theme, run, exec, shared, setShared, openOverlay
 import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
 
 /** The palette's own commands, offered first when they match what is typed. */
+import { registerRigRouting } from "./rig-lib.js";
 export { LOCAL_COMMANDS };
 const OWN = LOCAL_COMMANDS;
 
@@ -18,6 +19,7 @@ const STACK = "rig-work", PAGE = "rig-page";
 
 export default class RigPalette extends View {
   init(_p, cx) {
+    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
     this.input = InputState.new({ placeholder: "agent dev.design · :scopes · tab graph · /codex" });
     // An opener can start it with text (the Rig page's Filter… starts it at "/").
     if (typeof props()?.initial === "string") this.input.set_value(props().initial);
@@ -65,8 +67,8 @@ export default class RigPalette extends View {
       names.push({ line: `rig ${rig.name}`, hint: "Rig card" });
       for (const pod of rig.pods) for (const s of pod.seats) names.push({ line: `agent ${s.logicalId}`, hint: `Seat card · ${rig.name}` });
     }
-    const verbs = this.registry.filter((e) => !q || e.name.startsWith(verb) || e.aliases.some((a) => a.startsWith(verb)))
-      .map((e) => ({ line: e.sample || `${e.name} ${e.args}`.trim(), hint: e.description, verb: e.name, args: e.args ?? "" }));
+    const verbs = this.registry.filter((e) => !q || e.name.startsWith(verb) || e.aliases.some((a) => a.startsWith(verb)) || e.name === "attention" && ["need", "needs"].some(a => a.startsWith(verb)))
+      .map((e) => ({ line: e.sample || `${e.name} ${e.args}`.trim(), label: e.name === "attention" ? "Needs: requests and updates for you" : null, hint: e.name === "attention" ? "" : e.description, verb: e.name, args: e.args ?? "" }));
     const live = q ? names.filter((n) => n.line.toLowerCase().includes(q)) : [];
     const designReason = capabilityDisableReason("design-view", this.caps());
     const ownRows = OWN.map((o) => o.line === "view-design" && designReason ? { ...o, hint: designReason } : o);
@@ -103,16 +105,14 @@ export default class RigPalette extends View {
     }
     // The TUI's refresh re-reads its own view; here the sidebar re-reads (the page follows it).
     if (verb === "refresh" && !arg) { run("rig.refresh"); this.dismiss(); return true; }
+    if (verb === "show-sidebar-here" && !arg) { run("rig.show-sidebar-here"); this.dismiss(); return true; }
     if ((verb === "open-page" || verb === ":open-page") && !arg) {
       const entry = shared("rig.sel")?.entry ?? shared("rig.nav")?.stack?.at(-1) ?? { section: "topology" };
-      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, entry);
-      this.dismiss();
+      this.finishPage(openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, entry));
       return true;
     }
     if ((verb === "tui" || verb === "open-tui" || verb === ":open-tui") && !arg) {
-      // The Rig sidebar opens it (`rig.tui`): closing this palette would end a task of its own mid-way.
-      if (layoutHasMod(layout(), MOD_IDS.sidebar)) { run("rig.tui"); this.dismiss(); return true; }
-      // Without the sidebar, this palette's own task does it, with that task's cx, and closes the palette after.
+      // Wait for the sidebar's receipt, or complete the labelled local open here, before closing this palette.
       const inRigLayout = !!(function find(n) { return n && typeof n === "object" && (n.id === STACK || (n.children ?? []).some(find)); })(layout());
       const config = this.config ?? parseConfig(null);
       this.busy = true; cx.notify();
@@ -127,14 +127,12 @@ export default class RigPalette extends View {
     }
     if ((verb === "expand-all" || verb === ":expand-all") && !arg) {
       setShared("rig.open.page", expandAllTopology(shared("rig.open.page"), shared("rig.data")?.topology ?? []));
-      openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" });
-      this.dismiss();
+      this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" }));
       return true;
     }
     if ((verb === "collapse-all" || verb === ":collapse-all") && !arg) {
       setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), shared("rig.data")?.topology ?? []));
-      openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" });
-      this.dismiss();
+      this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" }));
       return true;
     }
     if (verb === "view-design" || verb === "design-view") return this.design(cx, arg ?? null);
@@ -253,7 +251,7 @@ export default class RigPalette extends View {
       const route = paletteRoute({ ...res, line }, top, shared("rig.data")?.topology ?? []);
       if (route.error) { this.error = route.error; cx.notify(); return; }
       if (route.note) { this.note = route.note; cx.notify(); return; }
-      if (route.back) { setShared("rig.nav", navBack(nav)); this.dismiss(); return; }
+      if (route.back) { setShared("rig.nav", navBack(nav)); this.finishPage(openOrFocusRigTab({run,spaces,panes,layout})); return; }
       if (route.act) { await this.act(cx, route, top); return; }
       this.applyRoute(route);
     });
@@ -267,8 +265,7 @@ export default class RigPalette extends View {
       setShared("rig.project", route.project);
       const prior = (shared("rig.nav")?.stack ?? []).filter((e) => e?.section !== "scopes");
       setShared("rig.nav", { stack: [...prior, route.entry] });
-      openOrFocusRigTab({ run, spaces, panes, layout, section: "scopes" });
-      this.dismiss();
+      this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: "scopes" }));
       return;
     }
     this.show(route.entry);
@@ -277,8 +274,12 @@ export default class RigPalette extends View {
   /** Shows a page entry on the Rig page and closes the palette. */
   show(entry) {
     setShared("rig.nav", navPush(shared("rig.nav"), entry));
-    openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology" });
-    this.dismiss();
+    this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology" }));
+  }
+
+  finishPage(result) {
+    Promise.resolve(result).catch(error=>notify({title:"OpenRig",body:String(error?.message??error),level:"warning"}))
+      .finally(()=>this.dismiss());
   }
 
   openOperator(cx) {
@@ -289,11 +290,6 @@ export default class RigPalette extends View {
       this.error = REMOTE_OPERATOR_REASON;
       this.note = null;
       cx.notify();
-      return true;
-    }
-    if (layoutHasMod(layout(), MOD_IDS.sidebar)) {
-      run("rig.operator");
-      this.dismiss();
       return true;
     }
     const topo = shared("rig.data")?.topology ?? [];
@@ -311,7 +307,7 @@ export default class RigPalette extends View {
     this.busy = true; cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals: () => terminals?.() ?? [], layout, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.palette) }, target, { ...config, daemonUrl }, { name: "Operator" });
+        const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals: () => terminals?.() ?? [], layout, shared, setShared, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.palette) }, target, { ...config, daemonUrl }, { name: "Operator", operator: true });
         if (res && res.ok === false && res.reason) notify({ title: "Open operator", body: res.reason, level: "warning" });
       } finally {
         this.dismiss();
@@ -401,7 +397,7 @@ export default class RigPalette extends View {
         setShared("rig.drafts", { ...(shared("rig.drafts") ?? {}), [draftKey(target, "reply")]: route.text });
         setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [`needs:${target.id}`]: true });
         setShared("rig.replyFocus", { id: target.id, at: Date.now() });
-        if (top.section === "needs" && (top.id === target.id || !top.id)) { openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" }); return this.dismiss(); }
+        if (top.section === "needs" && (top.id === target.id || !top.id)) { return this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" })); }
         return this.show({ section: "needs", id: target.id, name: target.summary });
       }
       if (route.act === "launch") {
@@ -454,8 +450,11 @@ export default class RigPalette extends View {
       .when(!this.error && !!this.note, (el) => el.child(div().px(6).text_size(12).text_color(t.muted).child(this.note)))
       .child(v_flex().id("rig-palette-rows").flex_1().overflow_y_scrollbar().children(rows.map((r, i) => h_flex().id(`row-${i}`).px(6).h(24).gap(10).items_center()
         .rounded(5).when(i === this.selected, (el) => el.bg(t.selected).text_color(t.foreground)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.selected = i; this.choose(cx); })
-        .child(div().w(200).truncate().text_size(12.5).child(r.line))
+        .child(div().w(r.label ? 280 : 200).truncate().text_size(12.5).tooltip(r.label ?? r.line).child(r.label ?? r.line))
         .child(div().flex_1().truncate().text_size(11.5).text_color(t.dim).child(r.hint ?? "")))))
+      .when(!rows.length && !!this.input.value().trim(), el => el.child(v_flex().id("palette-no-matches").px(6).gap(4)
+        .child(div().text_size(12).child(`No matches for “${this.input.value().trim()}”.`))
+        .child(div().text_size(11.5).text_color(t.dim).child("Searches commands, rigs, seats and specs."))))
       .child(div().px(6).text_size(11).text_color(t.dim).child(":topology  :specs  :scopes  :terminals  :needs  :system"));
   }
 }

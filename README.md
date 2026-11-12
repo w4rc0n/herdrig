@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.3.0
+Version: v0.4.0
 
 **OpenRig Mod for Herdr**
 
@@ -9,20 +9,33 @@ Version: v0.3.0
 ![Herdrig](preview.png)
 
 Herdrig puts [OpenRig](https://github.com/mvschwarz/openrig) inside the `herdr` window: your rigs, their seats and the
-decisions waiting for you, in a sidebar beside your own tabs. Every row opens a full page in its own tab, and you can
+decisions waiting for you, in a sidebar beside your own tabs. Select a row, then double-click or press Enter to open its page, and you can
 act from there (answer a request, message a seat, attach to it) without leaving Herdr.
 
 ## Features
 
+- **Seat now lines:** visible screen narration and tool status beside rig rows, with selectable cleaned lines on
+  hover and on the seat page. Drafts, incoming messages and terminal seats are excluded; ambiguous input stays blank.
+- **Calm status marks:** working dots stay visible without continuous animation; a seat starting work or a new
+  request gets one brief pulse. Action spinners still show work in progress.
+
+- **Archive and Restore:** hide a rig reversibly from its menu, then restore it stopped from Topology's Archived list.
+- **Plain seat activity:** readable status and context, with copyable raw details in **How OpenRig knows**.
 - **Sidebar tree** with six branches: **Topology** (host, rig, pod, seat, helper), **Specs**, **Scopes**,
   **Terminals**, **Needs** and **System**, each seat with its status and context usage.
 - **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
   OpenRig reports.
+- **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs show pod and seat
+  routes, hover/keyboard selection and native handoff motion. Dense edges group by pod; the text Edges list stays
+  available. Saved previews come from your connected OpenRig server, including a host-to-box tunnel.
 - **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
   questions, or reply in your own words), with quiet hours and modes in **System → People**.
 - **Command palette** on `ctrl-alt-r`.
 - **Right-click menus** on seats (send, queue, pause or resume, change model), Needs requests, specs and slices.
 - **Attach** opens a live seat in its own tab, and Herdr's **Agents** section shows its status.
+- **Follows your space:** the sidebar folds outside OpenRig's spaces, keeping Needs you and search visible. Click its
+  header to expand until you change spaces. Pages go to their rig's existing space or the **OpenRig** home, which
+  also holds the local TUI. Personal spaces stay free of new Rig tabs. Existing tabs offer **Move** or **Keep here**.
 - **Works with or without OpenRig running:** when OpenRig is missing, stopped or unhealthy, the sidebar says so in
   plain words, with the fix (for example **Start OpenRig**). Controls your OpenRig version doesn't support are greyed
   out, each with its reason.

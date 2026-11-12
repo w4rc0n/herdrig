@@ -18,6 +18,23 @@ export function seatActivityDetails(node, now = Date.now()) {
   };
 }
 
+/** Plain presentation of the public activity fields; raw evidence remains available separately. */
+export function seatActivityWords(node, now = Date.now()) {
+  const a = node?.agentActivity ?? {}, s = node?.activityState ?? {};
+  const state = String(s.display ?? s.activity ?? a.state ?? "unknown").replace(/_/g, " ");
+  const label = /needs.?input|attention/.test(state) ? "Needs you" : state === "working" || state === "running" ? "Working"
+    : state === "idle" ? "Idle" : state === "blocked" ? "Blocked" : state === "done" ? "Done" : "Not reported";
+  const source = a.evidenceSource === "runtime_hook" ? "seen from the runtime's own hooks"
+    : a.evidenceSource === "window-sampling" ? "seen from the terminal screen" : "";
+  const stamp = Date.parse(a.eventAt ?? node?.lastActivityAt ?? "");
+  const age = Number.isFinite(stamp) ? Math.max(0, Math.floor((now - stamp) / 60000)) : null;
+  const ago = age === null ? "" : age < 1 ? "less than a minute ago" : age < 60 ? `${age} min ago` : `${Math.floor(age / 60)} h ago`;
+  return { line: `${label}${source ? ` · ${source}` : ""}`, changed: Number.isFinite(stamp)
+    ? `Changed ${new Date(stamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${ago}` : "",
+    note: a.reason === "generation_unverifiable" ? "OpenRig couldn't confirm the latest turn" : "",
+    stale: a.stale === true && ago ? `Last confirmed ${ago}` : "" };
+}
+
 export function seatQueuePaths(session) {
   const base = `/api/queue/list?destinationSession=${encodeURIComponent(session)}`;
   return { open: `${base}&state=pending,in-progress,blocked&limit=100`,

@@ -1,8 +1,8 @@
-import { needTarget, missionAction, isUpdateNeed } from "./rig-lib.js";
+import { needTarget, missionAction, isUpdateNeed, isHealthAttention, filterAttentionHealth } from "./rig-lib.js";
 
 export const UNDO_MS = 10000;
 const RETAIN_MS = 30 * 86400000;
-export const dismissible = (item) => !!item?.id && isUpdateNeed(item) && !item.native
+export const dismissible = (item) => !!item?.id && !isHealthAttention(item) && isUpdateNeed(item) && !item.native
   && !item.answer?.verb && !["answer", "resolve", "native"].includes(item.reply);
 export const updateKey = (item) => JSON.stringify([item.id, needTarget(item).summary]);
 export const dismissalScope = (config) => JSON.stringify([config?.daemonUrl ?? "", config?.person ?? ""]);
@@ -45,7 +45,7 @@ export class DismissedUpdates {
   constructor(saved = {}, now = Date.now()) {
     this.show = saved.show === true;
     this.records = (Array.isArray(saved.records) ? saved.records : []).filter((r) =>
-      r && dismissible(r.item) && typeof r.key === "string" && r.key === updateKey(r.item)
+      r && (dismissible(r.item) || isHealthAttention(r.item)) && typeof r.key === "string" && r.key === updateKey(r.item)
       && Number.isFinite(r.at) && (!r.missingSince || now - r.missingSince < RETAIN_MS))
       .map((r) => ({ ...r, status: r.status === "sending" ? "local" : r.status,
         note: r.status === "sending" ? "Hidden here; the previous close was not confirmed. Check OpenRig before retrying." : r.note }));
@@ -88,15 +88,15 @@ export class DismissedUpdates {
   }
   restore(key) { const r = this.records.find((v) => v.key === key); if (r && r.status !== "sending") r.restored = true; }
   visible(items) {
-    return items.filter((i) => !dismissible(i) || !this.records.some((r) => r.key === updateKey(i) && !r.restored))
-      .concat(this.records.filter((r) => r.restored && !items.some((i) => updateKey(i) === r.key)).map((r) => r.item));
+    return filterAttentionHealth(items.filter((i) => !dismissible(i) || !this.records.some((r) => r.key === updateKey(i) && !r.restored))
+      .concat(this.records.filter((r) => r.restored && !items.some((i) => updateKey(i) === r.key)).map((r) => r.item)));
   }
-  hidden() { return this.records.filter((r) => !r.restored).sort((a, b) => b.at - a.at); }
-  receiptRows(now = Date.now()) { return this.receipts.filter((r) => now - r.at < UNDO_MS); }
+  hidden() { return this.records.filter((r) => !r.restored && !isHealthAttention(r.item)).sort((a, b) => b.at - a.at); }
+  receiptRows(now = Date.now()) { return this.receipts.filter((r) => now - r.at < UNDO_MS && r.keys.some(key => this.records.some(v => v.key === key && !isHealthAttention(v.item)))); }
   leave() { this.receipts = []; }
   async flush(commit, persist, now = Date.now()) {
     for (const r of this.records) {
-      if (r.status !== "pending" || r.restored || r.due > now) continue;
+      if (isHealthAttention(r.item) || r.status !== "pending" || r.restored || r.due > now) continue;
       // Persist before sending. A restart after an uncertain response never resends a close automatically.
       r.status = "sending"; await persist();
       let result;

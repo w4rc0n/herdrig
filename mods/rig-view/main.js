@@ -10,7 +10,8 @@
 // Needs-You: a request row expands in place to the request's words and a reply box (Answer or
 // Resolve, Ctrl+Enter); the item page shows the same. Drafts are rig-menu's (`shared("rig.drafts")`, draftKey).
 import { View, div, svg } from "gpui-kit";
-import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea } from "gpui-base";
+import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
+import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
 import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window, notify } from "herdr";
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
   configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
@@ -18,14 +19,19 @@ import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage,
+  rowStatusGlyph, formatHonestCount, attachToSeat, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, needsRequestCount,
   tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath, waitWith,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, isValidSessionName, newRigOverlay } from "./rig-lib.js";
-import { seatActivityDetails, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
+import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
+import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { dismissible, dismissalSnapshot, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { HERDRIG_VERSION } from "./rig-version.js";
-import { workerCapabilityText } from "./rig-lib.js";
+import { registerRigRouting, workerCapabilityText } from "./rig-lib.js";
+import { NowTailCache, nowTailPresentation } from "./rig-now.js";
+import { RigGraph } from "./rig-graph.js";
+import { normalizeRunningGraph } from "./rig-graph-state.js";
+import { readRigSpecPreview, groupSpecLibrary } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -96,11 +102,16 @@ const inRigLayout = () => !!(function find(n) {
 })(layout());
 const usd = (v) => typeof v === "number" ? `$${v.toFixed(2)}` : "—";
 
+import {rigSpecLibraryPath} from "./rig-lib.js";
+import {StatusMotion} from "./rig-status-motion.js";
 export default class RigView extends View {
   init(p, cx) {
+    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
+    this.statusMotion = new StatusMotion();
     this.pulseFilter = null; // Page-session only: never restore the legacy persisted shared filter.
     this.initialEntry = p?.entry ?? null;
     this.config = null;
+    this.resetNowTails(cx);
     this.cache = {}; // path → { data, error, at }
     this.files = {}; // file path → { state, error, text }
     this.present = {}; // file path → true | false (on disk)
@@ -149,7 +160,7 @@ export default class RigView extends View {
   }
 
   /** herdr's teardown: the watch loop ends with this copy; a reply typed and not sent stays as a draft. */
-  async close() { this.closed = true; this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); }
+  async close() { this.closed = true; this.statusMotion.close(); this.nowTails?.close(); for(const graph of this.graphs?.values()??[])graph.reset(); this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); }
 
   updateAction(action, value) { requestDismissal({ shared, setShared, run, scope: dismissalScope(this.config) }, action, value); }
   updateModel() {
@@ -203,7 +214,7 @@ export default class RigView extends View {
     cx.spawn(async (cx) => {
       const next = preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())), this.config);
       if (sameConfig(next, this.config)) return;
-      if (this.config && next.daemonUrl !== this.config.daemonUrl) this.cache = {};
+      if (this.config && next.daemonUrl !== this.config.daemonUrl) { this.cache = {}; this.resetNowTails(cx); }
       this.config = next;
       // The spec editor's folders, from local facts only (never the daemon's list).
       this.specRoots = await localSpecRoots(next, exec, home());
@@ -238,7 +249,10 @@ export default class RigView extends View {
 
   /** Topology · Specs · Scopes · Terminals · Needs · System, in the TUI's order; Needs shows its open count in red. */
   sectionBar(t, entry) {
-    const needs = shared("rig.data")?.attention ?? 0;
+    const data = shared("rig.data") ?? {};
+    const ownRigs = this.cache?.["/api/rigs/summary"]?.data;
+    const topology = data.topology ?? (Array.isArray(ownRigs) ? ownRigs.map(r => rigModel(r, this.cache?.[`/api/rigs/${r.id}/nodes`]?.data)) : []);
+    const needs = needsRequestCount(topology, data.attentionItems ?? this.cache?.["/api/attention"]?.data?.items ?? []);
     return h_flex().id("rig-sections").px(14).h(36).items_center().border_b(1).border_color(t.border).flex_none()
       .child(h_flex().rounded(6).border_1().border_color(t.border).items_center().children(RIG_SECTIONS.map((sec, i) => {
         const active = entry.section === sec;
@@ -318,7 +332,12 @@ export default class RigView extends View {
         cx.notify();
       });
     }
-    return this.cache[path] ?? { loading: true };
+    const result = this.cache[path] ?? { loading: true };
+    if (path.startsWith("/api/attention") && result.data?.items) {
+      const health = this.read(cx, "/api/health");
+      return { ...result, data: { ...result.data, items: filterAttentionHealth(result.data.items, health.error ? [] : health.data?.records ?? []) } };
+    }
+    return result;
   }
 
   /** Whether a file is on disk (read once; a file card lists only those that are). */
@@ -385,8 +404,8 @@ export default class RigView extends View {
       .child(label);
   }
   /** A status mark (`statusMark`: a seat's status, or a tone for counts and a rig): the same marks the sidebar draws. */
-  dot(t, key, cell = 14) {
-    return statusMarkElement({ div, svg }, t, key, { cell, iconOf: icon });
+  dot(t, key, cell = 14, identity = null, needs = []) {
+    return statusMarkElement({ div, svg }, t, key, { cell, iconOf: icon, pulse: this.statusMotion?.observe(identity,key,needs) });
   }
   /** A plain coloured dot, for what isn't a seat status (a Needs-You item's tier). */
   plainDot(t, tone) {
@@ -400,7 +419,7 @@ export default class RigView extends View {
   kv(t, rows) {
     const group = this.textSeq = (this.textSeq ?? 0) + 1;
     const exact = (key, value) => value != null && !["", "—", "not a file on disk"].includes(String(value))
-      && ["session", "attach:", "queue item", "target", "rig id", "request id", "slice", "mission", "view", "terminal", "address", "sender", "recipient", "cwd", "file", "path"].includes(String(key).toLowerCase());
+      && ["session", "attach:", "attach command", "queue item", "target", "rig id", "request id", "slice", "mission", "view", "terminal", "address", "sender", "recipient", "cwd", "file", "path"].includes(String(key).toLowerCase());
     return v_flex().gap(4).children(rows.filter(Boolean).map(([k, v, mono], i) => h_flex().gap(10).items_start()
       .child(div().w(120).flex_none().text_size(12).text_color(t.dim).child(k))
       .child(div().flex_1().min_w(0).when(!!mono, (el) => el.font_family(settings().font_family))
@@ -604,6 +623,7 @@ export default class RigView extends View {
   hostCard(t, cx, entry) {
     const hostId = entry.host ?? entry.name ?? "local";
     const summary = this.read(cx, "/api/rigs/summary");
+    const archived = this.read(cx, "/api/rigs/summary?archived=only");
     const hostsRes = this.read(cx, "/api/hosts");
     const wait = this.status(t, cx, "/api/rigs/summary", summary);
     if (wait) return wait;
@@ -637,7 +657,12 @@ export default class RigView extends View {
           onClick: () => push({ section: "topology", kind: "rig", rigId: rig.id, name: rig.name }),
         })),
         `No rigs on host ${hostId}.`,
-      )]));
+      )]))
+      .children(archivedElements({ div, svg, h_flex }, t, withArchivedHosts(archived.data, id => this.read(cx, `/api/rigs/${encodeURIComponent(id)}/nodes`).data), { host: hostId, icon, open: Boolean(this.archivedOpen?.[hostId]),
+        toggle: (_e, cx) => { (this.archivedOpen ??= {})[hostId] = !this.archivedOpen?.[hostId]; cx.notify(); },
+        restore: r => oneClick({ kind: "rig", rig: r.name, rigId: r.id, archived: true, lifecycle: "stopped" }, "unarchive-rig"),
+        menu: r => menu({ kind: "rig", rig: r.name, rigId: r.id, archived: true, lifecycle: "stopped" }),
+      }));
   }
 
   /** Pod inspection page (`Topology › <rig> › pod <name>`). */
@@ -747,8 +772,74 @@ export default class RigView extends View {
       ? { ...got, data: nodes } : got;
   }
 
+  // ---- visible screen narration: public transcript tails, never runtime/harness files -----------------------------
+  resetNowTails(cx) {
+    this.nowTails?.close(); this.nowDue = true; this.nowWidths = Object.create(null); this.nowSignature = null;
+    this.nowTails = new NowTailCache(async seat => {
+      const origin = await this.resolveDaemonUrl();
+      if (!origin) return { ok: false, error: "OpenRig daemon is unavailable." };
+      const response = await fetch(`${origin}/api/transcripts/${encodeURIComponent(seat.session)}/tail?lines=40`);
+      const data = await response.json(); return { ok: response.ok, status: response.status, data };
+    }, () => { if (!this.closed) cx.notify(); });
+  }
+  refreshNowTails(cx) {
+    if (!this.nowTails || this.closed || !this.config || this.config.missing) return;
+    const seats = [...(this.nowSeats?.values() ?? [])], signature = seats.map(s => `${s.session}:${s.open ? "open" : s.status}`).join("|");
+    if (!this.nowDue && signature === this.nowSignature) return;
+    this.nowDue = false; this.nowSignature = signature;
+    // This is called only by native render, not by a poll callback. The current page has no virtual-range API:
+    // use the approved expanded-rig/pod fallback, bounded by NowTailCache to 12 seats and four requests.
+    cx.spawn(async () => { this.nowTails?.refresh(seats); });
+  }
+  nowLines(t, state, key) {
+    return v_flex().max_h(240).overflow_y_scrollbar().p(8).gap(3).rounded(6).bg(t.raised)
+      .children(state.lines.map((line, i) => this.plain(t, line, `now-lines-${key}-${i}`).font_family("Geist Mono").text_size(11.5)));
+  }
+  nowTranscript(seat) {
+    const file = transcriptPath(this.config, seat.rig, seat.session);
+    return file ? () => push(fileEntry(file, `${seat.logicalId ?? seat.session} transcript`)) : null;
+  }
+  nowRow(t, seat, openSeat) {
+    const state = nowTailPresentation(this.nowTails?.records.get(seat.session));
+    const openTranscript = this.nowTranscript(seat);
+    const line = h_flex().w_full().h(20).min_w(0).gap(4).items_center().overflow_hidden().text_size(12)
+      .when(state.stale, el => el.child(div().flex_none().text_color(t.dim).child(state.prefix)));
+    const rowText = seat.word === "working" || seat.status === "active" || seat.status === "working"
+      ? state.line.replace(/^Working\s*/, "") : state.line;
+    const working = state.working && !state.stale ? state.line.split(" · ")[0] : "";
+    const rowWorking = working ? rowText.split(" · ")[0] : "";
+    if (rowWorking) line.child(div().flex_none().text_color(t.ansi2 ?? t.working).child(rowWorking));
+    line.child(div().flex_1().min_w(0).truncate().text_color(state.stale ? t.dim : t.muted).child(rowWorking ? rowText.slice(rowWorking.length) : rowText));
+    const link = (id, label, act) => div().id(id).text_size(12).text_color(act ? t.accent : t.dim)
+      .when(!!act, el => el.cursor_pointer()).on_click((_e, cx) => { cx.stop_propagation(); act?.(); }).child(label);
+    const hover = v_flex().w(420).p(12).gap(8).rounded(8).bg(t.background).border_1().border_color(t.border)
+      .child(div().text_size(12).text_color(t.muted).child(`${seat.logicalId} · ${state.state} · as of ${state.asOf}`))
+      .child(div().text_size(12).text_color(state.stale ? t.dim : t.foreground).child(`${state.prefix}${state.line}`))
+      .child(this.nowLines(t, state, `hover-${seat.session}`))
+      .child(h_flex().gap(12).child(link(`now-seat-${seat.session}`, "Open seat", openSeat))
+        .child(link(`now-transcript-${seat.session}`, "Open transcript", openTranscript)));
+    return div().id(`seat-now-${seat.session}`).flex_1().min_w(0)
+      .on_size_change((size, cx) => {
+        const visible = size.width >= 160;
+        if (this.nowWidths?.[seat.session] !== visible) { (this.nowWidths ??= Object.create(null))[seat.session] = visible; cx.notify(); }
+      })
+      .when(Boolean(state.line) && this.nowWidths?.[seat.session] !== false, el => el.child(HoverCard.new(`now-hover-${seat.session}`).open_delay(600).trigger(line).content(hover)));
+  }
+  nowBlock(t, seat, openTranscript) {
+    const state = nowTailPresentation(this.nowTails?.records.get(seat.session));
+    return this.card(t, "Now", [
+      h_flex().w_full().gap(8).items_center().child(div().flex_1().min_w(0)
+        .child(this.plain(t, `as of ${state.asOf} · ${state.state}${state.stale || state.state === "withheld" ? ` · ${state.reason}` : ""}`, "seat-now-state").text_size(11.5).text_color(t.muted)))
+        .child(div().flex_none().id("seat-now-open-transcript").text_size(12).text_color(t.accent).cursor_pointer().on_click(openTranscript).child("Open transcript")),
+      div().id("seat-now-summary").text_size(12.5).text_color(state.stale ? t.dim : t.foreground)
+        .child(state.line ? `${state.prefix}${state.line}` : "No recent screen text from OpenRig."),
+      ...(state.lines.length ? [this.nowLines(t, state, `page-${seat.session}`)] : []),
+    ]);
+  }
+
   invalidateLiveReads() {
-    markStale(this.cache, (path) => path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
+    this.nowDue = true;
+    markStale(this.cache, (path) => path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
   }
 
   /** One rig as a block: header with status counts, action bar, health banner, Edges, then pods as lines of seat chips.
@@ -863,45 +954,21 @@ export default class RigView extends View {
         } else if (activeRigTab === "graph") {
           const graphPath = `/api/rigs/${encodeURIComponent(rig.id)}/graph`;
           const graphGot = this.read(cx, graphPath);
-          const graphEdges = graphGot.data?.edges ?? [];
-          const podsByName = new Map();
-          for (const s of model.seats) {
-            const pName = s.pod ?? "default";
-            const list = podsByName.get(pName) ?? [];
-            list.push(s);
-            podsByName.set(pName, list);
-          }
-          const podLanes = [...podsByName.entries()].map(([pName, pSeats]) =>
-            v_flex().id(`rig-graph-pod-${rig.id}-${pName}`).p(8).gap(6).rounded(6).bg(t.raised).border_1().border_color(t.border)
-              .child(h_flex().gap(6).items_center()
-                .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(`pod ${pName}`))
-                .child(div().text_size(11).text_color(t.dim).child(`(${pSeats.length})`)))
-              .children(pSeats.map((s) => {
-                return h_flex().id(`rig-graph-node-${rig.id}-${s.logicalId}`).px(8).h(26).gap(6).items_center().rounded(5).bg(t.background).border_1().border_color(t.border).cursor_pointer().hover((st) => st.bg(t.hover))
-                  .on_click(() => push({ section: "topology", kind: "seat", rig: rig.name, rigId: rig.id, name: s.logicalId }))
-                  .child(this.dot(t, s.status))
-                  .child(div().text_size(12).font_semibold().text_color(t.foreground).child(s.logicalId))
-                  .child(div().px(4).h(16).rounded(3).bg(t.raised).items_center().text_size(10.5).text_color(t.dim).child(s.runtime ?? "seat"));
-              })),
-          );
-          const edgeRows = graphEdges.length
-            ? graphEdges.map((e, i) => {
-                const src = e.source ?? e.from ?? "?";
-                const dst = e.target ?? e.to ?? "?";
-                const kind = String(e.data?.kind ?? e.label ?? e.kind ?? "edge");
-                return h_flex().id(`rig-graph-edge-${rig.id}-${i}`).gap(6).items_center().px(4).text_size(12)
-                  .child(this.copyValue(t, `${src} ──${kind}──▸ ${dst}`, `graph-edge-${rig.id}-${i}`, "edge"));
-              })
-            : [this.dim(t, "No directed topology edges.")];
-          body.push(v_flex().id(`rig-graph-${rig.id}`).child(this.card(t, "Topology Graph", [
-            h_flex().gap(8).flex_wrap().items_start().children(podLanes.length ? podLanes : [this.dim(t, "No pods in this rig.")]),
-            v_flex().gap(2).pt(4).border_t(1).border_color(t.border).children(edgeRows),
-          ])));
+          const graphView=this.graphFor(`running:${rig.id}`);
+          this.wideGraph=true;
+          if(graphGot.data&&graphView.publicData!==graphGot.data){graphView.projection=normalizeRunningGraph(graphGot.data,model.seats);graphView.publicData=graphGot.data;}
+          if(graphGot.data)body.push(graphView.render(t,cx,graphView.projection,{
+            id:`rig-graph-${rig.id}`,assets:ASSETS,running:true,
+            events:shared("rig.graphActivity")?.origin===this.config?.daemonUrl?shared("rig.graphActivity").events:[],
+            open:s=>push({section:"topology",kind:"seat",rig:rig.name,rigId:rig.id,name:s.lid}),
+            menu:s=>menu({...s.node,kind:"seat",session:s.session,rig:rig.name,rigId:rig.id,logicalId:s.lid}),
+          }));
+          else body.push(this.status(t,cx,graphPath,graphGot)??this.skeleton(t));
         }
       }
       body.push(this.rigHealthEdges(t, cx, rig, { entry, rigCount, open }));
       if (nodes.data === undefined) body.push(this.status(t, cx, nodesPath, nodes));
-      else body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter) }));
+      else if(!(here&&entry.tab==="graph"))body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter) }));
     }
     return v_flex().id(`rig-block-${rig.id}`).rounded(10).bg(t.background).border_1().border_color(focused ? t.accent : t.border).p(10).gap(6).child(head)
       .children(body.length ? [v_flex().ml(22).pl(10).gap(8).border_l(1).border_color(t.border).children(body)] : []);
@@ -913,7 +980,8 @@ export default class RigView extends View {
     const health = this.read(cx, "/api/health");
     const findings = (health.data?.records ?? []).filter((r) => r.scope?.rigId ? r.scope.rigId === rig.id : r.scope?.rig ? r.scope.rig === rig.name : rigCount === 1);
     const healthOpen = open[`health:${rig.id}`] ?? (here && entry.tab === "health");
-    const edgesOpen = open[`edges:${rig.id}`] ?? (here && entry.tab === "graph");
+    // The graph already draws the relationships. Keep the copyable text list on explicit request.
+    const edgesOpen = open[`edges:${rig.id}`] ?? false;
     const recentKey = `rig-recent:${rig.name}`;
     const recentOpen = open[recentKey] ?? open[`rig-recent:${rig.id}`] ??
       ((here && entry.tab === "recent") || entry.openRecent === rig.name || entry.openRecent === rig.id);
@@ -951,9 +1019,10 @@ export default class RigView extends View {
       const path = `/api/rigs/${encodeURIComponent(rig.id)}/graph`;
       const graph = this.read(cx, path);
       const edges = graph.data?.edges ?? [];
+      const names=new Map((graph.data?.nodes??[]).map(n=>[n.id,n.data?.logicalId??n.logicalId??n.id]));
       edgesGroup.child(this.status(t, cx, path, graph) ?? (edges.length
         ? v_flex().gap(2).children(edges.map((e, i) => h_flex().id(`edge-${rig.id}-${i}`).gap(8).px(4).text_size(12).text_color(t.muted)
-          .child(this.copyValue(t, `${e.source} → ${e.target}`, `edge-${rig.id}-${i}`, "edge addresses")).child(div().text_color(t.dim).child(String(e.data?.kind ?? e.label ?? "")))))
+          .child(this.copyValue(t, `${names.get(e.source)??e.source} → ${names.get(e.target)??e.target}`, `edge-${rig.id}-${i}`, "edge addresses")).child(div().text_color(t.dim).child(String(e.data?.kind ?? e.label ?? "")))))
         : this.dim(t, "No edges.")));
     }
     out.push(edgesGroup);
@@ -1065,6 +1134,7 @@ export default class RigView extends View {
 
   /** A seat as an indented tree row (rig > pod > seat > helper) with runtime/model badge, slice badge, and quick actions. */
   seatChip(t, rig, s, lifecycle, { nativeSeat = null, seatNeed = null } = {}) {
+    if (!s.terminal) this.nowSeats?.set(s.session, s);
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
     const click = seatClickTarget(stripProps(), activeRigViewId(), s.session, panes?.() ?? [], terminals?.() ?? []);
     const seatTarget = {
@@ -1131,7 +1201,7 @@ export default class RigView extends View {
             .child(svg(icon(openHelpers ? "chevron-down" : "chevron-right")).size(12))
           : div().w(12).flex_none())
         .child(h_flex().id(`seat-chip-${s.session}`).flex_1().min_w(0).h(24).gap(6).items_center()
-          .child(this.dot(t, s.status))
+          .child(this.dot(t, s.status,14,s.session,this.statusMotion.seatNeeds(s.session,rig.name,s.logicalId)))
           .child(div().id(`seat-name-${s.session}`).text_size(12.5).text_color(t.foreground).hover((e) => e.text_color(t.accent))
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); })
             .child(s.logicalId))
@@ -1142,6 +1212,7 @@ export default class RigView extends View {
             .text_size(11).text_color(t.accent).cursor_pointer()
             .on_click((_e, cx) => { cx?.stop_propagation?.(); push({ section: "scopes", slice: s.slice }); })
             .child(String(s.slice))))
+          .when(!s.terminal, el => el.child(this.nowRow(t, { ...s, rig: rig.name }, () => push(seatEntry))))
           .when(click.kind === "card", (el) => el.child(div().id(`seat-go-${s.session}`).text_size(12).text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); }).child("›"))))
         .child(h_flex().gap(4).items_center().flex_none()
@@ -1188,7 +1259,10 @@ export default class RigView extends View {
     if (!act) return false;
     const row = act.row ?? rows.find((r) => r.key === act.key);
     if (act.type === "move") this.pageSel = act.key;
-    else if (act.type === "expand" || act.type === "collapse") toggleOpen(act.foldKey, act.type === "collapse", row?.seats);
+    else if (act.type === "expand" || act.type === "collapse") {
+      if (row?.setOpen) row.setOpen(act.type === "expand");
+      else toggleOpen(act.foldKey, act.type === "collapse", row?.seats);
+    }
     else if (act.type === "activate") { if (row?.open) row.open(); else if (row?.entry) push(row.entry); }
     else if (act.type === "action") { const fn = this.seatActions?.[act.key]?.[act.action]; if (fn) fn(); }
     else if (act.type === "menu") { if (row?.target) menu(row.target); }
@@ -1207,6 +1281,7 @@ export default class RigView extends View {
     const n = nodes.data.find((x) => x.logicalId === entry.name || x.canonicalSessionName === entry.session);
     if (!n) return this.dim(t, `${entry.name} isn't in ${entry.rig} any more.`);
     const rawStatus = seatStatus(n);
+    if (!isTerminalSeat(n)) this.nowSeats?.set(n.canonicalSessionName, { session: n.canonicalSessionName, runtime: n.runtime, status: rawStatus, open: true });
     const look = statusLook(rawStatus);
     const stoppedSeat = rawStatus === "stopped" || rawStatus === "exited" || n.lifecycleState === "stopped" || n.lifecycleState === "recoverable" || n.attachable === false;
     const rawCtx = n.contextUsage?.usedPercentage;
@@ -1244,6 +1319,7 @@ export default class RigView extends View {
     const basisText = qGot.error ? (queue.available ? `last successful read · ${asOf(qGot.at)}` : "unavailable") : queue.available ? "live queue" : "reading…";
     const queueEmpty = (text) => queue.available ? text : qGot.error ? "Queue unavailable." : "Reading queue…";
     const activity = seatActivityDetails(n);
+    const activityWords = seatActivityWords(n);
 
     const attGot = this.read(cx, "/api/attention");
     const allNeeds = (attGot.data?.items ?? shared("rig.data")?.attention?.items ?? []).map(needTarget);
@@ -1281,7 +1357,7 @@ export default class RigView extends View {
       // name OpenRig doesn't make, an attach command not in OpenRig's shape) says why.
       const config = this.config;
       cx.spawn(async (cx) => {
-        const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, target, config);
+        const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, target, config);
         if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" });
       });
     };
@@ -1310,9 +1386,10 @@ export default class RigView extends View {
       .child(h_flex().id("seat-title").gap(6).items_center()
         .child(svg(icon("rig-seat")).size(15).flex_none().text_color(t.foreground))
         .child(this.title(t, entry.name))
-        .child(this.dot(t, rawStatus))
+        .child(this.dot(t, rawStatus,14,n.canonicalSessionName,seatNeeds.map(it=>it.id)))
         .child(div().text_size(13).text_color(t[statusMark(rawStatus).word] ?? t.muted).child(look.word))
         .child(div().text_size(13).text_color(t.muted).child(`· ${entry.rig}`)))
+      .when(!isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && push(fileEntry(transcript, `${entry.name} transcript`)))))
       .child(h_flex().gap(6).items_center().flex_wrap()
         .child(this.button(t, "seat-attach", "Attach", doAttach, { primary: !stoppedSeat, small: true, iconName: "terminal", disabled: stoppedSeat, tooltip: attachReason }))
         .child(this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason }))
@@ -1331,7 +1408,7 @@ export default class RigView extends View {
         h_flex().id("seat-context-bar").gap(10).items_center()
           .child(div().w(120).text_size(12).text_color(t.dim).child("Context"))
           .child(ctx == null
-            ? div().text_size(12.5).child(`unknown${n.contextUsage?.reason ? ` (${n.contextUsage.reason})` : ""}`)
+            ? div().text_size(12.5).child("Not reported by this runtime")
             : h_flex().gap(8).items_center()
                 .child(div().w(160).h(6).rounded(3).bg(t.raised).child(div().h_full().rounded(3).w(Math.max(2, Math.min(160, 1.6 * rawCtx))).bg(ctxWarn ? t.blocked : t.accent)))
                 .child(div().id("seat-context-pct").text_size(12).text_color(ctxWarn ? t.blocked : t.muted).when(ctxWarn, (d) => d.font_semibold()).child(`${ctx}%`))
@@ -1342,30 +1419,35 @@ export default class RigView extends View {
           ["Runtime", n.runtime],
           ["Model", n.model ?? n.resolvedModel ?? "default"],
           ["Session", n.canonicalSessionName, true],
-          ["effort:", effortText],
-          ["attach:", attachCmd, true],
+          ["Effort", effortText],
+          ["Attach command", attachCmd, true],
         ]),
-        stoppedSeat || seatViewReason
+        ...(!stoppedSeat && seatViewReason ? [] : [stoppedSeat
           ? div().id("seat-open-terminal-link").text_size(12).text_color(t.dim)
             .tooltip(seatViewReason ?? "")
-            .child(stoppedSeat ? `terminal: not attachable (${n.attachabilitySummary ?? rawStatus})` : "terminal: needs a newer OpenRig")
+            .child("This seat has no running terminal to attach.")
           : h_flex().id("seat-open-terminal-link").gap(6).items_center().cursor_pointer()
               .on_click(() => oneClick(target, "open-seat", "seat-open-terminal"))
-              .child(div().w(120).text_size(12).text_color(t.dim).child("terminal:"))
-              .child(div().text_size(12.5).text_color(t.accent).child("Open terminal ▸")),
+              .child(div().w(120).text_size(12).text_color(t.dim).child("Terminal"))
+              .child(div().text_size(12.5).text_color(t.accent).child("Open terminal ▸"))]),
       ])))
       // 2. CURRENT ACTIVITY section
       .child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
-        h_flex().gap(10).items_center().child(this.chip(t, look, rawStatus))
-          .child(this.dim(t, [activity.reason === "—" ? null : activity.reason, ...activity.flags].filter(Boolean).join(" · "))),
-        this.kv(t, [
+        div().text_size(12.5).child(activityWords.line),
+        ...[activityWords.note, activityWords.changed, activityWords.stale].filter(Boolean).map(text => this.dim(t, text)),
+        h_flex().id("seat-evidence-fold").gap(5).items_center().cursor_pointer().text_color(t.muted)
+          .on_click((_e, cx) => { this.activityEvidenceOpen = !this.activityEvidenceOpen; cx.notify(); })
+          .child(svg(icon(this.activityEvidenceOpen ? "chevron-down" : "chevron-right")).size(11))
+          .child(div().text_size(12).child("How OpenRig knows")),
+        ...(this.activityEvidenceOpen ? [this.kv(t, [
+          ["Context", n.contextUsage?.reason ?? "—", true],
           ["state", activity.state],
           ["evidence", activity.evidence],
           ["reason", activity.reason],
           ["decided by", activity.decidedBy],
           ["signal", activity.signal],
           ["changed", activity.changed],
-        ]),
+        ].map(([key, value]) => [key, value, true]))] : []),
       ])))
       // 3. HEALTH section
       .child(v_flex().id("seat-section-health").child(this.card(t, "HEALTH", seatFindings.length
@@ -1532,24 +1614,41 @@ export default class RigView extends View {
     }
     const wait = this.status(t, cx, "/api/specs/library", lib);
     if (wait) return wait;
-    const f = this.filter?.toLowerCase();
-    const list = f ? lib.data.filter((s) => [s.name, s.kind, s.version].some((c) => String(c ?? "").toLowerCase().includes(f))) : lib.data;
+    const f = this.filter?.trim().toLowerCase();
+    const groups = groupSpecLibrary(lib.data, f);
     const open = shared("rig.open.page") ?? {};
     const toggle = (id) => { const now = shared("rig.open.page") ?? {}; setShared("rig.open.page", { ...now, [`spec:${id}`]: !now[`spec:${id}`] }); };
     return this.card(t, "Specs", [v_flex()
       .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().w(12)).child(div().flex_1().child("Spec")).child(div().w(90).flex_none().child("Kind")).child(div().w(80).flex_none().child("Version")))
-      .children(list.length ? list.map((s, i) => {
+      .children(groups.length ? groups.map(g => {
+        const key = `spec-kind:${g.kind}`, expanded = !!f || (open[key] ?? g.kind === "rig");
+        const toggleKind = () => { this.pageSel = key; if (!f) { const now = shared("rig.open.page") ?? {}; setShared("rig.open.page", { ...now, [key]: !expanded }); } };
+        this.pageRows?.push({ key, foldKey: key, expandable: true, isOpen: expanded, open: toggleKind,
+          setOpen: value => { if (!f) setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [key]: value }); } });
+        return v_flex().id(`spec-kind-group-${g.kind}`)
+          .child(h_flex().id(key).px(8).h(30).gap(6).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover(x => x.bg(t.hover))
+            .on_click(toggleKind)
+            .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(12).text_color(t.dim))
+            .child(div().text_size(12.5).font_semibold().text_color(t.muted).child(g.title))
+            .child(div().text_size(11.5).text_color(t.dim).child(`${g.items.length}${f ? ` of ${g.total}` : ""}${g.yours ? ` · ${g.yours} yours` : ""}`)))
+          .when(expanded, el => el.children(g.items.map((s, i) => {
         const shown = !!open[`spec:${s.id}`], box = this.specBoxes?.[s.id];
+        const builtin = s.sourceType === "builtin" || !s.sourcePath;
+        const key = `spec:${s.id}`;
+        this.pageRows?.push({ key, foldKey: key, parentKey: `spec-kind:${g.kind}`, expandable: true, isOpen: shown, open: () => toggle(s.id) });
         return v_flex()
-          .child(h_flex().id(`specs-${i}`).px(8).h(30).gap(10).items_center().rounded(6).hover((x) => x.bg(t.hover))
-            .on_click(() => toggle(s.id)).on_mouse_down("right", () => menu({ kind: "spec", id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
+          .when(builtin && i === g.yours && i > 0, el => el.child(div().id(`spec-divider-${g.kind}`).mx(8).h(1).bg(t.border)))
+          .child(h_flex().id(`specs-${lib.data.indexOf(s)}`).pl(24).pr(8).h(30).gap(10).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover((x) => x.bg(t.hover))
+            .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => menu({ kind: "spec", id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(s.name))
             .when(this.specDirty(box), (el) => el.child(div().text_size(11.5).text_color(t.working).flex_none().child("● Unsaved changes")))
+            .when(builtin, el => el.child(div().text_size(10.5).text_color(t.dim).child("built-in")))
             .child(div().w(90).flex_none().truncate().text_size(12.5).text_color(t.muted).child(s.kind ?? ""))
             .child(div().w(80).flex_none().truncate().text_size(12.5).text_color(t.muted).child(s.version ?? "")))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(t.border).child(this.specBody(t, cx, s, false))));
+      })));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : "No specifications found.")])]);
   }
 
@@ -1568,7 +1667,24 @@ export default class RigView extends View {
     push({ section: "topology", kind: "rig", rigId: r.id, name: r.name });
   }
 
-  /** A spec opened in place is read-only first, with 3 toolbar buttons: Edit / Save / Open file.
+  graphFor(key) {
+    this.graphs??=new Map();if(!this.graphs.has(key))this.graphs.set(key,new RigGraph());return this.graphs.get(key);
+  }
+
+  loadSpecGraph(cx,s,box) {
+    box.graphLoading=true;box.graphError=null;box.graph=null;
+    cx.spawn(async cx=>{
+      try{
+        const url=await this.resolveDaemonUrl();if(!url)throw new Error("Connect OpenRig before opening the saved spec graph.");
+        // This is the same public structured review used by rig specs preview in OpenRig0.7.11.
+        // It stays on the person's existing HTTP/tunnel origin and needs no local or remote CLI.
+        box.graph=await readRigSpecPreview(fetch,url,s);
+      }catch(error){box.graphError=singleLineText(error?.message??error).slice(0,240);}
+      finally{box.graphLoading=false;cx.notify();}
+    });
+  }
+
+  /** A spec opened in place is read-only first, with Graph/YAML for rig specs.
    *  `Edit` enters edit mode (`Cancel edit` exits with inline discard confirmation); `Edit` on a built-in creates an
    *  editable copy in the user library; `Launch` lives on the row's right-click menu and the palette. */
   specBody(t, cx, s, single) {
@@ -1583,6 +1699,9 @@ export default class RigView extends View {
     const mac = window()?.platform === "macos";
     const dirty = this.specDirty(box);
     const editing = Boolean(box.editing) && !isBuiltin;
+    const rigSpec=s.kind==="rig",graphView=rigSpec&&(box.view??(editing?"yaml":"graph"))==="graph";
+    if(graphView)this.wideGraph=true;
+    if(rigSpec&&!box.graph&&!box.graphLoading&&!box.graphError)this.loadSpecGraph(cx,s,box);
     const pills = this.runningRigsOf(cx, s);
     const editLabel = isBuiltin
       ? (box.copying ? "Copying…" : "Edit")
@@ -1591,17 +1710,21 @@ export default class RigView extends View {
     const saveDisabled = isBuiltin || !editing || !dirty || Boolean(box.saving);
     const openDisabled = !s.sourcePath;
     const toolbar = h_flex().gap(8).items_center().flex_wrap()
+      .when(rigSpec,el=>el.child(h_flex().rounded(6).border_1().border_color(t.border).children(["graph","yaml"].map(view=>
+        this.button(t,`spec-view-${view}-${s.id}`,view==="graph"?"Graph":"YAML",(_e,cx)=>{box.view=view;cx.notify();},{small:true})
+          .when((view==="graph")===graphView,el=>el.bg(t.accent).text_color(t.solid_foreground)
+            .hover(st=>st.bg(t.accent)))))))
       .child(this.button(t, sfx("spec-edit", true), editLabel, (_e, cx) => this.toggleEditSpec(cx, s, isBuiltin), {
         primary: !editing && !copyReason,
         iconName: editing ? "x" : "layers",
         disabled: Boolean(box.loading || box.copying || box.saving || copyReason),
         tooltip: copyReason,
       }))
-      .child(this.button(t, sfx("spec-save", true), box.saving ? "Saving…" : `Save ${mac ? "⌘↵" : "Ctrl+↵"}`, (_e, cx) => this.saveSpec(cx, s), {
+      .when(!graphView,el=>el.child(this.button(t, sfx("spec-save", true), box.saving ? "Saving…" : `Save ${mac ? "⌘↵" : "Ctrl+↵"}`, (_e, cx) => this.saveSpec(cx, s), {
         primary: editing && dirty,
         iconName: "check",
         disabled: saveDisabled,
-      }))
+      })))
       .child(this.button(t, sfx("spec-open", true), "Open file", () => {
         if (s.sourcePath) push(fileEntry(s.sourcePath, `${s.name} · spec`));
       }, {
@@ -1615,6 +1738,8 @@ export default class RigView extends View {
       .when(isBuiltin, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Built-in · read-only")))
       .when(!isBuiltin && !editing, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Read-only")))
       .when(dirty, (el) => el.child(div().text_size(11.5).text_color(t.working).child("● Unsaved changes")))
+      .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:460,height:300,
+        props:{target:{kind:"spec",id:s.id,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{primary:true,iconName:"rig-play"})))
       .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().child(div().text_size(11.5).text_color(t.dim).child("Restored unsaved edits"))
         .child(this.button(t, `spec-discard-draft-${s.id}`, "Discard", (_e, cx) => this.discardDraft(cx, s), { small: true }))));
     const errors = box.errors ?? [];
@@ -1634,7 +1759,10 @@ export default class RigView extends View {
         .child(this.button(t, `spec-reload-${s.id}`, box.confirmReload ? "Click Reload again to discard edits" : "Reload", (_e, cx) => this.reloadSpec(cx, s, isBuiltin)))
         .child(this.button(t, `spec-keep-editing-${s.id}`, "Keep editing", (_e, cx) => this.keepEditing(cx, s)))))
       .children(errors.map((e, i) => div().id(`spec-error-${s.id}-${i}`).text_size(12).text_color(t.blocked).child(String(e))))
-      .child(box.state
+      .when(graphView&&dirty,el=>el.child(this.dim(t,"Showing the saved spec. Save to update the graph.")))
+      .child(graphView ? (box.graph?this.graphFor(`spec:${s.id}`).render(t,cx,box.graph,{id:`spec-graph-${s.id}`,assets:ASSETS})
+        :box.graphError?v_flex().gap(6).child(div().text_size(12).text_color(t.blocked).child(box.graphError))
+          .child(this.button(t,`spec-graph-retry-${s.id}`,"Retry",(_e,cx)=>this.loadSpecGraph(cx,s,box),{small:true})):this.skeleton(t)) : box.state
         ? div().id(`spec-editor-${s.id}`).h(320).border_1().border_color(editing ? t.accent : t.border).rounded(6)
           // Clicks and keys typed in the YAML are the editor's: stop left-mouse-down from bubbling to rig-view-root's handle.focus().
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -1670,6 +1798,7 @@ export default class RigView extends View {
   toggleEditSpec(cx, s, isBuiltin) {
     const box = this.specBoxes?.[s.id];
     if (!box) return;
+    box.view="yaml";
     if (isBuiltin) {
       box.builtinEditNote = "Built-in spec — Edit creates an editable copy in your library.";
       this.copySpec(cx, s);
@@ -1745,7 +1874,7 @@ export default class RigView extends View {
     const box = this.specBoxes[s.id];
     if (this.specDirty(box) && !box.confirmReload) { box.confirmReload = true; cx.notify(); return; }
     setDraft(specDraftKey(s.id), null);
-    this.specBoxes[s.id] = { loading: true, editing: false };
+    this.specBoxes[s.id] = { loading: true, editing: false, view:box.view };
     this.loadSpec(cx, s, isBuiltin, this.specBoxes[s.id]);
     box.state?.release?.();
     cx.notify();
@@ -1819,6 +1948,7 @@ export default class RigView extends View {
         const synced = await fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(() => null);
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
         box.savedText = synced?.ok ? "Saved." : "Saved; library re-index failed.";
+        if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
         const key = specDraftKey(s.id), now = box.state.value();
         setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
@@ -1836,12 +1966,13 @@ export default class RigView extends View {
   /** User specs may read their file inside the local spec folders with symlinks resolved. All other entries use only
    *  the daemon's own copy, even when their sourcePath happens to name a local spec. */
   async specText(s) {
+    const path=rigSpecLibraryPath(s);if(!path)throw new Error("This library entry has no usable spec id.");
     const file = s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
     let text = file ? await readTextFile(file).catch(() => null) : null;
     if (text == null && this.config) {
       const daemonUrl = await this.resolveDaemonUrl();
       if (daemonUrl) {
-        const r = await fetch(`${daemonUrl}/api/specs/library/${encodeURIComponent(s.id)}`);
+        const r = await fetch(`${daemonUrl}${path}`);
         const body = await r.text();
         if (!r.ok) throw new Error(`GET /api/specs/library/${s.id} → ${r.status}`);
         let data = null; try { data = JSON.parse(body); } catch (_) { data = body; }
@@ -2250,7 +2381,7 @@ export default class RigView extends View {
     delete this.askerNotes[n.id];
     const config = this.config;
     cx.spawn(async (cx) => {
-      const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, resolved.seat, config);
+      const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, resolved.seat, config);
       if (res && res.ok === false && res.reason) {
         this.askerNotes[n.id] = res.reason;
       }
@@ -2454,20 +2585,24 @@ export default class RigView extends View {
       // One item (sidebar or toast click): the full Decision Card, here; no menu or dialog between.
       const n = items.find((x) => x.id === entry.id);
       if (!n) {
+        if (isHealthAttention({ id: entry.id })) return this.dim(t, "Health findings are in System → Health.")
+          .on_click(() => push({ section: "system", subview: "health" }));
         const receipt = dismissals.receiptRows().find((r) => r.keys.some((key) => dismissals.records.find((v) => v.key === key)?.item.id === entry.id));
         if (receipt) return this.updateReceipt(t, receipt);
         const hidden = dismissals.hidden().find((r) => r.item.id === entry.id);
         if (hidden) return v_flex().gap(8).child(this.dim(t, hidden.note ?? "Dismissed here."))
           .child(this.button(t, "restore-open-update", "Restore", () => this.updateAction("restore", hidden.key), { small: true }));
-        return this.dim(t, this.answered[entry.id]
-          ? `${this.answered[entry.id].words} This request was already answered.`
-          : "This request was already answered.");
+        const answered = this.answered[entry.id];
+        if (answered?.text) return v_flex().gap(10).child(this.title(t, answered.summary))
+          .child(h_flex().id(`need-result-${entry.id}`).gap(6).items_start().min_w(0)
+            .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(this.dim(t, answered.text).flex_1().min_w(0)));
+        return this.dim(t, "This request was already answered.");
       }
+      if (n.criticalHealth) return this.healthNeedsLine(t, n);
       return v_flex().gap(12)
         .when(!!whoseRow, (el) => el.child(whoseRow))
-        .child(this.title(t, n.summary))
         .child(this.decisionCard(t, cx, n, { standalone: true, perspective: att.data?.perspective }))
-        .child(this.dim(t, "Viewing is not approval."));
+        ;
     }
     // Replies sent from here whose item has left the list: said for a moment, then gone.
     const gone = Object.entries(this.answered).filter(([id, a]) => Date.now() - a.at < STATUS_MS && !items.some((n) => n.id === id));
@@ -2485,7 +2620,7 @@ export default class RigView extends View {
       .when(!!awayCard, (el) => el.child(awayCard))
       .when(!!entry.notice, (el) => el.child(div().id("need-expired-notice").text_size(12).text_color(t.muted).child(entry.notice)))
       .child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
-        .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(`${a.words} ${a.summary}`))),
+        .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(a.text ?? a.summary))),
         this.needRows(t, cx, "needs", actionableItems, att.data?.perspective)]))
       .child(this.card(t, `Updates (${updateItems.length})`, [
         ...receipts.filter((r) => r.keys.length > 1).map((r) => this.updateReceipt(t, r)),
@@ -2511,6 +2646,7 @@ export default class RigView extends View {
   /** Needs-You rows: a click opens the Decision Card in place (`shared("rig.open.page")`, `needs:<id>`, so the palette and the
    *  sidebar agree); right-click is the menu. A palette filter narrows them, as it does a table. */
   needRows(t, cx, idPrefix, list, perspective = null) {
+    if (idPrefix === "needs") return this.requestRows(t, cx, list, perspective);
     const f = this.filter?.toLowerCase();
     if (f) list = list.filter((n) => [n.summary, n.urgency, n.asker, n.scope, n.tier].some((c) => String(c ?? "").toLowerCase().includes(f)));
     const open = shared("rig.open.page") ?? {};
@@ -2565,8 +2701,208 @@ export default class RigView extends View {
   }
 
   /** A request opened in place or on its own item page: renders the full Decision Card. */
+  requestRows(t, cx, items, perspective) {
+    const filter = this.filter?.toLowerCase();
+    if (filter) items = items.filter(n => [n.summary, n.asker].some(s => String(s ?? "").toLowerCase().includes(filter)));
+    const toggle = (n) => { if (n.criticalHealth) { push({ section: "system", subview: "health" }); return; } this.selectedNeed = n.id; if (n.reply !== "none") this.replies[n.id] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
+    return v_flex().id("need-request-list").on_key_down((e, cx) => {
+      if (!["up", "down", "enter"].includes(e.key)) return;
+      cx.stop_propagation();
+      let i = items.findIndex(n => n.id === this.selectedNeed);
+      if (e.key === "enter") { if (i >= 0) toggle(items[i]); }
+      else { i = Math.max(0, Math.min(items.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = items[i]?.id; }
+      cx.notify();
+    }).children(items.length ? items.map((n, i) => {
+      if (n.criticalHealth) return this.healthNeedsLine(t, n);
+      // A blank summary needs the same body the expanded card uses; fetch it only for these rows.
+      const queue = n.summaryIsFallback && !n.body && n.qitemId ? this.read(cx, `/api/queue/${encodeURIComponent(n.qitemId)}`).data : null;
+      const text = requestCardText(n, queue?.body), tier = tierOf(n), urgent = ["alert", "escalation"].includes(tier);
+      const owner = n.reply === "resolve" || n.answer?.verb === "resolve" ? parkedWorkOwner(n) : n.asker ?? n.sourceSession;
+      const age = Date.parse(n.at ?? ""), mins = Number.isFinite(age) ? Math.max(0, Math.floor((Date.now() - age) / 60000)) : null;
+      const shown = Boolean((shared("rig.open.page") ?? {})[`needs:${n.id}`]);
+      return v_flex().min_w(0).child(h_flex().id(`needs-${i}`).px(8).h(34).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
+        .when(this.selectedNeed === n.id, el => el.bg(t.selection ?? t.raised))
+        .on_click(() => toggle(n)).on_mouse_down("right", () => menu(n))
+        .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
+        .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(text.headline))
+        .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).child(String(owner ?? "")))
+        .child(div().text_size(11).text_color(t.dim).tooltip(String(n.at ?? "")).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
+        .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); })))
+        .when(shown, el => el.child(this.decisionCard(t, cx, n, { perspective })));
+    }) : [this.dim(t, filter ? "No matching requests." : "No pending Needs-You requests.")]);
+  }
+
   needBody(t, cx, n, perspective = null) {
     return this.decisionCard(t, cx, n, { standalone: false, perspective });
+  }
+
+  healthNeedsLine(t, n) {
+    const started = Date.parse(n.healthFinding?.startedAt ?? "");
+    const minutes = Number.isFinite(started) ? Math.max(0, Math.floor((Date.now() - started) / 60000)) : null;
+    return h_flex().id(`critical-health-${n.id}`).px(8).h(34).gap(8).items_center().text_size(12.5).cursor_pointer().hover(el => el.bg(t.hover))
+      .on_click(() => push({ section: "system", subview: "health" }))
+      .child(div().w(12).text_color(t.blocked).child("◆"))
+      .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(n.summary))
+      .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).child("health · critical"))
+      .child(div().text_size(11.5).text_color(t.dim).tooltip(n.healthFinding?.startedAt ?? "Start time not reported").child(minutes === null ? "—" : minutes < 1 ? "<1m" : `${minutes}m`))
+      .child(div().text_size(11.5).text_color(t.accent).child("System → Health"));
+  }
+
+  prepareNeedFocus(cx, box, keys) {
+    if (!box || box.focusPreparing || !cx?.focus_handle) return;
+    const missing = keys.filter(key => !box.cardHandles?.[key]);
+    if (!missing.length) return;
+    box.focusPreparing = true;
+    cx.spawn(async (cx) => {
+      await Promise.resolve();
+      box.cardHandles ??= Object.create(null);
+      for (const key of missing) box.cardHandles[key] ??= cx.focus_handle();
+      box.focusPreparing = false; cx.notify();
+    });
+  }
+
+  routeNeedKey(e, cx, entry) {
+    if (e.modifiers?.control || e.modifiers?.platform || e.modifiers?.alt || !["r", "d", "escape"].includes(String(e.key).toLowerCase())) return false;
+    const id = entry.id ?? this.selectedNeed ?? shared("rig.focusNeed");
+    if (!id || (!entry.id && !(shared("rig.open.page") ?? {})[`needs:${id}`])) return false;
+    const key = this.replies[id]?.cardKey;
+    if (!key) return false;
+    key(e, cx); return true;
+  }
+
+  /** Requests use a short opening and an explicit action; the complete source stays in safe folded Details. */
+  requestCard(t, cx, { n, queueRow, detailItem, detailLines, recordedLines, evidenceFiles, qState, box, standalone, asker, perspective }) {
+    if (box) box.cardMode = true;
+    const id = n.id, width = this.needCardWidths?.[id] ?? 800, narrow = width < 480;
+    const text = requestCardText(n, detailLines.join("\n\n"), { openingLimit: Math.floor((width - 40) * 4 / 7) });
+    const headlineLimit = Math.max(20, Math.floor((width - 40) * 2 / ((narrow ? 15.5 : 17) * 0.55)));
+    const displayHeadline = text.headline.length <= headlineLimit ? text.headline : `${text.headline.slice(0, headlineLimit - 1).replace(/\s+\S*$/, "")}…`;
+    const verb = n.answer?.verb ?? n.verb ?? (n.reply === "resolve" ? "resolve" : n.reply === "answer" ? "answer" : null);
+    const resolve = verb === "resolve", tier = tierOf(n);
+    const tone = tier === "escalation" || tier === "alert" ? t.blocked : t.accent;
+    const tierWord = tier === "escalation" ? "Escalation · stuck work" : tier === "alert" ? "Needs you now" : "Routine";
+    const kind = resolve ? "Parked · needs your words" : qState.totalCount ? "Decision" : verb === "approve" ? "Approval" : "Question";
+    const owner = resolve ? parkedWorkOwner(queueRow ?? n) : asker;
+    const resolved = resolveAskerSeat(owner, this.currentTopology(cx));
+    const logical = resolved.found ? resolved.seat.logicalId : String(owner ?? "the asking seat").split("@")[0].replace(/-/g, ".");
+    const rig = resolved.found ? resolved.seat.rig : String(owner ?? "").split("@").slice(1).join("@");
+    const at = n.at ?? queueRow?.tsUpdated, timestamp = Date.parse(at ?? ""), elapsed = Math.max(0, Date.now() - timestamp);
+    const age = !Number.isFinite(timestamp) ? "unknown duration" : elapsed < 60000 ? "less than a minute" : elapsed < 3600000 ? `${Math.floor(elapsed / 60000)} min` : `${Math.floor(elapsed / 3600000)} h`;
+    const projectName = typeof n.project === "string" ? n.project : n.project?.name ?? n.project?.id;
+    const project = projectName && !/^(default|unknown|none)$/i.test(projectName.trim()) ? projectName : null;
+    const humanDetail = queueRow?.humanDetail ?? n.humanDetail;
+    const detailsKey = `need-details:${id}`, detailsOpen = Boolean((shared("rig.open.page") ?? {})[detailsKey]);
+    const recordedKey = `need-recorded:${id}`, recordedOpen = Boolean((shared("rig.open.page") ?? {})[recordedKey]);
+    const busy = Boolean(box?.busy), receipt = box?.result?.ok && qState.openCount === 0 && !qState.needsResume;
+    const whose = whoseQueueSummary(perspective, this.config, n);
+    const targetBox = () => this.replies[id] ??= this.makeReply(n);
+    const openComposer = (cx, denying = false) => {
+      if (!verb || n.native || busy) return;
+      const b = targetBox(); b.cardMode = true; b.composerOpen = true; b.denying = denying; b.result = null;
+      this.bindReplyInput(b, denying ? `Why not? ${asker ?? "the asking seat"} reads this.` : resolve ? "Your decision, in your own words" : "Your answer, in your own words");
+      b.input.focus(); cx?.notify?.();
+    };
+    const send = (act, cx) => { if (!busy) this.submitCardDecision(cx, n, detailItem, queueRow, act); };
+    const optionKeys = qState.questions.flatMap(q => q.options.map(o => `option:${q.id}:${o.id}`));
+    this.prepareNeedFocus(cx, box, ["card", "approve", "deny", "resolve", "answer", "reply", "details", "resume", ...optionKeys]);
+    const action = (key, label, click, { primary = false, recommended = false } = {}) => {
+      const handle = box?.cardHandles?.[key];
+      return h_flex().id(`need-${key}-${id}`).h(32).px(12).gap(8).items_center().justify_center().rounded(6)
+        .when(Boolean(whose?.onSomeoneElsesAsk), el => el.tooltip(whose.onSomeoneElsesAsk))
+        .when(narrow, el => el.w_full()).when(!narrow, el => el.flex_none())
+        .bg(primary ? (t.solid ?? t.accent) : t.raised).text_color(primary ? (t.solid_foreground ?? t.background) : t.foreground)
+        .border_1().border_color(primary ? (t.solid ?? t.accent) : t.border).text_size(13)
+        .when(!busy, el => el.cursor_pointer().hover(s => s.bg(primary ? t.accent : t.hover)))
+        .when(!!handle, el => el.track_focus(handle).tab_stop(true).tab_index(0))
+        .when(Boolean(handle?.is_focused?.()), el => el.border_color(t.accent).border_2())
+        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); handle?.focus(); })
+        .on_key_down((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); if (!busy) click(cx); } })
+        .on_click((_e, cx) => { cx.stop_propagation(); if (!busy) click(cx); })
+        .child(label).when(recommended, el => el.child(div().text_size(10.5).child("Recommended")));
+    };
+    const actions = [];
+    if (n.native) actions.push(action("resume", "Relaunch / Resume…", () => menu(n), { primary: true }));
+    else if (qState.totalCount && verb) {
+      for (const q of qState.questions) {
+        if (q.answered) continue;
+        const options = [...q.options].sort((a, b) => Number(b.recommended) - Number(a.recommended));
+        actions.push(v_flex().gap(6).child(this.plain(t, q.question, `need-question-${id}-${q.id}`))
+          .child((narrow ? v_flex() : h_flex()).gap(8).flex_wrap().children(options.map(o =>
+            action(`option:${q.id}:${o.id}`, o.label, cx => send({ mode: "choices", choices: [{ questionId: q.id, optionId: o.id }] }, cx), { primary: o.recommended, recommended: o.recommended })))));
+      }
+      if (qState.needsResume) actions.push(action("resume", "Send answers back", cx => send({ mode: "resume" }, cx), { primary: true }));
+    } else if (verb === "approve") actions.push((narrow ? v_flex() : h_flex()).gap(8)
+      .child(action("approve", "Approve", cx => send({ mode: "approve" }, cx), { primary: true }))
+      .child(action("deny", "Deny…", cx => openComposer(cx, true))));
+    else if (resolve || verb === "answer") {
+      if (!box?.composerOpen) actions.push((narrow ? v_flex() : h_flex()).child(action(resolve ? "resolve" : "answer", resolve ? "Resolve with my words…" : "Answer…", cx => openComposer(cx), { primary: true })));
+    }
+    else actions.push(this.dim(t, "This request still needs you. No response action was provided here; use Open in TUI to respond."));
+    const markDown = (body, key) => requestMarkdownView(body, { TextView, div, v_flex, id: key }).text_size(12.5).text_color(t.foreground);
+    const cardKey = (e, cx) => {
+      if (this.typing && e.key !== "escape") return;
+      if (["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); return; }
+      if (e.modifiers?.control || e.modifiers?.platform || e.modifiers?.alt) return;
+      if (String(e.key).toLowerCase() === "r") { cx.stop_propagation(); openComposer(cx); }
+      else if (String(e.key).toLowerCase() === "d") { cx.stop_propagation(); setOpen(detailsKey, !detailsOpen); }
+      else if (e.key === "escape") { cx.stop_propagation(); this.typing = false; if (box?.composerOpen) { box.composerOpen = false; box.confirmResolve = false; this.keepDraft(box); } else if (standalone) this.goSection("needs"); else setOpen(`needs:${id}`, false); cx.notify(); }
+    };
+    if (box) box.cardKey = cardKey;
+    return v_flex().id(`decision-card-${id}`).relative().rounded(8).bg(t.background).border_1().border_color(t.border)
+      .py(16).px(narrow ? 16 : 20).gap(10).min_w(0)
+      .child(div().id(`need-tier-bar-${id}`).absolute().left(0).top(6).bottom(6).w(3).bg(tone))
+      .on_size_change((size, cx) => { if (Math.abs((this.needCardWidths?.[id] ?? 0) - size.width) > 1) { (this.needCardWidths ??= Object.create(null))[id] = size.width; cx.notify(); } })
+      .when(!!box?.cardHandles?.card, el => el.track_focus(box.cardHandles.card))
+      .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); box?.cardHandles?.card?.focus(); })
+      .on_key_down(cardKey)
+      .child(h_flex().gap(8).items_center().flex_wrap()
+        .child(div().text_size(10.5).text_color(tone).child(tierWord.toUpperCase()))
+        .child(div().flex_1().text_size(11.5).text_color(t.dim).child(kind))
+        .child(this.copyButton(t, text.source, `need-body-${id}`, "request body source")))
+      .child(div().id(`need-headline-${id}`).text_size(narrow ? 15.5 : 17).line_height(1.3).font_semibold().text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(displayHeadline))
+      .when(Boolean(box?.changedSinceAnswered), el => el.child(h_flex().gap(6).items_center().text_size(12).text_color(t.muted)
+        .child(svg(icon("rig-refresh")).size(12)).child("Changed since you answered")))
+      .when(Boolean(text.opening), el => el.child(div().id(`need-opening-${id}`).max_h(76).overflow_hidden().child(markDown(text.opening, `need-opening-text-${id}`))))
+      .child(h_flex().id(`need-context-${id}`).gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted)
+        .child(svg(icon("rig-seat")).size(12).flex_none()).child(`${logical}${rig ? ` · ${rig}` : ""}`)
+        .child(div().tooltip(String(at ?? "")).child(`· waiting ${age}`))
+        .when(Boolean(owner), el => el.child(div().id(`need-open-asker-${id}`).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { cx.stop_propagation(); this.openAskerSeat(cx, { ...n, asker: owner }); }).child("Open seat")))
+        .when(Boolean(project), el => el.child(`· ${project}`)))
+      .when(Boolean(this.askerNotes[id]), el => el.child(div().id(`need-asker-note-${id}`).text_size(11.5).text_color(t.muted).child(this.askerNotes[id])))
+      .when(Boolean(whose?.onSomeoneElsesAsk), el => el.child(this.dim(t, whose.onSomeoneElsesAsk)))
+      .when(Boolean(box?.result), el => el.child(h_flex().id(`need-result-${id}`).gap(6).items_start()
+        .child(svg(icon(box.result.ok ? "check" : "rig-alert")).size(12).text_color(box.result.ok ? t.working : t.blocked))
+        .child(div().flex_1().text_size(12).text_color(box.result.ok ? t.muted : t.blocked).child(box.result.text))))
+      .when(Boolean(box?.result?.networkError && box.result.retryAct), el => el.child(this.button(t, `need-check-and-finish-${id}`, "Check and finish",
+        (_e, cx) => { if (!busy) this.submitCardDecision(cx, box.target ?? n, detailItem, queueRow, box.result.retryAct); }, { small: true, disabled: busy })))
+      .when(!receipt && !box?.result?.networkError, el => el.children(actions)
+        .when(!n.native && (qState.totalCount > 0 || verb === "approve"), el => el.child(div().id(`need-reply-link-${id}`).text_size(12).text_color(t.accent).cursor_pointer()
+          .on_click((_e, cx) => { cx.stop_propagation(); openComposer(cx); }).child("Reply in your own words")))
+        .when(Boolean(box?.composerOpen), el => el.child(this.replyBox(t, cx, n, { detailItem, queueRow, onSomeoneAskText: whose?.onSomeoneElsesAsk }))
+          .child(this.dim(t, "A response is not approval. What you send is recorded as your words; the asking seat reads it and decides."))))
+      .when(!n.native && !n.decisionRevision, el => el.child(div().id(`need-no-revision-note-${id}`).text_size(11).text_color(t.dim)
+        .child("OpenRig < 0.7.9 (no decisionRevision): a changed request won't be caught before sending.")))
+      .child(v_flex().pt(10).border_t(1).border_color(t.border).gap(8)
+        .child(h_flex().id(`need-details-toggle-${id}`).gap(6).items_center().cursor_pointer()
+          .on_click((_e, cx) => { cx.stop_propagation(); setOpen(detailsKey, !detailsOpen); })
+          .child(svg(icon(detailsOpen ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
+          .child(div().text_size(12).text_color(t.muted).child("Details"))
+          .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(text.detailHint)))
+        .when(detailsOpen, el => el.child(v_flex().id(`need-details-${id}`).gap(10)
+          .when(Boolean(text.details), el => el.child(markDown(text.details, `need-details-text-${id}`)))
+          .when(Boolean(humanDetail), el => el.child(this.dim(t, `More from ${asker ?? "the asker"}`)).child(markDown(typeof humanDetail === "string" ? humanDetail : JSON.stringify(humanDetail, null, 2), `need-human-detail-${id}`)))
+          .when(Boolean(n.unblocks), el => el.child(this.dim(t, `Unblocks: ${n.unblocks}`)))
+          .children(evidenceFiles.map((file, i) => {
+            const path = typeof file === "string" ? file : file.path ?? "";
+            return h_flex().gap(6).child(div().id(`need-evidence-${id}-${i}`).flex_1().text_size(12).text_color(t.accent).cursor_pointer()
+              .on_click(() => push(fileEntry(path, typeof file === "object" ? file.label : path.split("/").pop()))).child(path))
+              .child(this.copyButton(t, path, `need-evidence-path-${id}-${i}`, "evidence path"));
+          }))
+          .child(v_flex().gap(4).child(h_flex().id(`need-recorded-toggle-${id}`).gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
+            .on_click(() => setOpen(recordedKey, !recordedOpen))
+            .child(svg(icon(recordedOpen ? "chevron-down" : "chevron-right")).size(11)).child("What OpenRig recorded"))
+            .when(recordedOpen, el => el.children(recordedLines.map((line, i) => this.plain(t, line, `need-recorded-${id}-${i}`)))
+              .child(this.copyValue(t, `Inspect: rig queue show ${n.qitemId ?? id} --full`, `need-inspect-${id}`, "inspect command")))))));
   }
 
   decisionCard(t, cx, n, { standalone = false, perspective = null } = {}) {
@@ -2602,7 +2938,7 @@ export default class RigView extends View {
       qitemId: n.qitemId ?? detailItem?.answer?.qitemId ?? queueRow?.id ?? null,
     };
 
-    const box = n.reply !== "none" && !n.update ? this.replyFor(cx, mergedItem) : null;
+    const box = !isUpdateNeed(mergedItem) ? this.replyFor(cx, mergedItem) : null;
     if (box && queueRow && observeNeedDecision(box, queueRow, queueRes.at)) {
       delete this.answered[n.id];
       delete this.questionChoices[n.id];
@@ -2622,257 +2958,35 @@ export default class RigView extends View {
     const unblocks = mergedItem.unblocks ?? n.unblocks ?? null;
     const askerNote = this.askerNotes[n.id] ?? null;
 
-    const open = shared("rig.open.page") ?? {};
-    const recordedOpen = Boolean(open[`need-recorded:${n.id}`]);
-    const toggleRecorded = (_e, cx) => {
-      cx?.stop_propagation?.();
-      setOpen(`need-recorded:${n.id}`, !recordedOpen);
-    };
+    if (!isUpdateNeed(mergedItem)) return this.requestCard(t, cx, {
+      n: mergedItem, queueRow, detailItem, detailLines, recordedLines, evidenceFiles, qState, box, standalone,
+      asker, perspective: perspective ?? got.data?.perspective,
+    });
 
-    const choicesForNeed = this.questionChoices[n.id] ?? {};
-    const openQuestionIds = new Set(qState.questions.filter((q) => !q.answered).map((q) => q.id));
-    const chosenOpenEntries = Object.entries(choicesForNeed).filter(([qid, oid]) => oid && openQuestionIds.has(qid));
-    const chosenCount = chosenOpenEntries.length;
-    const openCount = qState.openCount;
-
-    const toggleOptionPill = (qId, optId, cx) => {
-      const cur = Object.assign(Object.create(null), this.questionChoices[n.id] ?? {});
-      if (cur[qId] === optId) delete cur[qId];
-      else cur[qId] = optId;
-      this.questionChoices[n.id] = cur;
-      cx?.notify?.();
-    };
-
-    const isBusy = Boolean(box?.busy);
-    const verb = mergedItem.answer?.verb ?? mergedItem.verb ?? (n.reply === "resolve" ? "resolve" : n.reply === "answer" ? "answer" : null);
-    const isResolve = n.reply === "resolve" || verb === "resolve";
-    const isUpdate = isUpdateNeed(mergedItem);
-    // The public queue-update detail starts with this informational preamble. The card supplies its own note.
-    const lines = isUpdate && detailLines[0] === "Informational update; no action needed. Viewing is not approval or proof of delivery."
+    // Updates keep their existing read-only body and dismissal controls; request actions have one renderer above.
+    const open = shared("rig.open.page") ?? {}, recordedOpen = Boolean(open[`need-recorded:${n.id}`]);
+    const lines = detailLines[0] === "Informational update; no action needed. Viewing is not approval or proof of delivery."
       ? detailLines.slice(1) : detailLines;
-    const isNoQuestionAsk = !isUpdate && !isResolve && !n.native && qState.totalCount === 0 && (verb === "approve" || n.reply === "answer");
-    const isQuestionsOpen = !isUpdate && !isResolve && !n.native && qState.totalCount > 0 && qState.openCount > 0;
-    const isNeedsResume = !isUpdate && !isResolve && !n.native && qState.needsResume;
-    const hasDecisionRevision = typeof mergedItem.decisionRevision === "number"
-      || (typeof mergedItem.decisionRevision === "string" && mergedItem.decisionRevision.trim() !== "");
-    const onSomeoneAskText = whose?.onSomeoneElsesAsk ?? null;
-    const onSomeonePrefix = onSomeoneAskText ? `On ${onSomeoneAskText.slice(3)}. ` : "";
-    const showApproveRecordLine = (isNoQuestionAsk || verb === "approve") && this.approveHoverNeedId === n.id;
-    const recordSentence = showApproveRecordLine
-      ? `${onSomeonePrefix}Approve closes this request as done. It records that you approved, not why.`
-      : `${onSomeonePrefix}A response is not approval. What you send is recorded as your words; the asking seat reads it and decides.`;
-
-    const focused = shared("rig.focusNeed") === n.id;
-    const clearApproveHover = (_e, cx) => {
-      if (this.approveHoverNeedId === n.id) {
-        this.approveHoverNeedId = null;
-        cx?.notify?.();
-      }
-    };
-    const cardWrap = (children) => standalone
-      ? v_flex().id(`decision-card-${n.id}`).rounded(10).bg(t.background).border_1().border_color(focused ? t.accent : t.border).border_l(3).border_color(stripColor).p(12).gap(10).on_mouse_move(clearApproveHover).children(children)
-      : v_flex().id(`decision-card-${n.id}`).border_l(2).border_color(stripColor).pl(10).py(4).gap(8).on_mouse_move(clearApproveHover).children(children);
-
-    return cardWrap([
-      // 1. Tier strip + summary
-      ...(strip.text || strip.badge ? [
-        h_flex().id(`need-tier-strip-${n.id}`).gap(8).items_center()
-          .when(!!strip.badge, (el) => el.child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.blocked + "26").text_color(t.blocked).text_size(10.5).font_semibold().child(strip.badge)))
-          .when(!!strip.text, (el) => el.child(div().text_size(11.5).font_semibold().text_color(stripColor).child(strip.text))),
-      ] : []),
-      ...(standalone ? [
-        h_flex().gap(6).items_center()
-          .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child(isUpdate ? "Update" : "Request"))
-          .when(!isUpdate && lines.length > 0, (el) => el.child(this.copyButton(t, lines.join("\n\n"), `need-body-${n.id}`, "request body source"))),
-        this.kv(t, [["Urgency", n.urgency], ["Scope", scope], ["Since", since], n.native ? ["Seat", `${n.logicalId}@${n.rig}`] : null]),
-      ] : []),
-
-      // 2. Who line (`From <asker> · to <recipient> · <scope> · since <at>` + clickable `Open seat`)
-      ...(asker || recipient || scope || since ? [
-        h_flex().id(`need-who-${n.id}`).gap(6).items_center().flex_wrap().text_size(11.5).text_color(t.muted)
-          .when(!!asker, (el) => el.child(
-            h_flex().id(`need-open-asker-${n.id}`).px(6).h(20).gap(5).rounded(5).items_center().cursor_pointer()
-              .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
-              .on_click((_e, cx) => { cx?.stop_propagation?.(); this.openAskerSeat(cx, mergedItem); })
-              .child(div().text_size(11.5).text_color(t.foreground).font_medium().child(`From ${asker}`))
-              .child(div().text_size(10.5).text_color(t.accent).child("Open seat"))
-          ))
-          .when(!!asker, (el) => el.child(this.copyButton(t, asker, `asker-${n.id}`, "sender address")))
-          .when(!!recipient, (el) => el.child(div().child(`· to ${recipient}`)).child(this.copyButton(t, recipient, `recipient-${n.id}`, "recipient address")))
-          .when(!!scope, (el) => el.child(div().child(`· ${scope}`)))
-          .when(!!since, (el) => el.child(div().child(`· since ${since}`))),
-      ] : []),
-      ...(askerNote ? [div().id(`need-asker-note-${n.id}`).text_size(11.5).text_color(t.muted).child(askerNote)] : []),
-
-      // 3. Body + Unblocks
-      ...(!standalone && !isUpdate && lines.length ? [h_flex().gap(6).items_center()
-        .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child("Request"))
-        .child(this.copyButton(t, lines.join("\n\n"), `need-body-${n.id}`, "request body source"))] : []),
-      lines.length
-        ? isUpdate ? v_flex().id(`need-body-${n.id}`).gap(6).children(lines.flatMap((line) => line.split(/\r?\n/)).filter((line) => line.trim())
-          .map((line, i) => this.plain(t, line, `need-body-line-${n.id}-${i}`)))
-        : v_flex().id(`need-body-${n.id}`).gap(6)
-          .child(requestMarkdownView(lines.join("\n\n"), { TextView, div, v_flex, id: `need-body-text-${n.id}` }).text_size(12.5).text_color(t.foreground))
-        : got.error
-          ? div().text_size(12).text_color(t.blocked).child(got.error)
-          : got.data === undefined
-            ? this.dim(t, "Reading the request…")
-            : div().text_size(12.5).text_color(t.foreground).child(n.summary),
-      ...(unblocks ? [this.dim(t, `Unblocks: ${unblocks}`)] : []),
-
-      // 4. Questions block
-      ...(qState.totalCount > 0 ? [
-        v_flex().id(`need-questions-${n.id}`).gap(8).pt(4).children(qState.questions.map((q) => {
-          const pickedOptId = choicesForNeed[q.id] ?? null;
-          return v_flex().id(`need-question-${n.id}-${q.id}`).rounded(8).bg(t.raised).border_1().border_color(t.border).p(10).gap(6)
-            .child(h_flex().gap(8).items_start()
-              .child(div().flex_1().child(this.plain(t, q.question).font_medium()))
-              .child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(11).text_color(q.answered ? t.working : t.dim).child(q.stateLabel)))
-            .when(q.options.length > 0 && !qState.allAnswered, (el) => el.child(
-              h_flex().gap(6).items_center().flex_wrap().children(q.options.map((o) => {
-                const isRecordedChoice = (q.answered && q.chosenOptionId === o.id) || (box?.recordedChoiceByQuestion?.[q.id] === o.id);
-                const isSelected = !q.answered && !isRecordedChoice && pickedOptId === o.id;
-                const pillLocked = q.answered || isBusy || Boolean(box?.recordedChoiceByQuestion?.[q.id]);
-                return h_flex().id(`need-opt-${n.id}-${q.id}-${o.id}`).px(10).h(26).gap(6).rounded(6).items_center()
-                  .when(!pillLocked, (d) => d.cursor_pointer())
-                  .bg(isSelected || isRecordedChoice ? t.selected : t.background)
-                  .border_1().border_color(isSelected ? t.accent : isRecordedChoice ? t.working : t.border)
-                  .hover((s) => s.bg(pillLocked ? (isSelected || isRecordedChoice ? t.selected : t.background) : t.hover))
-                  .when(!!o.description, (d) => d.tooltip(o.description))
-                  .on_click((_e, cx) => {
-                    cx?.stop_propagation?.();
-                    if (!pillLocked) toggleOptionPill(q.id, o.id, cx);
-                  })
-                  .when(isRecordedChoice, (d) => d.child(svg(icon("check")).size(11).flex_none().text_color(t.working)))
-                  .child(div().text_size(12).text_color(isSelected || isRecordedChoice ? t.foreground : t.muted).when(isSelected || isRecordedChoice, (d) => d.font_semibold()).child(o.label))
-                  .when(o.recommended, (d) => d.child(div().px(4).h(15).rounded(3).flex().items_center().bg(t.raised).text_size(10).text_color(t.dim).child("recommended")));
-              }))
-            ));
-        })),
-      ] : []),
-
-      // 5. Evidence (`detail.files` — file-text icon + label, no emoji)
-      ...(evidenceFiles.length > 0 ? [
-        v_flex().id(`need-evidence-list-${n.id}`).gap(4).children(evidenceFiles.map((f, fi) => {
-          const fPath = typeof f === "string" ? f : f?.path;
-          const fLabel = (typeof f === "object" && f?.label) ? f.label : String(fPath ?? "").split(/[\\/]/).pop();
-          return h_flex().id(`need-evidence-${n.id}-${fi}`).px(8).h(26).gap(6).rounded(6).items_center().cursor_pointer()
-            .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
-            .on_click((_e, cx) => { cx?.stop_propagation?.(); if (fPath) push(fileEntry(fPath, fLabel)); })
-            .child(svg(icon("file-text")).size(12).flex_none().text_color(t.muted))
-            .child(div().text_size(12).text_color(t.foreground).child(fLabel));
-        })),
-      ] : []),
-
-      // 6. Act row (four distinct acts, never conflated)
-      ...(n.native ? [
-        h_flex().gap(8).child(this.button(t, `need-native-${n.id}`, "Relaunch / Resume…", () => menu(n), { iconName: "rig-refresh" })),
-      ] : []),
-      ...(isUpdate ? [
-        div().id(`need-update-note-${n.id}`).text_size(12).text_color(t.dim).child("No action needed. Viewing isn't approval or proof of delivery."),
-        ...(dismissible(n) ? [h_flex().child(this.updateButton(t, `dismiss-open-${n.id}`, "Dismiss", () => this.updateAction("dismiss", n)))] : []),
-        ...(this.updateModel().records.find((r) => r.key === updateKey(n) && r.restored && r.status === "closed")
-          ? [this.dim(t, "Restored here; OpenRig still has it closed.")] : []),
-      ] : []),
-      ...(!isUpdate && !n.native && n.reply === "none" && !verb ? [
-        this.dim(t, "This request still needs you. No response action was provided here; use Open in TUI to respond."),
-      ] : []),
-      ...(isNoQuestionAsk ? [
-        v_flex().id(`need-act-approve-row-${n.id}`).gap(6)
-          .child(h_flex().gap(8).items_center().flex_wrap()
-            .child(this.button(
-              t,
-              `need-approve-${n.id}`,
-              isBusy ? "Working…" : "Approve",
-              (_e, cx) => {
-                if (!isBusy) this.submitCardDecision(cx, mergedItem, detailItem, queueRow, { mode: "approve" });
-              },
-              { primary: true, iconName: "check", disabled: isBusy, tooltip: onSomeoneAskText },
-            ).on_mouse_move((_e, cx) => {
-              cx?.stop_propagation?.();
-              if (this.approveHoverNeedId !== n.id) {
-                this.approveHoverNeedId = n.id;
-                cx?.notify?.();
-              }
-            }))
-            .child(this.button(t, `need-deny-${n.id}`, box?.denying ? "Denying below…" : "Deny…", (_e, cx) => {
-              const b = this.replyFor(cx, mergedItem) ?? (this.replies[n.id] ??= this.makeReply(mergedItem));
-              b.denying = !b.denying;
-              b.result = null;
-              const askerLabel = asker ?? "the asking seat";
-              this.bindReplyInput(
-                b,
-                b.denying
-                  ? `Why not? ${askerLabel} reads this.`
-                  : (mergedItem.reply === "resolve" ? "Your decision, in your own words" : "Your answer, in your own words"),
-              );
-              cx.notify();
-            }, { disabled: isBusy })))
-          .child(this.dim(t, "Approve closes it as done. Deny closes it as denied, with your reason. Or answer in your own words below.")),
-      ] : []),
-      ...(isQuestionsOpen ? [
-        v_flex().id(`need-act-answers-row-${n.id}`).gap(6)
-          .child(h_flex().gap(8).items_center().flex_wrap()
-            .child(this.button(
-              t,
-              `need-send-answers-${n.id}`,
-              isBusy
-                ? (box?.stepProgress ? `Sending ${box.stepProgress.step} of ${box.stepProgress.total}…` : "Sending…")
-                : (chosenCount > 0 && chosenCount < openCount ? `Send ${chosenCount} of ${openCount} answers` : "Send answers"),
-              (_e, cx) => {
-                if (chosenCount < 1 || isBusy) return;
-                this.submitCardDecision(cx, mergedItem, detailItem, queueRow, {
-                  mode: "choices",
-                  choices: chosenOpenEntries.map(([questionId, optionId]) => ({ questionId, optionId })),
-                });
-              },
-              { primary: chosenCount > 0, iconName: "rig-reply", disabled: chosenCount < 1 || isBusy, tooltip: onSomeoneAskText },
-            )))
-          .child(this.dim(t, "Each choice is sent as your answer to that question. Or answer in your own words below: that fills the first open question and closes the request.")),
-      ] : []),
-      ...(isNeedsResume ? [
-        v_flex().id(`need-act-resume-row-${n.id}`).gap(6)
-          .child(h_flex().gap(8).items_center()
-            .child(this.button(
-              t,
-              `need-resume-${n.id}`,
-              isBusy ? "Sending…" : `Send answers back to ${asker ?? "asking seat"}`,
-              (_e, cx) => {
-                if (!isBusy) this.submitCardDecision(cx, mergedItem, detailItem, queueRow, { mode: "resume" });
-              },
-              { primary: true, iconName: "rig-reply", disabled: isBusy, tooltip: onSomeoneAskText },
-            )))
-          .child(this.dim(t, "Your answers are recorded but the asking seat hasn't had them yet.")),
-      ] : []),
-      ...(isResolve ? [
-        this.dim(t, `Resolve unparks it for ${parkedWorkOwner(queueRow ?? mergedItem)}, with your words. It doesn't close it, and it isn't approval.`),
-      ] : []),
-
-      // 7. Own-words box
-      ...(n.reply !== "none" && !isUpdate ? [this.replyBox(t, cx, mergedItem, { detailItem, queueRow, isNoQuestionAsk, onSomeoneAskText })] : []),
-
-      // 8. Record line (11 px `t.dim`, always present; swaps when Approve is hovered/focused)
-      ...(!isUpdate && !n.native && (n.reply === "answer" || n.reply === "resolve" || verb) ? [
-        v_flex().id(`need-record-line-${n.id}`).gap(2)
-          .child(div().text_size(11).text_color(t.dim).child(recordSentence)),
-      ] : []),
-      ...(!n.native && !isUpdate && !hasDecisionRevision ? [
-        div().id(`need-no-revision-note-${n.id}`).text_size(11).text_color(t.dim).child("OpenRig < 0.7.9 (no decisionRevision): a changed request won't be caught before sending."),
-      ] : []),
-
-      // 9. Fold: "What OpenRig recorded" (collapsed by default)
-      v_flex().id(`need-recorded-fold-${n.id}`).gap(4).pt(2)
-        .child(h_flex().id(`need-recorded-toggle-${n.id}`).gap(6).items_center().cursor_pointer().on_click(toggleRecorded)
-          .child(svg(icon(recordedOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
-          .child(div().text_size(11.5).text_color(t.dim).child("What OpenRig recorded")))
-        .when(recordedOpen, (el) => el.child(v_flex().id(`need-recorded-body-${n.id}`).ml(16).pl(8).py(4).gap(3).border_l(1).border_color(t.border)
-          .children(recordedLines.length
-            ? recordedLines.map((rl, rli) => this.plain(t, rl, `need-recorded-line-${n.id}-${rli}`))
-            : [div().text_size(11.5).text_color(t.dim).child(`State: ${queueRow?.state ?? "pending"}`)])
-          .child(div().id(`need-recorded-cmd-${n.id}`).pt(2).font_family(settings().font_family)
-            .child(div().child("Inspect:"))
-            .child(this.copyValue(t, `rig queue show ${mergedItem.qitemId ?? n.id} --full`, `inspect-${n.id}`, "inspect command"))))),
-    ]);
+    return v_flex().id(`decision-card-${n.id}`).gap(8).pl(10).py(4).border_l(2).border_color(t.dim)
+      .when(standalone, el => el.child(this.title(t, n.summary)).child(this.dim(t, "Update")))
+      .child(h_flex().gap(6).items_center().flex_wrap().text_size(11.5).text_color(t.muted)
+        .when(Boolean(asker), el => el.child(div().id(`need-open-asker-${n.id}`).text_color(t.accent).cursor_pointer()
+          .on_click((_e, cx) => { cx.stop_propagation(); this.openAskerSeat(cx, { ...mergedItem, asker }); }).child(`From ${asker}`)))
+        .when(Boolean(recipient), el => el.child(`· to ${recipient}`))
+        .when(Boolean(scope), el => el.child(`· ${scope}`)).when(Boolean(since), el => el.child(`· since ${since}`)))
+      .when(Boolean(askerNote), el => el.child(this.dim(t, askerNote)))
+      .child(v_flex().id(`need-body-${n.id}`).gap(6).children(lines.flatMap(line => line.split(/\r?\n/)).filter(line => line.trim())
+        .map((line, i) => this.plain(t, line, `need-body-line-${n.id}-${i}`))))
+      .when(Boolean(unblocks), el => el.child(this.dim(t, `Unblocks: ${unblocks}`)))
+      .child(div().id(`need-update-note-${n.id}`).text_size(12).text_color(t.dim).child("No action needed. Viewing isn't approval or proof of delivery."))
+      .when(dismissible(n), el => el.child(h_flex().child(this.updateButton(t, `dismiss-open-${n.id}`, "Dismiss", () => this.updateAction("dismiss", n)))))
+      .when(Boolean(this.updateModel().records.find(r => r.key === updateKey(n) && r.restored && r.status === "closed")), el => el.child(this.dim(t, "Restored here; OpenRig still has it closed.")))
+      .child(v_flex().gap(4).child(h_flex().id(`need-recorded-toggle-${n.id}`).gap(6).items_center().cursor_pointer()
+        .on_click(() => setOpen(`need-recorded:${n.id}`, !recordedOpen))
+        .child(svg(icon(recordedOpen ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
+        .child(this.dim(t, "What OpenRig recorded")))
+        .when(recordedOpen, el => el.children(recordedLines.map((line, i) => this.plain(t, line, `need-recorded-line-${n.id}-${i}`)))
+          .child(this.copyValue(t, `rig queue show ${n.qitemId ?? n.id} --full`, `inspect-${n.id}`, "inspect command"))));
   }
 
   /** The reply box for a request, made outside render (herdr forbids making state there) on first sight; the palette's
@@ -2887,6 +3001,7 @@ export default class RigView extends View {
         await Promise.resolve();
         const box = this.replies[n.id] ??= this.makeReply(n);
         this.making.delete(n.id);
+        if (want && !box.busy) box.composerOpen = true;
         if (want && !box.busy) { box.input.set_value((shared("rig.drafts") ?? {})[box.key] ?? ""); box.result = null; box.input.focus(); }
         cx.notify();
       });
@@ -3020,15 +3135,11 @@ export default class RigView extends View {
             delete this.questionChoices[n.id];
           }
           if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
-          const wordPrefix = act.mode === "resolve" || n.reply === "resolve"
-            ? "Resolved:"
-            : act.mode === "approve"
-              ? "Approved:"
-              : act.mode === "deny"
-                ? "Denied:"
-                : "Answered:";
-          this.answered[n.id] = { summary: n.summary, words: wordPrefix, at: Date.now() };
-          box.result = { ok: true, text: outcome.text };
+          const sentText = this.sentNeedConfirmation(itemForAction, queueRow, act);
+          const confirmation = `${sentText} ${outcome.text}`;
+          this.answered[n.id] = { summary: requestCardText(n).headline, text: confirmation, at: Date.now() };
+          box.composerOpen = false; box.changedSinceAnswered = false;
+          box.result = { ok: true, text: confirmation };
           box.receipt = { at: Date.now(), revision: outcome.decisionRevision, body: queueRow?.body,
             state: act.mode === "resolve" || n.reply === "resolve" ? "in-progress" : null };
           run("rig.refresh");
@@ -3074,6 +3185,15 @@ export default class RigView extends View {
       }
       cx.notify();
     });
+  }
+
+  /** Called only after a confirmed action; the local receipt survives removal from attention. */
+  sentNeedConfirmation(item, queueRow, act) {
+    const questions = questionsState(item, queueRow).questions;
+    const labels = (act.choices ?? []).map(c => questions.find(q => q.id === c.questionId)?.options.find(o => o.id === c.optionId)?.label ?? c.optionId);
+    const words = String(act.decision ?? act.text ?? (labels.length ? labels.join("; ")
+      : act.mode === "approve" ? "Approved" : act.mode === "deny" ? "Denied" : "Answers sent")).trim();
+    return `Sent: ${words}${/[.!?]$/.test(words) ? "" : "."}`;
   }
 
   /** Sends the own-words box via `POST /api/mission-control/action`. */
@@ -3132,6 +3252,7 @@ export default class RigView extends View {
           this.sendReply(cx, box);
         }, { primary: true, iconName: "rig-reply", disabled: box.busy || (isDenying && !hasReasonText), tooltip: onSomeoneAskText }))
         .child(this.button(t, `need-cancel-${n.id}`, isDenying ? "Back" : "Cancel", (_e, cx) => {
+          if (box.cardMode) { this.keepDraft(box); box.composerOpen = false; box.confirmResolve = false; box.denying = false; cx.notify(); return; }
           if (isDenying) {
             box.denying = false;
             box.result = null;
@@ -3830,7 +3951,13 @@ export default class RigView extends View {
   }
 
   render(cx) {
+    this.wideGraph=false;
+    const graphNav=navKey(nav().stack?.at(-1))+":"+(nav().stack?.at(-1)?.tab??"");
+    if(this.graphNav!==graphNav){for(const graph of this.graphs?.values()??[])graph.reset();this.graphNav=graphNav;}
     this.textSeq = 0;
+    // Collect only rows the active native render actually builds (expanded rigs/pods and the open seat).
+    // Existing timers merely mark refresh due; hidden page copies never start tail reads from a timer.
+    this.nowSeats = new Map();
     // The rows this frame draws, for the page's keys; each seat's Send/Queue for S and Q.
     this.pageRows = [];
     this.seatActions = {};
@@ -3855,6 +3982,9 @@ export default class RigView extends View {
     this.previousUpdateEntry = navKey(entry);
     this.previousSection = entry?.section;
     this.filter = entry?.filter ?? null;
+    this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,navKey(entry)]),cx,{
+      attention: this.cache["/api/attention"]?.data?.items ?? shared("rig.data")?.attentionItems,
+    });
     let body;
     if (!this.config) body = this.dim(t, "Reading OpenRig's settings…");
     else if (!entry) body = this.dim(t, "Nothing open. Pick a rig, seat, spec or slice in the Rig sidebar.");
@@ -3868,6 +3998,7 @@ export default class RigView extends View {
     const file = entry?.section === "file";
     // After the body: its reads are what the note checks.
     const note = file ? null : this.refreshNote(t);
+    this.refreshNowTails(cx);
     return v_flex().id("rig-view-root").size_full().bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).track_focus(this.handle)
       // A click inside takes the keyboard, so Esc and Alt+Left work after it.
       .on_mouse_down("left", () => this.handle.focus())
@@ -3878,6 +4009,7 @@ export default class RigView extends View {
         if (e.key === "left" && e.modifiers?.alt) this.back();
         // Alt+1..6: the sections, in the switch's order.
         else if (e.modifiers?.alt && /^[1-6]$/.test(e.key)) this.goSection(RIG_SECTIONS[Number(e.key) - 1]);
+        else if (entry?.section === "needs" && this.routeNeedKey(e, cx, entry)) { /* open card consumes its shortcuts */ }
         else if (e.key === "escape" && entry?.section === "topology" && !entry.kind && this.pulseFilter) { this.pulseFilter = null; cx.notify(); }
         else if (e.key === "escape") closeInspection();
         else if (e.key === "delete" && entry?.section === "needs" && !entry.id && dismissible(this.selectedUpdate) && !this.selectedUpdate.dismissed
@@ -3891,6 +4023,6 @@ export default class RigView extends View {
       .child(file ? this.fileHeader(t, entry) : this.header(t, cx, stack, entry ?? { section: "topology" }))
       .when(!file, (el) => el.child(this.sectionBar(t, entry ?? { section: "topology" })))
       .child(file ? v_flex().id("rig-view-body").flex_1().min_h(0).child(body)
-        : v_flex().id("rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(14).child(v_flex().max_w(960).gap(12).when(!!note, (el) => el.child(note)).child(body)));
+        : v_flex().id("rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(14).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!note, (el) => el.child(note)).child(body)));
   }
 }

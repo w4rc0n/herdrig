@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.3.0
+Version: v0.4.0
 
 ## Updating
 
@@ -10,8 +10,21 @@ Restart herdr-app after all four are copied. Folds and settings are kept outside
 Check the `Version:` line in the README you copied, or **Herdrig Version** in System.
 
 Herdrig brings OpenRig into the `herdr` window: a sidebar with six collapsible branches of a rig's live topology,
-specs, scopes, terminals, needs-you items and system state. Rig rows open the rig's Herdr space; other rows open
-graphical pages. The Page and the TUI are pop-outs of the sidebar, not modes — the sidebar stays put while you read.
+specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
+its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
+
+The sidebar folds to a 30 px header in personal spaces, keeping Needs you and search. Click the header, press Enter
+while it has focus, or choose **OpenRig: show sidebar here** to expand until the space changes. Its previous pixel
+or weighted height is restored; tree folds and scroll position are untouched. Give the rig block its own layout id
+for automatic resizing. Without one it draws only the header and explains the fallback.
+Pages for a rig use its existing rig space; when none exists they use the local **OpenRig** home. Cross-rig pages
+stay in the current OpenRig space, or go home from personal spaces. The TUI always goes home. The first home terminal
+is a labelled local TUI; its recorded space id survives renames, and closing the space recreates it on the next open.
+Closing only its TUI does not reopen that TUI during a page open. A simultaneous first Attach and grid shares one
+queue per rig. Background updates never create spaces or select tabs, including when a destination closes during preparation.
+Legacy Rig pages and labelled TUI tabs offer one **Move** / **Keep here** choice per space. Nothing moves silently.
+Move verifies each tab contains only Rig pages or still-running TUI terminals, opens replacements at home, and then
+closes the originals; personal split panes and replaced shells are left alone with an explanation.
 
 Each rig space has a **Seats** tab with an equal grid of local tmux viewers (equal columns first, then equal rows).
 Joining, leaving and restarting rebuild only mod-labelled viewer panes, leaving seat sessions alive. Background
@@ -20,7 +33,12 @@ Leave the grid or explicitly open it again to apply the change. Personal panes i
 prevent automatic rebuilding. Closing a rig space keeps it closed across membership changes and restarts; only an
 explicit sidebar/menu open or Attach recreates it. Names never claim personal spaces: collisions get a numeric suffix.
 New Attach tabs use the rig space with the existing status relay; grid viewers stay plain and Needs you supplies alerts.
-Existing Rig pages and TUI tabs stay in their original spaces. Native Herdr seats use Attach instead of this grid.
+Native Herdr seats use Attach instead of this grid.
+Attach requests from the Page, menu and palette share the sidebar's queue when it is present, including local seats.
+They wait for a live sidebar receipt; if a declared sidebar is not running, a bounded wait says **Open the Rig sidebar to attach**.
+Running terminal-only seats can be attached without inventing an agent status. The relay checks its private tmux
+directory through the opened handle before changing permissions. Shell recovery reads only a regular config file,
+up to 1 MiB, through one nonblocking handle; symlinks to regular user configs remain supported.
 Attach and grids use local tmux unless a Herdr machine is explicitly configured (see below). A loopback HTTP tunnel
 does not change the selected machine. In local mode, Attach and Operator use a local rig space even when a remote
 space is active. The TUI uses a labelled local terminal too. A failed labelled start reports the failure; it never
@@ -415,7 +433,7 @@ What tripped this build up, and what a fresh build would get wrong:
   you already use — nothing else is taken.
 - **`place` is `"none"`, so the layout must reference `{ "mod": "rig" }`.** Herdr never auto-docks a `"place": "none"`
   mod or modifies a shipped layout on folder discovery. Tell the person before changing their layout; if they are on
-  `main`, `layout.clone` it to their own and insert a `{ "mod": "rig" }` block (`"size": { "weight": 2 }` or a pixel
+  `main`, `layout.clone` it to their own and insert a block with `"id": "openrig-sidebar"`, `"content": { "mod": "rig" }` (`"size": { "weight": 2 }` or a pixel
   height) as the first child of `sidebar-lists` (otherwise ask the person).
 - **The sidebar wants 260 px of width, and the rail keys off column `id: "sidebar"`.** Below 160 px wide the column with
   `id: "sidebar"` becomes a rail; between 160 and 260 the tree is cramped rather than broken. Keep `id: "sidebar"` if you
@@ -433,13 +451,18 @@ What tripped this build up, and what a fresh build would get wrong:
 
 ## Done when
 
+Archived rigs are listed under their host in By rig and on the host page, or in a remembered fold after Idle in
+Priority. Restore returns a rig stopped; Resume starts it. Local grid pads say **Empty tile** and ignore typing.
+Remote pads remain a plain sleep: the grid copies no mod code there, so those pads cannot print this explanation.
+
 Each of these is something this build really does:
 
 1. `herdr-app check mods/rig mods/rig-view mods/rig-palette mods/rig-menu` → all four pass, from the clone, with no
    install step.
 2. Copy **all four folders** — `mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu` — into a throwaway
    `<appHome>/mods/`, clone `main` (`layout.clone`) and insert the `{ "mod": "rig" }` block as the first child of
-   `sidebar-lists` in the `sidebar` column → a sidebar titled **OpenRig** with six branches, and a `ctrl-alt-r`
+   `sidebar-lists` in the `sidebar` column → a sidebar titled **OpenRig** opening on Topology's Priority view
+   (Needs you, Working, Idle), with the other branches below it, and a `ctrl-alt-r`
    palette that opens. Copying only some of them is the one shape that half-works: the sidebar draws but its menus
    and palette open nothing.
 3. With the daemon running, a rig appears under **Topology** with its seats and their status marks; clicking a seat

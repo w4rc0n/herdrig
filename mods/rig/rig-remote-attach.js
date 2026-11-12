@@ -1,5 +1,6 @@
 import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, layoutHasMod, MOD_IDS } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
+import { resolveRigSpace, markRigSpace, rigOrigin } from "./rig-space-context.js";
 
 const list = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
 
@@ -40,35 +41,35 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     const machine = remote.machine, origin = config.daemonUrl.replace(/\/$/, "");
     const local = (id) => machineLocalId(id, machine), qualified = (id) => machineId(id, machine);
     const terms = () => list(host, "terminals").filter((t) => t.address?.startsWith(`${machine}/`));
-    const spaces = () => list(host, "spaces").filter((s) => s.machine === machine);
     const flags = tmuxServerArgsFrom(seat.tmuxAttachCommand, session);
     if (!seat.tmuxAttachCommand || !flags) throw new Error("The seat has no checked tmux attach command. Refresh OpenRig before attaching.");
     const probe = await host.exec("tmux", [...flags, "has-session", "-t", `=${session}`], { on: machine, timeout: 10000 });
     if (probe.code !== 0) throw new Error(`The seat's tmux session is unavailable on ${machine}. Connect as the user running OpenRig and check its tmux socket.`);
     const argv = buildAttachRelayArgv({ daemonUrl: remote.daemonUrl, rig: [remote.node], openrigHome: null }, seat, remote.relayPath);
     const existingViewer = () => terms().find((t) => t.labels?.["herdr-openrig.attach"] === session
-      && t.labels?.["herdr-openrig.origin"] === origin && t.labels?.["herdr-openrig.role"] === "attach"
+      && rigOrigin(t.labels?.["herdr-openrig.origin"]) === rigOrigin(origin) && t.labels?.["herdr-openrig.role"] === "attach"
       && relayIdentity(t.argv) === relayIdentity(argv) && (!t.state || ["running", "live"].includes(t.state)));
-    const reuse = (existing) => {
+    const reuse = async (existing) => {
       const tab = qualified(existing.labels["herdr.tab"]);
+      const destination=resolveRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)]);
+      if(destination?.tabs?.some(item=>item.id===tab))await markRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)],destination);
       host.run("space.select", { id: qualified(existing.labels["herdr.space"]) });
       host.run("tab.select", { id: tab }); host.run("pane.focus", { terminal: existing.address });
       return { ok: true, reused: true, terminal: existing.address, tab };
     };
     const existing = existingViewer();
-    if (existing) return reuse(existing);
+    if (existing) return await reuse(existing);
     const refuseChangedViewer = () => {
       const changed = terms().find((t) => t.labels?.["herdr-openrig.attach"] === session
-        && t.labels?.["herdr-openrig.origin"] === origin && t.labels?.["herdr-openrig.role"] === "attach"
+        && rigOrigin(t.labels?.["herdr-openrig.origin"]) === rigOrigin(origin) && t.labels?.["herdr-openrig.role"] === "attach"
         && list(host, "panes").some((p) => p.terminal === t.address));
       if (changed) throw new Error(`Close that tab, then Attach again. Save any work before closing it: the Attach tab for ${seat.logicalId ?? session} is no longer running its viewer, possibly after a Herdr restart.`);
     };
     refuseChangedViewer();
     const rig = seat.rig ?? session.slice(session.lastIndexOf("@") + 1);
     const isOperator = options.operator || session === "operator-agent@kernel";
-    const ids = new Set(terms().filter((t) => t.labels?.["herdr-openrig.space"] === "1"
-      && t.labels?.["herdr-openrig.rig"] === rig && t.labels?.["herdr-openrig.origin"] === origin).map((t) => qualified(t.labels["herdr.space"])));
-    const space = spaces().find((s) => ids.has(s.id));
+    const space = resolveRigSpace(host,config,[rig,seat.rigId]);
+    if(space)await markRigSpace(host,config,[rig,seat.rigId],space);
     const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const spaceId = space?.id ?? qualified(`sp-openrig-${nonce}`), tab = qualified(`tb-attach-${nonce}`);
     // Preparation revalidates the profile, identity and relay bytes immediately before launching.
@@ -76,7 +77,7 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     if (!checked.ok) return checked;
     if (JSON.stringify(checked) !== JSON.stringify(remote)) throw new Error("The remote machine changed during Attach. Retry.");
     const appeared = existingViewer();
-    if (appeared) return reuse(appeared);
+    if (appeared) return await reuse(appeared);
     refuseChangedViewer();
     const started = await host.hc(["run", "--on", machine, "--bg", "--json", "--no-parent", "--no-notify",
       "--label", `herdr.space=${local(spaceId)}`, "--label", `herdr.tab=${local(tab)}`,

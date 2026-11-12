@@ -24,12 +24,24 @@ function configuredShell(text) {
 }
 function readShell(env = process.env) {
   const folder = env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  let fd;
   try {
     const file = path.join(folder, "herdr-core", "config.toml");
-    if (fs.statSync(file).size > 1048576) return null;
-    const text = fs.readFileSync(file, "utf8");
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd), limit = 1048576;
+    if (!stat.isFile() || stat.size > limit) return null;
+    const bytes = Buffer.alloc(limit + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = fs.readSync(fd, bytes, length, bytes.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+    if (length > limit) return null;
+    const text = bytes.subarray(0, length).toString("utf8");
     if (/^\s*shell\s*=/m.test(text)) return configuredShell(text);
   } catch (e) { if (e.code !== "ENOENT") return null; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
   // Without an explicit setting, leave recognition to the controller's common-shell fallback.
   return null;
 }

@@ -1,6 +1,7 @@
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
 import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8 } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
+import { resolveRigSpace, rigOrigin } from "./rig-space-context.js";
 
 const ROLE = "rig-grid";
 const get = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
@@ -8,7 +9,7 @@ const labels = (t) => t?.labels ?? {};
 const addr = (t) => t?.address ?? t?.terminal;
 const origin = (config) => String(config?.daemonUrl ?? "").replace(/\/$/, "");
 const belongs = (t, rig, url) => labels(t)["herdr-openrig.space"] === "1"
-  && labels(t)["herdr-openrig.rig"] === rig.name && labels(t)["herdr-openrig.origin"] === url;
+  && labels(t)["herdr-openrig.rig"] === rig.name && rigOrigin(url)!==null && rigOrigin(labels(t)["herdr-openrig.origin"]) === rigOrigin(url);
 const shell = (t, configured) => Array.isArray(t.argv) && (
   Array.isArray(configured) && configured.length > 0 && JSON.stringify(t.argv) === JSON.stringify(configured)
   || t.argv.length === 1 && /(?:^|\/)(?:sh|bash|dash|zsh|fish|ksh)$/.test(t.argv[0]));
@@ -19,10 +20,8 @@ const tileSnapshot = (t, p) => ({ terminal: addr(t), pane: p.pane, tab: p.tab,
   labels: Object.fromEntries(Object.entries(labels(t)).filter(([k]) => k.startsWith("herdr-openrig.") || k === "herdr.space" || k === "herdr.tab").sort(([a], [b]) => a.localeCompare(b))) });
 
 export function ownedRigSpace(host, rig, config) {
-  const machine = config?.daemonMachine || null;
-  const ids = new Set(get(host, "terminals").filter((t) => belongs(t, rig, origin(config))
-    && (machine ? addr(t)?.startsWith(`${machine}/`) : !addr(t)?.includes("/"))).map((t) => machineId(labels(t)["herdr.space"], machine)));
-  return get(host, "spaces").find((s) => (s.machine || null) === machine && ids.has(s.id)) ?? null;
+  // Background grid activation still requires its explicit marker; recognising legacy Attach alone never starts a grid.
+  return resolveRigSpace(host,config,[rig.id,rig.name],{markedOnly:true});
 }
 
 /** The sidebar issues consent for one exact dialog; shared-state callers cannot supply their own snapshot. */
@@ -182,7 +181,10 @@ export class RigSpaces {
       && rebuild.tiles.some((s) => JSON.stringify(s) === JSON.stringify(tileSnapshot(t, p)));
     const focused = () => get(host, "spaces").some((s) => s.active && s.tabs?.some((t) => t.id === tab && t.active))
       || tabPanes().some((p) => p.focused || (p.terminal && p.terminal === host.focused?.()?.terminal));
-    const guard = () => { if (!explicit && focused()) throw new Error("deferred-focus"); };
+    const guard = () => {
+      if (!explicit && !get(host, "spaces").some(s => s.id === space?.id)) throw new Error("space-closed");
+      if (!explicit && focused()) throw new Error("deferred-focus");
+    };
     const ready = async () => {
       if (!machine) return;
       const current = await host.prepareRemote(config);
@@ -301,6 +303,7 @@ export class RigSpaces {
     } catch (e) {
       this.done.delete(key);
       if (e.message === "deferred-focus") return { ok: true, deferred: true };
+      if (e.message === "space-closed") return { ok: true, closed: true };
       const failure = remoteFailure(e, machine), retryable = e.retryable || failure.retryable;
       return { ...failure, ...(retryable ? { retryable: true, preparationFailed: true } : { closeAvailable: this.ownedPanes(rig, config).length > 0 }) };
     }
