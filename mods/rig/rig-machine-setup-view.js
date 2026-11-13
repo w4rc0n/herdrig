@@ -3,10 +3,11 @@ import {v_flex,h_flex} from "gpui-base";
 import {reviewMachineSetup,approveMachineSetup,stopUsingMachine} from "./rig-machine-setup.js";
 
 export class MachineSetupPanel {
-  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,cancelHandle,primaryHandle}={}){
+  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,cancelHandle,primaryHandle,copyHandles={}}={}){
     this.host=host;this.config=config;this.machine=machine;this.done=done;this.cancel=cancel;
     this.mono=mono;this.copyIcon=copyIcon;this.stop=stop;this.phase=stop?"ready":"checking";
     this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
+    this.copyHandles=copyHandles;
   }
   async check(cx){
     if(this.busy)return;this.phase="checking";this.error=null;cx.notify();
@@ -26,7 +27,7 @@ export class MachineSetupPanel {
         else if(result.needsConsent){this.phase="error";this.error="The machine or helper changed. Check again and review its details.";}
         else {this.phase="error";this.error=result.reason;}
       }catch(error){this.phase="error";this.error=String(error?.message??error);}
-      finally{this.busy=false;cx.notify();if(this.phase==='done'&&this.primaryHandle)cx.timer.after(0,nextCx=>{this.primaryHandle.focus();nextCx.notify();});}
+      finally{this.busy=false;cx.notify();const handle=this.phase==='done'?this.primaryHandle:this.stop&&this.phase==='error'?this.cancelHandle:null;if(handle)cx.timer.after(0,nextCx=>{handle.focus();nextCx.notify();});}
     });
   }
   button(id,text,callback,{disabled=false,primary=false}={}){
@@ -45,6 +46,7 @@ export class MachineSetupPanel {
       .child(div().w(76).flex_none().text_color(this.theme.muted).child(label))
       .child(div().flex_1().min_w(0).font_family(this.mono).text_size(11).child(value))
       .when(copy,el=>el.child(div().id(`machine-setup-copy-${label==="SHA-256"?"sha":label.toLowerCase()}`).role("button").tab_stop(true).size(20).flex_none().cursor_pointer().tooltip("Copy SHA-256")
+        .when(!!this.copyHandles[label],el=>el.track_focus(this.copyHandles[label])).focus(el=>el.border(1).border_color(this.theme.accent))
         .on_click((_e,cx)=>cx.write_to_clipboard(value))
         .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(value);}})
         .child(svg(this.copyIcon).size(12).text_color(this.theme.muted))));
@@ -53,7 +55,11 @@ export class MachineSetupPanel {
     this.theme=t;
     const c=this.review?.confirmation,done=this.phase==="done",update=!!this.review?.alreadyConfigured&&c?.fileState==="older";
     const cycle=(forward,cx)=>{
-      cx.stop_propagation();const first=done?this.primaryHandle:this.cancelHandle,last=done||this.phase==='ready'||this.phase==='error'?this.primaryHandle:this.cancelHandle;
+      cx.stop_propagation();
+      const copies=this.stop?[this.copyHandles.Command]:!done&&this.phase!=='checking'&&c?[this.copyHandles.Folder,this.copyHandles['SHA-256']]:[];
+      const first=copies[0]??(done?this.primaryHandle:this.cancelHandle);
+      const last=this.busy?copies.at(-1):done||this.phase==='ready'||this.phase==='error'&&!this.stop?this.primaryHandle:this.cancelHandle;
+      if(this.busy&&!last)return;
       const boundary=forward&&last?.is_focused?.()?first:!forward&&first?.is_focused?.()?last:null;
       if(boundary){this.focusTask?.cancel?.();this.focusTask=cx.timer.after(16,nextCx=>{boundary.focus();nextCx.notify();});}
       else if(forward)globalThis.window.focus_next();else globalThis.window.focus_prev();

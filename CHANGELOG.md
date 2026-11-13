@@ -2,6 +2,9 @@
 
 ## v0.4.4
 
+- Copy & edit keeps newer file changes and unsaved drafts, and recovers agent paths from your copy. All seats' Show all works from the keyboard; parked work stays with its owner.
+- Tab reaches the machine setup's Copy buttons. New rig keeps your field focused while loading specs, and Cancel is focused when no daemon is found. Typing notifications off or on in the palette does exactly that.
+- Set how many older recap paths a rebuild briefing previews when OpenRig reports that setting; zero lists them all. Older OpenRig versions keep their existing settings controls.
 - New worker views finish opening in an existing rig space while herdrig refreshes its labels. Changed or focused split targets are still left alone.
 - Changing the Spaces list preserves concurrent layout edits, and rig marks and actions stay on the configured machine. Uninstalling restores personal Spaces blocks safely.
 - Worker views with empty cells keep working when refreshed or reopened. If a rig's seats cannot load, its existing tiles stay open.

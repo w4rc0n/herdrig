@@ -5,7 +5,8 @@ const ranks={needs_input:0,attention_required:1,blocked:1,failed:1,active:2,done
 export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,filter='',orderMap={}}={}){
  const asks=attention.filter(n=>n&&!isUpdateNeed(n)&&!['done','closed','canceled'].includes(n.state)).map(n=>{
   const target=needTarget(n);
-  if(n.answer?.verb==='resolve'||n.reply==='resolve')target.session=n.waiting?.owner??n.destinationSession??target.session;
+  target.ownerAttributed=n.answer?.verb==='resolve'||n.reply==='resolve';
+  if(target.ownerAttributed)target.session=n.waiting?.owner??n.destinationSession??null;
   return target;
  });
  const hosts=orderSiblings([...new Set(models.map(m=>m.host||'local'))],'topology:hosts',orderMap,h=>h);
@@ -15,7 +16,7 @@ export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,fil
   // The Rig table uses this projection order; only rig order follows the sidebar overrides.
   const seats=(model.pods??[]).flatMap(p=>p.seats);
   const rows=(state==='ready'?seats:[]).filter(s=>matchesPulseFilter(s,model,pulse,attention)&&(!filter||[s.logicalId,rig.name,s.runtime,s.model,s.word].some(v=>String(v??'').toLowerCase().includes(filter.toLowerCase())))).map(seat=>{
-   const ids=[...new Set(asks.filter(n=>!!n.session&&n.session===seat.session||(n.rig===rig.name&&(n.logicalId??n.seat)===seat.logicalId)).map(n=>n.id))];
+   const ids=[...new Set(asks.filter(n=>!!n.session&&n.session===seat.session||(!n.ownerAttributed&&n.rig===rig.name&&(n.logicalId??n.seat)===seat.logicalId)).map(n=>n.id))];
    const status=matchesPulseFilter(seat,model,'needs',attention)?'needs_input':seat.status;
    const raw=model.nodesState?.data?.find(n=>n.canonicalSessionName===seat.session)??{};
    return {rig,seat,status,needIds:ids,rigIndex,key:`all-seat:${rig.id}:${seat.session??seat.logicalId}`,

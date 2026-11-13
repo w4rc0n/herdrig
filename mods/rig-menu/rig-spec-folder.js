@@ -23,6 +23,9 @@ export function copyDisplayName(base, taken) {
 }
 
 const RELATIVE_AGENT_REF = /^[ \t]*(?:-[ \t]+)?agent_ref:[ \t]*["']?local:/m;
+const inCopyFolder=(file,folder)=>typeof file==='string'&&typeof folder==='string'&&folder.startsWith('/')&&folder!=='/'
+  &&!/[\u0000-\u001f\u007f]/.test(file+folder)&&![...file.split('/'),...folder.split('/')].some(p=>p==='.'||p==='..')
+  &&file.startsWith(folder+'/')&&/\.ya?ml$/i.test(file);
 
 /** First copy of a built-in. Returns { ok, copy, folder } | { needsConsent, confirmation } | { ok:false, reason } | { exists, folder }. */
 export async function copyBuiltinFolder(host, spec, grant = null) {
@@ -49,7 +52,7 @@ export async function copyBuiltinFolder(host, spec, grant = null) {
  *  Returns { state: "finished", entry } | { state: "unfinished", entry, baseText, rewritten } | { state: "unindexed" }. */
 export async function findExistingCopy(host, spec, folder) {
   const list = await host.library(true);
-  const mine = list.filter((x) => x.sourceType === "user_file" && typeof x.sourcePath === "string" && x.sourcePath.startsWith(`${folder}/`));
+  const mine = list.filter((x) => x.sourceType === "user_file" && inCopyFolder(x.sourcePath,folder));
   if (!mine.length) return { state: "unindexed" };
   // An unfinished copy first: it is the one the person's earlier attempt left behind.
   for (const entry of mine) {
@@ -58,9 +61,10 @@ export async function findExistingCopy(host, spec, folder) {
     if (entry.name === spec.name) {
       const name = copyDisplayName(spec.name, new Set(list.map((x) => x.name)));
       current = (await host.rename(entry.id, name)) ?? { ...entry, name };
+      if(!inCopyFolder(current.sourcePath,folder))return{state:'unindexed',reason:"The copy's location changed. Refresh the library before opening it."};
       text = await host.specText(current); // the rename rewrote the name inside the file: fix the file as it is now
     }
-    const prepared = copyableSpecText(text, spec.sourcePath);
+    const prepared = copyableSpecText(text, current.sourcePath);
     if (prepared.refused) return { state: "unindexed", reason: prepared.refused };
     return { state: "unfinished", entry: current, baseText: text, rewritten: prepared.text };
   }

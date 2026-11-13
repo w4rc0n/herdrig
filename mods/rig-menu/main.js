@@ -183,6 +183,7 @@ export default class RigMenu extends View {
         this.setupPanel=new MachineSetupPanel(this.machineSetupHost(cx),this.config,step.machine??step.confirmation?.machine,{
           mono:settings()?.font_family??"monospace",copyIcon:icon("rig-copy"),stop:step.action==="stop-machine",
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,
+          copyHandles:Object.fromEntries(['Folder','SHA-256','Command'].map(label=>[label,cx.focus_handle?.()])),
           cancel:()=>this.dismiss(),done:(_cx,result)=>{
             if(step.token){setShared("rig.machineConfirmation",step.token);run("rig.confirm-machine");}
             this.dismiss();
@@ -249,6 +250,7 @@ export default class RigMenu extends View {
   initNewRig(cx) {
     const drafts = shared("rig.drafts") ?? {};
     this.newMode = "spec";
+    this.newFocusTouched=false;
     this.newRuntime = NEW_RIG_RUNTIMES[0];
     this.newSpec = null;
     this.newSpecs = null;
@@ -262,12 +264,12 @@ export default class RigMenu extends View {
     for (const field of [this.folder, this.rigName]) {
       field.on("focus", () => { this.typing = true; });
       field.on("blur", () => { this.typing = false; });
-      field.on("change", (_e, cx) => { this.newProblem = null; cx.notify(); });
+      field.on("change", (_e, cx) => { this.newFocusTouched=true;this.newProblem = null; cx.notify(); });
       field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, props().target, props().step); });
     }
     cx.spawn(async (cx) => {
       const config = await configNow();
-      if (!config.daemonUrl) { this.newSpecs = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start')." }; cx.notify(); return; }
+      if (!config.daemonUrl) { this.newSpecs = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start')." }; cx.timer.after(0,nextCx=>{if(!this.newFocusTouched)this.dialogCancelHandle?.focus?.();nextCx.notify();});cx.notify(); return; }
       try {
         const r = await fetch(`${config.daemonUrl}/api/specs/library`);
         const body = await r.json();
@@ -276,7 +278,7 @@ export default class RigMenu extends View {
         this.newSpecs = list.filter((s) => s && (s.name || s.sourcePath) && (!s.kind || s.kind === "rig"));
         this.newSpec=this.newSpecs[0]??null;
       } catch (e) { this.newSpecs = { error: String(e?.message ?? e) }; }
-      cx.timer.after(0,nextCx=>{(this.newSpec?this.newSpecHandle:this.dialogCancelHandle)?.focus?.();nextCx.notify();});
+      cx.timer.after(0,nextCx=>{if(!this.newFocusTouched&&this.newMode==='spec')(this.newSpec?this.newSpecHandle:this.dialogCancelHandle)?.focus?.();nextCx.notify();});
       cx.notify();
     });
   }
@@ -909,6 +911,7 @@ export default class RigMenu extends View {
   dialogTab(e,cx){
     if(String(e.key).toLowerCase()!=='tab'||e.modifiers?.control||e.modifiers?.platform||e.modifiers?.alt)return false;
     cx.stop_propagation();
+    if(this.newMode!==undefined)this.newFocusTouched=true;
     const first=this.dialogFirstControl,last=this.dialogLastControl;
     const boundary=e.modifiers?.shift&&first?.is_focused?.()?last:!e.modifiers?.shift&&last?.is_focused?.()?first:null;
     if(boundary){
@@ -921,7 +924,7 @@ export default class RigMenu extends View {
     this.dialogObservedFields??=new Set();
     if(!this.dialogObservedFields.has(state)){
       this.dialogObservedFields.add(state);
-      state.on('focus',()=>{this.typing=true;this.dialogFocusedField=state;});
+      state.on('focus',()=>{this.typing=true;this.dialogFocusedField=state;if(this.newMode!==undefined)this.newFocusTouched=true;});
       state.on('blur',()=>{this.typing=false;if(this.dialogFocusedField===state)this.dialogFocusedField=null;});
     }
     this.dialogFirstControl??={focus:()=>state.focus(),is_focused:()=>this.dialogFocusedField===state};
@@ -1888,7 +1891,7 @@ export default class RigMenu extends View {
   newRigView(t) {
     const pill = (id, label, active, onClick) => this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
       .bg(active ? t.accent : t.raised).text_color(active ? (t.solid_foreground ?? t.background) : t.muted).border_1().border_color(active ? t.accent : t.border)
-      .hover((s) => s.bg(active ? t.accent : t.hover)),null,(_e,cx)=>{onClick();cx.notify();},false,label);
+      .hover((s) => s.bg(active ? t.accent : t.hover)),null,(_e,cx)=>{this.newFocusTouched=true;onClick();cx.notify();},false,label);
     const label = (text) => div().text_size(11.5).text_color(t.dim).child(text);
     const field = (text, state) => v_flex().gap(3).child(label(text)).child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(this.dialogField(state,Input)));
     const seat = this.newMode === "seat";
@@ -1909,7 +1912,7 @@ export default class RigMenu extends View {
           .child(div().flex_1().truncate().tooltip(String(s.name ?? s.id ?? "Unnamed spec"??"")).child(s.name ?? s.id ?? "Unnamed spec")))
           .when(this.newExpandedSpec === s, (el) => el.child(v_flex().id(`new-rig-spec-preview-${i}`).ml(14).pb(4).child(this.newSpecPreviewView(t, s))));
       }));
-    return v_flex().id("new-rig-view").gap(8)
+    return v_flex().id("new-rig-view").gap(8).on_mouse_down('left',()=>{this.newFocusTouched=true;})
       .child(h_flex().id("new-rig-mode").gap(4)
         .child(pill("new-rig-mode-spec", "From a spec", !seat, () => { this.newMode = "spec"; this.newProblem = null; this.result = null; }))
         .child(pill("new-rig-mode-seat", "One seat", seat, () => { this.newMode = "seat"; this.newProblem = null; this.result = null; })))

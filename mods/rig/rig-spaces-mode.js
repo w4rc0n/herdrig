@@ -24,7 +24,12 @@ const modOf = (node) => node?.content?.mod ?? null;
 const isOnly = (node) => modOf(node) === OUR_MOD && node?.content?.props?.only === true;
 const isOurs = (node) => modOf(node) === OUR_MOD;
 const isFull = (node) => isOurs(node) && !isOnly(node);
-const isAdded = (node) => isOnly(node) && typeof node.id === "string" && node.id.startsWith(ONLY_ID);
+// The ids herdrig itself writes for the block it adds: `rig-spaces-only`, then `rig-spaces-only-2`, `-3`, ... planMode's loop
+// starts at 2 (rig-spaces-mode.js:88), so there is never a `-1`. Matching that format exactly — not the prefix, and not a
+// broader numeric suffix — is what keeps a person's block that happens to look like ours. Getting this wrong deletes their block,
+// which is data loss, so it is anchored at both ends and the suffix starts where our own generation starts.
+const ADDED_ID = new RegExp(`^${ONLY_ID}(?:-[2-9]|-[1-9][0-9]+)?$`);
+const isAdded = (node) => isOnly(node) && typeof node.id === "string" && ADDED_ID.test(node.id);
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 /** Every node, depth first, with its parent and index. */
@@ -38,14 +43,23 @@ const ids = (tree) => { const out = new Set(); walk(tree, (n) => { if (typeof n.
 
 /** What the layout shows now: counts of each kind of block and the mode they add up to ("custom" when they don't). */
 export function detectMode(tree) {
-  let herdr = 0, full = 0, only = 0;
-  walk(tree, (n) => { if (modOf(n) === HERDR_MOD) herdr++; else if (isFull(n)) full++; else if (isOnly(n)) only++; });
+  let herdr = 0, full = 0, only = 0, personal = 0;
+  // Only the blocks herdrig itself generates count as a herdrig mode. A person's own `only` block has an id we never write, so
+  // it is THEIR block: it must not make the layout "both", because a request for "herdr" would then short-circuit on "already
+  // shows" while System still reported Both (CodeRabbit 4566227823, found natively). It is counted separately so a refusal can
+  // say plainly what is left. personal does not enter the mode expression: a person's block is not a mode of ours.
+  walk(tree, (n) => {
+    if (modOf(n) === HERDR_MOD) herdr++;
+    else if (isFull(n)) full++;
+    else if (isAdded(n)) only++;
+    else if (isOnly(n)) personal++;
+  });
   const mode = herdr + full + only === 0 ? "none"
     : herdr > 0 && full === 0 && only === 0 ? "herdr"
     : herdr === 0 && full > 0 && only === 0 ? "herdrig"
     : herdr > 0 && full === 0 && only > 0 ? "both"
     : "custom";
-  return { mode, herdr, full, only };
+  return { mode, herdr, full, only, personal };
 }
 
 const LINES = {
@@ -94,6 +108,13 @@ export function planMode(tree, target) {
     added++;
     changed.push(id);
   }
+  // CodeRabbit 4566227823: a transition may report success only when the result really IS the requested mode. A block we cannot
+  // manage (a person's own `only` block, say) can leave the layout short of the target, and claiming success then would tell the
+  // person their layout changed when it did not. Say plainly what is left instead.
+  const after = detectMode(next);
+  if (after.mode !== target)
+    return { ok: false, from: now.mode, to: target, reached: after.mode,
+      reason: `This layout can't reach that mode: it still shows ${after.mode === "custom" ? "a mixture of blocks" : `the ${after.mode} mode`}${after.personal ? `, including ${after.personal} of your own block${after.personal === 1 ? "" : "s"}` : ""}. Nothing was changed.` };
   return { ok: true, tree: next, from: now.mode, to: target, lines: LINES[now.mode][target], blocks: changed.length, added, removed };
 }
 
@@ -131,6 +152,10 @@ export function namedOurMods(tree) {
  *  goes, and every block of the Rig sidebar (mod `rig`) goes. Nothing else is touched; a row or column that only held those blocks
  *  goes with them. Returns { ok: true, tree, spaces, rigBlocks } or null when the layout names none of ours. */
 export function uninstallPlan(tree) {
+  // Which containers held something BEFORE we touched anything: a container that was already empty is the person's structure and
+  // must survive, while one we empty ourselves should go (CodeRabbit 4566227713).
+  const wasPopulated = new Set();
+  walk(tree, (node) => { if (Array.isArray(node?.children) && node.children.length > 0 && typeof node.id === "string") wasPopulated.add(node.id); });
   const back = switchBack(tree);
   const next = clone(back?.ok ? back.tree : tree);
   let rigBlocks = 0;
@@ -141,6 +166,17 @@ export function uninstallPlan(tree) {
     return !isRoot && before > 0 && node.children.length === 0;
   };
   strip(next, true);
+  // A container `switchBack` emptied (it held blocks and now holds none) is pruned too, matched to the pre-switch node by id so a
+  // container that was already empty is never mistaken for one we emptied.
+  const pruneEmptied = (node, isRoot) => {
+    if (!Array.isArray(node?.children)) return;
+    node.children = node.children.filter((child) => {
+      pruneEmptied(child, false);
+      const heldBlocks = typeof child?.id === "string" && wasPopulated.has(child.id);
+      return !(Array.isArray(child?.children) && child.children.length === 0 && heldBlocks);
+    });
+  };
+  if (back?.ok) pruneEmptied(next, true);
   // CodeRabbit 4560854971: switchBack puts back the blocks it can trace (a full block, or the one whose id we generated). A
   // `rig-spaces` block it cannot trace — a Rig-spaces-only block a person copied, or one an older build wrote — would survive and
   // still name a mod that is being removed, so herdr would fall back to its own layout. Convert EVERY remaining one to Herdr's

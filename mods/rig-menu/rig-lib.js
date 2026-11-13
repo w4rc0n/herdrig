@@ -4489,8 +4489,9 @@ export function recentTransitionRows(data, topologyOrOpts = [], extraOpts = {}) 
 function isSeatNeedsYou(seat, rigName, actionableNeeds) {
   if (seat?.status === "needs_input" || seat?.word === "needs you") return true;
   return actionableNeeds.some((item) => {
-    const asker = String(item?.asker ?? "");
-    const itemSeat = String(item?.seat ?? item?.logicalId ?? "");
+    const resolving=item?.answer?.verb==='resolve'||item?.reply==='resolve';
+    const asker = String(resolving?(item?.waiting?.owner??item?.destinationSession??''):(item?.asker??''));
+    const itemSeat = resolving?'':String(item?.seat ?? item?.logicalId ?? "");
     if (seat?.session && (asker === seat.session || itemSeat === seat.session)) return true;
     if (seat?.logicalId && (itemSeat === seat.logicalId || asker === seat.logicalId || (rigName && asker === `${seat.logicalId}@${rigName}`))) return true;
     return false;
@@ -4546,8 +4547,9 @@ export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], 
     const rigHasMatchedSeat = (rig?.seats ?? []).some((s) => isSeatNeedsYou(s, rigName, actionableNeeds));
     if (!rigHasMatchedSeat) {
       return actionableNeeds.some((item) => {
-        const asker = String(item?.asker ?? "");
-        const itemRig = String(item?.rig ?? item?.scope ?? (asker.includes("@") ? asker.slice(asker.lastIndexOf("@") + 1) : ""));
+        const resolving=item?.answer?.verb==='resolve'||item?.reply==='resolve';
+        const asker = String(resolving?(item?.waiting?.owner??item?.destinationSession??''):(item?.asker??''));
+        const itemRig = String((resolving?null:item?.rig??item?.scope) ?? (asker.includes("@") ? asker.slice(asker.lastIndexOf("@") + 1) : ""));
         return Boolean(rigName && itemRig && itemRig === rigName);
       });
     }
