@@ -1,7 +1,7 @@
 const fold=text=>String(text??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
 /** Menu/select-list typeahead only; callers keep tree letter commands untouched. */
 export function typeahead(state,event,labels,current,now=Date.now()){
- if(Object.values(event.modifiers??{}).some(Boolean))return null;
+ if(Object.entries(event.modifiers??{}).some(([key,value])=>key!=='shift'&&value))return null;
  const char=event.key_char??(event.key==='space'?' ':event.key);
  if(typeof char!=='string'||[...char].length!==1||/[\u0000-\u001f\u007f]/.test(char))return null;
  const active=!!state?.query&&now-state.at<=500;

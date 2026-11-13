@@ -141,8 +141,14 @@ export function uninstallPlan(tree) {
     return !isRoot && before > 0 && node.children.length === 0;
   };
   strip(next, true);
-  if (!back?.ok && rigBlocks === 0) return null;
-  return { ok: true, tree: next, spaces: !!back?.ok, rigBlocks };
+  // CodeRabbit 4560854971: switchBack puts back the blocks it can trace (a full block, or the one whose id we generated). A
+  // `rig-spaces` block it cannot trace — a Rig-spaces-only block a person copied, or one an older build wrote — would survive and
+  // still name a mod that is being removed, so herdr would fall back to its own layout. Convert EVERY remaining one to Herdr's
+  // Spaces list; personal blocks of other mods are untouched.
+  let converted = 0;
+  walk(next, (node) => { if (modOf(node) === OUR_MOD) { node.content = { mod: HERDR_MOD }; converted++; } });
+  if (!back?.ok && rigBlocks === 0 && converted === 0) return null;
+  return { ok: true, tree: next, spaces: !!back?.ok || converted > 0, rigBlocks, converted };
 }
 
 /** Switch every `rig-spaces` block of a layout back to Herdr's (the uninstall and the way back): the plan to `herdr`, or null when

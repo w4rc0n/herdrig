@@ -2,7 +2,7 @@
 import {isValidSessionName} from "./rig-lib.js";
 import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
-import {rigOrigin,resolveRigSpace,openRigSpaceContext} from "./rig-space-context.js";
+import {rigOrigin,resolveRigSpace,openRigSpaceContext,sameDaemonOrigin,hostLabelValue} from "./rig-space-context.js";
 import {rigSpaceRelocation} from "./rig-spaces.js";
 
 const list=(host,key)=>(typeof host[key]==="function"?host[key]():host[key])??[];
@@ -14,6 +14,27 @@ const addr=terminal=>terminal?.address??terminal?.terminal;
 const snapshot=(terminal,pane)=>JSON.stringify({address:addr(terminal),argv:terminal?.argv,labels:Object.fromEntries(Object.entries(terminal?.labels??{})
   .filter(([key])=>key.startsWith("herdr-openrig.")||key==="herdr.space"||key==="herdr.tab").sort(([a],[b])=>a.localeCompare(b))),
   pid:terminal?.pid,created:terminal?.created_ms,pane:pane?.pane,tab:pane?.tab});
+// Splitting may overlap markRigSpace repairing this rig's labels. Accept only its one-way,
+// verified transitions; all other identity fields and labels still bind the target. Close/prune
+// continue comparing the original strict snapshot, with no repair tolerance.
+export function sameSplitTarget(before,after,config,remote){
+  const prior=JSON.parse(before.snapshot),next=JSON.parse(after.snapshot),a=prior.labels,b=next.labels;
+  for(const key of ['herdr-openrig.space','herdr-openrig.origin','herdr-openrig.host']){
+    if(a[key]===b[key])continue;
+    if(key==='herdr-openrig.space'){
+      if(b[key]!=='1')return false;
+    }else if(key==='herdr-openrig.origin'){
+      if(!a[key]||b[key]!==String(config.daemonUrl).replace(/\/$/,'')
+        ||!sameDaemonOrigin(a[key],rigOrigin(config.daemonUrl),config.daemonMachine))return false;
+    }else{
+      const stamp=hostLabelValue(remote.selfHostId);
+      if(a[key]||!stamp||b[key]!==stamp)return false;
+    }
+    a[key]=b[key];
+  }
+  prior.labels=Object.fromEntries(Object.entries(a).sort(([x],[y])=>x.localeCompare(y)));
+  return JSON.stringify(prior)===JSON.stringify(next);
+}
 function payloadFrom(value){
   if(typeof value!=="string"||value.length>21848||!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))throw new Error("Invalid worker payload");
   const alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";let bits=0,buffer=0,escaped="";
@@ -90,7 +111,7 @@ export class HostWorkerViews{
         return {ok:false,reason:"This worker view changed since preview. Refresh it before opening."};
       const plan=hostWorkerPlan(preview,nodes,remote,view);
       const existing=this.owned(config,view,remote);
-      for(const tile of existing.filter(t=>t.programArgv[0]!=="sleep")){
+      for(const tile of existing.filter(t=>t.session&&t.programArgv[0]!=="sleep")){
         const wanted=plan.pages.flatMap(p=>p.tiles).find(t=>t.session===tile.session&&!t.placeholder);
         if(wanted&&!!payloadFrom(tile.programArgv[2]).readOnly!==wanted.readOnly)
           throw new Error(`The read-only mode changed for ${wanted.label}. Close its worker tab, then reopen this view. Existing tiles were kept.`);
@@ -137,7 +158,7 @@ export class HostWorkerViews{
       const start=async(tile,page,tab,parent=null,direction="right")=>{
         await ready();let pane;
         if(parent){
-          const liveParent=this.owned(config,view,remote).find(t=>t.snapshot===parent.snapshot);
+          const liveParent=this.owned(config,view,remote).find(t=>sameSplitTarget(parent,t,config,remote));
           if(!liveParent||liveParent.pane.focused&&!fresh.has(parent.pane.terminal))throw new Error("The worker split target changed or has focus. It was left alone.");
           const before=new Set(list(host,"panes").map(p=>p.pane)),argv=["env",`HERDR_OPENRIG_VIEW_TILE=${nonce()}`,...tile.argv];
           host.run("pane.split",{pane:parent.pane.pane,direction,argv});

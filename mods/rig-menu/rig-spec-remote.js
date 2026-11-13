@@ -2,7 +2,7 @@
 // configured machine and freshly resolved box roots, including after a dialog.
 import { RemoteMachine } from './rig-remote.js';
 import { specCopyName } from './rig-lib.js';
-export const SPEC_SHA256 = '9482d10163b6dc9e033b328817dceb520a71246f77ee4188bb523c8d9d570a52';
+export const SPEC_SHA256 = '737eb9b9dbd16b5271eb67cdb36fdb4805ba25f890f9138e522d0f282731baa8';
 const jobs = new Map();
 const identity = r => [r.target ?? '', r.id ?? '', r.via ?? '', r.session ?? ''];
 const parse = r => {

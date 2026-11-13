@@ -4,7 +4,7 @@
 const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
 const {spawnSync}=require("node:child_process");
 const {MAX_BYTES,utf8,targetName,absolute,rootState}=require("./rig-spec-files.cjs");
-const SPEC_SHA256="9482d10163b6dc9e033b328817dceb520a71246f77ee4188bb523c8d9d570a52";
+const SPEC_SHA256="737eb9b9dbd16b5271eb67cdb36fdb4805ba25f890f9138e522d0f282731baa8";
 const FOLDER=".local/share/herdr-openrig",FILE="rig-spec-files.cjs";
 const hash=b=>crypto.createHash("sha256").update(b).digest("hex");
 function transferPath(appHome){

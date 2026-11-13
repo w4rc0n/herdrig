@@ -7,8 +7,9 @@ import {pageBodyLayout} from './rig-page-layout.js';
 /** Uses the page's existing row keys, marks, Attach and seat menu. No data reads. */
 export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,openSpecs,orderMap={}}){
  const padding=pageBodyLayout(page.pageWidth).padding;
- const width=(page.pageWidth??960)-padding*2,layout=allSeatsLayout(width);
+ const width=(page.pageWidth??960)-padding*2;
  const model=allSeatsModel(models,attention,{order:page.allSeatsOrder,pulse:page.pulseFilter,filter:page.filter??'',orderMap});
+ const layout=allSeatsLayout(width,model.rigWidth);
  const cell=(id,text,size=120,color=t.foreground)=>div().when(!!id,el=>el.id(id)).min_w(120).when(!!size,el=>el.w(size).flex_none()).when(!size,el=>el.flex_1())
   .truncate().text_size(12).text_color(color).tooltip(String(text??'')).child(text??'');
  const link=(id,rig)=>cell(id,rig.name,model.rigWidth,t.muted).cursor_pointer().hover(el=>el.underline()).on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,name:rig.name});});
@@ -27,7 +28,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    .child(page.moreButton(t,`all-seat-more-${id}`,()=>menu(target)));
   const logical=String(seat.logicalId??seat.session??''),dot=logical.lastIndexOf('.');
   const name=h_flex().id(`all-seat-name-${id}`).min_w(120).flex_1().gap(0).items_center().tooltip([logical,runtime].filter(Boolean).join('\n'))
-   .when(dot>=0,el=>el.child(div().flex_none().text_color(t.dim).text_size(12.5).child(logical.slice(0,dot+1))))
+   .when(dot>=0,el=>el.child(div().min_w(0).max_w(80).truncate().text_color(t.dim).text_size(12.5).child(logical.slice(0,dot+1))))
    .child(div().min_w(0).truncate().text_color(t.foreground).text_size(12.5).child(logical.slice(dot+1)));
   const mark=()=>page.dot(t,r.status,14,seat.session,r.needIds);
   const el=v_flex().id(`all-seat-row-${id}`).py(layout.compact?6:0).min_h(layout.compact?48:34).gap(4).rounded(5)
@@ -58,9 +59,13 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
   const line=h_flex().id(`all-seats-group-${g.rig.id}`).px(6).py(6).gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted)
    .child(div().font_semibold().child(g.rig.name));
   if(g.state==='loading')line.child(div().text_color(t.dim).child('loading seats…'));
-  else if(g.state==='failed')line.child(div().text_color(t.dim).child(`Couldn't load seats for ${g.rig.name}.`))
-   .child(div().id(`all-seats-retry-${g.rig.id}`).text_color(t.accent).cursor_pointer().child('Retry')
-    .on_click((_e,cx)=>{page.read(cx,`/api/rigs/${encodeURIComponent(g.rig.id)}/nodes`,true);cx.notify();}));
+  else if(g.state==='failed'){
+   const key=`all-seats-retry:${g.rig.id}`,retry=cx=>{page.read(cx,`/api/rigs/${encodeURIComponent(g.rig.id)}/nodes`,true);cx.notify();};
+   page.pageRows.push({key,expandable:false,open:retry});
+   line.child(div().text_color(t.dim).child(`Couldn't load seats for ${g.rig.name}.`))
+    .child(div().id(`all-seats-retry-${g.rig.id}`).px(4).rounded(3).bg(page.pageSel===key?t.selection:t.background)
+     .text_color(t.accent).cursor_pointer().child('Retry').on_click((_e,cx)=>retry(cx)));
+  }
   else line.child(div().text_color(t.dim).child(`${g.total} seat${g.total===1?'':'s'}`))
    .children(countItems.map(([word,n,color])=>div().text_color(color).child(`· ${n} ${word}`)));
   return v_flex().id(`all-seats-rig-${g.rig.id}`).gap(2).child(line).children(g.state==='ready'?g.rows.map(row):[]);
