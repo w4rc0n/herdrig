@@ -25,10 +25,11 @@ export function archivedElements({ div, svg, h_flex }, t, records, { host = null
     const rawStamp = String(r.archivedAt), stamp = Date.parse(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(rawStamp) ? rawStamp.replace(" ", "T") + "Z" : rawStamp);
     const minutes = Math.max(0, Math.floor((now - stamp) / 60000));
     const ago = !Number.isFinite(stamp) ? "archived" : minutes < 1 ? "archived just now" : minutes < 60 ? `archived ${minutes}m ago` : `archived ${Math.floor(minutes / 60)}h ago`;
+    const label = `${r.name ?? r.id}${showHost ? ` · ${(r.hosts ?? [r.host ?? r.hostSelfId ?? r.hostId ?? "local"]).join(", ")}` : ""}`;
     return h_flex().id(`archived-rig-${r.id}`).pl(indent + 16).pr(8).h(24).gap(6).items_center().text_color(t.dim)
       .on_mouse_down("right", () => menu(r)).tooltip(`${r.name ?? r.id} · ${ago}`)
       .child(svg(icon("rig-archive")).size(12))
-      .child(div().flex_1().min_w(0).truncate().text_size(12).child(`${r.name ?? r.id}${showHost ? ` · ${(r.hosts ?? [r.host ?? r.hostSelfId ?? r.hostId ?? "local"]).join(", ")}` : ""}`))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).tooltip(`${label}\n${ago}`).child(label))
       .child(div().id(`restore-rig-${r.id}`).px(6).h(20).rounded(5).bg(t.raised).text_size(11).text_color(t.accent).flex().items_center().cursor_pointer()
         .on_click((_e, cx) => { cx.stop_propagation(); restore(r); }).child("Restore"));
   }) : [])];

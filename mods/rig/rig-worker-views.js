@@ -16,15 +16,23 @@ export function workerViewDetails(entry){
 }
 
 /** Narrow projection: deliberately never inspect preview commands, roots or socket paths. */
-export function hostWorkerPlan(preview,nodes,remote){
+function verifiedRemote(remote){
   if(!remote?.ok||!remote.machine||!remote.selfHostId||!goodHome(remote.node)||!goodHome(remote.relayPath))
     throw new Error("The remote worker-view destination has not been verified.");
+}
+export function workerPad(remote){
+  verifiedRemote(remote);
+  return {blank:true,session:"",label:"empty",title:"empty",argv:[remote.node,remote.relayPath,base64EncodeUtf8(JSON.stringify({mode:"pad"}))]};
+}
+export function hostWorkerPlan(preview,nodes,remote,view=null){
+  verifiedRemote(remote);
   const descriptor=preview?.viewDescriptor,pages=preview?.composed?.pages,grids=preview?.grids;
   if(!preview||typeof preview.planId!=="string"||!preview.planId||preview.planId.length>256
     ||!["fixed","following"].includes(descriptor?.kind)||typeof descriptor.name!=="string"
     ||!Array.isArray(pages)||!Array.isArray(grids)||pages.length!==grids.length||pages.length>32
     ||pages.some(page=>!Array.isArray(page)||page.length>64)||pages.reduce((n,page)=>n+page.length,0)>256)invalid();
-  const name=text(descriptor.name,80)||"Worker view",inventory=new Map();
+  const rawName=text(descriptor.name,80)||"Worker view";
+  const name=typeof view==="string"&&view.startsWith("rig:")?`Workers · ${text(view.slice(4),80)}`:rawName,inventory=new Map();
   for(const node of Array.isArray(nodes)?nodes:[]){
     const session=node?.canonicalSessionName;
     if(typeof session==="string")inventory.set(session,inventory.has(session)?null:node);
@@ -50,7 +58,7 @@ export function hostWorkerPlan(preview,nodes,remote){
       }))];
       return {session,label,runtime,readOnly:pane.readOnly,title,argv,...(reason?{placeholder:true,reason}:{})};
     });
-    for(let i=0;i<blanks;i++)tiles.push({blank:true,session:"",label:"empty",title:"empty",argv:["sleep","2147483647"]});
+    for(let i=0;i<blanks;i++)tiles.push(workerPad(remote));
     return {name:pages.length>1?`${name} · ${index+1}/${pages.length}`:name,columns,rows,tiles};
   });
   const missing=[...(Array.isArray(preview.composed.absent)?preview.composed.absent:[]),

@@ -1,6 +1,6 @@
 // The person's configured Herdr machine is the only remote authority. Daemon data never selects it.
 import { isLoopbackDaemonUrl, parseDaemonStatusJson } from "./rig-lib.js";
-export const RELAY_SHA256 = "6372063b2566489fef1c7a3a547800d57382c95c48935e5c7bbe92b1ba03ce60";
+export const RELAY_SHA256 = "2262f8a2be1899555e79edbfded474c2858468d72eeec66ca6df603017aa3e66";
 const MACHINE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 // Attach and every rig space create separate callers. Serialize the whole preparation across them;
 // each queued caller still rechecks its own config, consent, profile and bytes instead of sharing readiness.

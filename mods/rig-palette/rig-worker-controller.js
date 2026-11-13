@@ -1,6 +1,6 @@
 // The sidebar owns reconciliation. Daemon previews are read-only; Herdr owns PTYs.
 import {isValidSessionName} from "./rig-lib.js";
-import {hostWorkerPlan} from "./rig-worker-views.js";
+import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
 import {rigOrigin,resolveRigSpace,openRigSpaceContext} from "./rig-space-context.js";
 import {rigSpaceRelocation} from "./rig-spaces.js";
@@ -63,7 +63,13 @@ export class HostWorkerViews{
         ||argv?.length===2&&argv[0]==="sleep"&&argv[1]==="2147483647";
       if(!program||labels["herdr-openrig.viewer-argv"]!==JSON.stringify(terminal.argv))return [];
       if(argv[0]!=="sleep"){
-        try{const payload=payloadFrom(argv[2]);if(payload.mode!=="grid"||payload.session!==labels["herdr-openrig.seat"]||!isValidSessionName(payload.session))return [];}catch{return [];}
+        try{
+          const payload=payloadFrom(argv[2]);
+          // Core removes empty label values; absent and empty both mean no seat.
+          const pad=payload.mode==="pad"&&labels["herdr-openrig.blank"]==="1"&&(labels["herdr-openrig.seat"]??"")===""
+            &&JSON.stringify(argv)===JSON.stringify(workerPad(remote).argv);
+          if(!pad&&(payload.mode!=="grid"||payload.session!==labels["herdr-openrig.seat"]||!isValidSessionName(payload.session)))return [];
+        }catch{return [];}
       }
       return [{pane,terminal,programArgv:argv,session:labels["herdr-openrig.seat"]??"",page:Number(labels["herdr-openrig.page"]),
         blank:labels["herdr-openrig.blank"]==="1",snapshot:snapshot(terminal,pane)}];
@@ -82,7 +88,7 @@ export class HostWorkerViews{
       this.current(config);
       if(options.expectedPlan&&preview?.planId!==options.expectedPlan)
         return {ok:false,reason:"This worker view changed since preview. Refresh it before opening."};
-      const plan=hostWorkerPlan(preview,nodes,remote);
+      const plan=hostWorkerPlan(preview,nodes,remote,view);
       const existing=this.owned(config,view,remote);
       for(const tile of existing.filter(t=>t.programArgv[0]!=="sleep")){
         const wanted=plan.pages.flatMap(p=>p.tiles).find(t=>t.session===tile.session&&!t.placeholder);
@@ -148,6 +154,17 @@ export class HostWorkerViews{
         fresh.add(pane.terminal);
         return this.waitFor(()=>this.owned(config,view,remote).find(t=>t.pane.pane===pane.pane),"worker tile labels");
       };
+      // Upgrade only our old inert blanks on an explicit reopen; retain every seat viewer.
+      if(options.explicit)for(const old of existing.filter(t=>t.blank&&!t.session&&t.programArgv[0]==="sleep"&&!t.pane.focused)){
+        const next=await start(workerPad(remote),old.page,old.pane.tab,old);
+        await ready();
+        const current=this.owned(config,view,remote).find(t=>t.pane.pane===old.pane.pane);
+        if(!current||current.pane.focused||current.snapshot!==old.snapshot)
+          throw new Error("An old empty tile changed during refresh. Both empty tiles were kept.");
+        if(!this.owned(config,view,remote).some(t=>t.pane.pane===next.pane.pane&&t.blank))
+          throw new Error("Herdr did not confirm the new empty tile. The old tile was kept.");
+        host.run("pane.close",{pane:old.pane.pane});
+      }
       const desired=new Map(plan.pages.flatMap(p=>p.tiles).filter(t=>t.session).map(t=>[t.session,t])),retire=[];
       const present=new Set(existing.filter(t=>t.session).flatMap(t=>{
         const wanted=desired.get(t.session);
@@ -156,9 +173,13 @@ export class HostWorkerViews{
       }));
       let pages=[...new Set(existing.map(t=>t.pane.tab))];
       for(let index=0;index<plan.pages.length;index++){
-        const page=plan.pages[index],wanted=page.tiles.map(t=>t.session&&(present.has(t.session)||entry.pruned[t.session])?{blank:true,session:"",argv:["sleep","2147483647"]}:t);
-        if(!wanted.some(t=>!t.blank))continue;
+        const page=plan.pages[index],wanted=page.tiles.map(t=>t.session&&(present.has(t.session)||entry.pruned[t.session])?workerPad(remote):t);
         let anchors=this.owned(config,view,remote).filter(t=>t.page===index),tab=anchors[0]?.pane.tab,pageIndex=index;
+        const oldTitle=list(host,"spaces").flatMap(space=>space.tabs??[]).find(item=>item.id===tab)?.name;
+        // Only migrate the generated old title; a person's renamed tab stays theirs.
+        if(tab&&view.startsWith("rig:")&&(oldTitle===view||oldTitle===`${view} · ${index+1}/${plan.pages.length}`))
+          host.run("tab.rename",{id:tab,name:page.name});
+        if(!wanted.some(t=>!t.blank))continue;
         if(anchors.length){
           for(const tile of wanted.filter(t=>!t.blank)){
             const parent=anchors.find(t=>!t.pane.focused);
@@ -194,7 +215,7 @@ export class HostWorkerViews{
           const since=entry.inactiveSince[tile.session];
           if(since===undefined||now-since<entry.pruneMs||tile.pane.focused||!inactive(bySession.get(tile.session)))continue;
           // Keep an inert pad so pruning the last viewer never closes a space or asks a destructive dialog.
-          if(list(host,"panes").filter(p=>p.tab===tile.pane.tab).length===1)await start({blank:true,session:"",argv:["sleep","2147483647"]},tile.page,tile.pane.tab,tile);
+          if(list(host,"panes").filter(p=>p.tab===tile.pane.tab).length===1)await start(workerPad(remote),tile.page,tile.pane.tab,tile);
           await ready();
           const current=this.owned(config,view,remote).find(t=>t.pane.pane===tile.pane.pane);
           if(!current||current.pane.focused||current.snapshot!==tile.snapshot)continue;

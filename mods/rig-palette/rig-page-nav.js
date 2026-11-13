@@ -1,7 +1,8 @@
 // Page location and view selection are independent of navigation history.
 export const SYSTEM_PAGE_VIEWS = [["overview","Overview"],["people","People"],["config","Configuration"],["health","Health"],
-  ["connections","Connections"],["usage","Usage"],["cost","Cost"],["notifications","Notifications"]];
+  ["connections","Connections"],["layout","Layout"],["usage","Usage"],["cost","Cost"],["notifications","Notifications"]];
 export function pageViewKind(entry = {}) {
+  if(entry.section==='topology'&&!entry.kind)return 'topology';
   if(entry.section==='scopes'&&entry.workflow)return entry.packet?'packet':'workflow';
   if(entry.section==='scopes'&&entry.mission&&!entry.slice)return 'mission';
   return entry.section === "topology" && ["rig","seat"].includes(entry.kind) ? entry.kind
@@ -9,6 +10,7 @@ export function pageViewKind(entry = {}) {
 }
 export function pageViewOptions(entry = {}, spec = null, counts = {}) {
   const kind=pageViewKind(entry);
+  if(kind==='topology')return [['rigs','Rigs'],['seats','All seats']];
   if(kind==='workflow')return counts.workflowsSupported===false?[]:[['work','Work'],['obligations','Obligations'],['plan','Plan and sources']];
   if(kind==='mission')return [['slices','Slices'],...(counts.workflowsSupported?[['workflows',`Workflows (${counts.workflows??0})`]]:[])];
   if(kind==="rig")return [["table","Table"],["recent","Recent"],["overview","Overview"],["graph","Graph"],["health","Health"]];
@@ -19,7 +21,7 @@ export function pageViewOptions(entry = {}, spec = null, counts = {}) {
 }
 export function selectedPageView(entry = {}, memory = {}, spec = null, counts = {}) {
   const kind=pageViewKind(entry), options=pageViewOptions(entry,spec,counts), allowed=new Set(options.map(([id])=>id));
-  let explicit=kind==="rig"?entry.tab:kind==="seat"?entry.seatTab:kind==="needs"?entry.needsTab:kind==="spec"?entry.specTab
+  let explicit=kind==='topology'?entry.topologyTab:kind==="rig"?entry.tab:kind==="seat"?entry.seatTab:kind==="needs"?entry.needsTab:kind==="spec"?entry.specTab
     :kind==='workflow'?entry.workflowTab:kind==='mission'?entry.missionTab
     :kind==="system"?(entry.subview==="usage-hosts"||entry.openUsageHosts?"usage":entry.subview??(entry.settingKey||entry.category?"config":null)):null;
   if(kind==="rig"&&!explicit&&entry.openRecent)explicit="recent";
@@ -28,7 +30,8 @@ export function selectedPageView(entry = {}, memory = {}, spec = null, counts = 
 }
 export function entryWithPageView(entry, view, {preserveScope=false}={}) {
   const kind=pageViewKind(entry), next={...entry};
-  if(kind==="rig")next.tab=view;
+  if(kind==='topology')next.topologyTab=view;
+  else if(kind==="rig")next.tab=view;
   else if(kind==='workflow')next.workflowTab=view;
   else if(kind==='mission')next.missionTab=view;
   else if(kind==="seat")next.seatTab=view;

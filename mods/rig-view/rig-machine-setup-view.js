@@ -3,9 +3,10 @@ import {v_flex,h_flex} from "gpui-base";
 import {reviewMachineSetup,approveMachineSetup,stopUsingMachine} from "./rig-machine-setup.js";
 
 export class MachineSetupPanel {
-  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false}={}){
+  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,cancelHandle,primaryHandle}={}){
     this.host=host;this.config=config;this.machine=machine;this.done=done;this.cancel=cancel;
     this.mono=mono;this.copyIcon=copyIcon;this.stop=stop;this.phase=stop?"ready":"checking";
+    this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
   }
   async check(cx){
     if(this.busy)return;this.phase="checking";this.error=null;cx.notify();
@@ -25,15 +26,19 @@ export class MachineSetupPanel {
         else if(result.needsConsent){this.phase="error";this.error="The machine or helper changed. Check again and review its details.";}
         else {this.phase="error";this.error=result.reason;}
       }catch(error){this.phase="error";this.error=String(error?.message??error);}
-      finally{this.busy=false;cx.notify();}
+      finally{this.busy=false;cx.notify();if(this.phase==='done'&&this.primaryHandle)cx.timer.after(0,nextCx=>{this.primaryHandle.focus();nextCx.notify();});}
     });
   }
   button(id,text,callback,{disabled=false,primary=false}={}){
-    return div().id(id).role("button").tab_stop(!disabled).tab_index(0).px(10).py(6).rounded(5)
+    return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role("button").tab_stop(!disabled)
+      .when(!!(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle),el=>el.track_focus(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle))
+      .focus(el=>el.border_color(this.theme.accent))
+      .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}})
+      .child(div().id(id).px(10).py(6).rounded(5)
       .text_size(12).bg(primary?this.theme.accent:this.theme.raised).text_color(primary?this.theme.solid_foreground:this.theme.foreground)
       .when(disabled,el=>el.opacity(.45)).when(!disabled,el=>el.cursor_pointer().hover(el=>el.bg(primary?this.theme.accent:this.theme.hover)))
       .on_click((_e,cx)=>{if(!disabled)callback(cx);})
-      .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}}).child(text);
+      .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}}).child(text));
   }
   value(label,value,{copy=false}={}){
     return h_flex().gap(8).items_start()
@@ -47,8 +52,17 @@ export class MachineSetupPanel {
   render(t,cx){
     this.theme=t;
     const c=this.review?.confirmation,done=this.phase==="done",update=!!this.review?.alreadyConfigured&&c?.fileState==="older";
+    const cycle=(forward,cx)=>{
+      cx.stop_propagation();const first=done?this.primaryHandle:this.cancelHandle,last=done||this.phase==='ready'||this.phase==='error'?this.primaryHandle:this.cancelHandle;
+      const boundary=forward&&last?.is_focused?.()?first:!forward&&first?.is_focused?.()?last:null;
+      if(boundary){this.focusTask?.cancel?.();this.focusTask=cx.timer.after(16,nextCx=>{boundary.focus();nextCx.notify();});}
+      else if(forward)globalThis.window.focus_next();else globalThis.window.focus_prev();
+    };
     const root=v_flex().id("machine-setup").size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
-      .on_key_down((event,cx)=>{if(event.key==="escape"&&!this.busy){cx.stop_propagation();(done?this.done:this.cancel)?.(cx,this.result);}})
+      .key_context('RigDialog').on_action('rig-dialog-next',(_e,cx)=>cycle(true,cx)).on_action('rig-dialog-prev',(_e,cx)=>cycle(false,cx))
+      .on_key_down((event,cx)=>{
+        if(event.key==='tab'&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt){cx.stop_propagation();if(event.modifiers?.shift)globalThis.window.focus_prev();else globalThis.window.focus_next();}
+        else if(event.key==="escape"&&!this.busy){cx.stop_propagation();(done?this.done:this.cancel)?.(cx,this.result);}})
       .child(div().text_size(15).font_semibold().child(this.stop?`Stop using ${this.machine}?`:update?`Update the Attach helper on ${this.machine}`:`Use ${this.machine}`));
     let body=v_flex().flex_1().min_h(0).overflow_y_scrollbar().gap(8);
     if(this.stop)body=body.child(div().child(`OpenRig's spaces will open on this computer again. Seats on ${this.machine} keep running; open box tiles stay until you close them. The Attach helper stays on that machine.`))

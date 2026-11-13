@@ -5,8 +5,8 @@
 const fs = require("node:fs"), path = require("node:path"), os = require("node:os");
 // A conservative parser for a top-level TOML string array. Unsupported syntax fails closed.
 function configuredShell(text) {
-  const match = /^\s*shell\s*=\s*(\[[\s\S]*)/m.exec(text);
-  if (!match || /^\s*\[[^\n]*\]/m.test(text.slice(0, match.index))) return null;
+  const match = /^[^\S\n]*shell[^\S\n]*=[^\S\n]*(\[[\s\S]*)/m.exec(text);
+  if (!match || /^[^\S\n]*\[[^\n]*\]/m.test(text.slice(0, match.index))) return null;
   const source = match[1]; let i = 1; const argv = [];
   const skip = () => { for (;;) { while (/\s/.test(source[i] ?? "") && i < source.length) i++; if (source[i] !== "#") return; while (i < source.length && source[i] !== "\n") i++; } };
   for (;;) {
@@ -39,7 +39,7 @@ function readShell(env = process.env) {
     }
     if (length > limit) return null;
     const text = bytes.subarray(0, length).toString("utf8");
-    if (/^\s*shell\s*=/m.test(text)) return configuredShell(text);
+    if (/^[^\S\n]*shell[^\S\n]*=/m.test(text)) return configuredShell(text);
   } catch (e) { if (e.code !== "ENOENT") return null; }
   finally { if (fd !== undefined) fs.closeSync(fd); }
   // Without an explicit setting, leave recognition to the controller's common-shell fallback.

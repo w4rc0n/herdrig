@@ -5,7 +5,7 @@
 // the session name, an optional tmux server flag pair, and what to show. The relay never runs a command string: it
 // validates the session and the server flags again here and starts `tmux` directly with an argv (no shell). Polling
 // the daemon reads the seat's state for the status dot; nothing it returns is executed.
-// An explicit grid mode uses the shared sizing viewer below, without OSC or daemon requests. No other mode is accepted.
+// Grid mode uses the shared sizing viewer without daemon requests. Pad mode prints fixed inert title/cursor controls.
 // Encoded payloads must be canonical base64 containing a UTF-8 JSON object, at most 16 KiB decoded.
 "use strict";
 const { spawn, spawnSync } = require("node:child_process");
@@ -140,7 +140,8 @@ function decodeRelayPayload(value) {
   if (!Buffer.from(text, "utf8").equals(bytes)) throw new Error("payload is not UTF-8");
   const cfg = JSON.parse(text);
   if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) throw new Error("payload is not an object");
-  if (Object.hasOwn(cfg, "mode") && cfg.mode !== "grid") throw new Error("unsupported relay mode");
+  if (Object.hasOwn(cfg, "mode") && cfg.mode !== "grid" && cfg.mode !== "pad") throw new Error("unsupported relay mode");
+  if(cfg.mode==="pad"&&Object.keys(cfg).length!==1)throw new Error("pad accepts no other fields");
   if(cfg.mode==="grid"&&Object.hasOwn(cfg,"readOnly")&&typeof cfg.readOnly!=="boolean")throw new Error("readOnly must be a boolean");
   if(cfg.mode==="grid"&&Object.hasOwn(cfg,"title")&&typeof cfg.title!=="string")throw new Error("title must be text");
   return cfg;
@@ -153,6 +154,7 @@ function main(payloadArg) {
     process.stderr.write("rig-attach-relay: the payload isn't readable\n");
     return process.exit(2);
   }
+  if (cfg.mode === "pad") return padMain();
   if (cfg.mode === "grid") return gridMain(payloadArg);
   let argv;
   try {
@@ -277,6 +279,16 @@ function viewerArgs(cfg, version, clients = "") {
   if(cfg.readOnly===true)argv.splice(argv.indexOf("attach-session")+1,0,"-r");
   if(sizingClients(clients).some(c=>!c.ignore))argv.splice(argv.indexOf("attach-session") + 1, 0, ...ignoreSizeArgs(version));
   return argv;
+}
+// Fixed inert output only: no subprocess, daemon request, path lookup or payload text.
+function padMain() {
+  for(const signal of ["SIGINT","SIGTERM","SIGHUP"])process.on(signal,()=>process.exit(0));
+  // A half-closed PTY must not turn this kept pad into a recovered shell.
+  process.stdin.on("error",()=>{});process.stdout.on("error",()=>{});
+  if(process.stdin.isTTY)process.stdin.setRawMode(true);
+  process.stdin.on("data",()=>{});process.stdin.resume();
+  setInterval(()=>{},2147483647);
+  process.stdout.write("\x1b]2;empty\x07\x1b[?25l");
 }
 async function gridMain(payload) {
   let argv, cfg, child, parked = false;

@@ -15,12 +15,14 @@
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
 import { registerRigRouting } from "./rig-lib.js";
+import { typeahead } from "./rig-typeahead.js";
+import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { workerCapabilityText } from "./rig-lib.js";
 import { rigOrigin } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
-import { h_flex, v_flex, TextareaState, Textarea, InputState, Input } from "gpui-base";
+import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc, settings, machines } from "herdr";
 import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
@@ -161,9 +163,18 @@ export default class RigMenu extends View {
     this.busy = null;
     this.result = null;
     this.handle = cx.focus_handle?.() ?? null;
-    if(props()?.target?.kind==="page-navigation")this.handle?.focus?.();
+    this.menuIndex = -1;
+    this.menuScroll = ScrollHandle.new();
+    if(!props()?.step)this.handle?.focus?.();
     this.typing = false;
     const step = props()?.step;
+    if(step){
+      cx.bind_keys?.([{keystroke:'tab',action:'rig-dialog-next',context:'RigDialog'},{keystroke:'shift-tab',action:'rig-dialog-prev',context:'RigDialog'}]);
+      this.dialogCancelHandle=cx.focus_handle?.();
+      this.dialogConfirmHandle=cx.focus_handle?.();
+      this.dialogArchiveHandle=cx.focus_handle?.();
+      this.dialogOpenSpaceHandle=cx.focus_handle?.();
+    }
     cx.spawn(async (cx) => {
       // The daemon's address as the other mods find it (config.json, a loopback address in shared state, then the CLI),
       // so Attach and Retry work without the sidebar too.
@@ -171,11 +182,13 @@ export default class RigMenu extends View {
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         this.setupPanel=new MachineSetupPanel(this.machineSetupHost(cx),this.config,step.machine??step.confirmation?.machine,{
           mono:settings()?.font_family??"monospace",copyIcon:icon("rig-copy"),stop:step.action==="stop-machine",
+          cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,
           cancel:()=>this.dismiss(),done:(_cx,result)=>{
             if(step.token){setShared("rig.machineConfirmation",step.token);run("rig.confirm-machine");}
             this.dismiss();
           }});
         if(step.action!=="stop-machine")await this.setupPanel.check(cx);
+        cx.timer.after(0,nextCx=>{(step.action==='stop-machine'?this.dialogCancelHandle:this.dialogConfirmHandle)?.focus?.();nextCx.notify();});
       }
 
       cx.notify();
@@ -194,17 +207,17 @@ export default class RigMenu extends View {
         field.on("blur", () => { this.typing = false; });
         field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, complete(props().target), props().step); });
       }
-      this.folder.focus();
+      this.dialogFocusedField=this.folder;this.folder.focus();
       this.typing = true;
     }
     if (step?.action === "new-rig") this.initNewRig(cx);
     if (step?.action === "design-view") {
       this.initDesigner(complete(props().target));
-      this.handle?.focus?.();
+      cx.timer.after(0,nextCx=>{this.dialogConfirmHandle?.focus?.();nextCx.notify();});
     }
     if (step?.action === "change-model") {
       this.initChangeModel(complete(props().target));
-      this.handle?.focus?.();
+      cx.timer.after(0,nextCx=>{this.dialogConfirmHandle?.focus?.();nextCx.notify();});
     }
     if (step?.input) {
       // The draft typed last time for this action and target, if it was never sent or cancelled.
@@ -219,11 +232,17 @@ export default class RigMenu extends View {
       });
       // Enter adds a line; Ctrl+Enter (Cmd+Enter on macOS: GPUI's secondary-enter) sends.
       this.input.on("submit", (e, cx) => { if (e?.secondary && !this.result) this.go(cx, complete(props().target), props().step); });
-      this.input.focus();
+      this.dialogFocusedField=this.input;this.input.focus();
       this.typing = true;
       cx.timer.after(400, () => this.input.focus());
     }
     if (step?.load === "pause") this.loadPause(cx);
+    if(step&&!step.input&&!['new-rig','launch-spec','design-view','change-model','confirm-machine','setup-machine','stop-machine'].includes(step.action)){
+      cx.timer.after(0,nextCx=>{
+        const cancel=step.run||['pause','fresh','delete-rig','archive-rig','rebuild-space'].includes(step.action)||!['resume','move-grid','confirm-spec-write','spaces-list'].includes(step.action);
+        (cancel?this.dialogCancelHandle:this.dialogConfirmHandle)?.focus?.();nextCx.notify();
+      });
+    }
   }
 
   /** New rig: from a spec in the library (`rig up`) or one seat (`rig create`); the folder is the last one launched in. */
@@ -237,6 +256,7 @@ export default class RigMenu extends View {
     this.newExpandedSpec = null;
     this.newSpecFocus = 0;
     this.newSpecHandle = cx.focus_handle?.() ?? null;
+    this.newSpecScroll=ScrollHandle.new();
     this.folder = InputState.new({ placeholder: "Working folder (an absolute path)", value: drafts["launch-folder"] ?? "" });
     this.rigName = InputState.new({ placeholder: "Rig name" });
     for (const field of [this.folder, this.rigName]) {
@@ -254,7 +274,9 @@ export default class RigMenu extends View {
         const list = Array.isArray(body) ? body : Array.isArray(body?.specs) ? body.specs : [];
         // Rig specs only: an agent spec isn't a `rig up` source.
         this.newSpecs = list.filter((s) => s && (s.name || s.sourcePath) && (!s.kind || s.kind === "rig"));
+        this.newSpec=this.newSpecs[0]??null;
       } catch (e) { this.newSpecs = { error: String(e?.message ?? e) }; }
+      cx.timer.after(0,nextCx=>{(this.newSpec?this.newSpecHandle:this.dialogCancelHandle)?.focus?.();nextCx.notify();});
       cx.notify();
     });
   }
@@ -264,6 +286,7 @@ export default class RigMenu extends View {
     this.newSpecFocus = this.newSpecs?.indexOf(spec) ?? 0;
     this.newExpandedSpec = toggle && this.newExpandedSpec === spec ? null : spec;
     if (this.newExpandedSpec) this.loadNewSpecPreview(cx, spec);
+    if(this.newSpecScroll){this.cancelSpecReveal?.();this.cancelSpecReveal=revealAfterKey(cx,this.newSpecScroll,()=>this.newSpecFocus,this);}
     cx.notify();
   }
 
@@ -282,7 +305,11 @@ export default class RigMenu extends View {
   newSpecKey(e, cx) {
     if (e.modifiers?.control || e.modifiers?.platform || e.modifiers?.alt || !Array.isArray(this.newSpecs) || !this.newSpecs.length) return;
     const key = String(e.key ?? "").toLowerCase();
-    if (!["up", "arrowup", "down", "arrowdown", "left", "arrowleft", "right", "arrowright", "enter", "return"].includes(key)) return;
+    if (!["up", "arrowup", "down", "arrowdown", "left", "arrowleft", "right", "arrowright", "enter", "return"].includes(key)) {
+      const next=typeahead(this.newSpecSearch,e,this.newSpecs.map(s=>s.name??s.id??''),this.newSpecFocus);
+      if(!next)return;this.newSpecSearch=next;this.newSpecFocus=next.index;
+      cx.stop_propagation();this.pickNewSpec(cx,this.newSpecs[next.index]);return;
+    }
     cx.stop_propagation();
     if (key === "left" || key === "arrowleft") { this.newExpandedSpec = null; cx.notify(); return; }
     const delta = key === "up" || key === "arrowup" ? -1 : key === "down" || key === "arrowdown" ? 1 : 0;
@@ -299,12 +326,12 @@ export default class RigMenu extends View {
         .on_click((_e, cx) => this.loadNewSpecPreview(cx, spec, true)).child("Retry"));
     const data = got.data;
     return v_flex().gap(4)
-      .when(!!data.summary, (el) => el.child(div().truncate().text_size(11.5).text_color(t.dim).child(data.summary)))
+      .when(!!data.summary, (el) => el.child(div().truncate().text_size(11.5).text_color(t.dim).tooltip(String(data.summary??"")).child(data.summary)))
       .child(div().text_size(11.5).text_color(t.dim).child(`${data.pods.length} pod${data.pods.length === 1 ? "" : "s"} · ${data.seatCount} seat${data.seatCount === 1 ? "" : "s"}`))
       .children(data.pods.map((pod) => v_flex().gap(2).pt(3)
         .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(pod.label))
         .children(pod.seats.map((seat) => h_flex().gap(6).pl(8).items_center()
-          .child(div().min_w(0).truncate().text_size(12).text_color(t.foreground).child(seat.lid))
+          .child(div().min_w(0).truncate().text_size(12).text_color(t.foreground).tooltip(String(seat.lid??"")).child(seat.lid))
           .when(!!seat.runtime || !!seat.model, (el) => el.child(div().px(5).py(1).rounded(4).bg(t.raised).font_family("monospace").text_size(10.5).text_color(t.dim)
             .child([seat.runtime, seat.model].filter(Boolean).join(" · "))))
           .when(!!seat.profile, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(seat.profile)))))));
@@ -492,10 +519,16 @@ export default class RigMenu extends View {
   }
 
   /** herdr's teardown (a click beside the dialog closes it): what was typed stays for next time. */
-  async close() { this.cancelSpecPermission(); this.keepDraft(); }
+  async close() { this.dialogBoundaryTask?.cancel?.();this.setupPanel?.focusTask?.cancel?.();this.dialogHandleTask?.cancel?.();for(const handle of this.dialogButtonHandles??[])handle.release?.();this.cancelMenuReveal?.();this.cancelSpecReveal?.();this.newSpecScroll?.release?.(); this.menuScroll?.release?.(); this.cancelSpecPermission(); this.keepDraft(); }
 
   cancelSpecPermission() {
-    const step=props()?.step;if(step?.action!=="confirm-spec-write"||!step.token)return;
+    const step=props()?.step;
+    if(step?.action==="spaces-list"&&step.token){
+      const decided=shared("rig.spacesListDecisions")??{};
+      if(!decided[step.token])setShared("rig.spacesListDecisions",{...decided,[step.token]:"cancel"});
+      return;
+    }
+    if(step?.action!=="confirm-spec-write"||!step.token)return;
     const decisions=shared("rig.specWriteDecisions")??{};
     if(!decisions[step.token])setShared("rig.specWriteDecisions",{...decisions,[step.token]:"cancel"});
   }
@@ -541,6 +574,10 @@ export default class RigMenu extends View {
       this.busy = null;
       if (dismissOnSuccess && this.result?.ok) { this.dismiss(); return; }
       cx.notify();
+      if(this.dialogCancelHandle)cx.timer.after(0,nextCx=>{
+        const openSpace=props()?.step?.action==='new-rig'&&this.result?.ok&&typeof this.result?.createdRig==='string'&&/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(this.result.createdRig);
+        (openSpace?this.dialogOpenSpaceHandle:this.dialogCancelHandle)?.focus?.();nextCx.notify();
+      });
     });
   }
 
@@ -563,11 +600,11 @@ export default class RigMenu extends View {
   items(target) {
     const out = [];
     const caps = this.caps();
-    const item = (iconName, label, act, actionName = null) => {
+    const item = (iconName, label, act, actionName = null, dynamicLabel = false) => {
       const capReason = actionName ? capabilityDisableReason(actionName, caps) : null;
       const pReason = actionName && this.config ? personDisableReason(actionName === "reply-answer" ? "reply" : actionName, this.config) : null;
       const reason = capReason ?? pReason;
-      out.push({ icon: iconName, label, act, disabled: !!reason, reason });
+      out.push({ icon: iconName, label, act, disabled: !!reason, reason, dynamicLabel });
     };
     if(target.kind==="sidebar-header"){
       const enabled=(shared("rig.settings")?.notifications??true)!==false;
@@ -587,6 +624,10 @@ export default class RigMenu extends View {
     }
     if (target.kind === "seat" || target.kind === "cell") {
       const stoppedSeat = isStopped(target);
+      if(target.allSeats){
+        item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',rigId:target.rigId,name:target.rig}));
+        if(target.session)item('rig-copy','Copy session name',cx=>cx.write_to_clipboard(target.session));
+      }
       // The row's own actions first: ⋯, the right-click and the Menu key open this same list.
       // A terminal seat is a person's shell, not an agent: no message, work or model to give it.
       if (!(target.terminal === true || isTerminalSeat(target))) {
@@ -595,7 +636,7 @@ export default class RigMenu extends View {
         item("rig-swap", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), "change-model");
       }
       item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, name: target.logicalId, session: target.session }));
-      if (target.session) item("rig-copy", "Copy session address", (cx) => cx.write_to_clipboard(target.session));
+      if (target.session&&!target.allSeats) item("rig-copy", "Copy session address", (cx) => cx.write_to_clipboard(target.session));
       out.push({
         icon: "terminal",
         label: "Attach",
@@ -613,6 +654,7 @@ export default class RigMenu extends View {
         disabled: stoppedSeat,
         reason: stoppedSeat ? "Stopped: seat has no running session to attach" : null,
       });
+      if(target.allSeats&&target.compactActions){const index=out.findIndex(item=>item.label==='Attach');if(index>=0)out.unshift(...out.splice(index,1));}
       // Focusing a pane the seat already has needs nothing from OpenRig; with none, Focus pane opens a view, which needs
       // OpenRig's herdr provider ("open-seat"), as on the seat page.
       const live = seatClickTarget(viewsPropsFromLayout(layout(), shared), null, target.session, panes?.() ?? [], terminals?.() ?? []);
@@ -645,10 +687,27 @@ export default class RigMenu extends View {
       // A native seat's `hc run` children: peek at one over the tab, herdr's own way.
       const children = Array.isArray(target.children) ? target.children : [];
       if (children.length) out.push({ divider: "Helpers (hc run)" });
-      for (const child of children) item("rig-helper", `Peek ${child.label}`, () => run("terminal.peek", { terminal: child.address }));
+      for (const child of children) item("rig-helper", `Peek ${child.label}`, () => run("terminal.peek", { terminal: child.address }), null, true);
     }
     if (target.kind === "pod") {
       item("rig-card", "Show pod card", () => page({ section: "topology", kind: "pod", rig: target.rig, rigId: target.rigId, pod: target.pod, name: target.pod }));
+    }
+    if (target.kind === "rigspace") {
+      // herdrig's Spaces list: herdr's own two actions for any space first (herdr's own commands, with herdr's own confirmation for
+      // Close), then the rig's actions with the same verbs and confirmations as the Rig block's menu.
+      item("square-pen", "Rename", () => run("space.rename", { id: target.space }));
+      item("x", "Close", () => run("space.close", { id: target.space }));
+      out.push({ divider: "" }); // the popup header already names the rig
+      const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, name: target.rig,
+        lifecycle: (shared("rig.data")?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig)?.lifecycle ?? null };
+      item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology" } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, name: target.rig }));
+      item("rig-operator", "Attach operator", () => run("rig.operator"));
+      if (!target.home && target.rig) {
+        item("rig-snapshot", "Snapshot now", () => oneClick(rigTarget, "snapshot"));
+        const stoppedRig = isRigStopped(rigTarget.lifecycle, this.rigSeats(rigTarget));
+        if (!stoppedRig && rigTarget.lifecycle !== "stopped") item("rig-pause", "Pause rig…", () => dialog(rigTarget, { action: "pause", load: "pause" }, 360));
+        if (stoppedRig || rigTarget.lifecycle !== "running") item("rig-play", "Resume rig…", () => dialog(rigTarget, { action: "resume", confirm: true }, 380));
+      }
     }
     if (target.kind === "rig" || target.kind === "pod" || target.kind === "seat") {
       // The popup's header already names a rig target; a seat's or a pod's rig actions get their own label.
@@ -656,7 +715,7 @@ export default class RigMenu extends View {
       if (target.rigId) item("rig-copy", "Copy rig id", (cx) => cx.write_to_clipboard(target.rigId));
       item("rig-view", "Open rig space", () => run(`rig.space:${target.rigId ?? target.rig}`));
       if(rigSpaceRelocation({spaces,panes,terminals},{id:target.rigId,name:target.rig},this.config))
-        item("rig-view",`Move rig space to ${this.config.daemonMachine}…`,()=>run(`rig.space:${target.rigId??target.rig}`));
+        item("rig-view",`Move rig space to ${this.config.daemonMachine}…`,()=>run(`rig.space:${target.rigId??target.rig}`),null,true);
       item("rig-view", "New worker view", () => oneClick({ ...target, view: `rig:${target.rig}` }, "open-view"), "open-view");
       item("rig-view", "Design worker view…", () => openDesigner(target), "design-view");
       // One Following view per rig in this window; the toggle turns its following on or off.
@@ -729,7 +788,7 @@ export default class RigMenu extends View {
       item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
     }
     if (target.kind === "views") {
-      for (const v of target.views ?? []) item("rig-view", v.name, () => selectWorkerView(v.id, { run, layout, views: target.views ?? [], spaces, panes }));
+      for (const v of target.views ?? []) item("rig-view", v.name, () => selectWorkerView(v.id, { run, layout, views: target.views ?? [], spaces, panes }), null, true);
       item("plus", "New worker view", () => oneClick({ ...target, view: `rig:${target.rig}` }, "open-view"), "open-view");
       item("rig-view", "Design worker view…", () => openDesigner(target), "design-view");
     }
@@ -749,7 +808,7 @@ export default class RigMenu extends View {
           return;
         }
         oneClick({ kind: "open-view", view: `rig:${target.rig}`, rig: target.rig, grid: nextGrid, replace: target.viewId }, "open-designed-view");
-      }, "cell-split");
+      }, "cell-split", true);
       out.push({ divider: "" });
       const stripView = viewInStrip(target.viewId);
       const following = Boolean(target.following || stripView?.following?.enabled || stripView?.following);
@@ -768,23 +827,34 @@ export default class RigMenu extends View {
     }
     if (target.kind === "updates-group") item("check", "Dismiss all updates", () =>
       requestDismissal({ shared, setShared, run, scope: this.config ? dismissalScope(this.config) : undefined }, "dismiss", target.items ?? []));
-    if (target.kind === "open-view") item("rig-view", `Open ${target.view}`, () => oneClick(target, "open-view"), "open-view");
+    if (target.kind === "open-view") item("rig-view", `Open ${target.view}`, () => oneClick(target, "open-view"), "open-view", true);
     // Sidebar rows that are places: each opens its page; a saved or rig view also opens in herdr.
-    if (target.kind === "branch") item("rig-popout", `Open ${target.name} in the Rig page`, () => page({ section: target.section }));
+    if (target.kind === "branch") {
+      item("rig-popout", `Open ${target.name} in the Rig page`, () => page({ section: target.section }), null, true);
+      if(target.section==='topology')item('rig-seat','All seats',()=>page({section:'topology',topologyTab:'seats'}));
+    }
     if (target.kind === "host") item("rig-card", "Show host card", () => page({ section: "topology", kind: "host", hostId: target.hostId, name: target.name }));
     if (target.kind === "mission") item("rig-card", "Show mission card", () => page({ section: "scopes", mission: target.mission, name: target.name }));
     if(target.kind==='workflow'){
       item('rig-copy','Copy instance id',cx=>cx.write_to_clipboard(String(target.id??'')));
       if(target.ownerEntry)item('rig-seat',"Open owner's seat",()=>page(target.ownerEntry));
     }
-    if (target.kind === "specs-group") item("rig-popout", `Open ${target.name} specs in the Rig page`, () => page({ section: "specs", kindFilter: target.specKind, name: target.name }));
+    if (target.kind === "specs-group") item("rig-popout", `Open ${target.name} specs in the Rig page`, () => page({ section: "specs", kindFilter: target.specKind, name: target.name }), null, true);
     if (target.kind === "system-config") item("rig-popout", "Open Configuration", () => page({ section: "system", subview: "config", name: "Configuration" }));
-    if (target.kind === "system" && target.entry) item("rig-popout", `Open ${target.name}`, () => page(target.entry));
+    if (target.kind === "system" && target.entry) item("rig-popout", `Open ${target.name}`, () => page(target.entry), null, true);
     if (target.kind === "saved-view" || target.kind === "terminal") {
       item("rig-card", "Show view", () => page({ section: "terminals", view: target.view, name: target.name }));
       item("rig-view", "Open in herdr", () => oneClick({ kind: "open-view", view: target.view, rig: target.rig }, "open-view"), "open-view");
     }
     // A group's order can live under several keys (Specs: one per namespace): Reset clears every one that has an order.
+    if (target.reorder) {
+      const row = target.reorder, index = row.siblingIds?.indexOf(row.itemId) ?? -1;
+      for (const [label, direction] of [["Move up", -1], ["Move down", 1]]) {
+        item(direction < 0 ? "rig-arrow-open-up" : "rig-arrow-open-down", label, () => run(`rig.move-row:${direction}:${encodeURIComponent(row.key)}`));
+        const unavailable = index < 0 || index + direction < 0 || index + direction >= (row.siblingIds?.length ?? 0);
+        if (unavailable) Object.assign(out.at(-1), { disabled: true, reason: direction < 0 ? "Already first in this group" : "Already last in this group" });
+      }
+    }
     const orderKeys = target.orderGroupKeys ?? (target.orderGroupKey ? [target.orderGroupKey] : []);
     const ordered = orderKeys.filter((k) => { const o = (shared("rig.order") ?? {})[k]; return Array.isArray(o) && o.length > 0; });
     if (orderKeys.length && (target.hasCustomOrder || ordered.length)) {
@@ -836,6 +906,75 @@ export default class RigMenu extends View {
   argsFor(target, action, text) { return actionArgs(target, action, text, appHome()); }
 
   // ---- views --------------------------------------------------------------------------------------------------------
+  dialogTab(e,cx){
+    if(String(e.key).toLowerCase()!=='tab'||e.modifiers?.control||e.modifiers?.platform||e.modifiers?.alt)return false;
+    cx.stop_propagation();
+    const first=this.dialogFirstControl,last=this.dialogLastControl;
+    const boundary=e.modifiers?.shift&&first?.is_focused?.()?last:!e.modifiers?.shift&&last?.is_focused?.()?first:null;
+    if(boundary){
+      this.dialogBoundaryTask?.cancel?.();
+      this.dialogBoundaryTask=cx.timer.after(16,nextCx=>{boundary.focus();nextCx.notify();});
+    }else if(e.modifiers?.shift)globalThis.window.focus_prev();else globalThis.window.focus_next();
+    return true;
+  }
+  dialogField(state,Widget){
+    this.dialogObservedFields??=new Set();
+    if(!this.dialogObservedFields.has(state)){
+      this.dialogObservedFields.add(state);
+      state.on('focus',()=>{this.typing=true;this.dialogFocusedField=state;});
+      state.on('blur',()=>{this.typing=false;if(this.dialogFocusedField===state)this.dialogFocusedField=null;});
+    }
+    this.dialogFirstControl??={focus:()=>state.focus(),is_focused:()=>this.dialogFocusedField===state};
+    return Widget.new(state);
+  }
+  dialogButton(t,element,handle,act,disabled=false,content){
+    const index=this.dialogButtonIndex++;
+    if(!handle&&this.dialogRenderCx){
+      this.dialogButtonHandles??=[];
+      handle=this.dialogButtonHandles[index];
+      if(!handle){
+        this.dialogHandleCount=Math.max(this.dialogHandleCount??0,index+1);
+        // Handles are retained on the view and created after render, as the SDK requires.
+        if(!this.dialogHandleTask)this.dialogHandleTask=this.dialogRenderCx.timer.after(0,nextCx=>{
+          while(this.dialogButtonHandles.length<this.dialogHandleCount)this.dialogButtonHandles.push(nextCx.focus_handle());
+          this.dialogHandleTask=null;nextCx.notify();
+        });
+      }
+    }
+    if(!disabled&&!this.dialogFirstControl)this.dialogFirstControl=handle;
+    if(!disabled&&handle)this.dialogLastControl=handle;
+    const key=(event,cx)=>{
+        if(this.dialogTab(event,cx))return;
+        if(disabled||event.modifiers?.control||event.modifiers?.platform||event.modifiers?.alt)return;
+        if(!['enter','return','space',' '].includes(String(event.key).toLowerCase()))return;
+        cx.stop_propagation();act(event,cx);
+      };
+    return div().id(`dialog-focus-${index}`).p(2).border(2).border_color('#00000000').rounded(8).flex_none()
+      .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled)
+      .focus(el=>el.border_color(t.accent)).on_key_down(key)
+      .child(element.on_click((event,cx)=>{if(!disabled)act(event,cx);}).on_key_down(key).when(content!==undefined,el=>el.child(content)));
+  }
+
+  menuKey(e,cx,items) {
+    if(e.key==='escape'){cx.stop_propagation();this.dismiss();return;}
+    const indices=items.flatMap((item,i)=>item.divider===undefined?[i]:[]);
+    if(!indices.length)return;
+    const at=Math.max(0,indices.indexOf(this.menuIndex??indices[0]));
+    if(e.key==='down'||e.key==='up')this.menuIndex=indices[(at+(e.key==='down'?1:-1)+indices.length)%indices.length];
+    else if(e.key==='home')this.menuIndex=indices[0];
+    else if(e.key==='end')this.menuIndex=indices.at(-1);
+    else if(e.key==='enter')this.choose(items[indices[at]],cx);
+    else {
+      const next=typeahead(this.menuSearch,e,indices.map(i=>items[i].label),at);
+      if(!next)return;
+      this.menuSearch=next;this.menuIndex=indices[next.index];
+    }
+    this.menuRevealed=null;
+    this.cancelMenuReveal?.();
+    if(e.key!=='enter')this.cancelMenuReveal=revealAfterKey(cx,this.menuScroll,()=>this.menuIndex,this);
+    cx.stop_propagation();cx.notify();
+  }
+
   popup(t, target) {
     if (target.kind === "page-navigation") return v_flex().id("page-navigation-menu").size_full().p(4).bg(t.raised).border_1().border_color(t.border).rounded(8)
       .when(!!this.handle,el=>el.track_focus(this.handle))
@@ -852,26 +991,40 @@ export default class RigMenu extends View {
     if (this.pending) return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
       .child(div().id("rig-menu-pending").px(8).py(6).text_color(t.muted).child(`${this.pending}…`));
     const items = this.items(target);
-    const rawReasons = [...new Set(items.map((it) => it.reason).filter(Boolean))];
-    const workerReasons = rawReasons.filter(r => workerCapabilityText(r) !== r);
-    const reasons = rawReasons.filter(r => !workerReasons.includes(r));
-    if (workerReasons.length) reasons.push(workerReasons.join("\n"));
-    return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
-      .child(div().px(8).py(4).text_size(11).text_color(t.dim).child(target.kind === "seat" || target.kind === "cell" ? `Seat ${target.logicalId ?? target.session} · ${target.rig}`
+    if(!items[this.menuIndex]?.act){
+      this.menuIndex=items.findIndex(it=>it.act&&!it.disabled);
+      if(this.menuIndex<0)this.menuIndex=items.findIndex(it=>it.divider===undefined);
+    }
+    if(this.menuIndex>=0&&this.menuRevealed!==this.menuIndex){this.menuScroll?.scroll_to_item(this.menuIndex);this.menuRevealed=this.menuIndex;}
+    const selectedReason=items[this.menuIndex]?.reason;
+    const rawReasons=[...new Set(items.map(it=>it.reason).filter(reason=>reason&&reason!==selectedReason))];
+    const workerReasons=rawReasons.filter(r=>workerCapabilityText(r)!==r);
+    const reasons=rawReasons.filter(r=>!workerReasons.includes(r));
+    if(workerReasons.length)reasons.push(workerReasons.join('\n'));
+    return v_flex().id("rig-menu").size_full().min_h(0).p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
+      .when(!!this.handle,el=>el.track_focus(this.handle))
+      .on_key_down((e,cx)=>this.menuKey(e,cx,items))
+      .child(div().flex_none().px(8).py(4).text_size(11).text_color(t.dim).child(target.kind === "seat" || target.kind === "cell" ? `Seat ${target.logicalId ?? target.session} · ${target.rig}`
+        : target.kind === "sidebar-row" ? `${(target.rowKind ?? "row").replace(/^./, c => c.toUpperCase())} ${target.name ?? ""}`
         : target.kind === "need" ? (target.summary ?? "Needs you") : target.kind === "tui" ? "Rig TUI" : target.kind === "spec" ? `Spec ${target.name}`
         : target.kind === "slice" ? `Slice ${target.name}` : target.kind === "strip-view" || target.kind === "following" ? `View ${target.name ?? target.viewId}`
         : target.kind === "cell-split" ? `Split ${target.logicalId ?? target.seat}` : target.kind === "pod" ? `Pod ${target.pod} · ${target.rig}`
         : target.kind === "host" ? `Host ${target.name}` : target.kind === "mission" ? `Mission ${target.name}` : target.kind === "branch" ? target.name
         : target.kind === "specs-group" ? `${target.name} specs` : target.kind === "system-config" || target.kind === "system" ? target.name
         : target.kind === "saved-view" || target.kind === "terminal" ? `View ${target.name ?? target.view}` : `Rig ${target.rig ?? ""}`))
+      .child(v_flex().id('rig-action-list').min_h(0).h(Math.min(260,items.length*26+reasons.length*40)).overflow_y_scrollbar().track_scroll(this.menuScroll)
+        .on_size_change((_size,cx)=>{if(this.menuIndex>=0)this.menuScroll?.scroll_to_item(this.menuIndex);cx.notify();})
       .children(items.map((it, i) => it.divider !== undefined
         ? v_flex().child(div().h(1).bg(t.border).my(3)).when(!!it.divider, (el) => el.child(div().px(8).py(2).text_size(11).text_color(t.dim).child(it.divider)))
-        : h_flex().id(`rig-menu-${i}`).px(8).h(26).gap(8).rounded(5).items_center().text_color(it.disabled ? t.dim : t.foreground).hover((s) => s.bg(it.disabled ? t.raised : t.hover))
+        : h_flex().id(`rig-menu-${i}`).flex_none().px(8).h(26).gap(8).rounded(5).items_center().text_color(it.disabled ? t.dim : t.foreground)
+          .when(i===this.menuIndex,el=>el.bg(t.selection??t.hover)).hover(s=>s.bg(t.hover))
+          .on_mouse_move((_e,cx)=>{if(this.menuIndex!==i){this.menuIndex=i;cx.notify();}})
           .when(!!it.reason, (el) => el.tooltip(it.reason))
           .on_click((_e, cx) => this.choose(it, cx))
           .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
-          .child(div().flex_1().truncate().child(it.label))))
-      .when(reasons.length > 0, (el) => el.child(v_flex().id("rig-menu-reasons").px(8).py(4).gap(2).children(reasons.map((r, idx) => div().id(`rig-menu-reason-${idx}`).text_size(11).text_color(t.dim).tooltip(r).child(workerCapabilityText(r,this.caps()))))));
+          .child(div().flex_1().truncate().when(!!(it.dynamicLabel || it.reason), el=>el.tooltip([String(it.label ?? ""), it.reason].filter(Boolean).join("\n"))).child(it.label))))
+        .when(reasons.length>0,el=>el.child(v_flex().id('rig-menu-reasons').flex_none().px(8).py(4).gap(2).children(reasons.map((r,i)=>div().id(`rig-menu-reason-${i}`).text_size(11).text_color(t.dim).tooltip(r).child(workerCapabilityText(r,this.caps())))))))
+      .when(!!selectedReason,el=>el.child(div().id('rig-menu-selected-reason').flex_none().border_t(1).border_color(t.border).px(8).py(4).text_size(11).text_color(t.dim).child(workerCapabilityText(selectedReason,this.caps()))));
   }
 
   resultView(t, cx, target, step) {
@@ -894,8 +1047,8 @@ export default class RigMenu extends View {
         .child(div().text_size(11.5).text_color(r.ok ? t.dim : t.blocked).child(r.ok
           ? `${target.rig} archived. Restore it any time from Topology → Archived.`
           : r.text || "It didn't work, and the CLI gave no reason."))
-        .when(r.ok, (el) => el.child(h_flex().child(div().id("rig-unarchive").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
-          .on_click(() => { oneClick(target, "unarchive-rig"); this.dismiss(); }).child("Undo"))));
+        .when(r.ok, (el) => el.child(h_flex().child(this.dialogButton(t,div().id("rig-unarchive").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
+          () => { oneClick(target, "unarchive-rig"); this.dismiss(); },false,"Undo"))));
     }
     // A teardown result (even with a non-zero exit, as for a rig already stopped) reads as what it says.
     if (step.action === "pause" && r.json && "sessionsKilled" in r.json) {
@@ -913,10 +1066,10 @@ export default class RigMenu extends View {
         .children(out.seats.map((s, i) => v_flex().gap(1)
           .child(h_flex().gap(8).items_center()
             .child(svg(icon(s.ok ? "check" : s.needsFresh ? "rig-alert" : "x")).size(13).flex_none().text_color(s.ok ? t.working : t.blocked))
-            .child(div().w(120).truncate().child(s.logicalId))
-            .child(div().flex_1().truncate().text_color(t.muted).child(s.label))
-            .when(s.needsFresh, (el) => el.child(div().id(`fresh-${i}`).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().hover((x) => x.bg(t.hover))
-              .on_click(() => dialog({ ...target, logicalId: s.logicalId }, { action: "fresh", confirm: true }, RESULT_HEIGHT)).child("Start fresh…"))))
+            .child(div().w(120).truncate().tooltip(String(s.logicalId??"")).child(s.logicalId))
+            .child(div().flex_1().truncate().text_color(t.muted).tooltip(String(s.label??"")).child(s.label))
+            .when(s.needsFresh, (el) => el.child(this.dialogButton(t,div().id(`fresh-${i}`).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().hover((x) => x.bg(t.hover)),null,
+              () => dialog({ ...target, logicalId: s.logicalId }, { action: "fresh", confirm: true }, RESULT_HEIGHT),false,"Start fresh…"))))
           .when(!s.ok && !!s.error, (el) => el.child(div().pl(22).text_size(11.5).text_color(t.dim).child(s.error)))));
     }
     return v_flex().gap(6)
@@ -930,8 +1083,8 @@ export default class RigMenu extends View {
         : step.action === "delete-rig" ? "Check the rig list before trying again; Retry runs the delete again."
         : step.action === "pause" || step.action === "resume" ? "Check the current state before trying again; Retry re-reads it first." : "Retry runs it again.")))
       // A message or an answer is never resent from here: it may have arrived. Anything else runs again.
-      .when(!r.ok && !RESEND_UNSAFE.has(step.action), (el) => el.child(div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => this.retry(cx, target, step)).child("Retry")));
+      .when(!r.ok && !RESEND_UNSAFE.has(step.action), (el) => el.child(this.dialogButton(t,div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
+        (_e,cx)=>this.retry(cx,target,step),false,"Retry")));
   }
 
   /** What a success says when the CLI printed no message of its own. */
@@ -960,6 +1113,11 @@ export default class RigMenu extends View {
     if(step.action==="confirm-spec-write"){
       if(!step.token)return;
       setShared("rig.specWriteDecisions",{...(shared("rig.specWriteDecisions")??{}),[step.token]:"allow"});
+      this.dismiss();return;
+    }
+    if(step.action==="spaces-list"){
+      if(!step.token)return;
+      setShared("rig.spacesListDecisions",{...(shared("rig.spacesListDecisions")??{}),[step.token]:"allow"});
       this.dismiss();return;
     }
     if (step.action === "archive-rig") { this.archive(cx, target); return; }
@@ -1127,9 +1285,9 @@ export default class RigMenu extends View {
     );
     const models = filterAllowedModels(SWAP_MODELS_BY_RUNTIME[this.swapRuntime] ?? []);
     const efforts = SWAP_EFFORTS_BY_RUNTIME[this.swapRuntime] ?? [];
-    const pill = (id, label, active, onClick) => div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
+    const pill = (id, label, active, onClick) => this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
       .bg(active ? t.accent : t.raised).text_color(active ? (t.solid_foreground ?? t.background) : t.muted).border_1().border_color(active ? t.accent : t.border)
-      .hover((s) => s.bg(active ? t.accent : t.hover)).on_click((_e, cx) => { onClick(); cx.notify(); }).child(label);
+      .hover((s) => s.bg(active ? t.accent : t.hover)),null,(_e,cx)=>{onClick();cx.notify();},false,label);
     const toneColor = plan.tone === "working" ? (t.working ?? t.accent) : plan.tone === "warn" ? (t.ansi3 ?? t.blocked) : (t.blocked ?? t.foreground);
     return v_flex().id("change-model-view").gap(10)
       .child(div().text_size(11.5).text_color(t.muted).child(
@@ -1194,10 +1352,9 @@ export default class RigMenu extends View {
     this.focusCell = this.clampFocusCell(this.focusCell);
     const grid = this.grid;
     const change = (cx, fn) => { this.typing = false; this.handle?.focus?.(); fn(); this.edited(cx); };
-    const small = (id, label, act, on = true) => div().id(id).w(18).h(18).flex_none().rounded(4).flex().items_center().justify_center().text_size(12)
-      .text_color(on ? t.muted : t.border).hover((s) => s.bg(t.hover)).on_click((_e, cx) => { cx.stop_propagation(); if (on) act(cx); }).child(label);
-    const chipButton = (id, label, act) => div().id(id).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().text_size(12).hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => act(cx)).child(label);
+    const small = (id, label, act, on = true) => this.dialogButton(t,div().id(id).w(18).h(18).flex_none().rounded(4).flex().items_center().justify_center().text_size(12)
+      .text_color(on ? t.muted : t.border).hover((s) => s.bg(t.hover)),null,(_e,cx)=>{cx.stop_propagation();act(cx);},!on,label);
+    const chipButton = (id, label, act) => this.dialogButton(t,div().id(id).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().text_size(12).hover((s) => s.bg(t.hover)),null,(_e,cx)=>act(cx),false,label);
     const place = (cx, r, c, seat) => {
       if (seat) {
         change(cx, () => {
@@ -1208,10 +1365,9 @@ export default class RigMenu extends View {
     };
     const checkboxSquare = (on, disabled = false) => div().w(13).h(13).flex_none().rounded(3).border_1().border_color(disabled ? t.border : (on ? t.accent : t.border)).flex().items_center().justify_center()
       .when(on && !disabled, (box) => box.bg(t.accent).child(svg(icon("check")).size(10).text_color(t.solid_foreground ?? t.background)));
-    const toggle = (id, label, on, flip) => h_flex().id(id).gap(6).items_center().cursor_pointer()
-      .on_click((_e, cx) => { this.typing = false; this.handle?.focus?.(); flip(); cx.notify(); })
-      .child(checkboxSquare(on))
-      .child(div().text_size(12).child(label));
+    const toggle = (id, label, on, flip) => this.dialogButton(t,h_flex().id(id).gap(6).items_center().cursor_pointer()
+      .child(checkboxSquare(on)).child(div().text_size(12).child(label)),null,
+      (_e, cx) => { this.typing = false; flip(); cx.notify(); });
     const logicalOf = (session) => seats.find((s) => s.session === session)?.logicalId ?? String(session).split("@")[0];
     const spot = (seat) => { const at = gridFind(grid, seat); return at ? cellLabel(at.r, at.c) : null; };
     const toggleSeatChecked = (cx, session) => change(cx, () => {
@@ -1242,19 +1398,18 @@ export default class RigMenu extends View {
         return h_flex().id(`design-seat-${lid}`).px(6).h(26).gap(6).items_center().rounded(5).when(picked && !stopped, (el) => el.bg(t.selected))
           .when(stopped, (el) => el.opacity(0.5).tooltip("not running: no pane to attach")).hover((x) => x.bg(t.hover))
           .on_click((_e, cx) => { if (!stopped) { this.typing = false; this.handle?.focus?.(); this.selectedSeat = s.session; this.draggingSeat = null; cx.notify(); } })
-          .on_mouse_down("left", (_e, cx) => { if (!stopped) { this.typing = false; this.handle?.focus?.(); this.draggingSeat = s.session; this.selectedSeat = s.session; cx.notify(); } })
-          .on_mouse_up("left", (_e, cx) => { this.draggingSeat = null; cx.notify(); })
+          .on_mouse_down("left", (e, cx) => { if (!stopped) { this.typing = false; this.handle?.focus?.(); this.beginSeatPress(s.session,e); this.selectedSeat = s.session; cx.notify(); } })
+          .on_mouse_up("left", (_e, cx) => { this.pressedSeat=null;this.draggingSeat = null; cx.notify(); })
           .child(div().id(`design-seat-check-${lid}`).w(13).h(13).flex_none().rounded(3).border_1().border_color(stopped ? t.border : (isChecked ? t.accent : t.border)).flex().items_center().justify_center()
             .on_click((_e, cx) => { cx.stop_propagation(); if (!stopped) toggleSeatChecked(cx, s.session); })
             .when(isChecked && !stopped, (box) => box.bg(t.accent).child(svg(icon("check")).size(10).text_color(t.solid_foreground ?? t.background))))
           .child(div().size(7).flex_none().rounded(4).bg(t[s.tone] ?? t.dim))
-          .child(div().flex_1().truncate().child(lid))
+          .child(div().flex_1().truncate().tooltip(String(lid??"")).child(lid))
           .child(div().text_size(11).flex_none().text_color(t.dim).child(stopped ? "(stopped) · not running: no pane to attach" : placed ? `✓ ${placed}` : s.word ?? ""));
       }))
-      .child(div().id("design-add-shell").mt(4).px(8).h(24).rounded(5).bg(t.raised).flex().items_center().text_size(11.5).text_color(t.muted)
+      .child(this.dialogButton(t,div().id("design-add-shell").mt(4).px(8).h(24).rounded(5).bg(t.raised).flex().items_center().text_size(11.5).text_color(t.muted)
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .on_click((_e, cx) => addShellPane(cx))
-        .child("+ Add shell pane"));
+        ,null,(_e,cx)=>addShellPane(cx),false,"+ Add shell pane"));
 
     const cell = (r, c, row) => {
       const x = row.cells[c], pad = isPad(x), shell = isShell(x), over = this.hoveredCell?.r === r && this.hoveredCell?.c === c;
@@ -1277,10 +1432,11 @@ export default class RigMenu extends View {
           }
         })
         .on_click((_e, cx) => { this.typing = false; this.handle?.focus?.(); this.focusCell = { row: r, col: c }; place(cx, r, c, this.selectedSeat); })
-        .on_mouse_down("left", (_e, cx) => { if (!pad) { this.typing = false; this.handle?.focus?.(); this.draggingSeat = x.seat ?? x.cellId ?? { r, c }; cx.notify(); } })
+        .on_mouse_down("left", (e, cx) => { if (!pad) { this.typing = false; this.handle?.focus?.(); this.beginSeatPress(x.seat ?? x.cellId ?? {r,c},e); cx.notify(); } })
         .on_mouse_up("left", (e, cx) => {
           if (this.draggingDivider) { cx.stop_propagation(); this.finishDividerDrag(e, cx); return; }
           cx.stop_propagation();
+          this.advanceSeatDrag(e,cx);this.pressedSeat=null;
           const dragged = this.draggingSeat;
           this.draggingSeat = null;
           if (!dragged) { cx.notify(); return; }
@@ -1306,7 +1462,7 @@ export default class RigMenu extends View {
               gridRemoveCell(grid, r, c);
             }
           })))))
-        .child(div().flex_1().truncate().text_size(12).text_color(pad ? t.dim : t.foreground).child(cellTitle));
+        .child(div().flex_1().truncate().text_size(12).text_color(pad ? t.dim : t.foreground).tooltip(String(cellTitle??"")).child(cellTitle));
     };
 
     const rowViews = [];
@@ -1391,7 +1547,7 @@ export default class RigMenu extends View {
       .child(v_flex().gap(6).pt(6).border_t(1).border_color(t.border)
         .child(h_flex().gap(6).items_center()
           .child(preset("design-preset-auto", "Auto grid", "auto")).child(preset("design-preset-lead", "Lead + 2×2", "lead-2x2")).child(preset("design-preset-wide", "Wide + stack", "wide-stack"))
-          .child(div().flex_1().border(1).border_color(t.border).rounded(6).px(6).py(2).child(Input.new(this.viewName))))
+          .child(div().flex_1().border(1).border_color(t.border).rounded(6).px(6).py(2).child(this.dialogField(this.viewName,Input))))
         .child(h_flex().gap(14).items_center()
           .child(toggle("design-save-toggle", "Save as a named view", this.saveNamed, () => { this.saveNamed = !this.saveNamed; }))
           .child(toggle("design-follow-toggle", "Follow active workers", this.followWorkers, () => { this.followWorkers = !this.followWorkers; }))
@@ -1447,11 +1603,26 @@ export default class RigMenu extends View {
   }
 
   /** Completes or clears an active drag on mouse-up anywhere in `#design-view` or `#rig-dialog`. */
+  beginSeatPress(value,event){
+    const point=event?.position??event;
+    this.draggingSeat=null;
+    this.pressedSeat={value,start:Number.isFinite(point?.x)&&Number.isFinite(point?.y)?{x:point.x,y:point.y}:null};
+  }
+
+  advanceSeatDrag(event,cx){
+    const press=this.pressedSeat,point=event?.position??event;
+    if(!press||!Number.isFinite(point?.x)||!Number.isFinite(point?.y))return;
+    if(!press.start){press.start={x:point.x,y:point.y};return;}
+    if(Math.hypot(point.x-press.start.x,point.y-press.start.y)<3)return;
+    this.draggingSeat=press.value;this.pressedSeat=null;cx.notify();
+  }
+
   finishDrag(cx, e = null) {
     if (this.draggingDivider) {
       this.finishDividerDrag(e, cx);
       return;
     }
+    this.advanceSeatDrag(e,cx);this.pressedSeat=null;
     if (!this.draggingSeat) return;
     const seat = this.draggingSeat;
     this.draggingSeat = null;
@@ -1483,13 +1654,17 @@ export default class RigMenu extends View {
   }
 
   dialogView(t, cx, target, step) {
+    this.dialogRenderCx=cx;this.dialogButtonIndex=0;
+    this.dialogFirstControl=step.action==='design-view'?this.handle:null;
+    this.dialogLastControl=null;
     const result = this.result;
     const title = ["delete-rig", "archive-rig", "unarchive-rig"].includes(step.action) && result
       ? result.kind === "archive" ? (result.ok ? `${target.rig} archived` : `Couldn't archive ${target.rig}`)
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
-      : step.action === "confirm-spec-write" ? `Save specs on ${step.confirmation?.machine}?`
+      : step.action === "spaces-list" ? (step.copy?.title ?? "Spaces list")
+      : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? `Copy built-in specs on ${step.confirmation?.machine}?` : `Save specs on ${step.confirmation?.machine}?`)
       : step.action === "confirm-machine" ? `Open seats on ${step.confirmation?.machine}?`
       : step.action === "move-grid" ? `Move ${target.rig} to ${step.relocation?.machine}?`
       : step.action === "rebuild-space" ? `Rebuild ${target.rig}'s tiles?` : actionTitle(target, step.action);
@@ -1500,15 +1675,35 @@ export default class RigMenu extends View {
       const exact=(label,value,id)=>h_flex().gap(8).items_center()
         .child(div().w(100).flex_none().text_color(t.muted).child(label))
         .child(div().flex_1().min_w(0).font_family(settings()?.font_family??"monospace").text_size(10.5).child(value))
-        .child(div().id(id).size(20).flex_none().cursor_pointer().tooltip(`Copy ${label}`)
-          .on_click((_e,cx)=>{cx.stop_propagation();cx.write_to_clipboard(value);})
-          .child(svg(icon("rig-copy")).size(12).text_color(t.dim)));
+        .child(this.dialogButton(t,div().id(id).size(20).flex_none().cursor_pointer().tooltip(`Copy ${label}`),null,
+          (_e,cx)=>{cx.stop_propagation();cx.write_to_clipboard(value);},false,svg(icon("rig-copy")).size(12).text_color(t.dim)));
+      const folderCopy=c.capability==="copy-folder";
       body=v_flex().gap(10)
-        .child(div().child(`Save specs on ${c.machine} as ${c.user}. Herdr writes only inside the folders below and installs its spec helper on ${c.machine}.`))
+        .child(div().child(folderCopy
+          ? `Copy a built-in spec's whole folder on ${c.machine} as ${c.user}, with OpenRig's own rig specs add, then make that copy's agent paths absolute. Herdr writes only inside the folders below and installs its spec helper on ${c.machine}.`
+          : `Save specs on ${c.machine} as ${c.user}. Herdr writes only inside the folders below and installs its spec helper on ${c.machine}.`))
+        .when(folderCopy&&!!c.from,el=>el.child(exact("Copies",c.from,"copy-spec-from")))
+        .when(folderCopy&&!!c.into,el=>el.child(exact("Into",c.into,"copy-spec-into")))
         .children((c.roots??[]).map((root,i)=>exact(i?"":"Writes only inside",root,`copy-spec-root-${i}`)))
         .child(exact("Helper",c.helperPath,"copy-spec-helper"))
         .child(exact("SHA-256",c.sha256,"copy-spec-hash"))
-        .child(div().text_color(t.muted).child("Built-in specs are never overwritten. A changed helper or spec folder asks again. This permission is separate from opening seats."));
+        .child(div().text_color(t.muted).child(folderCopy
+          ? "The built-in itself is never changed, and an existing copy is never overwritten. A changed helper or spec folder asks again. This permission is separate from saving specs and from opening seats."
+          : "Built-in specs are never overwritten. A changed helper or spec folder asks again. This permission is separate from opening seats."));
+    } else if (step.action === "spaces-list") {
+      const c = step.copy ?? {}, row = (label, value, mono) => h_flex().gap(8).items_start()
+        .child(div().w(70).flex_none().text_color(t.muted).child(label))
+        .child(div().flex_1().min_w(0).when(mono, (el) => el.font_family(settings()?.font_family ?? "monospace").text_size(11)).child(value));
+      const section = (id, head, text) => v_flex().id(id).gap(3).child(div().text_size(11.5).font_semibold().text_color(t.muted).child(head)).child(div().child(text));
+      body = v_flex().gap(12)
+        .child(div().id("spaces-list-intro").child(c.intro ?? ""))
+        .when(!!c.note, (el) => el.child(div().id("spaces-list-shipped").text_color(t.muted).child(c.note)))
+        .child(v_flex().id("spaces-list-changes").gap(5).child(div().text_size(11.5).font_semibold().text_color(t.muted).child("What changes"))
+          .children((c.changes ?? []).map(([label, value, mono]) => row(label, value, mono)))
+          .child(div().text_color(t.muted).child(c.unchanged ?? "")))
+        .child(section("spaces-list-stays", "What stays as it is", c.stays ?? ""))
+        .when(!!c.good, (el) => el.child(section("spaces-list-good", "Good to know", c.good)))
+        .child(section("spaces-list-back", "The way back", c.wayBack ?? ""));
     } else if (step.action === "confirm-machine") {
       const c = step.confirmation ?? {};
       body = v_flex().gap(10)
@@ -1549,7 +1744,7 @@ export default class RigMenu extends View {
       body = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? div().text_color(t.blocked).child(p.error)
         : v_flex().gap(3)
           .child(div().child(`This stops all ${p.total} agents. Work in progress stops with them:`))
-          .children(p.busy.map((s) => h_flex().gap(8).child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().child(s.logicalId))
+          .children(p.busy.map((s) => h_flex().gap(8).child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().tooltip(String(s.logicalId??"")).child(s.logicalId))
             .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))))
           .child(div().text_color(t.dim).child("OpenRig snapshots first (best effort). Resume brings back each conversation where the harness allows."));
     } else if (step.action === "archive-rig" && !this.result && !this.busy) {
@@ -1564,7 +1759,7 @@ export default class RigMenu extends View {
       body = div().child(`${target.logicalId} starts a new conversation; the old one is not resumed.`);
     } else if (step.action === "launch-spec" && !this.result?.ok && !this.busy) {
       const field = (label, state) => v_flex().gap(3).child(div().text_size(11.5).text_color(t.dim).child(label))
-        .child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(Input.new(state)));
+        .child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(this.dialogField(state,Input)));
       // The exact source rig up is given, not only the spec's name: what the person approves is what runs.
       const source = target.sourcePath ?? target.name;
       const sourceProblem = launchSourceProblem(source);
@@ -1586,7 +1781,8 @@ export default class RigMenu extends View {
       : null;
     const confirmLabel = step.action === "change-model"
       ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
-      : step.action === "confirm-spec-write" ? "Allow spec saves"
+      : step.action === "spaces-list" ? (step.copy?.confirm ?? "Change")
+      : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? "Allow built-in copies" : "Allow spec saves")
       : step.action === "confirm-machine" ? "Allow this machine"
       : step.action === "move-grid" ? `Move ${target.rig}`
       : step.action === "rebuild-space" ? `Rebuild ${step.recovery?.tiles?.length ?? 0} tile${step.recovery?.tiles?.length===1?"":"s"}${step.continueMove?" and continue Move":""}`
@@ -1599,16 +1795,23 @@ export default class RigMenu extends View {
     const canConfirm = !!confirmLabel && (step.action === "launch-spec" || step.action === "new-rig" || step.action === "design-view" || step.action === "change-model" ? !this.result?.ok : !this.result) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps()) : null;
     const mac = window()?.platform === "macos";
-    return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).size_full().p(14).gap(10).bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).text_size(12.5)
-      .on_mouse_move((e, cx) => { if (step.action === "design-view" && this.draggingDivider) this.moveDividerDrag(e, cx); })
+    return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).text_size(12.5)
+      .key_context('RigDialog')
+      .on_action('rig-dialog-next',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{}},cx))
+      .on_action('rig-dialog-prev',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{shift:true}},cx))
+      .on_mouse_move((e, cx) => { if(step.action==='design-view'){this.advanceSeatDrag(e,cx);if(this.draggingDivider)this.moveDividerDrag(e,cx);} })
       .on_mouse_up("left", (e, cx) => { if (step.action === "design-view") this.finishDrag(cx, e); })
       // Esc cancels an active drag in the designer first; otherwise Esc closes (a draft is kept); Ctrl+Enter / Cmd+Enter sends from anywhere in the dialog.
       .on_key_down((e, cx) => {
         const key = String(e.key ?? "").toLowerCase();
+        if(key==='tab'&&!e.modifiers?.control&&!e.modifiers?.platform&&!e.modifiers?.alt){
+          this.dialogTab(e,cx);return;
+        }
         if (key === "escape") {
           cx.stop_propagation();
-          if (step.action === "design-view" && (this.draggingSeat || this.draggingDivider)) {
+          if (step.action === "design-view" && (this.draggingSeat || this.pressedSeat || this.draggingDivider)) {
             this.draggingSeat = null;
+            this.pressedSeat=null;
             this.draggingDivider = null;
             this.designStatus = "Drag cancelled";
             cx.notify();
@@ -1640,26 +1843,26 @@ export default class RigMenu extends View {
         }
       })
       .child(div().id("rig-dialog-title").flex_none().text_size(14).font_semibold().child(title))
-      .when(!!body && !["change-model","new-rig","confirm-spec-write"].includes(step.action), (el) => el.child(body))
-      .when(!!this.input && !this.result, (el) => el.child(div().flex_1().border(1).border_color(t.border).rounded(6).p(6).child(Textarea.new(this.input).h(96)))
+      .when(!!body && !["change-model","new-rig","confirm-spec-write","spaces-list"].includes(step.action), (el) => el.child(body))
+      .when(!!this.input && !this.result, (el) => el.child(div().flex_1().border(1).border_color(t.border).rounded(6).p(6).child(this.dialogField(this.input,Textarea).h(96)))
         .child(div().text_size(11).text_color(t.dim).child(`${mac ? "⌘ Return" : "Ctrl+Enter"} sends · Esc or a click outside closes; your text is kept until you send or cancel`)))
       // Long results and the model/harness form scroll; the action footer never shrinks into the body.
       .when(step.action !== "design-view" || !!this.result || !!this.busy, (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
-        .when(["change-model","new-rig","confirm-spec-write"].includes(step.action) && !!body, (content) => content.child(body))
+        .when(["change-model","new-rig","confirm-spec-write","spaces-list"].includes(step.action) && !!body, (content) => content.child(body))
         .child(this.resultView(t, cx, target, step) ?? div())))
       .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
-        .child(div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover))
-          .on_click(() => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); }).child(done ? "Close" : "Cancel"))
+        .child(this.dialogButton(t,div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),this.dialogCancelHandle,
+          () => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); },false,done ? "Close" : "Cancel"))
         .when(done && step.action === "new-rig" && typeof result.createdRig === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(result.createdRig), el => el.child(
-          div().id("new-rig-open-space").px(12).h(26).rounded(6).bg(t.accent).text_color(t.background ?? "#fff").flex().items_center().cursor_pointer()
-            .on_click(() => { run(`rig.space:${result.createdRig}`); this.dismiss(); }).child("Open rig space")))
-        .when(canConfirm && step.action === "delete-rig", (el) => el.child(div().id("rig-archive").px(12).h(26).rounded(6).bg(t.raised).border_1().border_color(t.border)
+          this.dialogButton(t,div().id("new-rig-open-space").px(12).h(26).rounded(6).bg(t.accent).text_color(t.background ?? "#fff").flex().items_center().cursor_pointer(),this.dialogOpenSpaceHandle,
+            () => { run(`rig.space:${result.createdRig}`); this.dismiss(); },false,"Open rig space")))
+        .when(canConfirm && step.action === "delete-rig", (el) => el.child(this.dialogButton(t,div().id("rig-archive").px(12).h(26).rounded(6).bg(t.raised).border_1().border_color(t.border)
           .flex().items_center().hover((s) => s.bg(t.hover)).when(!!archiveReason, (b) => b.opacity(0.45).tooltip(archiveReason))
-          .on_click((_e, cx) => { if (!archiveReason) this.archive(cx, target); }).child(this.rigRunning(target) ? "Pause and archive" : "Archive")))
-        .when(canConfirm, (el) => el.child(div().id("rig-confirm").px(12).h(26).rounded(6)
+          ,this.dialogArchiveHandle,(_e,cx)=>this.archive(cx,target),!!archiveReason,this.rigRunning(target) ? "Pause and archive" : "Archive")))
+        .when(canConfirm, (el) => el.child(this.dialogButton(t,div().id("rig-confirm").px(12).h(26).rounded(6)
           .bg(step.action === "pause" || step.action === "fresh" || step.action === "delete-rig" ? t.blocked : t.accent)
-          .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center()
-          .on_click((_e, cx) => go(cx)).child(confirmLabel))));
+          .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center(),this.dialogConfirmHandle,
+          (_e,cx)=>go(cx),false,confirmLabel))));
   }
 
   /** Delete's confirmation: what stops (every seat, with its state and owned work), the command, and Archive instead. */
@@ -1669,7 +1872,7 @@ export default class RigMenu extends View {
     const what = p && !p.error ? `${target.rig}'s ${seats.length} seat${seats.length === 1 ? "" : "s"}` : `every seat of ${target.rig}`;
     const list = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? div().text_color(t.blocked).child(p.error)
       : v_flex().id("delete-seats").gap(3).children(seats.map((s, i) => h_flex().id(`delete-seat-${i}`).gap(8).items_center()
-        .child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().child(s.logicalId))
+        .child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().tooltip(String(s.logicalId??"")).child(s.logicalId))
         .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))));
     return v_flex().id("delete-view").gap(8)
       .child(div().child(`${this.rigRunning(target) ? `This stops ${what} and deletes the rig. OpenRig takes a snapshot first.` : `This removes the stopped rig ${target.rig}.`} The rig can't be brought back by name afterwards.`))
@@ -1683,26 +1886,27 @@ export default class RigMenu extends View {
 
   /** New rig: a two-choice control (from a spec, or one seat), its fields, and the command it will run. */
   newRigView(t) {
-    const pill = (id, label, active, onClick) => div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
+    const pill = (id, label, active, onClick) => this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
       .bg(active ? t.accent : t.raised).text_color(active ? (t.solid_foreground ?? t.background) : t.muted).border_1().border_color(active ? t.accent : t.border)
-      .hover((s) => s.bg(active ? t.accent : t.hover)).on_click((_e, cx) => { onClick(); cx.notify(); }).child(label);
+      .hover((s) => s.bg(active ? t.accent : t.hover)),null,(_e,cx)=>{onClick();cx.notify();},false,label);
     const label = (text) => div().text_size(11.5).text_color(t.dim).child(text);
-    const field = (text, state) => v_flex().gap(3).child(label(text)).child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(Input.new(state)));
+    const field = (text, state) => v_flex().gap(3).child(label(text)).child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(this.dialogField(state,Input)));
     const seat = this.newMode === "seat";
     const createReason = seat ? capabilityDisableReason("create-rig", this.caps()) : null;
     const specs = this.newSpecs;
     const specList = !specs ? div().text_color(t.muted).child("Reading the spec library…")
       : specs.error ? div().text_color(t.blocked).child(specs.error)
       : !specs.length ? div().text_color(t.muted).child("The spec library has no rig specs. Add one to the library, or make a one-seat rig.")
-      : v_flex().id("new-rig-specs").gap(2).h(this.newExpandedSpec ? 360 : 132).flex_none().overflow_y_scrollbar().mode("always")
-        .when(!!this.newSpecHandle, (el) => el.track_focus(this.newSpecHandle))
+      : v_flex().id("new-rig-specs").gap(2).h(this.newExpandedSpec ? 360 : 132).flex_none().overflow_y_scrollbar().mode("always").track_scroll(this.newSpecScroll)
+        .on_size_change((_size,cx)=>{this.newSpecScroll?.scroll_to_item(this.newSpecFocus);cx.notify();})
+        .when(!!this.newSpecHandle, (el) => el.track_focus(this.newSpecHandle)).tab_stop(true).focus(el=>el.border(1).border_color(t.accent))
         .on_key_down((e, cx) => this.newSpecKey(e, cx)).children(specs.map((s, i) => {
         const on = this.newSpec === s;
         return v_flex().flex_none().gap(3).child(h_flex().id(`new-rig-spec-${i}`).px(6).h(24).gap(8).rounded(5).items_center().cursor_pointer()
           .bg(on ? (t.selection ?? `${t.accent}1f`) : t.raised).hover((x) => x.bg(t.hover))
           .on_click((_e, cx) => { this.typing = false; this.newSpecHandle?.focus?.(); this.pickNewSpec(cx, s, true); })
           .child(svg(icon(on ? "check" : "rig-card")).size(12).flex_none().text_color(on ? t.accent : t.muted))
-          .child(div().flex_1().truncate().child(s.name ?? s.id ?? "Unnamed spec")))
+          .child(div().flex_1().truncate().tooltip(String(s.name ?? s.id ?? "Unnamed spec"??"")).child(s.name ?? s.id ?? "Unnamed spec")))
           .when(this.newExpandedSpec === s, (el) => el.child(v_flex().id(`new-rig-spec-preview-${i}`).ml(14).pb(4).child(this.newSpecPreviewView(t, s))));
       }));
     return v_flex().id("new-rig-view").gap(8)
@@ -1755,6 +1959,8 @@ export default class RigMenu extends View {
     if(p.step&&["confirm-machine","setup-machine","stop-machine"].includes(p.step.action))return div().p(14).child("Checking OpenRig configuration…");
     if (!p.target) return div();
     const target = complete(p.target);
-    return p.step ? this.dialogView(t, cx, target, p.step) : this.popup(t, target);
+    const tree=p.step ? this.dialogView(t, cx, target, p.step) : this.popup(t, target);
+    this.dialogRenderCx=null;
+    return tree;
   }
 }

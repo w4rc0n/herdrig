@@ -22,7 +22,8 @@ import { timezoneValue } from './rig-time.js';
 import { healthCounts } from "./rig-health.js";
 
 import { filterAttentionHealth } from "./rig-lib.js";
-import { h_flex, v_flex } from "gpui-base";
+import { h_flex, v_flex, ScrollHandle } from "gpui-base";
+import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, closeOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands, machines } from "herdr";
 import { RemoteMachine, detectDaemonMachine } from "./rig-remote.js";
 import { HostWorkerViews } from "./rig-worker-controller.js";
@@ -40,7 +41,7 @@ import {
   utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine,
   buildTopology, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
-  asOf, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, requestCardText,
+  asOf, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, requestHeadline,
   readCommand, writeCommand, writeOutcome, actionArgs, actionTitle, doneWords, startOneClick, ONE_CLICK, RIG_SECTIONS, SECTION_TITLES, CONFIG_CATEGORIES,
   navPush, navBack, navKey,
   probeCapabilities, currentCapabilities, capabilityDisableReason, herdrAppAvailability, isNeedsVisible, openNeed, worstHealthChip,
@@ -50,7 +51,7 @@ import {
   parseSidebarState, serializeSidebarState, treeKeyNav, rigViewsBranch, attachToSeat, isLoopbackDaemonUrl, formatSeatContextPct, isSeatContextWarning,
   tierOf, sortNeedsByTier, enrichAttentionItems, quietModeHeaderChip, whoseQueueSummary, statusMark, statusMarkElement, pageRevealOpen,
   attachRelayPath, isValidSessionName, sessionNameRefusal,
-  findAttachedSeat, newRigOverlay } from "./rig-lib.js";
+  findAttachedSeat, newRigOverlay, rigSpaceMarks } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.sidebar` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.sidebar}`;
@@ -108,6 +109,7 @@ import {openRigEventStream} from "./rig-event-stream.js";
 import {StatusMotion} from "./rig-status-motion.js";
 export default class RigSidebar extends View {
   init(_p, cx) {
+    this.listScroll = ScrollHandle.new();
     registerRigRouting(cx, context => ({ ...this.routeHost(context), config: this.config, notify }));
     this.routeReceiverId=`sidebar-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     setShared("rig.routeReceivers",{...(shared("rig.routeReceivers")??{}),[this.routeReceiverId]:true});
@@ -180,6 +182,15 @@ export default class RigSidebar extends View {
         }
         else if (cmdName === "palette") run("mod.open", { name: MOD_IDS.palette });
         else if (cmdName === "show-sidebar-here") { this.spaceFold?.expand(spaces().find(s => s.active)?.id); cx.notify(); }
+        else if (cmdName === "focus-sidebar") this.focusSidebar(cx);
+        else if (cmdName.startsWith("move-row:")) {
+          const parts = cmdName.slice("move-row:".length).split(":");
+          if (parts.length === 2 && ["-1", "1"].includes(parts[0]) && parts[1]) {
+            let key;
+            try { key = decodeURIComponent(parts[1]); } catch (_) { continue; }
+            this.moveSidebarRow(cx, key, Number(parts[0]));
+          }
+        }
         else if (cmdName === "tui" || cmdName === "open-tui" || cmdName === "rig.open-tui") this.tui(cx);
         else if (cmdName === "operator" || cmdName === "rig.operator" || cmdName === "open-operator") this.openOperator(cx);
         else if (cmdName === "start-daemon" || cmdName === "rig.start-daemon") this.startDaemon(cx);
@@ -858,9 +869,15 @@ export default class RigSidebar extends View {
   openRigSpace(cx, id, rebuild = null, consent = null, relocation = null, continueWorker = null) {
     const rig = this.data?.topology?.find((r) => r.id === id || r.name === id);
     if (!rig || this.error) { notify({ title: "Rig space", body: this.error ? String(this.error) : "OpenRig hasn't loaded this rig yet. Try again in a moment.", level: "warning" }); return; }
+    // Already building: a repeat click keeps the line and is a true no-op (no second open, no selection write).
+    if ((this.opening ??= new Set()).has(rig.id)) return;
     setShared("rig.sel", { key: rigKey(rig.id), entry: { section: "topology", kind: "rig", rigId: rig.id, name: rig.name }, at: Date.now() });
+    // A box grid takes 10-20 s to build: say so on the list until it is verified, so the click doesn't feel dead.
+    this.opening.add(rig.id); cx.notify();
     cx.spawn(async (cx) => {
-      const result = await routeRigOpen(this.routeHost(cx, consent), this.config, { kind: "grid", rigId: rig.id, options: { rebuild, relocation } });
+      let result;
+      try { result = await routeRigOpen(this.routeHost(cx, consent), this.config, { kind: "grid", rigId: rig.id, options: { rebuild, relocation } }); }
+      finally { this.opening.delete(rig.id); }
       setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
       if (result.needsRelocation) this.reviewGridMove(rig,result.relocation,rebuild,continueWorker);
       else if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval,relocation,continueWorker));
@@ -873,6 +890,9 @@ export default class RigSidebar extends View {
       cx.notify();
     });
   }
+
+  /** What the list says while a rig's grid builds (the machine as Herdr names it). */
+  openingLine(rig) { return this.config?.daemonMachine ? `Opening ${rig.name} on ${this.config.daemonMachine}…` : `Opening ${rig.name}…`; }
 
   notifyResult(title, result, changed = true) {
     this.machineNotices ??= new Map();
@@ -1022,6 +1042,9 @@ export default class RigSidebar extends View {
   }
   async hostWorkerAction(cx,id,target,action,consent=null){
     const view=target.view??target.target??(target.rig?`rig:${target.rig}`:null),controller=this.workerController(cx,consent);
+    const progress={token:`${id}:${Date.now()}:${Math.random()}`,view,daemonUrl:this.config.daemonUrl,machine:this.config.daemonMachine};
+    setShared("rig.workerProgress",progress);cx.notify();
+    try{
     const rig=(this.data?.topology??[]).find(r=>r.id===target.rigId||r.name===target.rig);
     let result;
     if(action==="unfollow")result=await controller.stop(this.config,view);
@@ -1034,9 +1057,13 @@ export default class RigSidebar extends View {
     else{
       const words=result.ok?(result.reason??`Worker view open here: ${result.pages?.length??0} pages.`):result.reason;
       setShared("rig.status",{id,ok:result.ok,busy:false,text:words,at:Date.now()});
-      if(!result.ok)notify({title:"Worker view",body:words,level:"warning"});
+      this.notifyResult("Worker view",result);
     }
     cx.notify();return result;
+    }finally{
+      if(shared("rig.workerProgress")?.token===progress.token)setShared("rig.workerProgress",null);
+      cx.notify();
+    }
   }
 
   /** Resolve the active worker view and its focused cell for `rig.zoom` / `rig.close-cell`. */
@@ -1156,6 +1183,9 @@ export default class RigSidebar extends View {
 
   async close() {
     this.closed = true;
+    this.cancelTreeReveal();
+    this.cancelScrollClamp?.cancel?.();
+    this.listScroll?.release?.();
     this.workerViews?.dispose();
     this.statusMotion.close();
     const receivers={...(shared("rig.routeReceivers")??{})};delete receivers[this.routeReceiverId];setShared("rig.routeReceivers",receivers);
@@ -1283,7 +1313,11 @@ export default class RigSidebar extends View {
         this.uiTimezone=timezoneValue(await this.get('/api/config/ui.timezone').catch(()=>null));
         const summary = await this.get("/api/rigs/summary");
         const nodesByRig = Object.create(null); // keyed by the daemon's rig ids: no prototype keys
-        await Promise.all(summary.filter((r) => !r.archivedAt).map(async (r) => { nodesByRig[r.id] = await this.get(`/api/rigs/${encodeURIComponent(r.id)}/nodes`); }));
+        const unavailableRigs = new Set();
+        await Promise.all(summary.filter((r) => !r.archivedAt).map(async (r) => {
+          try { nodesByRig[r.id] = await this.get(`/api/rigs/${encodeURIComponent(r.id)}/nodes`); }
+          catch { unavailableRigs.add(r.id); }
+        }));
         const attention = await this.get("/api/attention").catch(() => null);
         const attentionHealth = (attention?.items ?? []).some(i => String(i.id ?? "").startsWith("health:") || String(i.source ?? "").startsWith("/api/health/"))
           ? await this.get("/api/health").catch(() => null) : null;
@@ -1356,6 +1390,16 @@ export default class RigSidebar extends View {
         }else capabilities.hostWorkerViews=false;
         setShared("rig.capabilities", capabilities);
         const topology = buildTopology(summary, nodesByRig, native?.seats);
+        for (const rig of topology) {
+          rig.nodesUnavailable = unavailableRigs.has(rig.id);
+          const previous = this.data?.daemonUrl === this.config.daemonUrl
+            ? this.data.topology?.find(r => r.id === rig.id) : null;
+          const knownHost = hostOf(summary.find(r => r.id === rig.id))
+            || (nodesByRig[rig.id] ?? []).map(hostOf).find(Boolean)
+            || (previous?.hostKnown ? previous.host : null);
+          rig.hostKnown = Boolean(knownHost);
+          if (rig.nodesUnavailable) rig.host = knownHost || "Host unknown";
+        }
         if (attentionItems !== null) {
           const needsVisible = isNeedsVisible({
             nav: shared("rig.nav"),
@@ -1400,6 +1444,7 @@ export default class RigSidebar extends View {
         });
         const versionLine = formatOpenRigVersionLine({ healthz: this.healthz, cliVersion: this.cliVersion });
         this.data = {
+          daemonUrl: this.config.daemonUrl,
           topology,
           attention: attentionItems ? needsRequestCount(topology, attentionItems) : null,
           attentionItems,
@@ -1418,7 +1463,7 @@ export default class RigSidebar extends View {
         for (const path of Object.keys(this.lists)) this.lists[path] = { ...this.lists[path], stale: true };
       }
     } catch (e) {
-      const errMsg = String(e?.message ?? e);
+      const errMsg = "Couldn't refresh OpenRig. Check the connection and retry.";
       this.error = errMsg;
       if (!this.data) {
         const fallbackProbe = probed ?? await probeOpenRigState(
@@ -1513,16 +1558,47 @@ export default class RigSidebar extends View {
     });
   }
 
-  menu(target, height = 320) {
+  menu(target, height = 320, rowKey = this.menuRowKey) {
+    // A popup may consume the mouse-up that would otherwise end a row drag.
+    this.cancelDrag();
+    const reorder = this.reorderRows?.get(rowKey);
     const orderMap = shared("rig.order") ?? {};
     const hasCustomOrder = Boolean(target?.orderGroupKey && Array.isArray(orderMap[target.orderGroupKey]) && orderMap[target.orderGroupKey].length > 0);
     openOverlay({
       mod: MOD_IDS.menu,
       kind: "popup",
       width: 280,
-      height: hasCustomOrder ? height + 28 : height,
-      props: { target: { ...target, hasCustomOrder } },
+      height: height + (hasCustomOrder ? 28 : 0) + (reorder ? 56 : 0),
+      props: { target: { ...target, hasCustomOrder, ...(reorder ? { reorder: { ...reorder, key: rowKey } } : {}) } },
     });
+  }
+
+  focusSidebar(cx) {
+    this.showSidebarHere(cx);
+    // The palette closes first; focus on the next tick so its dismissal cannot take it back.
+    cx.timer.after(0, next => {
+      this.focusHandle?.focus?.();
+      const first = this.visibleTreeRows[0] ?? { key: branchKey("topology"), entry: { section: "topology" } };
+      setShared("rig.sel", { key: first.key, entry: first.entry, at: Date.now() });
+      this.revealTreeSelection(next);next.notify();
+    });
+  }
+
+  moveSidebarRow(cx, key, direction) {
+    const row = this.reorderRows?.get(key);
+    if (!row || ![-1, 1].includes(direction)) return;
+    const order = shared("rig.order") ?? {};
+    const ids = orderSiblings(row.siblingIds, row.groupKey, order, id => id);
+    const index = ids.indexOf(row.itemId), destination = index + direction;
+    if (index < 0 || destination < 0 || destination >= ids.length) return;
+    const next = [...ids]; [next[index], next[destination]] = [next[destination], next[index]];
+    const updated = { ...order, [row.groupKey]: next };
+    setShared("rig.order", updated); this.persistSidebarState(shared("rig.open.sidebar"), updated); cx.notify();
+  }
+
+  cancelDrag(cx) {
+    if (!this.dragState) return;
+    this.dragState = null; this.dropTarget = null; cx?.notify?.();
   }
 
   /** Clicking a seat row in the sidebar opens the seat page (`rig-view`) and selects the node. */
@@ -1567,10 +1643,11 @@ export default class RigSidebar extends View {
   priorityView(t, cx) {
     const rows = this.priorityRows();
     if (this.sidebarState?.id === "S4" && !this.data?.topology?.some((r) => r.name !== "kernel")) return this.topologyRows(t, cx);
-    return [...priorityElements({ div, svg, h_flex }, t, rows, {
+    const registered=[];
+    const elements=priorityElements({ div, svg, h_flex }, t, rows, {
       requestCount: needsRequestCount(this.data?.topology, this.data?.attentionItems),
       folds: shared("rig.open.sidebar") ?? {}, selected: shared("rig.sel")?.key, iconOf: icon,
-      register: (row) => this.visibleTreeRows.push(row),
+      register: (row) => {this.visibleTreeRows.push(row);registered.push(row);},
       fold: (key, value, cx) => { this.fold(key, value); cx.notify(); },
       open: (row, event, cx) => {
         if((event?.click_count??1)>=2) this.openPriority(row);
@@ -1582,7 +1659,9 @@ export default class RigSidebar extends View {
       helper: (child) => run("terminal.peek", { terminal: child.address }),
       hovered: this.priorityHovered, hover: (key, cx) => { this.priorityHovered = key; cx.notify(); },
       mark: row => needsMark({div,svg},t,row.mark,true,icon,this.statusMotion.observe(row.seat?.session??row.key,row.mark,row.asks.map(n=>n.id))),
-    }), ...this.archivedRows(t, cx)];
+    });
+    return [...(this.data?.topology ?? []).filter(r => r.nodesUnavailable).map(r => this.rigSeatsUnavailable(t, cx, r)),
+      ...elements.map((el,i)=>this.scrollRow(el,registered[i]?.key)),...this.archivedRows(t,cx)];
   }
 
   archivedRows(t, cx, host = null, indent = 18) {
@@ -1591,12 +1670,14 @@ export default class RigSidebar extends View {
     if (got.error) return [div().pl(indent).text_size(11.5).text_color(t.dim).child("Archived rigs unavailable.").tooltip(got.error)];
     const records = withArchivedHosts(got.data, id => this.list(cx, `/api/rigs/${encodeURIComponent(id)}/nodes`).data);
     const showHost = host === null && new Set([...(this.data?.topology ?? []).map(r => hostOf(r) ?? "local"), ...records.flatMap(r => r.hosts)]).size > 1;
-    return archivedElements({ div, svg, h_flex }, t, records, { host, showHost, indent, icon,
-      open: Boolean(shared("rig.open.sidebar")?.[key]), register: row => this.visibleTreeRows.push(row),
+    const registered=[];
+    const elements=archivedElements({ div, svg, h_flex }, t, records, { host, showHost, indent, icon,
+      open: Boolean(shared("rig.open.sidebar")?.[key]), register: row => {this.visibleTreeRows.push(row);registered.push(row);},
       toggle: (_e, cx) => { this.fold(key, !shared("rig.open.sidebar")?.[key]); cx.notify(); },
       restore: r => startOneClick({ shared, setShared, run, layout, openOverlay }, { kind: "rig", rig: r.name, rigId: r.id, archived: true, lifecycle: "stopped" }, "unarchive-rig"),
       menu: r => this.menu({ kind: "rig", rig: r.name, rigId: r.id, archived: true, lifecycle: "stopped" }),
     });
+    return elements.map((el,i)=>this.scrollRow(el,registered[i]?.key));
   }
 
   revealPriorityNeeds(cx) {
@@ -1608,8 +1689,7 @@ export default class RigSidebar extends View {
     setShared("rig.topology.view", "priority");
     setShared("rig.open.sidebar", { ...(shared("rig.open.sidebar") ?? {}), [branchKey("topology")]: true, "priority:4": true });
     setShared("rig.sel", { key: "priority:4", entry: null, at: Date.now() });
-    // Ordinary scroll containers have no public scroll-to-item handle. A new identity resets to their top.
-    this.priorityReveal = (this.priorityReveal ?? 0) + 1;
+    this.revealTreeSelection(cx);
     this.persistSidebarState();
     cx?.notify?.();
   }
@@ -1628,10 +1708,10 @@ export default class RigSidebar extends View {
       .on_mouse_down("right",()=>openOverlay({mod:MOD_IDS.menu,kind:"popup",width:260,height:210,props:{target:{kind:"sidebar-header"}}}))
       .on_size_change((size, cx) => { if (this.headerWidth !== size.width) { this.headerWidth = size.width; cx.notify(); } })
       .child(h_flex().flex_1().min_w(0).overflow_hidden().gap(6).items_center()
-        .when(showTitle, el => el.child(div().id("rig-header-title").flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.muted).child("OpenRig")))
+        .when(showTitle, el => el.child(div().id("rig-header-title").flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.muted).tooltip("OpenRig").child("OpenRig")))
         .when((this.activeSpaceContext?.rigs?.length ?? 0) > 0, el => el.child(div().id("rig-space-context").max_w(88).truncate()
           .px(4).h(18).rounded(4).bg(t.raised).text_size(10.5).text_color(t.muted)
-          .tooltip(this.activeSpaceContext.rigs.join(", ")+(!this.live ? " · updates every 5 s" : "")).child(this.activeSpaceContext.rigs.join(", "))))
+          .tooltip([this.activeSpaceContext.rigs.join(", "), !this.live ? "updates every 5 s" : null].filter(Boolean).join("\n")).child(this.activeSpaceContext.rigs.join(", "))))
         .when(needs > 0, (el) => el.child(h_flex().id("rig-needs").flex_none().px(5).h(18).gap(4).rounded(4).items_center().cursor_pointer()
           .bg(`${t.blocked}26`).text_color(t.blocked).hover((s) => s.bg(t.hover))
           .on_click((_e, cx) => {
@@ -1732,7 +1812,8 @@ export default class RigSidebar extends View {
               cx.stop_propagation();
               this.startDaemon(cx);
             })
-            .when(this.startingDaemon, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().text_color(t.accent).spin(900)))
+            .when(this.startingDaemon, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().text_color(t.accent)
+              .when(this.config?.reducedMotion !== true, icon => icon.spin(900))))
             .child(div().text_size(11.5).text_color(t.accent).child(this.startingDaemon ? "Starting…" : STATE_COPY.S2.actionLabel))
         ))
         .when(Boolean(this.startDaemonError), (el) => el.child(div().id("rig-start-daemon-error").text_size(11).text_color(t.blocked).child(this.startDaemonError)));
@@ -1757,6 +1838,7 @@ export default class RigSidebar extends View {
 
   /** Toggle a fold key in `shared("rig.open.sidebar")` and persist to `<appHome>/openrig/state.json`. */
   fold(key, open, seats = []) {
+    this.cancelTreeReveal();
     if (!open && [branchKey("needs"), "needs:updates"].includes(key)) {
       this.dismissalModel()?.leave();
       this.publishDismissals();
@@ -1792,6 +1874,7 @@ export default class RigSidebar extends View {
       String(this.dragState.id) !== String(itemId)
     );
     let out = el
+      .when(this.dragState?.moved && this.dragState.groupKey === groupKey && String(this.dragState.id) === String(itemId), s => s.opacity(0.5))
       .when(isSelected, (s) => s.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
       .when(entry?.kind === "rig" && this.activeSpaceContext?.rigs?.some(name => name === entry.name || name === entry.rigId),
         s => s.border_l(2).border_color(t.accent))
@@ -1806,6 +1889,11 @@ export default class RigSidebar extends View {
     };
 
     if (groupKey && itemId && Array.isArray(siblingIds) && siblingIds.length > 1) {
+      this.reorderRows ??= new Map();
+      this.reorderRows.set(rowKey, { groupKey, itemId: String(itemId), siblingIds: siblingIds.map(String) });
+      out = out.when(isSelected, row => row.child(div().id(`reorder-${rowKey}`).size(18).flex_none().text_size(12).text_color(t.dim).cursor_pointer().tooltip("Move this row")
+        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.cancelDrag(cx); })
+        .on_click((_e, cx) => { cx.stop_propagation(); this.menu({ kind: "sidebar-row", rowKind: entry?.kind ?? "row", name: entry?.name ?? itemId }, 320, rowKey); }).child("⋯")));
       out = out
         .on_mouse_down("left", (e, cx) => {
           if (openOnDouble(e, cx)) return;
@@ -1828,9 +1916,11 @@ export default class RigSidebar extends View {
         })
         .on_mouse_up("left", (e, cx) => {
           if (!this.dragState) return;
+          cx.stop_propagation();
           const x = e?.position?.x ?? e?.x ?? this.dragState.currentX ?? 0;
           const y = e?.position?.y ?? e?.y ?? this.dragState.currentY ?? 0;
-          const drop = this.dropTarget ?? { groupKey, id: String(itemId), position: "after", x, y };
+          // The release row decides the destination; an old hover target cannot survive a cross-group release.
+          const drop = { groupKey, id: String(itemId), position: this.dropTarget?.position ?? "after", x, y };
           const res = applySiblingDrop(shared("rig.order") ?? {}, this.dragState, drop, this.dragState.siblingIds);
           this.dragState = null;
           this.dropTarget = null;
@@ -1847,7 +1937,7 @@ export default class RigSidebar extends View {
     if (elsewhere && showElsewhere) {
       out = out.child(div().id(`elsewhere-${rowKey}`).text_size(11).text_color(t.muted).child("·"));
     }
-    return out;
+    return this.scrollRow(out, rowKey);
   }
 
   /** Render a top-level collapsible Explorer branch header (`Topology`, `Specs`, `Scopes`, `Terminals`, `Needs`, `System`). */
@@ -1865,7 +1955,7 @@ export default class RigSidebar extends View {
         setShared("rig.sel", { key: bKey, entry, at: Date.now() });
         cx.notify();
       })
-      .on_mouse_down("right", () => this.menu({ kind: "branch", section, name: title, orderGroupKey: groupKey }, 140))
+      .on_mouse_down("right", () => this.menu({ kind: "branch", section, name: title, orderGroupKey: groupKey }, 140, bKey))
       .child(div().id(`branch-fold-${section}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
         .on_click((_e, cx) => {
           cx.stop_propagation();
@@ -1873,7 +1963,7 @@ export default class RigSidebar extends View {
           cx.notify();
         })
         .child(svg(icon(openBranch ? "chevron-down" : "chevron-right")).size(11)))
-      .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).child(title))
+      .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).tooltip(String(title??"")).child(title))
       .when(Boolean(extraLeftOfCount), (el) => el.child(extraLeftOfCount))
       .when(countBadge !== null && countBadge !== undefined && countBadge !== "", (el) =>
         el.child(div().id(`branch-count-${section}`).text_size(10.5).text_color(badgeColor).child(String(countBadge))))
@@ -1889,6 +1979,15 @@ export default class RigSidebar extends View {
   }
 
   /** Render the `Topology` branch's children (`Host -> Rig -> Pod -> Seat -> helper` and per-rig `Views`). */
+  rigSeatsUnavailable(t, cx, rig, indent = 18) {
+    return v_flex().id(`rig-seats-unavailable-${rig.id}`).pl(indent).pr(8).py(4).gap(3)
+      .child(div().text_size(12).text_color(t.foreground).child(rig.name))
+      .child(h_flex().gap(5).items_center()
+        .child(div().text_size(11.5).text_color(t.muted).child("Couldn't load seats."))
+        .child(div().id(`rig-seats-retry-${rig.id}`).text_size(11.5).text_color(t.accent).cursor_pointer()
+          .on_click((_e, ctx) => { ctx.stop_propagation(); ctx.spawn(async task => this.refresh(task)); }).child("Retry")));
+  }
+
   topologyRows(t, cx) {
     const stale = !!this.error;
     const strip = stripProps();
@@ -1921,6 +2020,8 @@ export default class RigSidebar extends View {
     const hosts = orderSiblings(rawHosts, "topology:hosts", orderMap, (h) => h);
 
     const renderRigSubtree = (rig, hostParentKey, rigSiblingIds, rigGroupKey, baseIndent = treeIndent(1)) => {
+      // Match a rig name after its 12px chevron slot and 6px row gap.
+      if (rig.nodesUnavailable) { out.push(this.rigSeatsUnavailable(t, cx, rig, baseIndent + 18)); return; }
       const rigSeats = rig.pods.flatMap((p) => p.seats);
       const rKey = rigKey(rig.id);
       const openRig = rigFoldOpen(rig, rigSeats, folds);
@@ -1931,11 +2032,11 @@ export default class RigSidebar extends View {
 
       const rigRow = h_flex().id(`rig-${rig.id}`).pl(baseIndent).pr(8).h(24).gap(6).items_center().hover((s) => s.bg(t.hover))
         .on_click((_e, cx) => { selectRow(rigEntry,rKey);cx.notify(); })
-        .on_mouse_down("right", () => this.menu({ kind: "rig", rig: rig.name, rigId: rig.id, lifecycle: rig.lifecycle, orderGroupKey: `rig:${rig.id}:pods` }))
+        .on_mouse_down("right", () => this.menu({ kind: "rig", rig: rig.name, rigId: rig.id, lifecycle: rig.lifecycle, orderGroupKey: `rig:${rig.id}:pods` }, 320, rKey))
         .child(div().id(`rig-fold-${rig.id}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { cx.stop_propagation(); this.fold(rKey, !openRig, rigSeats); cx.notify(); })
           .child(svg(icon(openRig ? "chevron-down" : "chevron-right")).size(11)))
-        .child(div().flex_1().truncate().text_size(12.5).font_semibold().text_color(stale || stoppedRig ? t.dim : t.foreground).child(rig.name))
+        .child(div().flex_1().truncate().text_size(12.5).font_semibold().text_color(stale || stoppedRig ? t.dim : t.foreground).tooltip(String(rig.name??"")).child(rig.name))
         .when(stoppedRig, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("stopped"))
           .child(div().id(`rig-resume-${rig.id}`).px(5).h(18).rounded(4).bg(t.raised).flex().items_center().text_size(10.5).text_color(t.accent).hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => {
@@ -1981,11 +2082,11 @@ export default class RigSidebar extends View {
             setShared("rig.sel", { key: pKey, entry: podEntry, at: Date.now() });
             cx.notify();
           })
-          .on_mouse_down("right", () => this.menu({ kind: "pod", rig: rig.name, rigId: rig.id, pod: pod.name, lifecycle: rig.lifecycle, orderGroupKey: `pod:${key}:seats` }))
+          .on_mouse_down("right", () => this.menu({ kind: "pod", rig: rig.name, rigId: rig.id, pod: pod.name, lifecycle: rig.lifecycle, orderGroupKey: `pod:${key}:seats` }, 320, pKey))
           .child(div().id(`pod-fold-${key}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => { cx.stop_propagation(); this.fold(pKey, !openPod, pod.seats); cx.notify(); })
             .child(svg(icon(openPod ? "chevron-down" : "chevron-right")).size(11).flex_none()))
-          .child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(pod.name || "—"))
+          .child(div().flex_1().truncate().text_size(12).text_color(t.muted).tooltip(String((pod.name || "—")??"")).child(pod.name || "—"))
           .child(div().text_size(10.5).text_color(t.dim).child(String(pod.seats.length)));
 
         out.push(this.decorateRow(t, podRow, {
@@ -2030,14 +2131,14 @@ export default class RigSidebar extends View {
               status: seat.status,
               runtime: seat.runtime,
               terminal: seat.terminal,
-            }))
+            }, 320, sKey))
             .child(helpers.length
               ? div().id(`seat-fold-${seat.session}`).w(12).flex_none().text_color(t.dim).hover((s) => s.text_color(t.foreground))
                 .on_click((_e, cx) => { cx.stop_propagation(); this.fold(hKey, !openHelpers); cx.notify(); })
                 .child(svg(icon(openHelpers ? "chevron-down" : "chevron-right")).size(11))
               : leafCell())
             .child(this.dot(t, seat.status,14,seat.session,this.statusMotion.seatNeeds(seat.session,rig.name,seat.logicalId)))
-            .child(div().flex_1().truncate().text_size(12).text_color(stale ? t.dim : seat.tone === "idle" || seat.tone === "done" ? t.muted : t.foreground).child(seat.member))
+            .child(div().flex_1().truncate().text_size(12).text_color(stale ? t.dim : seat.tone === "idle" || seat.tone === "done" ? t.muted : t.foreground).tooltip(String(seat.logicalId ?? seat.member??"")).child(seat.member))
             .child(div().text_size(11).text_color(t[statusMark(seat.status).word] ?? t.dim).child(stale ? "" : seat.word))
             .when(Boolean(ctxLabel), (el) => el.child(div().id(`seat-ctx-${seat.session}`).text_size(10.5).text_color(ctxWarn ? t.blocked : t.dim).child(ctxLabel)));
 
@@ -2055,7 +2156,7 @@ export default class RigSidebar extends View {
               .on_click(() => run("terminal.peek", { terminal: child.address }))
               .child(leafCell())
               .child(svg(icon("rig-helper")).size(11).flex_none().text_color(t.dim))
-              .child(div().flex_1().truncate().text_size(11.5).text_color(t.muted).child(child.label)));
+              .child(div().flex_1().truncate().text_size(11.5).text_color(t.muted).tooltip(String(child.label??"")).child(child.label)));
           }
         }
       }
@@ -2072,11 +2173,11 @@ export default class RigSidebar extends View {
           this.fold(vKey, !openViewsBranch);
           cx.notify();
         })
-        .on_mouse_down("right", () => this.menu({ kind: "views", rig: rig.name, rigId: rig.id, views, orderGroupKey: `rig:${rig.id}:views` }))
+        .on_mouse_down("right", () => this.menu({ kind: "views", rig: rig.name, rigId: rig.id, views, orderGroupKey: `rig:${rig.id}:views` }, 320, vKey))
         .child(div().id(`views-fold-${rig.id}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { cx.stop_propagation(); this.fold(vKey, !openViewsBranch); cx.notify(); })
           .child(svg(icon(openViewsBranch ? "chevron-down" : "chevron-right")).size(11)))
-        .child(div().flex_1().truncate().text_size(11.5).text_color(t.muted).child("Views"))
+        .child(div().flex_1().truncate().text_size(11.5).text_color(t.muted).tooltip("Views").child("Views"))
         .child(div().text_size(10.5).text_color(t.dim).child(`⬚ ${vBranch.openCount + vBranch.savedCount}`));
 
       out.push(this.decorateRow(t, viewsHeaderRow, {
@@ -2114,9 +2215,9 @@ export default class RigSidebar extends View {
                   enabled: Boolean(v.following.enabled ?? v.following),
                   pruneAfterMs: v.following.pruneAfterMs,
                 } : {}),
-              }))
+              }, 320, itemKey))
               .child(leafCell())
-              .child(div().text_size(11.5).text_color(t.accent).child(`▦ ${viewTitle}`).flex_1().truncate())
+              .child(div().text_size(11.5).text_color(t.accent).tooltip(`▦ ${viewTitle}`).child(`▦ ${viewTitle}`).flex_1().truncate())
               .child(div().text_size(10.5).text_color(t.dim).child(v.following ? "follow" : "open"));
             out.push(this.decorateRow(t, viewRow, {
               rowKey: itemKey,
@@ -2132,9 +2233,9 @@ export default class RigSidebar extends View {
             this.visibleTreeRows.push({ key: itemKey, expandable: false, parentKey: vKey, entry: itemEntry });
             const savedRow = h_flex().id(`sidebar-saved-view-${rig.id}-${item.rawId}`).pl(baseIndent + 2 * TREE_STEP).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
               .on_click(() => selectRow(itemEntry, itemKey))
-              .on_mouse_down("right", () => this.menu({ kind: "saved-view", rig: rig.name, view: item.id, name: item.name, orderGroupKey: viewItemsGroupKey }, 140))
+              .on_mouse_down("right", () => this.menu({ kind: "saved-view", rig: rig.name, view: item.id, name: item.name, orderGroupKey: viewItemsGroupKey }, 140, itemKey))
               .child(leafCell())
-              .child(div().text_size(11.5).text_color(t.foreground).child(`⬚ ${item.name}`).flex_1().truncate())
+              .child(div().text_size(11.5).text_color(t.foreground).tooltip(`⬚ ${item.name}`).child(`⬚ ${item.name}`).flex_1().truncate())
               .child(div().text_size(10.5).text_color(t.dim).child("saved"));
             out.push(this.decorateRow(t, savedRow, {
               rowKey: itemKey,
@@ -2161,7 +2262,7 @@ export default class RigSidebar extends View {
             },
           }))
           .child(leafCell())
-          .child(div().text_size(11).text_color(t.muted).child("+ New worker view…").flex_1().truncate()));
+          .child(div().text_size(11).text_color(t.muted).tooltip("+ New worker view…").child("+ New worker view…").flex_1().truncate()));
       }
     };
 
@@ -2174,11 +2275,11 @@ export default class RigSidebar extends View {
         const rigsOnHost = this.data.topology.filter((r) => (hostOf(r) || "local") === h);
         const hostRow = h_flex().id(`host-${h}`).pl(treeIndent(1)).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
           .on_click(() => selectRow(hostEntry, hKey))
-          .on_mouse_down("right", () => this.menu({ kind: "host", hostId: h, name: h, orderGroupKey: `topology:rigs:${h}` }, 140))
+          .on_mouse_down("right", () => this.menu({ kind: "host", hostId: h, name: h, orderGroupKey: `topology:rigs:${h}` }, 140, hKey))
           .child(div().id(`host-fold-${h}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => { cx.stop_propagation(); this.fold(hKey, !openHost); cx.notify(); })
             .child(svg(icon(openHost ? "chevron-down" : "chevron-right")).size(11)))
-          .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).child(h))
+          .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).tooltip(String(h??"")).child(h))
           .child(div().text_size(10.5).text_color(t.dim).child(String(rigsOnHost.length)));
         out.push(this.decorateRow(t, hostRow, {
           rowKey: hKey,
@@ -2232,11 +2333,14 @@ export default class RigSidebar extends View {
     this.visibleTreeRows.push({ key: rowKey ?? id, expandable: false, parentKey, entry });
     let el = h_flex().id(id).pl(indent).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
       .on_click(onClick ?? (() => entry && selectRow(entry, rowKey ?? id)));
-    if (onRight) el = el.on_mouse_down("right", onRight);
+    if (onRight) el = el.on_mouse_down("right", () => {
+      this.menuRowKey = rowKey ?? id;
+      try { onRight(); } finally { this.menuRowKey = null; }
+    });
     if (tooltip) el = el.tooltip(tooltip);
     el = el
       .child(leafCell())
-      .child(div().flex_1().truncate().text_size(12).text_color(textColor ?? t.foreground).child(label))
+      .child(div().flex_1().truncate().text_size(12).text_color(textColor ?? t.foreground).tooltip([String(label ?? ""), tooltip].filter(Boolean).join("\n")).child(label))
       .when(Boolean(detail), (s) => s.child(div().text_size(10.5).text_color(t.dim).child(String(detail))));
     return this.decorateRow(t, el, {
       rowKey: rowKey ?? id,
@@ -2281,7 +2385,7 @@ export default class RigSidebar extends View {
     if (updates.length && hovered(key)) head.child(div().id("sidebar-dismiss-all").text_size(11).text_color(t.dim)
       .hover(s => s.text_color(t.foreground)).cursor_pointer().on_click(action("dismiss", updates)).child("Dismiss all"));
     else head.child(div().text_size(11).text_color(t.dim).child(String(updates.length)));
-    const out = [head];
+    const out = [this.scrollRow(head,key)];
     if (!expanded) return out;
     const row = (n, record, position) => {
       const rowKey = record ? `dismissed:${record.key}` : `need:${n.id}`;
@@ -2291,7 +2395,7 @@ export default class RigSidebar extends View {
         .on_hover(hover(rowKey)).hover(s => s.bg(t.hover))
         .on_click(() => { selectRow(entry, rowKey); cx.notify(); })
         .on_mouse_down("right", () => this.menu({ ...n, dismissed: !!record }))
-        .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(12).text_color(hovered(rowKey) ? t.foreground : t.dim).child(n.summary));
+        .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(12).text_color(hovered(rowKey) ? t.foreground : t.dim).tooltip(String(n.summary??"")).child(n.summary));
       if (hovered(rowKey) && dismissible(n)) {
         el.child(div().id(`sidebar-${record ? "restore" : "dismiss"}-${n.id}`).size(16).flex_none().items_center().justify_center()
           .cursor_pointer().text_color(t.dim).hover(s => s.text_color(t.foreground))
@@ -2309,7 +2413,7 @@ export default class RigSidebar extends View {
     const rows = updates.map((n, index) => row(n, null, index));
     for (const receipt of receipts) rows.splice(Math.min(receipt.position, rows.length), 0,
       h_flex().id(`sidebar-receipt-${receipt.id}`).pl(treeIndent(1)).pr(8).h(24).gap(4).items_center().text_size(11.5)
-        .child(div().truncate().text_color(t.muted).child(receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`))
+        .child(div().truncate().text_color(t.muted).tooltip(String((receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`)??"")).child(receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`))
         .child(div().id(`sidebar-undo-${receipt.id}`).text_color(t.accent).cursor_pointer().on_click(action("undo", receipt.id)).child("Undo")));
     out.push(...rows);
     if (hidden.length) {
@@ -2352,11 +2456,11 @@ export default class RigSidebar extends View {
           this.visibleTreeRows.push({ key: rowKey, foldKey: item.foldKey, expandable: true, isOpen: openCfg, parentKey: parentBranchKey, entry: item.entry });
           const cfgRow = h_flex().id(`sys-node-${item.id}`).pl(treeIndent(1)).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
             .on_click(() => selectRow(item.entry, rowKey))
-            .on_mouse_down("right", () => this.menu({ kind: "system-config", name: "Configuration", orderGroupKey: "system:config:categories" }, 140))
+            .on_mouse_down("right", () => this.menu({ kind: "system-config", name: "Configuration", orderGroupKey: "system:config:categories" }, 140, rowKey))
             .child(div().id(`sys-fold-${item.id}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
               .on_click((_e, cx) => { cx.stop_propagation(); this.fold(item.foldKey, !openCfg); cx.notify(); })
               .child(svg(icon(openCfg ? "chevron-down" : "chevron-right")).size(11)))
-            .child(div().flex_1().truncate().text_size(12).text_color(t.foreground).child(item.label));
+            .child(div().flex_1().truncate().text_size(12).text_color(t.foreground).tooltip(String(item.label??"")).child(item.label));
           out.push(this.decorateRow(t, cfgRow, {
             rowKey,
             entry: item.entry,
@@ -2443,7 +2547,7 @@ export default class RigSidebar extends View {
           .child(div().id(`specs-kind-fold-${g.kind}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => { cx.stop_propagation(); this.fold(gFoldKey, !openKind); cx.notify(); })
             .child(svg(icon(openKind ? "chevron-down" : "chevron-right")).size(11)))
-          .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).child(g.title))
+          .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).tooltip(String(g.title??"")).child(g.title))
           .child(div().text_size(10.5).text_color(t.dim).child(String(g.items.length)));
         out.push(this.decorateRow(t, kindRow, {
           rowKey: gFoldKey,
@@ -2466,7 +2570,7 @@ export default class RigSidebar extends View {
               .child(div().id(`specs-ns-fold-${g.kind}-${ns}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
                 .on_click((_e, cx) => { cx.stop_propagation(); this.fold(nsKey, !openNs); cx.notify(); })
                 .child(svg(icon(openNs ? "chevron-down" : "chevron-right")).size(11)))
-              .child(div().flex_1().truncate().text_size(11).text_color(t.muted).child(ns))
+              .child(div().flex_1().truncate().text_size(11).text_color(t.muted).tooltip(String(ns??"")).child(ns))
               .child(div().text_size(10).text_color(t.dim).child(String(nsItems.length)));
             out.push(this.decorateRow(t, nsRow, { rowKey: nsKey, entry: nsEntry }));
           }
@@ -2505,11 +2609,11 @@ export default class RigSidebar extends View {
         const slices = Array.isArray(m.slices) ? m.slices : [];
         const mRow = h_flex().id(`mission-${m.mission}`).pl(treeIndent(1)).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
           .on_click(() => selectRow(missionEntry, mKey))
-          .on_mouse_down("right", () => this.menu({ kind: "mission", mission: m.mission, name: m.mission, orderGroupKey: `mission:${m.mission}:slices` }, 160))
+          .on_mouse_down("right", () => this.menu({ kind: "mission", mission: m.mission, name: m.mission, orderGroupKey: `mission:${m.mission}:slices` }, 160, mKey))
           .child(div().id(`mission-fold-${m.mission}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
             .on_click((_e, cx) => { cx.stop_propagation(); this.fold(mKey, !openMission); cx.notify(); })
             .child(svg(icon(openMission ? "chevron-down" : "chevron-right")).size(11)))
-          .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).child(m.mission))
+          .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).tooltip(String(m.mission??"")).child(m.mission))
           .child(div().text_size(10.5).text_color(t.dim).child(String(slices.length)));
         out.push(this.decorateRow(t, mRow, {
           rowKey: mKey,
@@ -2544,7 +2648,7 @@ export default class RigSidebar extends View {
               .on_click(()=>selectRow(entry,key)).on_mouse_down('right',()=>this.menu(menuTarget(owners.length===1?owners[0]:null),120))
               .child(div().w(12).when(wf.packets.length>0,el=>el.on_click((_e,ctx)=>{ctx.stop_propagation();this.fold(key,!expanded);ctx.notify();})
                 .child(svg(icon(expanded?'chevron-down':'chevron-right')).size(11).text_color(t.dim))))
-              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(wf.finished?t.dim:t.foreground).child(wf.title))
+              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(wf.finished?t.dim:t.foreground).tooltip(String(wf.title??"")).child(wf.title))
               .child(div().text_size(10.5).text_color(t.dim).child(wf.status)),{rowKey:key,entry}));
             if(expanded)for(const [pi,p] of wf.packets.entries())out.push(this.treeLeafRow(t,{
               id:`workflow-packet-${m.mission}-${index}-${pi}`,rowKey:`${key}:packet:${p.packet_id}`,
@@ -2647,15 +2751,15 @@ export default class RigSidebar extends View {
         const rowKey = `need:${n.id}`;
         this.visibleTreeRows.push({ key: rowKey, expandable: false, parentKey: parentBranchKey, entry });
         if (!n.update) {
-          const headline = requestCardText(n).headline;
+          const headline = requestHeadline(n);
           const owner = n.reply === "resolve" ? n.waiting?.owner ?? n.destinationSession : n.asker ?? n.sourceSession;
           const mins = Math.max(0, Math.floor((Date.now() - (Date.parse(n.at ?? "") || Date.now())) / 60000));
           const rowEl = h_flex().id(rowId).pl(treeIndent(1)).pr(8).h(40).gap(6).items_center().hover(s => s.bg(t.hover))
-            .on_click(() => openPage({ ...entry, name: headline }, rowKey)).on_mouse_down("right", () => this.menu(n))
+            .on_click(() => openPage({ ...entry, name: headline }, rowKey)).on_mouse_down("right", () => this.menu(n, 320, rowKey))
             .child(this.requestRowMark(t, tier))
             .child(v_flex().flex_1().min_w(0).gap(2)
               .child(div().truncate().text_size(12).text_color(t.foreground).tooltip(headline).child(headline))
-              .child(div().truncate().text_size(11).text_color(t.dim).child(`${owner ?? "OpenRig"} · ${mins < 1 ? "<1m" : `${mins}m`}`)));
+              .child(div().truncate().text_size(11).text_color(t.dim).tooltip(`${owner ?? "OpenRig"} · ${mins < 1 ? "<1m" : `${mins}m`}`).child(`${owner ?? "OpenRig"} · ${mins < 1 ? "<1m" : `${mins}m`}`)));
           out.push(this.decorateRow(t, rowEl, { rowKey, entry: { ...entry, name: headline }, popoutId: `popout-${rowId}`, groupKey: "needs:items", itemId: n.id, siblingIds: needIds }));
           continue;
         }
@@ -2683,6 +2787,7 @@ export default class RigSidebar extends View {
   /** Render the single 6-branch collapsible Explorer tree (`Topology`, `Specs`, `Scopes`, `Terminals`, `Needs`, `System`). */
   treeRows(t, cx) {
     this.visibleTreeRows = [];
+    this.reorderRows = new Map();
     const folds = shared("rig.open.sidebar") ?? {};
     const orderMap = shared("rig.order") ?? {};
     const orderedSections = orderSiblings(RIG_SECTIONS, "tree:branches", orderMap, (s) => s);
@@ -2726,7 +2831,7 @@ export default class RigSidebar extends View {
                 cx.notify();
               })
               .when(quietChip.kind === "quiet", (d) => d.child(svg(icon("rig-moon")).size(10).flex_none()))
-              .child(div().max_w(110).truncate().text_size(10.5).child(quietChip.shortLabel ?? quietChip.label))
+              .child(div().max_w(110).truncate().text_size(10.5).tooltip(String(quietChip.label ?? quietChip.shortLabel ?? "")).child(quietChip.shortLabel ?? quietChip.label))
           : null;
         out.push(this.branchHeader(t, cx, "needs", {
           openBranch,
@@ -2789,8 +2894,60 @@ export default class RigSidebar extends View {
     return out;
   }
 
+  scrollRow(el,key) {
+    if(key){this.scrollRowKeys??=new WeakMap();this.scrollRowKeys.set(el,key);}
+    return el;
+  }
+
+  cancelTreeReveal() {
+    this.cancelSidebarReveal?.();this.cancelSidebarReveal=null;this.keyRevealPending=false;
+  }
+
+  revealTreeSelection(cx) {
+    this.cancelTreeReveal();
+    if(!this.listScroll)return;
+    this.keyRevealPending=true;this.renderRevealKey=null;
+    this.cancelSidebarReveal=revealAfterKey(cx,this.listScroll,()=>{
+      if(this.closed||this.listWasFolded||!this.keyRevealPending)return -1;
+      this.keyRevealPending=false;
+      return this.scrollRowIndices?.get(shared("rig.sel")?.key)??-1;
+    },this);
+  }
+
+  scrollChildren(content) {
+    this.scrollRowIndices=new Map();this.scrollRowHeights??=new Map();
+    const tokens=content.map((el,i)=>{
+      const key=this.scrollRowKeys?.get(el);
+      if(key)this.scrollRowIndices.set(key,i);
+      return key?`key:${key}`:`notice:${i}`;
+    });
+    this.scrollRowTokens=tokens;
+    const live=new Set(tokens);
+    for(const key of this.scrollRowHeights.keys())if(!live.has(key))this.scrollRowHeights.delete(key);
+    return content.map((el,i)=>div().id(`rig-scroll-row-${encodeURIComponent(tokens[i])}`).flex_none().w_full()
+      .on_size_change((size,cx)=>{
+        if(!this.scrollRowTokens?.includes(tokens[i]))return;
+        this.scrollRowHeights.set(tokens[i],size.height);
+        this.measureScrollContent(cx);
+      }).child(el));
+  }
+
+  measureScrollContent(cx) {
+    if(!this.scrollRowTokens?.every(key=>this.scrollRowHeights.has(key)))return;
+    const height=this.scrollRowTokens.reduce((sum,key)=>sum+this.scrollRowHeights.get(key),0);
+    this.listContentHeight=height;
+    if(!this.scrollClampReady)return;
+    const previous=this.pendingScrollClamp;this.pendingScrollClamp=null;
+    // A rare shrink while folded can strand the retained offset. No public offset setter exists.
+    if(Number.isFinite(previous)&&height<previous){
+      this.cancelTreeReveal();this.listScroll?.release?.();this.listScroll=ScrollHandle.new();
+      this.listScrollVersion=(this.listScrollVersion??0)+1;cx.notify();
+    }
+  }
+
   handleTreeKeyDown(e, cx) {
     const key = e?.key ?? "";
+    if (["escape", "esc"].includes(key.toLowerCase()) && this.dragState) { cx?.stop_propagation?.(); this.cancelDrag(cx); return; }
     const sel = shared("rig.sel");
     const selectedUpdate = this.visibleTreeRows.find((row) => row.key === sel?.key)?.update;
     if (key.toLowerCase() === "delete" && dismissible(selectedUpdate)) {
@@ -2799,10 +2956,13 @@ export default class RigSidebar extends View {
       cx?.notify?.();
       return;
     }
-    const act = treeKeyNav(this.visibleTreeRows, sel?.key ?? null, key, { openMap: shared("rig.open.sidebar") ?? {} });
+    const act = treeKeyNav(this.visibleTreeRows, sel?.key ?? null, key, { openMap: shared("rig.open.sidebar") ?? {}, shift: Boolean(e.modifiers?.shift) });
     if (!act) return;
+    if (act.type === "menu" && this.reorderRows?.has(act.key)) { this.menu({ kind: "sidebar-row", rowKind: act.row?.entry?.kind ?? "row", name: act.row?.entry?.name }, 320, act.key); return; }
     if (act.type === "move") {
+      if(act.key===sel?.key)return;
       setShared("rig.sel", { key: act.key, entry: act.row?.entry ?? null, at: Date.now() });
+      this.revealTreeSelection(cx);
       cx?.notify?.();
     } else if (act.type === "expand") {
       this.fold(act.foldKey, true);
@@ -2848,6 +3008,9 @@ export default class RigSidebar extends View {
     const context = openRigSpaceContext(spaces(), terminals(), panes(), shared("rig.spaceState") ?? {}, MOD_IDS.view)
       .find(c => c.id === active?.id);
     this.activeSpaceContext = context;
+    // herdrig's Spaces list marks rig spaces from this: published only when it changes.
+    const marks = JSON.stringify(rigSpaceMarks({ spaces: spaces(), terminals: terminals(), panes: panes(), state: shared("rig.spaceState") ?? {}, topology: this.data?.topology ?? [], config: this.config ?? {}, hostId: this.healthz?.selfHostId }));
+    if (marks !== this.publishedMarks) { this.publishedMarks = marks; setShared("herdrig.spaces", JSON.parse(marks)); }
     const block = find(layout(), n => n.content?.mod === MOD_IDS.sidebar);
     let foldCx = cx;
     const folded = this.spaceFold.observe(context, block, {
@@ -2858,6 +3021,7 @@ export default class RigSidebar extends View {
       })),
       warn: body => notify({ title: "OpenRig", body, level: "warning" }), notify: () => foldCx.notify(),
     });
+    if (folded || narrow()) {this.reorderRows = new Map();this.cancelTreeReveal();this.cancelScrollClamp?.cancel?.();this.scrollClampReady=false;}
     if (folded && narrow()) {
       let root=v_flex().id("rig-sidebar-folded").size_full().bg(t.chrome)
         .on_mouse_down("left",()=>this.focusHandle?.focus?.())
@@ -2872,12 +3036,23 @@ export default class RigSidebar extends View {
     if (narrow()) return this.rail(t);
     const state = folded?null:this.states(t);
     if(folded&&!this.listWasFolded)this.foldedContentHeight=this.listContentHeight;
-    if(!folded&&this.listWasFolded)this.pendingScrollClamp=this.foldedContentHeight;
+    if(!folded&&this.listWasFolded){
+      this.pendingScrollClamp=this.foldedContentHeight;this.scrollClampReady=false;
+      // Retain measurements: unchanged keyed rows need not emit another size event on return.
+      // Keep the render context's implicit owner: explicitly reading this view here re-enters its native update.
+      this.cancelScrollClamp=cx.timer.after(16,next=>{if(this.closed||this.listWasFolded)return;this.scrollClampReady=true;this.measureScrollContent(next);});
+    }
     this.listWasFolded=folded;
-    const listId=(this.priorityReveal?`rig-list-reveal-${this.priorityReveal}`:"rig-list")
-      +(this.listScrollVersion?`-resize-${this.listScrollVersion}`:"");
+    const content=folded?[]:this.listRows(t,cx,state);
+    const scrollChildren=folded?[div().h(this.listContentHeight??0).flex_none()]:this.scrollChildren(content);
+    if(this.keyRevealPending&&this.renderRevealKey!==shared("rig.sel")?.key){
+      const index=this.scrollRowIndices?.get(shared("rig.sel")?.key);
+      if(Number.isInteger(index)){this.listScroll?.scroll_to_item(index);this.renderRevealKey=shared("rig.sel")?.key;}
+    }
+    const listId="rig-list"+(this.listScrollVersion?`-resize-${this.listScrollVersion}`:"");
     let root = v_flex().id("rig-sidebar-root").size_full().bg(t.chrome).text_color(t.foreground)
-      .on_mouse_down("left", () => this.focusHandle?.focus?.())
+      .on_mouse_up("left", (_e, ctx) => this.cancelDrag(ctx))
+      .on_mouse_down("left", () => {this.cancelTreeReveal();this.focusHandle?.focus?.();})
       .on_key_down((e, cx) => {
         if(folded){if(String(e?.key??"").toLowerCase()==="enter")this.showSidebarHere(cx);}
         else this.handleTreeKeyDown(e,cx);
@@ -2887,21 +3062,23 @@ export default class RigSidebar extends View {
       .child(folded?this.foldedHeader(t):this.header(t))
       .child(div().h(folded?0:1).bg(t.border).mx(8))
       .child(v_flex().id(listId).flex_1().overflow_y_scrollbar().py(4)
+        .when(!!this.listScroll,el=>el.track_scroll(this.listScroll))
         .when(folded,el=>el.h(0).min_h(0).flex_none().py(0))
-        .child(folded?div().h(this.listContentHeight??0).flex_none():v_flex().id("rig-list-content").flex_none()
-        .on_size_change((size,cx)=>{
-          const previous=this.pendingScrollClamp;this.pendingScrollClamp=null;
-          this.listContentHeight=size.height;
-          // Plain scroll areas expose no offset setter. A folded content shrink can strand the old offset.
-          if(Number.isFinite(previous)&&size.height<previous){this.listScrollVersion=(this.listScrollVersion??0)+1;cx.notify();}
-        })
-        .when(!!this.machineChoiceAvailable,el=>el.child(this.machineOfferCard(t)))
-        .when(this.gridMoveResultHere(),el=>el.child(this.gridMoveReport(t)))
-        .when(this.migrationResultHere() || (needsTabMigration(this.activeSpaceContext,this.config)
+        .on_size_change((_size,cx)=>{if(this.keyRevealPending){const index=this.scrollRowIndices?.get(shared("rig.sel")?.key);if(Number.isInteger(index))this.listScroll?.scroll_to_item(index);cx.notify();}})
+        .children(scrollChildren));
+  }
+
+  listRows(t,cx,state) {
+    const out=[];
+    if(this.machineChoiceAvailable)out.push(this.machineOfferCard(t));
+    if(this.gridMoveResultHere())out.push(this.gridMoveReport(t));
+    if(this.migrationResultHere() || (needsTabMigration(this.activeSpaceContext,this.config)
           ||this.activeSpaceContext?.id&&this.data?.topology?.some(r=>rigSpaceRelocation({spaces,panes,terminals},r,this.config)?.source===this.activeSpaceContext.id))
-          && !migrationChoice(shared("rig.spaceState"),this.config,this.activeSpaceContext?.id), el=>el.child(this.migrationCard(t)))
-        .children((this.data?.topology ?? []).flatMap((rig) => {
+          && !migrationChoice(shared("rig.spaceState"),this.config,this.activeSpaceContext?.id))out.push(this.migrationCard(t));
+    out.push(...(this.data?.topology ?? []).flatMap((rig) => {
           const status = shared("rig.spaceStatus")?.[rig.id];
+          if (this.opening?.has(rig.id)) return [div().id(`opening-grid-${rig.id}`).mx(8).my(4).px(8).py(6).rounded(6).bg(t.raised).text_size(11.5).text_color(t.muted)
+            .child(this.openingLine(rig))];
           if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}: ${status.reason}`))
             .when(!!status.needsConsent,el=>el.child(div().id(`review-grid-machine-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer().child("Review")
@@ -2915,7 +3092,8 @@ export default class RigSidebar extends View {
               : `${rig.name}: ${status.stale.map((s) => this.gridSeatName(rig, s.seat)).join(", ")} no longer runs the expected viewer. Save your work, close those panes yourself, then open the rig space again.`))
             .when(!!status.recovery, (el) => el.child(div().id(`rebuild-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
               .on_click(() => this.reviewRigRebuild(rig, status)).child("Rebuild tiles…")))];
-        }))
-        .children(state ? [state] : this.treeRows(t, cx))));
+    }));
+    out.push(...(state?[state]:this.treeRows(t,cx)));
+    return out;
   }
 }
