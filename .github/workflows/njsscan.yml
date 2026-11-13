@@ -28,6 +28,12 @@ jobs:
       # njsscan reads .js files only; the .cjs files are covered by CodeQL and Semgrep.
       - name: njsscan
         uses: ajinabraham/njsscan-action@231750a435d85095d33be7d192d52ec650625146
+        env:
+          # Semgrep's default 5s per-rule, per-file timeout is too short for the
+          # bundled main.js and rig-lib.js files (slowest pair measured ~26s).
+          # Any timeout lands in njsscan's errors list, which marks the SARIF run
+          # executionSuccessful=false and leaves those rule/file pairs unscanned.
+          SEMGREP_TIMEOUT: "120"
         with:
           args: ". --sarif --output results.sarif || true"
 
