@@ -915,6 +915,7 @@ export default class RigSidebar extends View {
       try {
         for (const rig of this.data?.topology ?? []) {
           if (this.error) break;
+          if (rig.nodesUnavailable) continue;
           const result = await routeRigOpen(this.routeHost(cx), this.config, { kind: "grid", rigId: rig.id, background: true });
           const statuses = shared("rig.spaceStatus") ?? {};
           // A background skip means "nothing to update here". It must not wipe the card of a failed explicit open.

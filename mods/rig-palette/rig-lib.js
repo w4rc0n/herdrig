@@ -2245,6 +2245,13 @@ export function rigSpaceMarks({ spaces = [], terminals = [], panes = [], state =
   const machineOf = (context) => context.space.machine ?? (String(context.id ?? "").includes("/") ? String(context.id).split("/")[0] : null);
   for (const context of openRigSpaceContext(spaces, terminals, panes, state)) {
     if (context.home) { out[context.id] = { home: true }; continue; }
+    // CodeRabbit 4560854996: the machine restriction applies to BOTH branches below. Without it, two machines answering on the same
+    // loopback URL with a same-named rig cross-wire here — and these marks drive the Spaces menu, so an action could reach the other
+    // machine's rig. `resolveRigSpace` filters by machine before choosing a space; this must agree with it.
+    // With no machine configured this still filters to local spaces, which is exactly what `lookup` does: a mark must agree with
+    // what `resolveRigSpace` would open, and with no daemonMachine that is only a local space. A box space getting the local rig id
+    // would offer a menu action the open would not use.
+    if (machineOf(context) !== machine) continue;
     let links = context.markedRigLinks.filter((l) => !l.origin || rigOrigin(l.origin) === expected);
     // The same vouching the open uses (v0.4.3), read-only: a space made under another loopback spelling of this daemon's address is
     // the rig's own space when its host stamp equals the daemon's, or (older spaces) the daemon lists every seat in it. Nothing is written.

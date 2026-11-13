@@ -61,7 +61,7 @@ export class MachineSetupPanel {
     const root=v_flex().id("machine-setup").size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
       .key_context('RigDialog').on_action('rig-dialog-next',(_e,cx)=>cycle(true,cx)).on_action('rig-dialog-prev',(_e,cx)=>cycle(false,cx))
       .on_key_down((event,cx)=>{
-        if(event.key==='tab'&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt){cx.stop_propagation();if(event.modifiers?.shift)globalThis.window.focus_prev();else globalThis.window.focus_next();}
+        if(event.key==='tab'&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt){cycle(!event.modifiers?.shift,cx);}
         else if(event.key==="escape"&&!this.busy){cx.stop_propagation();(done?this.done:this.cancel)?.(cx,this.result);}})
       .child(div().text_size(15).font_semibold().child(this.stop?`Stop using ${this.machine}?`:update?`Update the Attach helper on ${this.machine}`:`Use ${this.machine}`));
     let body=v_flex().flex_1().min_h(0).overflow_y_scrollbar().gap(8);

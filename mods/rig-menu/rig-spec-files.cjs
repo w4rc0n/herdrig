@@ -65,6 +65,15 @@ function readFd(fd, io) {
   const bytes=buffer.subarray(0,used);utf8(bytes);return bytes;
 }
 function same(a,b){return a.dev===b.dev&&a.ino===b.ino&&a.isFile()&&b.isFile();}
+// Keep the checked inode open: a path must never be reopened for the content read.
+function readChecked(file, before, io) {
+  if (!Number.isInteger(io.constants.O_NOFOLLOW)) throw failure("This machine cannot safely open spec files.");
+  const fd = io.openSync(file, io.constants.O_RDONLY | io.constants.O_NOFOLLOW | io.constants.O_NONBLOCK);
+  try {
+    if (!same(before, io.fstatSync(fd))) throw failure("The spec changed while it was being copied.", "conflict");
+    return readFd(fd, io);
+  } finally { io.closeSync(fd); }
+}
 
 // Copy & edit of a built-in: OpenRig's own `rig specs add` copies the built-in's whole folder (rig.yaml, CULTURE.md, guidance/...).
 // Everything that selects what is copied is derived HERE from the executable actually run; the request supplies only the
@@ -100,14 +109,14 @@ function builtinFolder(sourcePath, builtinRoot, io) {
   if (io.realpathSync(folder) !== folder) throw failure("The built-in's folder isn't its own real path.");
   const yaml = io.lstatSync(sourcePath);
   if (yaml.isSymbolicLink() || !yaml.isFile()) throw failure("The built-in's rig.yaml must be a regular file.");
-  return folder;
+  return { folder, yaml };
 }
 function copyFolder(sourcePath, input, options, io, roots) {
   const run = options.run ?? spawnSync, home = options.home ?? process.env.HOME, searchPath = options.searchPath ?? process.env.PATH;
   if (input?.expectedRoots !== undefined && JSON.stringify(input.expectedRoots) !== JSON.stringify(roots))
     throw failure("The spec folders changed. Review the permission again.", "roots_changed");
   const { exe, builtinRoot } = installedRig({ io, run, home, searchPath });
-  const folder = builtinFolder(sourcePath, builtinRoot, io);
+  const { folder, yaml } = builtinFolder(sourcePath, builtinRoot, io);
   // The destination is the helper's to check, never the CLI's: the library only looks in the user's own spec folders.
   let userRoot;
   try { userRoot = io.realpathSync(path.posix.join(home, ".openrig/specs")); } catch { userRoot = null; }
@@ -124,10 +133,10 @@ function copyFolder(sourcePath, input, options, io, roots) {
   if (folderStat.isSymbolicLink() || !folderStat.isDirectory()) throw failure("The copied folder isn't a regular folder.");
   const file = path.posix.join(dest, "rig.yaml"), fileStat = io.lstatSync(file);
   if (fileStat.isSymbolicLink() || !fileStat.isFile()) throw failure("The copy's rig.yaml isn't a regular file.");
-  const copied = io.readFileSync(file); utf8(copied);
+  const copied = readChecked(file, fileStat, io);
   if (typeof input?.content !== "string") return { ok: true, folder: dest, path: file, sha256: hash(copied) };
   // The one rewrite (agent paths made absolute): only when the copy is exactly the built-in's rig.yaml.
-  if (!io.readFileSync(sourcePath).equals(copied)) throw failure("The copied rig.yaml differs from the built-in's, so it wasn't rewritten.", "refused", { folder: dest });
+  if (!readChecked(sourcePath, yaml, io).equals(copied)) throw failure("The copied rig.yaml differs from the built-in's, so it wasn't rewritten.", "refused", { folder: dest });
   return operation("save", file, { content: input.content, expectedSha256: hash(copied), expectedRoots: roots }, options);
 }
 function operation(verb,target,input,options={}) {

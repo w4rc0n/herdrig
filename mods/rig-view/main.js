@@ -1403,7 +1403,7 @@ export default class RigView extends View {
       if (row?.setOpen) row.setOpen(act.type === "expand");
       else toggleOpen(act.foldKey, act.type === "collapse", row?.seats);
     }
-    else if (act.type === "activate") { if (row?.open) row.open(); else if (row?.entry) push(row.entry); }
+    else if (act.type === "activate") { if (row?.open) row.open(cx); else if (row?.entry) push(row.entry); }
     else if (act.type === "action") { const fn = this.seatActions?.[act.key]?.[act.action]; if (fn) fn(); }
     else if (act.type === "menu") { if (row?.target) menu(row.target); }
     cx?.notify?.();

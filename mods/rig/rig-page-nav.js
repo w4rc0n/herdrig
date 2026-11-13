@@ -21,7 +21,7 @@ export function pageViewOptions(entry = {}, spec = null, counts = {}) {
 }
 export function selectedPageView(entry = {}, memory = {}, spec = null, counts = {}) {
   const kind=pageViewKind(entry), options=pageViewOptions(entry,spec,counts), allowed=new Set(options.map(([id])=>id));
-  let explicit=kind==='topology'?entry.topologyTab:kind==="rig"?entry.tab:kind==="seat"?entry.seatTab:kind==="needs"?entry.needsTab:kind==="spec"?entry.specTab
+  let explicit=kind==='topology'?(entry.topologyTab??(entry.focusRig||entry.focus==='pulse'||entry.openRecent?'rigs':null)):kind==="rig"?entry.tab:kind==="seat"?entry.seatTab:kind==="needs"?entry.needsTab:kind==="spec"?entry.specTab
     :kind==='workflow'?entry.workflowTab:kind==='mission'?entry.missionTab
     :kind==="system"?(entry.subview==="usage-hosts"||entry.openUsageHosts?"usage":entry.subview??(entry.settingKey||entry.category?"config":null)):null;
   if(kind==="rig"&&!explicit&&entry.openRecent)explicit="recent";

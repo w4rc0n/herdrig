@@ -2,6 +2,11 @@
 
 ## v0.4.4
 
+- New worker views finish opening in an existing rig space while herdrig refreshes its labels. Changed or focused split targets are still left alone.
+- Changing the Spaces list preserves concurrent layout edits, and rig marks and actions stay on the configured machine. Uninstalling restores personal Spaces blocks safely.
+- Worker views with empty cells keep working when refreshed or reopened. If a rig's seats cannot load, its existing tiles stay open.
+- Use the keyboard to Retry an unavailable rig in All seats. Long names fit narrow rows, requests stay with their seats, and rig links return to the right view. Typeahead accepts Shift-uppercase letters.
+- Copy & edit refuses a spec file replaced while its built-in folder is being copied, without following a replacement symlink.
 - Long requests no longer interrupt sidebar redraws, and Needs cards avoid repeating work on the same message.
 - Sidebar row menus show both Move actions. Closing a row menu leaves no drag behind, and typing focus then Enter focuses the sidebar.
 
