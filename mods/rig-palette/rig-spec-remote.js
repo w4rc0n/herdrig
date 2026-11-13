@@ -60,6 +60,16 @@ export class RemoteSpecs {
    return await operation();
   }finally{await this.call(config,'remove',[this.host.appHome]);}
  }
+ // Local copy readbacks share the same constant transfer and cross-operation lock as remote writes.
+ hashText(config,text){
+  const key=this.host.appHome;
+  const job=(jobs.get(key)??Promise.resolve()).catch(()=>{}).then(async()=>{
+   const result=await this.transfer(config,text,()=>this.call(config,'digest',[key]));
+   if(!/^[a-f0-9]{64}$/.test(result.sha256??''))throw Error('The spec text hash could not be verified.');
+   return result.sha256;
+  });
+  jobs.set(key,job);return job.finally(()=>{if(jobs.get(key)===job)jobs.delete(key);});
+ }
  perform(config, request, consent=null){
   const key=this.host.appHome;
   const job=(jobs.get(key)??Promise.resolve()).catch(()=>{}).then(async()=>{

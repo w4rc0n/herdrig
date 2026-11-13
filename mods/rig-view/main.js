@@ -1846,7 +1846,8 @@ export default class RigView extends View {
       : (editing ? "Cancel edit" : "Edit");
     const copyReason = isBuiltin ? personDisableReason("specs-add", this.config) : null;
     const remoteEdit = !isBuiltin && Boolean(this.config?.daemonMachine);
-    const guidance = [box.note || (remoteEdit ? this.remoteSpecGuidance() : null), this.specCopyNotes?.[s.id]].filter(Boolean).join(" ") || null;
+    const guidance = box.note || (remoteEdit ? this.remoteSpecGuidance() : null);
+    const copyNote = this.specCopyNotes?.[s.id];
     const saveDisabled = isBuiltin || !editing || !dirty || Boolean(box.saving || box.awaitingPermission);
     const openDisabled = !s.sourcePath || Boolean(this.config?.daemonMachine);
     const toolbar = h_flex().gap(8).items_center().flex_wrap()
@@ -1897,6 +1898,7 @@ export default class RigView extends View {
       ))
       .when(!!box.savedText && !dirty, (el) => el.child(this.dim(t, box.savedText)))
       .when(!!guidance, (el) => el.child(this.specNoteView(t, guidance, s.id)))
+      .when(!!copyNote, (el) => el.child(this.specNoteView(t, copyNote, s.id, /^(?:An earlier copy|You already have a copy)/.test(copyNote))))
       .when(!!box.conflict, (el) => el.child(v_flex().gap(6).min_w(0).child(div().text_size(12).text_color(t.blocked).child(box.conflict))
         .child(h_flex().gap(8).items_center().flex_wrap()
         .child(this.button(t, `spec-reload-${s.id}`, box.confirmReload ? "Click Reload again to discard edits" : "Reload", (_e, cx) => this.reloadSpec(cx, s, isBuiltin)))
@@ -1942,7 +1944,7 @@ export default class RigView extends View {
     return specFolderRefusal(this.specRoots, { machine: this.config?.daemonMachine, realpathAvailable: this.specRealpathAvailable });
   }
 
-  specNoteView(t, note, id) {
+  specNoteView(t, note, id, information = false) {
     const machine=this.config?.daemonMachine,command=`hc machine login ${machine}`;
     if(machine&&note.startsWith(`${machine} is unreachable, so nothing was saved.`)&&note.includes(command)){
       const [before,after]=note.split(command);
@@ -1952,7 +1954,7 @@ export default class RigView extends View {
     }
     const marker = "daemonMachine";
     const guidance = note === this.specRefusal() || note === this.remoteSpecGuidance();
-    const tone = guidance ? t.muted : t.blocked;
+    const tone = guidance || information ? t.muted : /^(?:Your copy of .*Copy & edit didn't overwrite it\.|The copied spec at .*Your copy was kept;)/.test(note) ? t.working : t.blocked;
     if (!guidance || !note.includes(marker)) return div().text_size(12).text_color(tone).child(note);
     const [before, after] = note.split(marker);
     return h_flex().gap(4).items_center().flex_wrap().text_size(12).text_color(tone)
@@ -2131,6 +2133,7 @@ export default class RigView extends View {
         const synced = await fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(() => null);
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
         box.savedText = synced?.ok ? "Saved." : "Saved; library re-index failed.";
+        delete this.specCopyNotes?.[s.id];
         if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
         const key = specDraftKey(s.id,this.config), now = box.state.value();
@@ -2358,7 +2361,7 @@ export default class RigView extends View {
       },
       addFolder: (request, grant) => config.daemonMachine
         ? this.remoteSpecController(cx).perform(config, { verb: "copy-folder", ...request }, grant)
-        : this.localAddFolder(request, daemonUrl),
+        : this.localAddFolder(request, daemonUrl, cx),
       library: async (fresh) => {
         if (fresh) await post("/api/specs/library/sync").catch(() => null);
         const res = await fetch(`${daemonUrl}/api/specs/library`);
@@ -2378,7 +2381,7 @@ export default class RigView extends View {
 
   /** No machine configured: this computer's own OpenRig copies the folder through the shipped helper, after checking the
    *  daemon this page talks to is this computer's (a copy made here is invisible to another machine's daemon). */
-  async localAddFolder(request, daemonUrl) {
+  async localAddFolder(request, daemonUrl, cx) {
     const status = parseDaemonStatusJson((await exec("rig", ["status", "--json"], { timeout: 15000 })).stdout);
     if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
     const health = async (url) => { const r = await fetch(`${url}/healthz`); if (!r.ok) throw new Error("OpenRig isn't answering."); return JSON.parse(await r.text()); };
@@ -2393,7 +2396,11 @@ export default class RigView extends View {
     if (!file) throw new Error(this.specRefusal());
     const current = await readTextFile(file);
     if (current == null) throw new Error("The copied spec couldn't be read back.");
-    await writeTextFile(file, request.content, current);
+    const conflict = `The copied spec at ${file} changed before it could be rewritten. Your copy was kept; reopen it to review the changes.`;
+    if (!/^[a-f0-9]{64}$/.test(out.sha256 ?? "") || await this.remoteSpecController(cx).hashText(this.config, current) !== out.sha256)
+      throw new Error(conflict);
+    try { await writeTextFile(file, request.content, current); }
+    catch { throw new Error(conflict); }
     return { ok: true, path: out.path, folder: out.folder };
   }
 
@@ -2422,7 +2429,9 @@ export default class RigView extends View {
         if (config.daemonMachine) this.specConsentMachine = config.daemonMachine;
         this.showSpecCopy(cx, out.copy);
       } catch (error) {
-        box.note = error?.machineNotice && String(error.message).startsWith(`${config.daemonMachine} is unreachable.`)
+        box.note = error?.folder && /differs from the built-in/.test(String(error.message))
+          ? `Your copy of ${s.name} at ${error.folder} was changed since it was made, so Copy & edit didn't overwrite it.`
+          : error?.machineNotice && String(error.message).startsWith(`${config.daemonMachine} is unreachable.`)
           ? `${config.daemonMachine} is unreachable, so nothing was copied. Run hc machine login ${config.daemonMachine}, then try again.`
           : String(error?.message ?? error);
       } finally { box.copying = false; cx.notify(); }
@@ -2431,9 +2440,10 @@ export default class RigView extends View {
 
   /** The copy's page, in edit mode, with an optional note above its editor. */
   showSpecCopy(cx, copy, note = null) {
-    delete this.specBoxes?.[copy.id];
+    if (!this.specDirty(this.specBoxes?.[copy.id])) delete this.specBoxes?.[copy.id];
     (this.specAutoEdit ??= new Set()).add(copy.id);
     if (note) (this.specCopyNotes ??= Object.create(null))[copy.id] = note;
+    else delete this.specCopyNotes?.[copy.id];
     push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml" });
     this.read(cx, "/api/specs/library", true); run("rig.refresh");
   }
@@ -2447,8 +2457,11 @@ export default class RigView extends View {
       return;
     }
     if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`); return; }
-    setDraft(specDraftKey(found.entry.id, this.config), { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
-    this.showSpecCopy(cx, found.entry, `An earlier copy of ${s.name} wasn't finished: its agent paths still point at the built-in's folder. The fixed text is in the editor; press Save to finish it.`);
+    const key=specDraftKey(found.entry.id,this.config),draft=(shared("rig.drafts")??{})[key];
+    const retained=this.specDirty(this.specBoxes?.[found.entry.id]) || typeof draft==='string' || typeof draft?.text==='string';
+    if(!retained)setDraft(key, { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
+    this.showSpecCopy(cx, found.entry, retained ? null
+      : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`);
   }
 
   remoteSpecController(cx) {
@@ -2497,6 +2510,7 @@ export default class RigView extends View {
         if(request.verb==="save"){
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
           box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
+          delete this.specCopyNotes?.[s.id];
           const now=box.state.value();setDraft(specDraftKey(s.id,this.config),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
           if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true);}
         }else{

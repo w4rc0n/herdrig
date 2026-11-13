@@ -61,7 +61,9 @@ for (const key of `transcripts.enabled daemon.seat_poll_interval_ms host.name la
   agents.advisor_session agents.operator_session workspace.operator_seat_name workflow.exception_routing policies.claude_compaction.threshold_percent
   policies.idle_gate_qitem.auto_register snapshots.periodic.enabled transport.draft_delivery decisions.consumers acp.to stream.intake
   queue.stuck_sweep_interval_seconds queue.wake_retry_cap queue.wake_human_rung`.split(/\s+/)) definitions[key].risk = "medium";
+// Required baseline; newer reviewed controls below are offered only for entries the daemon reports.
 export const CONFIG_CLI_KEYS = Object.freeze(Object.keys(definitions).sort());
+add("int", "output.rebuild_recaps", { min: 0, optional: true }); // public help: 0 lists all recap paths
 export const CONFIG_KEYS = Object.freeze(Object.keys(definitions).sort());
 export const CONFIG_SCHEMA = Object.freeze(definitions);
 

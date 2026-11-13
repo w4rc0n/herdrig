@@ -105,6 +105,8 @@ export default class RigPalette extends View {
   selectionIndex(rows = this.rows()) {
     if (this.selected >= 0) return this.selected;
     const line = this.input.value().trim();
+    // Explicit local arguments belong to the typed command, even when invalid.
+    if(/\s/.test(line)&&OWN.some(row=>row.line.split(/\s+/)[0]===line.split(/\s+/)[0].toLowerCase()))return -1;
     return line && !resolveTuiLineFallback(line) && rows.length ? 0 : -1;
   }
 
