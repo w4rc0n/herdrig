@@ -2,13 +2,14 @@
 // (https://github.com/herdrdev/herdr-app), licensed under the Apache License, Version 2.0.
 // Modified for herdrig: OpenRig seats and asks instead of herdr agents; see Third-party code in README.md.
 // This file is licensed under the Apache License, Version 2.0 (LICENSES/herdr-app-Apache-2.0.txt).
-import { needsToastFor, diffNeedsNotifications, findAttachedSeat, statusMarkElement, isUpdateNeed, requestCardText, statusNeedHalo } from "./rig-lib.js";
+import { needsToastFor, diffNeedsNotifications, findAttachedSeat, statusMarkElement, isUpdateNeed, requestCardText, statusNeedHalo, resolveAskerSeat } from "./rig-lib.js";
 
 export const PRIORITY_GROUPS = [
   { rank: 4, label: "Needs you", tone: "blocked" }, { rank: 3, label: "Done", tone: "ansi4" },
   { rank: 2, label: "Working", tone: "ansi2" }, { rank: 1, label: "Idle", tone: "muted" },
+  { rank: 0, label: "Not reported", tone: "dim" },
 ];
-const RANK = { needs: 4, done: 3, working: 2, idle: 1 };
+const RANK = { needs: 4, done: 3, working: 2, idle: 1, unreported: 0 };
 const excluded = (seat) => seat.terminal || ["stopped", "detached", "exited"].includes(seat.sessionStatus) || ["terminal", "stopped", "detached", "exited", "unknown"].includes(seat.status);
 const needs = (seat) => !excluded(seat) && ["needs_input", "attention_required", "failed"].includes(seat.status);
 const helperStatus = (child) => ["blocked", "error", "needs_input"].includes(child.status) ? "needs" : child.status === "working" ? "working" : "idle";
@@ -53,9 +54,9 @@ export class NeedsTracker {
     for (const ask of attention ?? []) {
       if (!ask?.id || isUpdateNeed(ask) || ["done", "closed", "denied", "canceled", "handed-off"].includes(ask.state)) continue;
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
-      const owner = bySession.get(session);
+      const owner = bySession.get(session) ?? bySession.get(resolveAskerSeat(session, topology).seat?.session);
       if (owner && !excluded(owner.seat)) owner.asks.push(ask);
-      else rows.push({ key: `ask:${ask.id}`, kind: "ask", ask, name: requestCardText(ask).headline, helpers: [], asks: [ask] });
+      else rows.push({ key: `ask:${ask.id}`, kind: "ask", ask, seat: owner?.seat, rig: owner?.rig, name: requestCardText(ask).headline, helpers: [], asks: [ask] });
     }
     for (const row of rows) {
       if (row.kind === "ask") {
@@ -63,7 +64,7 @@ export class NeedsTracker {
         continue;
       }
       const s = row.seat;
-      const raw = excluded(s) ? "idle" : needs(s) || row.asks.length ? "needs" : ["active", "blocked"].includes(s.status) ? "working" : "idle";
+      const raw = s.status==="unknown" ? "unreported" : excluded(s) ? "idle" : needs(s) || row.asks.length ? "needs" : ["active", "blocked"].includes(s.status) ? "working" : "idle";
       const prev = Object.hasOwn(this.changed, row.key) ? this.changed[row.key] : null;
       // Attaching viewers can briefly trip window sampling. Require a working stretch or stronger evidence.
       const worked = prev?.s === "working" && (prev.strong === true || (Number.isFinite(prev.at) && now - prev.at >= 10000));
@@ -130,7 +131,7 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
   for (const group of PRIORITY_GROUPS) {
     const members = rows.filter((r) => r.rank === group.rank);
     if (!members.length) continue;
-    const key = `priority:${group.rank}`, expanded = folds[key] ?? !(group.rank === 1 && many);
+    const key = `priority:${group.rank}`, expanded = folds[key] ?? (group.rank===0?false:!(group.rank === 1 && many));
     register({ key, foldKey: key, expandable: true, isOpen: expanded, parentKey: "branch:topology" });
     out.push(h_flex().id(key).px(16).h(30).pt(8).gap(6).items_center().text_size(11).font_medium().cursor_pointer()
       .on_click((_e, cx) => fold(key, !expanded, cx))
@@ -148,8 +149,9 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
         .on_click((event,cx) => open(row,event,cx)).on_mouse_down("right", () => menu(row))
         .child(svg(iconOf(row.kind === "ask" ? "rig-bell" : row.seat.terminal ? "rig-terminal-prompt" : "rig-seat")).size(13).flex_none().text_color(t.muted))
         .child(h_flex().flex_1().min_w(0).gap(4).text_size(12.5)
-          .child(div().min_w(0).max_w(130).truncate().text_color(row.rank === 1 ? t.muted : t.foreground).child(row.name))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`· ${row.ask?.criticalHealth ? "health" : row.rig?.name ?? "no seat"}`)))
+          .child(div().min_w(0).max_w(130).truncate().text_color(row.rank === 0 ? t.dim : row.rank === 1 ? t.muted : t.foreground).child(row.name))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`· ${row.ask?.criticalHealth ? "health" : row.kind === "ask" && row.seat
+            ? [row.seat.logicalId, row.rig?.name].filter(Boolean).join(" · ") : row.rig?.name ?? "no seat"}`)))
         .when(row.helpers.length > 0, (el) => el.child(div().id(`priority-fold-${row.key}`).px(3).h(18).text_color(t.dim)
           .on_click((_e, cx) => { cx.stop_propagation(); fold(helperKey, !helpersOpen, cx); })
           .child(svg(iconOf(helpersOpen ? "chevron-down" : "chevron-right")).size(11))

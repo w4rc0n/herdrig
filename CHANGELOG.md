@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased
+## v0.4.2
+
+- **Security:** Remote spec writes use a separate verified helper and folder permission. Worker tiles enforce their read-only flag; setup approval includes the helper checksum and is renewed when it changes.
+- Scopes and workflows stay reachable with one project even when OpenRig has no default project.
+- Save and Copy & edit on OpenRig's machine, with changed-file checks and unsaved-draft recovery.
+- Location breadcrumbs and one tab row per page make navigation clearer; narrow pages keep actions and graph edges reachable.
+- Browse real workflows and current packets under Scopes, with obligations, plan sources and copy-only next actions.
+- Running seats without usable activity reports say Not reported and no longer count as idle.
+- Answer receipts preserve OpenRig's actual outcome, including when a request is still waiting and nothing ran.
+- Absolute timestamps support UTC exactly; other configured zones use local time with an explicit Configuration note.
+- Open worker views here when OpenRig runs on your other machine. Saved pages, read-only seats and Follow use
+  the approved helper. Optional pruning closes inactive viewers without stopping seats; failures keep your tiles.
+- Copy & edit of a built-in spec keeps the copy's agents reachable: the copy points at the built-in's agents by their full path instead of a path
+  that only worked beside the original. If the built-in also lists files beside itself (such as CULTURE.md), Specs names them and says plainly
+  that the copy will not launch until they exist beside it. A spec whose agents can't be located is not copied.
+
+- Choose OpenRig's Herdr machine in one setup screen that names the account, helper file and checksum.
+  It verifies the helper before saving the choice, asks again for a changed helper, and offers Stop using in Connections.
+
+- Move an older rig space to OpenRig's machine without making a second space. Personal tabs stay here.
+- Move a Rig page to OpenRig's home even when it shares a tab with a shell. The shell and its tab stay where they are.
+- Remote Seats tiles fit their panes while alone and yield sizing to Attach, matching local tiles. Sizing settles within about five seconds.
+- Graph arrows meet cleanly and stay clear of headers and other routes. Handoffs light the whole path briefly;
+  details stay above the graph. Set reducedMotion to keep status changes and graph entrances still.
+- Edit OpenRig settings in System, with a save or reset for each setting, clear source labels and confirmation
+  for consequential changes. Saves go to the displayed OpenRig, including when it runs on another machine.
 
 ## v0.4.1
 

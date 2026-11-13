@@ -6,6 +6,7 @@
 // Local commands (`LOCAL_COMMANDS`): `open-page` opens/focuses the Rig Page tab, and `open-tui` / `tui` shows the active
 // space's TUI (or opens one, with the recorded CLI).
 import { View, div } from "gpui-kit";
+import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, theme, run, exec, shared, setShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout, notify } from "herdr";
 import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
@@ -80,7 +81,10 @@ export default class RigPalette extends View {
       hint: `Change harness, model, or effort · ${rig.name}`,
     }))));
     const own = q ? [...ownRows, ...designs, ...overviews, ...recents, ...changeModels].filter((o) => o.line.startsWith(q) || q.startsWith(o.line.split(" ")[0])) : [];
-    return [...own, ...live.slice(0, 8), ...verbs.slice(0, 12)];
+    // `/text` is the grammar's page filter: offer it as a row, so typing it never reads as "No matches" before Enter applies it.
+    const typed = this.input.value().trim();
+    const filter = typed.length > 1 && typed.startsWith("/") ? [{ line: typed, label: `Filter this page: ${typed}`, hint: "Enter applies it" }] : [];
+    return [...filter, ...own, ...live.slice(0, 8), ...verbs.slice(0, 12)];
   }
 
   /** Enter and Ctrl+Enter alike: the row Up/Down chose, else what is typed. A chosen verb that needs an
@@ -388,7 +392,8 @@ export default class RigPalette extends View {
         return this.show({ ...fileEntry(at), ...(route.target.anchor ? { anchor: route.target.anchor } : {}) });
       }
       if (route.act === "slice-file") {
-        const folder = ((await this.get("/api/slices"))?.slices ?? []).map((x) => x.slicePath).find((p) => typeof p === "string" && p.split(/[\\/]/).pop() === route.slice);
+        const project=effectiveScopeProject(top?.project,shared('rig.project'),await this.get('/api/scopes/projects'));
+        const folder = ((await this.get('/api/slices'+(project?`?project=${encodeURIComponent(project)}`:'')))?.slices ?? []).map((x) => x.slicePath).find((p) => typeof p === "string" && p.split(/[\\/]/).pop() === route.slice);
         if (!folder) return fail(`OpenRig doesn't say where ${route.slice} is on disk.`);
         return this.show(fileEntry(`${folder}/${route.file}`, `${route.file} · ${route.slice}`));
       }

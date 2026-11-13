@@ -2,7 +2,7 @@
 "use strict";
 const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
-const RELAY_SHA256 = "e6f9710022795f7642a8af6ca1daf172fa6eccac2d405d225c831efe09af1ef5";
+const RELAY_SHA256 = "6372063b2566489fef1c7a3a547800d57382c95c48935e5c7bbe92b1ba03ce60";
 const RELAY_FOLDER = ".local/share/herdr-openrig";
 const goodHome = (s) => typeof s === "string" && s.startsWith("/") && s !== "/" && !/[\x00-\x1f\x7f]/.test(s) && s.split("/").slice(1).every((p) => p && p !== "." && p !== "..");
 const line = (value) => String(value ?? "").replace(/\r?\n$/, "");

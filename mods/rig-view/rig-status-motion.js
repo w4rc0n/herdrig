@@ -5,9 +5,9 @@ export class StatusMotion {
   constructor(){this.scope=null;this.states=new Map();this.diamonds=new Map();this.pulses=new Map();this.sequence=0;this.seeded=false;this.knownNeeds=new Set();this.freshNeeds=new Set();this.needs=[];}
   reset(){this.states.clear();this.diamonds.clear();this.pulses.clear();this.knownNeeds=new Set();this.seeded=false;}
   close(){this.reset();this.closed=true;}
-  begin(scope,cx,{attention,ready=Array.isArray(attention)}={}){
+  begin(scope,cx,{attention,ready=Array.isArray(attention),reducedMotion=false}={}){
     if(scope!==this.scope){this.reset();this.scope=scope;}
-    this.cx=cx;this.freshNeeds=new Set();
+    this.cx=cx;this.reducedMotion=reducedMotion;if(reducedMotion)this.pulses.clear();this.freshNeeds=new Set();
     this.needs=(attention??[]).filter(n=>needsToastFor(n)&&!["done","closed","canceled"].includes(n.state)).map(needTarget);
     if(ready){
       const ids=new Set(this.needs.map(n=>n.id));
@@ -28,7 +28,7 @@ export class StatusMotion {
     const need=needIds.find(id=>this.freshNeeds.has(id));
     // Multiple marks of one identity in a render share one pulse and one pair of callbacks.
     const kind=(need&&pulse?.need!==need)||(previousDiamond===false&&diamond)?"need":previous===false&&working?"working":null;
-    if(kind){
+    if(kind&&!this.reducedMotion){
       pulse={kind,need:kind==="need"?need??null:null,started:false,elementId:`status-pulse-${++this.sequence}-${key}`};
       this.pulses.set(key,pulse);
       const duration=kind==="working"?WORKING_PULSE_MS:NEED_PULSE_MS;

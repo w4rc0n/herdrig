@@ -1,3 +1,4 @@
+import { formatAbsoluteTime } from './rig-time.js';
 /** Screen text only, from OpenRig's public tail API. Never reads harness files or input drafts. */
 const plain = s => s.replace(/\*\*|`/g, "").replace(/^\s*(?:[-*]|\d+\.)\s+/, "").trim();
 const ansi = s => s.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
@@ -165,7 +166,7 @@ export class NowTailCache {
 }
 
 /** Fetch age is visible after thirty seconds even when the last ingest report said live. */
-export function nowTailPresentation(record, now = Date.now()) {
+export function nowTailPresentation(record, now = Date.now(), timezone = null) {
   const health = record?.ingestHealth ?? {}, captured = typeof health.lastCapturedAt === "number" ? health.lastCapturedAt : Date.parse(health.lastCapturedAt ?? "");
   const ageBase = Number.isFinite(captured) ? captured : record?.fetchedAt ?? now;
   const seconds = Math.max(0, Math.floor((now - ageBase) / 1000));
@@ -173,7 +174,7 @@ export function nowTailPresentation(record, now = Date.now()) {
   const age = seconds >= 3600 ? `${Math.floor(seconds / 3600)} h ago` : seconds >= 60 ? `${Math.floor(seconds / 60)} min ago` : `${seconds} s ago`;
   const unsupported = record?.status === 404;
   return { line: record?.parsed?.line ?? "", lines: record?.parsed?.lines ?? [], stale,
-    prefix: stale ? `${age} · ` : "", asOf: Number.isFinite(captured) ? new Date(captured).toLocaleTimeString() : "time unknown",
+    prefix: stale ? `${age} · ` : "", asOf: Number.isFinite(captured) ? formatAbsoluteTime(captured,{timezone,exact:true}) : "time unknown",
     state: record?.parsed?.withheld ? "withheld" : stale ? "not live" : "live", reason: record?.parsed?.withheld ? record.parsed.withheldReason ?? "Ambiguous input or incoming-message boundary; screen text withheld." : unsupported ? "This OpenRig doesn't serve transcripts." : String(record?.error ?? health.reason ?? "No recent screen text from OpenRig.").replace(/_/g, " "),
     working: Boolean(record?.parsed?.working), elapsed: record?.parsed?.elapsed ?? "" };
 }

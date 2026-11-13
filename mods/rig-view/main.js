@@ -1,10 +1,18 @@
+import {rigOrigin} from "./rig-space-context.js";
+import {workerViewDetails,workerMissingReason} from "./rig-worker-views.js";
+import { machineSetupReceiptLabel } from "./rig-machine-setup.js";
+import { effectiveScopeProject } from './rig-project.js';
+import { workflowPath,workflowView } from './rig-workflow.js';
+import { WorkflowPanel } from './rig-workflow-view.js';
+import { asOf } from './rig-lib.js';
+import { formatAbsoluteTime, timezoneValue } from './rig-time.js';
 // OpenRig's Rig page: the on-demand inspection tab (`mod: "rig-view"`), showing what the
 // sidebar, palette or a menu popped out. Navigation is a back stack in `shared("rig.nav")`; no layout write is needed to
 // move. Reads with GET and local files. Writes run the CLI as the person: one-click actions through the Rig sidebar
 // (rig-lib startOneClick), whose progress shows in this header's status line; a Needs-You reply here, inline.
 //
 // The sidebar is the single always-present OpenRig Explorer tree; this Page opens on demand as a native tab
-// with Back, crumbs, Filter…, Actions, Open in TUI, and ×. Navigating inside this Page never expands, collapses, or
+// with separate Back, location/section menu, object tabs, page actions, Open in TUI, and ×. Navigating inside this Page never expands, collapses, or
 // re-selects the sidebar tree (one-way sync: Sidebar → Page, never Page → Sidebar).
 // Text files open in a viewer drawn like herdr's Files, with the same editor, font and colours.
 // Needs-You: a request row expands in place to the request's words and a reply box (Answer or
@@ -16,7 +24,7 @@ import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, h
 
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window, notify } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window, notify, machines } from "herdr";
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
   configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
@@ -33,9 +41,14 @@ import { dismissible, dismissalSnapshot, requestDismissal, updateKey, dismissalS
 import { HERDRIG_VERSION } from "./rig-version.js";
 import { registerRigRouting, workerCapabilityText } from "./rig-lib.js";
 import { NowTailCache, nowTailPresentation } from "./rig-now.js";
-import { RigGraph } from "./rig-graph.js";
+import { RigGraph, GRAPH_EDGE_LOOK } from "./rig-graph.js";
+import { pageBodyLayout } from "./rig-page-layout.js";
 import { normalizeRunningGraph } from "./rig-graph-state.js";
+import { pageViewKind, pageViewOptions, selectedPageView, entryWithPageView, compactLocationCrumbs, visiblePageTabs, pageSectionChoices } from "./rig-page-nav.js";
 import { readRigSpecPreview, groupSpecLibrary } from "./rig-lib.js";
+import { ConfigPanel } from "./rig-config-view.js";
+import { RemoteSpecs, SPEC_SHA256 } from "./rig-spec-remote.js";
+import { copyableSpecText, siblingFileNames, siblingFileNote } from "./rig-spec-copy.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -94,11 +107,12 @@ const activeRigViewId = () => {
 /** Folds (rigs, pods, health, edges, needs) are one model in `shared("rig.open.page")`, shared with the sidebar tree. */
 const toggleOpen = (key, now, seats) => setShared("rig.open.page", seats ? foldChoice(shared("rig.open.page"), key, !now, seats) : { ...(shared("rig.open.page") ?? {}), [key]: !now });
 const setOpen = (key, open) => setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [key]: open });
-/** Spec drafts are `{ text, baseText, baseHash }` under `spec:<id>`: the file's text the edits started from rides along. */
-const specDraftKey = (id) => `spec:${id}`;
+/** Remote drafts belong to a connection and spec, never another daemon with the same path-derived id. */
+const specDraftKey = (id, config) => config?.daemonMachine
+  ? `remote-spec:${encodeURIComponent(config.daemonUrl??"")}:${encodeURIComponent(config.daemonMachine)}:${id}` : `spec:${id}`;
 const setDraft = (key, draft) => {
   const all = { ...(shared("rig.drafts") ?? {}) };
-  if (draft == null) delete all[key]; else all[key] = draft;
+  if (draft == null) delete all[key]; else all[key] = key.startsWith("remote-spec:") ? {...draft,at:Date.now()} : draft;
   setShared("rig.drafts", all);
 };
 const inRigLayout = () => !!(function find(n) {
@@ -109,9 +123,11 @@ const usd = (v) => typeof v === "number" ? `$${v.toFixed(2)}` : "—";
 import {rigSpecLibraryPath} from "./rig-lib.js";
 import {StatusMotion} from "./rig-status-motion.js";
 export default class RigView extends View {
+  time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
     this.statusMotion = new StatusMotion();
+    this.pageViewMemory = {}; // Session only; never persisted with folds or navigation.
     this.pulseFilter = null; // Page-session only: never restore the legacy persisted shared filter.
     this.initialEntry = p?.entry ?? null;
     this.config = null;
@@ -152,6 +168,15 @@ export default class RigView extends View {
     });
     // The header's status line and a reply's confirmation come and go by time: redraw while one shows or a new one arrives.
     cx.timer.every(1000, (cx) => { if (this.ticking || shared("rig.status")?.at !== this.statusAt) cx.notify(); });
+    cx.timer.every(250, (cx) => {
+      const pending=this.specPermission;if(!pending)return;
+      const decisions=shared("rig.specWriteDecisions")??{},decision=decisions[pending.token];
+      if(!decision&&Date.now()<pending.expires)return;
+      this.specPermission=null;const rest={...decisions};delete rest[pending.token];setShared("rig.specWriteDecisions",rest);
+      pending.box.awaitingPermission=false;
+      if(decision==="allow")this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation);
+      else {pending.box.note="Nothing was saved on the box.";cx.notify();}
+    });
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -217,16 +242,44 @@ export default class RigView extends View {
   loadConfig(cx) {
     cx.spawn(async (cx) => {
       const next = preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())), this.config);
+      try{
+        const saved=JSON.parse(await readTextFile(`${appHome()}/openrig/spec-consent.json`)??"null"),key=JSON.parse(saved?.key??"null");
+        this.specConsentMachine=key?.sha256===SPEC_SHA256?key.machine:null;
+      }catch{this.specConsentMachine=null;}
       if (sameConfig(next, this.config)) return;
-      if (this.config && next.daemonUrl !== this.config.daemonUrl) { this.cache = {}; this.resetNowTails(cx); }
+      if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine)) {
+        this.cache = {}; this.resetNowTails(cx);
+        for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
+        this.specBoxes={};
+      }
       this.config = next;
       // The spec editor's folders, from local facts only (never the daemon's list).
-      this.specRoots = await localSpecRoots(next, exec, home());
+      if(!next.daemonMachine)this.specRoots = await localSpecRoots(next, exec, home());
       this.specRealpathAvailable = await specRealpathAvailable(exec);
       cx.notify();
     });
   }
 
+  hostWorkerEntry(view){
+    const entry=Object.values(shared("rig.workerViews")??{}).find(e=>e.view===view&&e.config?.daemonMachine===this.config?.daemonMachine
+      &&rigOrigin(e.config?.daemonUrl)===rigOrigin(this.config?.daemonUrl));
+    return entry&&entry.pages?.some(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)))?entry:null;
+  }
+  hostWorkerLine(t,rig,view=`rig:${rig.name}`){
+    const entry=this.hostWorkerEntry(view);if(!entry)return null;
+    const pages=entry.pages.filter(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)));
+    const details=workerViewDetails(entry);
+    const missing=entry.missing?.map(m=>`${m.label} (${workerMissingReason(m.reason)})`).join(", ");
+    const message=`Worker view open here: ${pages.length} page${pages.length===1?"":"s"}.${details?` ${details}.`:""}${missing?` ${entry.missing.length} seat${entry.missing.length===1?"":"s"} not shown: ${missing}.`:""}`;
+    return v_flex().id(`host-worker-${rig.id}`).gap(4)
+      .child(div().text_size(11.5).text_color(t.dim).child(message))
+      .when(!!entry.paused,el=>el.child(div().text_size(11.5).text_color(t.working??t.muted).child("Couldn't refresh this view; tiles kept.")
+        .child(div().text_color(t.accent).cursor_pointer().child("Retry").on_click(()=>oneClick({kind:"open-view",view:entry.view,rig:rig.name,rigId:rig.id},"open-view")))))
+      .child(h_flex().gap(8).flex_wrap().children(pages.map((page,index)=>div().id(`host-worker-page-${rig.id}-${index}`).text_size(11.5).text_color(t.accent).cursor_pointer()
+        .child(`Show page ${index+1}`).on_click(()=>{if(spaces().some(s=>s.id===entry.space&&s.tabs?.some(tab=>tab.id===page.tab))){run("space.select",{id:entry.space});run("tab.select",{id:page.tab});}}))))
+      .child(div().text_size(11.5).text_color(t.accent).cursor_pointer().child(`herdrig prune: ${entry.pruneMs?Math.round(entry.pruneMs/60000)+"m":"off"}…`)
+        .on_click(()=>menu({kind:"following",target:entry.view,name:entry.name,rig:rig.name,rigId:rig.id,enabled:entry.following,pruneAfterMs:entry.pruneMs||null})));
+  }
   caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
 
   /** Open or switch to the active space's TUI. The Rig sidebar does it (`rig.tui`), as the menu does: it outlives
@@ -252,23 +305,39 @@ export default class RigView extends View {
     push({ section });
   }
 
-  /** Topology · Specs · Scopes · Terminals · Needs · System, in the TUI's order; Needs shows its open count in red. */
-  sectionBar(t, entry) {
-    const data = shared("rig.data") ?? {};
-    const ownRigs = this.cache?.["/api/rigs/summary"]?.data;
-    const topology = data.topology ?? (Array.isArray(ownRigs) ? ownRigs.map(r => rigModel(r, this.cache?.[`/api/rigs/${r.id}/nodes`]?.data)) : []);
-    const needs = needsRequestCount(topology, data.attentionItems ?? this.cache?.["/api/attention"]?.data?.items ?? []);
-    return h_flex().id("rig-sections").px(14).h(36).items_center().border_b(1).border_color(t.border).flex_none()
-      .child(h_flex().rounded(6).border_1().border_color(t.border).items_center().children(RIG_SECTIONS.map((sec, i) => {
-        const active = entry.section === sec;
-        return h_flex().id(`rig-section-tab-${sec}`).px(10).h(24).gap(5).items_center().cursor_pointer()
-          .bg(active ? t.accent : "#00000000").hover((s) => s.bg(active ? t.accent : t.hover))
-          .tooltip(`${SECTION_TITLES[sec]} (Alt+${i + 1})`)
-          .on_click(() => this.goSection(sec))
-          .child(div().text_size(12).text_color(active ? (t.solid_foreground ?? t.background) : t.muted).child(SECTION_TITLES[sec]))
-          .when(sec === "needs" && needs > 0, (el) => el.child(div().id("rig-section-needs-count").text_size(11).font_semibold()
-            .text_color(active ? (t.solid_foreground ?? t.background) : t.blocked).child(String(needs))));
-      })));
+  navigationMenu(choices, title = "Sections") {
+    openOverlay({ mod: MOD_IDS.menu, kind: "popup", width: 260, height: Math.min(360, 42 + choices.length * 30),
+      props: { target: { kind: "page-navigation", name: title, choices } } });
+  }
+
+  sectionMenu() {
+    const data = shared("rig.data") ?? {}, topology = data.topology ?? [];
+    const items = data.attentionItems ?? this.cache?.["/api/attention"]?.data?.items ?? [];
+    const health=data.health?.records??this.cache?.["/api/health"]?.data?.records;
+    this.navigationMenu(pageSectionChoices({ topology: `${topology.length} rigs`, specs: data.specs?.length??this.cache?.["/api/specs/library"]?.data?.length,
+      terminals: (data.ps ?? []).length, needs: needsRequestCount(topology, items),
+      system: Array.isArray(health)?healthCounts(health).problems||"ok":null }));
+  }
+
+  objectTabs(t, entry, spec, {prefix="page",active=this.activePageView}={}) {
+    const data=shared("rig.data")??{};
+    const counts=this.pageNeedsCounts??{requests:needsRequestCount(data.topology,data.attentionItems),updates:(data.attentionItems??[]).filter(isUpdateNeed).length};
+    const options = pageViewOptions(entry, spec, {...counts,...this.workflowCounts});
+    if (!options.length) return null;
+    const { tabs, more } = visiblePageTabs(options, this.pageWidth ?? 960);
+    const choose = view => push(entryWithPageView(entry, view));
+    const keyChoose=(e,cx,act)=>{if(e.key==="enter"){cx.stop_propagation();act();}};
+    return h_flex().id(`${prefix}-object-tabs`).px(14).gap(16).h(34).items_center().border_b(1).border_color(t.border).flex_none()
+      .when((this.pageWidth??960)<320,el=>el.h(68).flex_wrap().gap(8))
+      .children(tabs.map(([id, label]) => div().id(`${prefix}-tab-${id}`).tab_stop(true).h(34).flex_none().flex().items_center().cursor_pointer()
+        .border_b(active === id ? 2 : 0).border_color(t.accent).text_size(12.5).text_color(active === id ? t.foreground : t.muted)
+        .on_click(() => choose(id)).on_key_down((e,cx)=>keyChoose(e,cx,()=>choose(id))).child(label)))
+      .when(more.length > 0, el => el.child(div().id(`${prefix}-tabs-more`).tab_stop(true).cursor_pointer().text_size(12.5).text_color(t.muted)
+        .h(34).flex_none().flex().items_center().border_b(more.some(([id])=>id===active)?2:0).border_color(t.accent)
+        .tooltip(more.find(([id])=>id===active)?.[1]??"More views")
+        .on_click(() => this.navigationMenu(more.map(([id,label]) => ({ label, entry:entryWithPageView(entry,id) })), "Views"))
+        .on_key_down((e,cx)=>keyChoose(e,cx,()=>this.navigationMenu(more.map(([id,label])=>({label,entry:entryWithPageView(entry,id)})),"Views")))
+        .child(`${more.find(([id])=>id===active)?.[1]??"More"} ▾`)));
   }
 
   async resolveDaemonUrl() {
@@ -354,9 +423,13 @@ export default class RigView extends View {
     return this.present[path];
   }
 
-  /** The slice folders on disk, by folder name (`/api/slices`, project-scoped when `project` is set). */
+  /** Explicit selection wins; a sole catalog entry needs no picker or daemon default. */
+  scopesProject(cx, explicit=null) {
+    return effectiveScopeProject(explicit,shared('rig.project'),this.read(cx,'/api/scopes/projects').data);
+  }
+  /** The slice folders on disk, by folder name, scoped to the effective project. */
   slicePaths(cx, project = null) {
-    const proj = project ?? shared("rig.project") ?? null;
+    const proj = this.scopesProject(cx,project);
     const path = proj ? `/api/slices?project=${encodeURIComponent(proj)}` : "/api/slices";
     const got = this.read(cx, path);
     const fallback = proj && got.error && got.data === undefined ? this.read(cx, "/api/slices") : null;
@@ -386,17 +459,20 @@ export default class RigView extends View {
   dim(t, text) { return this.plain(t, text).text_size(12).text_color(t.dim); }
   workerCapabilityMessage() { const caps=this.caps(); return workerCapabilityText(capabilitiesSummaryDetail(caps).reason ?? "",caps); }
   workerCapabilityNote(t, reason, id = null) {
+    if(this.caps().hostWorkerViews)return div().when(!!id,el=>el.id(id)).text_size(11.5).text_color(t.dim).child(reason);
     return div().when(!!id, el => el.id(id)).text_size(11.5).text_color(t.dim)
       .tooltip(`${reason}\nProvider: https://github.com/mvschwarz/openrig/pull/2744\nFollow and custom grids need additional upstream support; see the README's Worker views section.`)
       .child(this.workerCapabilityMessage());
   }
   card(t, title, children, meta = null) {
-    return v_flex().rounded(10).bg(t.background).border_1().border_color(t.border).p(12).gap(8)
-      .when(!!title, (el) => el.child(h_flex().items_center().child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child(title))
+    const { compact, tight } = pageBodyLayout(this.pageWidth);
+    return v_flex().rounded(10).bg(t.background).border_1().border_color(t.border).p(tight ? 10 : 12).gap(8)
+      .when(!!title, (el) => el.child((compact ? v_flex() : h_flex()).when(!compact, e => e.items_center()).gap(compact ? 4 : 0).child(div().when(!compact, e => e.flex_1()).text_size(12.5).font_semibold().text_color(t.foreground).child(title))
         .when(!!meta, (h) => h.child(typeof meta === "string" ? div().text_size(11.5).text_color(t.dim).child(meta) : meta))))
       .children(children);
   }
   button(t, id, label, onClick, { primary = false, iconName = null, small = false, disabled = false, tooltip = null, actionKey = null } = {}) {
+    if(this.inPageActions&&(this.pageWidth??960)<480&&iconName&&!primary){tooltip??=label;label="";}
     const busyKey = shared("rig.busyAction");
     const busy = Boolean(busyKey && (busyKey === id || (actionKey && busyKey === actionKey)));
     return h_flex().id(id).px(small ? 10 : 12).h(small ? 24 : 28).gap(6).rounded(8).items_center().text_size(12).flex_none()
@@ -422,12 +498,13 @@ export default class RigView extends View {
     return h_flex().gap(6).items_center().child(this.dot(t, key)).child(div().text_size(12).text_color(t[statusMark(key).word] ?? t.muted).child(look.word));
   }
   kv(t, rows) {
+    const { compact } = pageBodyLayout(this.pageWidth);
     const group = this.textSeq = (this.textSeq ?? 0) + 1;
     const exact = (key, value) => value != null && !["", "—", "not a file on disk"].includes(String(value))
       && ["session", "attach:", "attach command", "queue item", "target", "rig id", "request id", "slice", "mission", "view", "terminal", "address", "sender", "recipient", "cwd", "file", "path"].includes(String(key).toLowerCase());
-    return v_flex().gap(4).children(rows.filter(Boolean).map(([k, v, mono], i) => h_flex().gap(10).items_start()
-      .child(div().w(120).flex_none().text_size(12).text_color(t.dim).child(k))
-      .child(div().flex_1().min_w(0).when(!!mono, (el) => el.font_family(settings().font_family))
+    return v_flex().gap(compact ? 6 : 4).children(rows.filter(Boolean).map(([k, v, mono], i) => (compact ? v_flex() : h_flex()).id(`kv-row-${group}-${i}`).gap(compact ? 2 : 10).items_start()
+      .child(div().when(!compact, el => el.w(120).flex_none()).text_size(compact ? 11 : 12).text_color(t.dim).child(k))
+      .child(div().when(compact, el => el.w_full()).when(!compact, el => el.flex_1()).min_w(0).when(!!mono, (el) => el.font_family(settings()?.font_family ?? "monospace"))
         .child(exact(k, v) ? this.copyValue(t, String(v), `field-${group}-${i}`, k) : this.plain(t, v, `field-${group}-${i}`)))));
   }
   skeleton(t) { return v_flex().gap(6).children([0, 1, 2].map((i) => div().h(12).w(220 - i * 40).rounded(3).bg(t.raised))); }
@@ -438,7 +515,7 @@ export default class RigView extends View {
       return v_flex().rounded(10).border_1().border_color(t.blocked).p(12).gap(8)
         .child(div().text_size(12).text_color(t.blocked).child(got.error))
         .child(h_flex().gap(8).items_center().child(this.button(t, `retry-${path}`, "Retry", (_e, cx) => { this.read(cx, path, true); cx.notify(); }))
-          .when(!!got.at, (el) => el.child(this.dim(t, `as of ${new Date(got.at).toTimeString().slice(0, 5)}`))));
+          .when(!!got.at, (el) => el.child(this.dim(t, `as of ${this.time(got.at)}`))));
     }
     if (got.data === undefined) return this.skeleton(t);
     return null;
@@ -448,7 +525,7 @@ export default class RigView extends View {
     const failed = [...(this.reading ?? [])].filter((p) => this.cache[p]?.error && this.cache[p].data !== undefined);
     if (!failed.length) return null;
     const first = this.cache[failed[0]];
-    const asOf = first.at ? new Date(first.at).toTimeString().slice(0, 5) : null;
+    const asOf = first.at ? this.time(first.at) : null;
     return h_flex().id("rig-refresh-error").gap(8).items_center().px(10).py(6).rounded(8).border_1().border_color(t.blocked)
       .child(svg(icon("rig-alert")).size(12).flex_none().text_color(t.blocked))
       .child(div().flex_1().min_w(0).text_size(12).text_color(t.blocked)
@@ -519,6 +596,7 @@ export default class RigView extends View {
     }
     return v_flex().id("rig-file").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_key_down(()=>{this.typing=true;})
       .child(f.state ? Editor.new(f.state).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(f.error || "Loading file…"));
   }
 
@@ -607,12 +685,12 @@ export default class RigView extends View {
             .child(h_flex().id(`topology-recent-event-${key}`).gap(8).px(6).py(4).rounded(6).items_center().cursor_pointer().hover((el) => el.bg(t.hover))
               .on_click((_e, cx) => { this.recentSelected = selected ? null : { ...row }; cx.notify(); })
               .child(svg(icon(selected ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
-              .child(div().w(70).flex_none().text_size(11).text_color(t.dim).child(String(row.ts ?? "").slice(11, 19)))
+              .child(div().min_w(70).flex_none().text_size(11).text_color(t.dim).child(this.time(row.ts,{seconds:true})))
               .child(v_flex().flex_1().min_w(0).gap(2)
                 .child(div().truncate().text_size(12).text_color(t.muted).child(`${row.actorSession || "Actor unknown"} · ${row.change || "Change unknown"}`))
                 .child(div().truncate().text_size(12.5).text_color(t.foreground).child(summary))))
             .when(selected, (el) => el.child(this.kv(t, [
-              ["Event", key], ["When", row.ts], ["Actor", row.actorSession], ["Change", row.change],
+              ["Event", key], ["When", this.time(row.ts,{exact:true})], ["Actor", row.actorSession], ["Change", row.change],
               ["Work", row.summary || row.bodyPreview || "No work served"], ["Queue item", row.qitemId],
               ["Target", row.target ? `${row.targetKind ?? "work"}: ${row.target}` : row.qitemId], ["Rig", row.rig ?? "not served"],
               ["Record", "This is the recorded change, not an independent check of its outcome."],
@@ -692,7 +770,7 @@ export default class RigView extends View {
       .child(this.card(t, "Pod", [this.kv(t, [
         ["Rig", entry.rig],
         ["Pod", podName],
-        ["Seats", `${podSeats.length} (${counts.working} working · ${counts.needs} needs you · ${counts.idle} idle)`],
+        ["Seats", `${podSeats.length} (${counts.working} working · ${counts.needs} needs you · ${counts.idle} idle${counts.unreported?` · ${counts.unreported} not reported`:""})`],
       ])]))
       .child(this.card(t, "Seats", podSeats.length
         ? podSeats.map((s) => {
@@ -723,7 +801,7 @@ export default class RigView extends View {
         .bg(active ? t.accent : t.raised)
         .hover((s) => s.bg(active ? t.accent : t.hover))
         .on_click((_e, cx) => { if (key === null) this.pulseFilter = null; else toggleFilter(key); cx?.notify?.(); })
-        .when(key === "idle", el => el.tooltip("Idle, done, stopped or unknown"))
+        .when(key === "idle", el => el.tooltip("Idle, done or stopped"))
         .when(!!mark, (el) => el.child(this.dot(t, mark, 12)))
         .child(div().text_size(11.5).text_color(active ? (t.solid_foreground ?? t.background) : color).font_medium().child(label));
     };
@@ -735,7 +813,8 @@ export default class RigView extends View {
         .child(seg("pulse-filter-working", "working", `${counts.working} working`, t.ansi2, "working"))
         .child(seg("pulse-filter-blocked", "blocked", `${counts.blocked} blocked`, t.blocked, "blocked"))
         .child(seg("pulse-filter-needs", "needs", `${counts.needs} needs you`, t.blocked, "needs_input"))
-        .child(seg("pulse-filter-idle", "idle", `${counts.idle} idle`, t.muted, "idle")))
+        .child(seg("pulse-filter-idle", "idle", `${counts.idle} idle`, t.muted, "idle"))
+        .when(counts.unreported>0,el=>el.child(seg("pulse-filter-unreported","unreported",`${counts.unreported} not reported`,t.dim,"unknown"))))
       .child(div().flex_1())
       .child(h_flex().id("topology-expand-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
@@ -751,7 +830,7 @@ export default class RigView extends View {
   pulseFilterBar(t, models, attentionItems) {
     const filter = this.pulseFilter;
     const hidden = models.reduce((n, model) => n + model.seats.filter(seat => !matchesPulseFilter(seat, model, filter, attentionItems)).length, 0);
-    const label = { idle: "Idle", working: "Working", blocked: "Blocked", needs: "Needs you" }[filter] ?? filter;
+    const label = { idle: "Idle", working: "Working", blocked: "Blocked", needs: "Needs you", unreported:"Not reported" }[filter] ?? filter;
     return h_flex().id("pulse-filter-notice").gap(8).items_center().text_size(12).text_color(t.muted)
       .child(`Showing ${label} · ${hidden} hidden`)
       .child(div().id("pulse-show-all").text_color(t.accent).cursor_pointer()
@@ -805,7 +884,7 @@ export default class RigView extends View {
     return file ? () => push(fileEntry(file, `${seat.logicalId ?? seat.session} transcript`)) : null;
   }
   nowRow(t, seat, openSeat) {
-    const state = nowTailPresentation(this.nowTails?.records.get(seat.session));
+    const state = nowTailPresentation(this.nowTails?.records.get(seat.session),Date.now(),this.uiTimezone);
     const openTranscript = this.nowTranscript(seat);
     const line = h_flex().w_full().h(20).min_w(0).gap(4).items_center().overflow_hidden().text_size(12)
       .when(state.stale, el => el.child(div().flex_none().text_color(t.dim).child(state.prefix)));
@@ -831,9 +910,10 @@ export default class RigView extends View {
       .when(Boolean(state.line) && this.nowWidths?.[seat.session] !== false, el => el.child(HoverCard.new(`now-hover-${seat.session}`).open_delay(600).trigger(line).content(hover)));
   }
   nowBlock(t, seat, openTranscript) {
-    const state = nowTailPresentation(this.nowTails?.records.get(seat.session));
+    const state = nowTailPresentation(this.nowTails?.records.get(seat.session),Date.now(),this.uiTimezone);
+    const { compact } = pageBodyLayout(this.pageWidth);
     return this.card(t, "Now", [
-      h_flex().w_full().gap(8).items_center().child(div().flex_1().min_w(0)
+      (compact ? v_flex() : h_flex()).id("seat-now-meta").w_full().gap(8).when(!compact, el => el.items_center()).child(div().when(!compact, el => el.flex_1()).min_w(0)
         .child(this.plain(t, `as of ${state.asOf} · ${state.state}${state.stale || state.state === "withheld" ? ` · ${state.reason}` : ""}`, "seat-now-state").text_size(11.5).text_color(t.muted)))
         .child(div().flex_none().id("seat-now-open-transcript").text_size(12).text_color(t.accent).cursor_pointer().on_click(openTranscript).child("Open transcript")),
       div().id("seat-now-summary").text_size(12.5).text_color(state.stale ? t.dim : t.foreground)
@@ -844,12 +924,13 @@ export default class RigView extends View {
 
   invalidateLiveReads() {
     this.nowDue = true;
-    markStale(this.cache, (path) => path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
+    markStale(this.cache, (path) => path==='/api/config/ui.timezone' || path.startsWith('/api/views/execution?') || path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
   }
 
   /** One rig as a block: header with status counts, action bar, health banner, Edges, then pods as lines of seat chips.
    *  Used on the Topology page and, alone, in the inspector. A filter that leaves nothing of the rig leaves its header, dim. */
   rigBlock(t, cx, rig, { entry = {}, rigCount = 1, attentionItems = [], allSeats = [], allowPulseFilter = false } = {}) {
+    const { compact, tight, graphHidden } = pageBodyLayout(this.pageWidth);
     const nodesPath = `/api/rigs/${encodeURIComponent(rig.id)}/nodes`;
     const nodes = this.nodesOf(cx, rig.id);
     const model = rigModel(rig, nodes.data);
@@ -860,6 +941,7 @@ export default class RigView extends View {
     const focused = (focusRig != null && (focusRig === rig.id || focusRig === rig.name)) ||
       focusKey === `rig:${rig.id}` || focusKey === `rig:${rig.name}`;
     const here = (entry.kind === "rig" && (entry.rigId === rig.id || entry.name === rig.name)) || focused;
+    const dedicated=entry.kind==="rig"&&(entry.rigId===rig.id||entry.name===rig.name);
     const open = shared("rig.open.page") ?? {};
     const explicitById = open[rigKey(rig.id)];
     const explicitByName = open[rigKey(rig.name)];
@@ -889,7 +971,7 @@ export default class RigView extends View {
     const viewTarget = { kind: "rig", rig: rig.name, rigId: rig.id, view: `rig:${rig.name}` };
     const dialog = (step, height) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
     const more = () => this.moreButton(t, `rig-more-${rig.id}`, () => menu(target));
-    const showBody = expanded && (!noMatch || Boolean(pulseFilter));
+    const showBody = dedicated || expanded && (!noMatch || Boolean(pulseFilter));
     const rigRowKey = rigKey(rig.id);
     const rigEntry = { section: "topology", kind: "rig", rigId: rig.id, name: rig.name };
     this.pageRows?.push({ key: rigRowKey, foldKey: rigRowKey, expandable: true, isOpen: expanded, entry: rigEntry, target, seats: model.seats });
@@ -897,18 +979,21 @@ export default class RigView extends View {
     const resume = () => this.button(t, `rig-resume-${rig.id}`, "Resume…", () => dialog({ action: "resume", confirm: true }, 380), { small: true, iconName: "rig-play" });
     // A count filters the page to seats in that state.
     const count = (n, word, color, key) => n ? h_flex().id(`rig-count-${key}-${rig.name}`).gap(4).items_center().cursor_pointer().on_click(() => { push({ ...(entry.section ? entry : { section: "topology" }), filter: word }); })
-      .child(div().text_size(11.5).text_color(color === "working" ? (t.ansi2 ?? t.working) : color === "blocked" ? t.blocked : t.muted).child(`${n} ${word}`)) : null;
+      .child(div().text_size(11.5).text_color(color === "working" ? (t.ansi2 ?? t.working) : color === "blocked" ? t.blocked : color==="dim"?t.dim:t.muted).child(`${n} ${word}`)) : null;
     const lifecycleText = stoppedRig && lifecycle === "recoverable" ? "stopped (recoverable)" : (lifecycle ?? "unknown");
-    const head = h_flex().id(`rig-head-${rig.id}`).px(4).h(30).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
+    if(dedicated)this.pageHeading={title:rig.name,tone,status:`${lifecycleText} · ${model.seats.length} seats · ${counts.working} working · ${counts.needs} needs you · ${counts.idle} idle${counts.unreported?` · ${counts.unreported} not reported`:""}`};
+    const head = h_flex().id(`rig-head-${rig.id}`).px(4).when(!compact, el => el.h(30)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
       .when(rigSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
       .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) push(rigEntry); else this.selectPageRow(rigRowKey, cx); })
       .on_mouse_down("right", () => menu(target))
       .child(div().id(`rig-fold-${rig.id}`).w(14).flex_none().text_color(t.dim).on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(rigKey(rig.id), expanded, model.seats); })
         .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(12)))
       .child(this.dot(t, tone))
-      .child(div().text_size(13).font_semibold().text_color(t.foreground).child(rig.name))
-      .child(div().text_size(12).text_color(t.muted).child(`${lifecycleText} · ${model.seats.length} seat${model.seats.length === 1 ? "" : "s"}`))
-      .children([count(counts.working, "working", "working", "working"), count(counts.blocked, "blocked", "blocked", "blocked"), count(counts.needs, "needs you", "blocked", "needs"), count(counts.idle, "idle", "idle", "idle")].filter(Boolean))
+      .child(div().id(`rig-name-${rig.id}`).text_size(13).font_semibold().text_color(t.foreground).cursor_pointer().hover(el=>el.underline())
+        .tooltip(`Open ${rig.name}`).on_click((_e,cx)=>{cx.stop_propagation();push({...rigEntry,tab:"table"});}).child(rig.name))
+      .when(!tight, el => el.child(div().text_size(12).text_color(t.muted).child(`${lifecycleText} · ${model.seats.length} seat${model.seats.length === 1 ? "" : "s"}`)))
+      .child(h_flex().id(`rig-counts-${rig.id}`).gap(8).when(compact, el => el.w_full().flex_wrap())
+        .children([count(counts.working, "working", "working", "working"), count(counts.blocked, "blocked", "blocked", "blocked"), count(counts.needs, "needs you", "blocked", "needs"), count(counts.idle, "idle", "idle", "idle"),count(counts.unreported,"not reported","dim","unreported")].filter(Boolean)))
       .when(noMatch, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("no matching seats")))
       .child(div().flex_1())
       .when(!showBody && (stoppedRig || lifecycle !== "running"), (el) => el.child(resume()))
@@ -916,34 +1001,30 @@ export default class RigView extends View {
     const body = [];
     if (showBody) {
       const followed = (stripProps()?.views ?? []).find((v) => v.following?.target === `rig:${rig.name}`);
-      const on = !!followed?.following?.enabled;
+      const on = this.hostWorkerEntry(`rig:${rig.name}`)?.following??!!followed?.following?.enabled;
       const caps = this.caps();
       const workerReason = capabilityDisableReason("open-view", caps);
       const designReason = capabilityDisableReason("design-view", caps);
       const followReason = capabilityDisableReason(on ? "unfollow" : "follow", caps);
-      body.push(h_flex().gap(6).items_center().flex_wrap()
-        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason, actionKey: "open-view" }))
+      this.inPageActions=dedicated;
+      const actionBar=h_flex().gap(6).items_center().flex_wrap()
+        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens here; tiles run on ${this.config.daemonMachine}.`:null), actionKey: "open-view" }))
         .child(this.button(t, `rig-act-design-${rig.name}`, "Design view…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target, step: { action: "design-view" } } }), { small: true, iconName: "rig-view", disabled: !!designReason, tooltip: designReason }))
         .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow" }))
         .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => oneClick({ kind: "rig", rig: rig.name, rigId: rig.id }, "snapshot", `rig-snapshot-${rig.id}`), { small: true, iconName: "rig-snapshot", actionKey: "snapshot" }))
         .when(!stoppedRig && lifecycle !== "stopped", (el) => el.child(this.button(t, `rig-pause-${rig.id}`, "Pause…", () => dialog({ action: "pause", load: "pause" }, 360), { small: true, iconName: "rig-pause" })))
         .when(stoppedRig || lifecycle !== "running", (el) => el.child(resume()))
-        .child(div().flex_1()).child(more()));
+        .child(div().flex_1()).child(more());
+      this.inPageActions=false;
+      if(dedicated)this.pageActions=actionBar;else body.push(actionBar);
+      const workerLine=this.hostWorkerLine(t,rig);if(workerLine)body.push(workerLine);
       const capReasons = [...new Set([workerReason, followReason, designReason].filter(Boolean))];
       if (capReasons.length) {
         body.push(this.workerCapabilityNote(t, capReasons.join(" · "), `rig-cap-note-${rig.id}`));
       }
-      if (here) {
+      if(!dedicated)body.push(this.objectTabs(t,{...rigEntry,tab:"table"},null,{prefix:`rig-${rig.id}`,active:"table"}));
+      if (dedicated) {
         const activeRigTab = entry.tab ?? (entry.openRecent ? "recent" : "table");
-        const tabLabels = { table: "Table", recent: "Recent", overview: "Overview", graph: "Graph", health: "Health" };
-        body.push(h_flex().id(`rig-tabs-${rig.id}`).gap(4).items_center().flex_wrap().children(RIG_TABS.map((tab) => {
-          const onTab = activeRigTab === tab;
-          return h_flex().id(`rig-subview-${tab}`).px(8).h(22).rounded(5).items_center().cursor_pointer()
-            .bg(onTab ? t.accent : t.raised).border_1().border_color(onTab ? t.accent : t.border).hover((s) => s.bg(onTab ? t.accent : t.hover))
-            .text_size(11.5).text_color(onTab ? (t.solid_foreground ?? t.background) : t.muted)
-            .on_click(() => push({ section: "topology", kind: "rig", rigId: rig.id, name: rig.name, ...(tab === "table" ? {} : { tab }) }))
-            .child(div().id(`rig-tab-${tab}`).child(tabLabels[tab] ?? tab));
-        })));
         if (activeRigTab === "overview") {
           const distinctHosts = [...new Set(model.seats.map((s) => s.host ?? "local"))].join(", ") || "local";
           const podNames = [...new Set(model.seats.map((s) => s.pod ?? "default"))].join(", ") || "—";
@@ -954,7 +1035,7 @@ export default class RigView extends View {
             ["Spec", rig.specName ?? rig.spec ?? model.seats[0]?.spec ?? "—"],
             ["Hosts", distinctHosts],
             ["Pods", podNames],
-            ["Seats", `${model.seats.length} (${counts.working} working · ${counts.needs} needs you · ${counts.idle} idle)`],
+            ["Seats", `${model.seats.length} (${counts.working} working · ${counts.needs} needs you · ${counts.idle} idle${counts.unreported?` · ${counts.unreported} not reported`:""})`],
           ])])));
         } else if (activeRigTab === "graph") {
           const graphPath = `/api/rigs/${encodeURIComponent(rig.id)}/graph`;
@@ -962,8 +1043,9 @@ export default class RigView extends View {
           const graphView=this.graphFor(`running:${rig.id}`);
           this.wideGraph=true;
           if(graphGot.data&&graphView.publicData!==graphGot.data){graphView.projection=normalizeRunningGraph(graphGot.data,model.seats);graphView.publicData=graphGot.data;}
-          if(graphGot.data)body.push(graphView.render(t,cx,graphView.projection,{
-            id:`rig-graph-${rig.id}`,assets:ASSETS,running:true,
+          if(graphHidden)body.push(this.dim(t,"Widen the pane to see the graph.").id(`rig-graph-narrow-${rig.id}`));
+          else if(graphGot.data)body.push(graphView.render(t,cx,graphView.projection,{
+            id:`rig-graph-${rig.id}`,assets:ASSETS,running:true,reducedMotion:this.config?.reducedMotion===true,
             events:shared("rig.graphActivity")?.origin===this.config?.daemonUrl?shared("rig.graphActivity").events:[],
             open:s=>push({section:"topology",kind:"seat",rig:rig.name,rigId:rig.id,name:s.lid}),
             menu:s=>menu({...s.node,kind:"seat",session:s.session,rig:rig.name,rigId:rig.id,logicalId:s.lid}),
@@ -971,12 +1053,12 @@ export default class RigView extends View {
           else body.push(this.status(t,cx,graphPath,graphGot)??this.skeleton(t));
         }
       }
-      body.push(this.rigHealthEdges(t, cx, rig, { entry, rigCount, open }));
+      if(!dedicated||entry.tab!=="overview")body.push(this.rigHealthEdges(t, cx, rig, { entry, rigCount, open }));
       if (nodes.data === undefined) body.push(this.status(t, cx, nodesPath, nodes));
-      else if(!(here&&entry.tab==="graph"))body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter) }));
+      else if(!dedicated||entry.tab==="table")body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter) }));
     }
-    return v_flex().id(`rig-block-${rig.id}`).rounded(10).bg(t.background).border_1().border_color(focused ? t.accent : t.border).p(10).gap(6).child(head)
-      .children(body.length ? [v_flex().ml(22).pl(10).gap(8).border_l(1).border_color(t.border).children(body)] : []);
+    return v_flex().id(`rig-block-${rig.id}`).rounded(10).bg(t.background).border_1().border_color(focused ? t.accent : t.border).p(compact ? 4 : 10).gap(6).when(!dedicated,el=>el.child(head))
+      .children(body.length ? [v_flex().ml(compact ? 8 : 22).pl(compact ? 6 : 10).gap(8).border_l(1).border_color(t.border).children(body)] : []);
   }
 
   /** The findings banner (only when the rig has findings), Recent activity disclosure, and Edges disclosure. */
@@ -985,10 +1067,13 @@ export default class RigView extends View {
     const health = this.read(cx, "/api/health");
     const findings = healthForRig(health.data?.records, rig, this.nodesOf(cx, rig.id).data ?? []).filter(r=>classifyHealth(r).actionable);
     // The graph already draws the relationships. Keep the copyable text list on explicit request.
-    const edgesOpen = open[`edges:${rig.id}`] ?? false;
+    const edgesOpen = here && entry.tab === "graph" && pageBodyLayout(this.pageWidth).graphHidden || (open[`edges:${rig.id}`] ?? false);
+    const graphPath=`/api/rigs/${encodeURIComponent(rig.id)}/graph`;
+    const graph=this.read(cx,graphPath);
+    const knownEdges=Array.isArray(graph.data?.edges)?graph.data.edges:null;
     const recentKey = `rig-recent:${rig.name}`;
-    const recentOpen = open[recentKey] ?? open[`rig-recent:${rig.id}`] ??
-      ((here && entry.tab === "recent") || entry.openRecent === rig.name || entry.openRecent === rig.id);
+    const recentOpen = here&&entry.tab==="recent" || (open[recentKey] ?? open[`rig-recent:${rig.id}`] ??
+      (entry.openRecent === rig.name || entry.openRecent === rig.id));
     const row = (id, text, on, key, color) => h_flex().id(id).gap(4).items_center().cursor_pointer().on_click(() => toggleOpen(key, on))
       .child(svg(icon(on ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
       .child(div().text_size(12).text_color(color).child(text));
@@ -1002,7 +1087,7 @@ export default class RigView extends View {
       });
     };
     const out = [];
-    if (findings.length > 0) {
+    if ((!here||entry.tab==="health"||entry.tab==="table")&&findings.length > 0) {
       const counts = healthCounts(findings);
       const text = counts.problems ? `${counts.problems} problem${counts.problems === 1 ? "" : "s"}` : counts.notes ? `${counts.notes} note${counts.notes === 1 ? "" : "s"}` : "Health";
       out.push(v_flex().id(`rig-health-group-${rig.id}`).gap(4)
@@ -1020,26 +1105,30 @@ export default class RigView extends View {
       const recentGot = this.read(cx, recentPath);
       recentGroup.child(this.recentTransitionsBlock(t, cx, `rig-recent-${rig.name}`, recentPath, recentGot));
     }
-    out.push(recentGroup);
+    if(!here||entry.tab==="recent")out.push(recentGroup);
+    if(here&&entry.tab==="health"&&!findings.length)out.push(this.dim(t,"No health findings for this rig."));
     const edgesGroup = v_flex().id(`rig-edges-group-${rig.id}`).gap(4)
-      .child(row(`rig-edges-toggle-${rig.id}`, "Edges", edgesOpen, `edges:${rig.id}`, t.muted));
+      .child(row(`rig-edges-toggle-${rig.id}`, `Edges as text (${knownEdges?knownEdges.length:"…"})`, edgesOpen, `edges:${rig.id}`, t.muted));
     if (edgesOpen) {
-      const path = `/api/rigs/${encodeURIComponent(rig.id)}/graph`;
-      const graph = this.read(cx, path);
       const edges = graph.data?.edges ?? [];
       const names=new Map((graph.data?.nodes??[]).map(n=>[n.id,n.data?.logicalId??n.logicalId??n.id]));
-      edgesGroup.child(this.status(t, cx, path, graph) ?? (edges.length
-        ? v_flex().gap(2).children(edges.map((e, i) => h_flex().id(`edge-${rig.id}-${i}`).gap(8).px(4).text_size(12).text_color(t.muted)
-          .child(this.copyValue(t, `${names.get(e.source)??e.source} → ${names.get(e.target)??e.target}`, `edge-${rig.id}-${i}`, "edge addresses")).child(div().text_color(t.dim).child(String(e.data?.kind ?? e.label ?? "")))))
+      const openGraph=()=>push({section:"topology",kind:"rig",rigId:rig.id,name:rig.name,tab:"graph"});
+      edgesGroup.child(div().id(`rig-open-graph-${rig.id}`).tab_stop(true).text_size(12).text_color(t.accent).cursor_pointer().hover(el=>el.underline())
+        .on_click(openGraph).on_key_down((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();openGraph();}}).child("Open the graph"));
+      edgesGroup.child(this.status(t, cx, graphPath, graph) ?? (edges.length
+        ? v_flex().gap(pageBodyLayout(this.pageWidth).compact ? 10 : 2).children(edges.map((e, i) => (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id(`edge-${rig.id}-${i}`).gap(pageBodyLayout(this.pageWidth).compact ? 2 : 8).px(4).text_size(12).text_color(t.muted)
+          .child(this.copyValue(t, `${names.get(e.source)??e.source} → ${names.get(e.target)??e.target}`, `edge-${rig.id}-${i}`, "edge addresses"))
+          .child(div().id(`edge-kind-${rig.id}-${i}`).when(pageBodyLayout(this.pageWidth).compact, el => el.pl(8)).text_color(t.dim)
+            .child(String(pageBodyLayout(this.pageWidth).compact ? GRAPH_EDGE_LOOK[e.data?.kind ?? e.label]?.word ?? e.data?.kind ?? e.label ?? "" : e.data?.kind ?? e.label ?? "")))))
         : this.dim(t, "No edges.")));
     }
-    out.push(edgesGroup);
+    if(!here||entry.tab==="graph")out.push(edgesGroup);
     return v_flex().gap(6).children(out);
   }
 
   /** Render the 10 most recent queue transitions for a rig block or System disclosure. */
   recentTransitionsBlock(t, cx, idPrefix, path, got) {
-    const activeProject = shared("rig.project") ?? null;
+    const activeProject = this.scopesProject(cx);
     const scopePath = activeProject ? `/api/scopes?detail=1&project=${encodeURIComponent(activeProject)}` : "/api/scopes?detail=1";
     const scopesGot = this.read(cx, scopePath);
     const attGot = this.read(cx, "/api/attention");
@@ -1062,7 +1151,7 @@ export default class RigView extends View {
     const attentionItems = Array.isArray(attGot.data?.items)
       ? attGot.data.items
       : (Array.isArray(shared("rig.data")?.attention?.items) ? shared("rig.data").attention.items : null);
-    const rows = recentTransitionRows(got.data, topo, { missions, attentionItems });
+    const rows = recentTransitionRows(got.data, topo, { missions, attentionItems, timezone:this.uiTimezone });
     if (!rows.length) return this.dim(t, "Nothing yet.");
     return v_flex().id(`${idPrefix}-list`).gap(2).children(rows.map((r, i) => {
       let el = h_flex().id(`${idPrefix}-row-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).text_size(12);
@@ -1070,7 +1159,7 @@ export default class RigView extends View {
         el = el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => push(r.navEntry));
       }
       return el
-        .child(div().w(70).flex_none().truncate().text_color(t.dim).child(r.ts))
+        .child(div().min_w(70).flex_none().text_color(t.dim).child(r.ts))
         .child(div().w(140).flex_none().truncate().text_color(t.muted).child(r.actor))
         .child(div().w(120).flex_none().truncate().text_color(t.accent).child(r.change))
         .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(r.label))
@@ -1080,6 +1169,7 @@ export default class RigView extends View {
 
   /** Pods and seats as an indented tree (rig > pod > seat > helper) matching the sidebar grammar. */
   rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden = false }) {
+    const { compact, tight } = pageBodyLayout(this.pageWidth);
     if (!seats.length && !preserveHidden) return this.dim(t, this.filter ? "No matching seats." : "No seats.");
     const nativeSeats = this.read(cx, `/api/native-seats?rig=${encodeURIComponent(rig.name)}`).data?.seats
       ?? this.cache["/api/native-seats"]?.data?.seats
@@ -1106,26 +1196,26 @@ export default class RigView extends View {
         this.pageRows?.push({ key, foldKey: key, expandable: true, isOpen: podOpen, parentKey: rigKey(rig.id), entry: podEntry, seats: all,
           target: { kind: "pod", rig: rig.name, rigId: rig.id, pod: name, lifecycle } });
         const podSelected = this.pageSel === key;
-        const countPills = [[c.working, "working", "working"], [c.blocked, "blocked", "blocked"], [c.needs, "needs you", "blocked"], [c.idle, "idle", "idle"]].filter(([n]) => n)
+        const countPills = [[c.working, "working", "working"], [c.blocked, "blocked", "blocked"], [c.needs, "needs you", "blocked"], [c.idle, "idle", "idle"],[c.unreported,"not reported","dim"]].filter(([n]) => n)
           .map(([n, word, tone]) => div().id(`pod-count-${word.replaceAll(" ", "-")}-${podId}`).text_size(11.5)
-            .text_color(tone === "working" ? (t.ansi2 ?? t.working) : tone === "blocked" ? t.blocked : t.muted).child(`${n} ${word}`));
+            .text_color(tone === "working" ? (t.ansi2 ?? t.working) : tone === "blocked" ? t.blocked : tone==="dim"?t.dim:t.muted).child(`${n} ${word}`));
         if (!podOpen && podSeats.length) {
-          return h_flex().id(`pod-summary-${podId}`).pl(8).pr(8).h(26).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+          return h_flex().id(`pod-summary-${podId}`).pl(compact ? 0 : 8).pr(compact ? 0 : 8).when(!compact, el => el.h(26)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .when(podSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
             .on_click(() => toggleOpen(key, false, all))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim))
-            .child(div().text_size(12).font_medium().text_color(t.muted).child(`${label} · ${countText}`))
-            .children(countPills)
+            .child(div().text_size(12).font_medium().text_color(t.muted).child(tight ? label : `${label} · ${countText}`))
+            .child(h_flex().id(`pod-counts-${podId}`).gap(8).when(compact, el => el.w_full().flex_wrap()).children(countPills))
             .child(div().flex_1()).child(div().text_size(11.5).text_color(t.accent).child("Show all"));
         }
         return v_flex().id(`pod-tree-${podId}`).gap(2)
-          .child(h_flex().id(`topo-pod-${podId}`).pl(8).pr(8).h(26).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+          .child(h_flex().id(`topo-pod-${podId}`).pl(compact ? 0 : 8).pr(compact ? 0 : 8).when(!compact, el => el.h(26)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .when(podSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
             .on_click(() => toggleOpen(key, podOpen, all))
             .child(svg(icon(podOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
             .child(div().text_size(12).font_medium().text_color(t.foreground).child(label))
-            .child(div().text_size(11.5).text_color(t.dim).child(`· ${countText}`))
-            .children(countPills)
+            .when(!tight, el => el.child(div().text_size(11.5).text_color(t.dim).child(`· ${countText}`)))
+            .child(h_flex().id(`pod-counts-${podId}`).gap(8).when(compact, el => el.w_full().flex_wrap()).children(countPills))
             .child(div().flex_1())
             .when(all.length > 12, (el) => el.child(div().id(`pod-collapse-${podId}`).text_size(11.5).text_color(t.dim).cursor_pointer()
               .on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(key, true, all); }).child("Collapse"))))
@@ -1143,6 +1233,8 @@ export default class RigView extends View {
 
   /** A seat as an indented tree row (rig > pod > seat > helper) with runtime/model badge, slice badge, and quick actions. */
   seatChip(t, rig, s, lifecycle, { nativeSeat = null, seatNeed = null } = {}) {
+    const { compact, tight } = pageBodyLayout(this.pageWidth);
+    const rowStatus = seatNeed ? "needs_input" : s.status;
     if (!s.terminal) this.nowSeats?.set(s.session, s);
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
     const click = seatClickTarget(stripProps(), activeRigViewId(), s.session, panes?.() ?? [], terminals?.() ?? []);
@@ -1196,11 +1288,15 @@ export default class RigView extends View {
     const selected = this.pageSel === rowKey;
     const send = () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 260, props: { target: seatTarget, step: { input: true, placeholder: `Message to ${s.session}`, action: "send", multiLine: true } } });
     const queue = () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: seatTarget, step: { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true } } });
+    const answer = () => quickBtn(`seat-answer-${s.session}`, "Answer", () => {
+      openNeed(setShared, { section: "needs", id: seatNeed.id });
+      openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" });
+    }, { primary: true });
     this.seatActions[rowKey] = { send: s.terminal || sendReason ? null : send, queue: s.terminal || queueReason ? null : queue };
     return v_flex().id(`topo-seat-${s.session}`).gap(2)
       // One pattern per row: quiet unless selected; a click on the body selects, a double-click or the
       // name opens; the selected row shows Send… and Queue…; ⋯ is the right-click menu.
-      .child(h_flex().id(`topo-seat-row-${s.session}`).pl(12).pr(8).h(28).gap(6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
+      .child(h_flex().id(`topo-seat-row-${s.session}`).pl(compact ? 0 : 12).pr(compact ? 0 : 8).h(28).gap(compact ? 4 : 6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
         .when(selected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
         .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) go(); else this.selectPageRow(rowKey, cx); })
         .on_mouse_down("right", () => menu(seatTarget))
@@ -1208,33 +1304,32 @@ export default class RigView extends View {
           ? div().id(`topo-seat-fold-${s.session}`).w(12).flex_none().text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); setOpen(hKey, !openHelpers); })
             .child(svg(icon(openHelpers ? "chevron-down" : "chevron-right")).size(12))
-          : div().w(12).flex_none())
+          : div().w(compact ? 0 : 12).flex_none())
         .child(h_flex().id(`seat-chip-${s.session}`).flex_1().min_w(0).h(24).gap(6).items_center()
-          .child(this.dot(t, s.status,14,s.session,this.statusMotion.seatNeeds(s.session,rig.name,s.logicalId)))
+          .child(this.dot(t, rowStatus,14,s.session,this.statusMotion.seatNeeds(s.session,rig.name,s.logicalId)))
           .child(div().id(`seat-name-${s.session}`).text_size(12.5).text_color(t.foreground).hover((e) => e.text_color(t.accent))
+            .when(compact, el => el.flex_1().min_w(0).truncate().tooltip(s.logicalId))
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); })
-            .child(s.logicalId))
-          .child(div().text_size(11.5).text_color(t[statusMark(s.status).word] ?? t.muted).child(s.word))
-          .when(!!runtimeBadge, (el) => el.child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
+            .child(tight ? s.logicalId?.split(".").at(-1) ?? s.logicalId : s.logicalId))
+          .when(!tight, el => el.child(div().id(`seat-status-${s.session}`).text_size(11.5).text_color(t[statusMark(rowStatus).word] ?? t.muted).child(seatNeed ? "needs you" : s.word)))
+          .when(!!runtimeBadge && !compact, (el) => el.child(div().id(`seat-runtime-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .font_family(settings().font_family).text_size(11).text_color(t.dim).child(runtimeBadge)))
-          .when(!!s.slice, (el) => el.child(div().id(`seat-slice-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
+          .when(!!s.slice && !compact, (el) => el.child(div().id(`seat-slice-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .text_size(11).text_color(t.accent).cursor_pointer()
             .on_click((_e, cx) => { cx?.stop_propagation?.(); push({ section: "scopes", slice: s.slice }); })
             .child(String(s.slice))))
-          .when(!s.terminal, el => el.child(this.nowRow(t, { ...s, rig: rig.name }, () => push(seatEntry))))
-          .when(click.kind === "card", (el) => el.child(div().id(`seat-go-${s.session}`).text_size(12).text_color(t.dim)
+          .when(!s.terminal && !compact, el => el.child(this.nowRow(t, { ...s, rig: rig.name }, () => push(seatEntry))))
+          .when(click.kind === "card" && !tight, (el) => el.child(div().id(`seat-go-${s.session}`).text_size(12).text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); }).child("›"))))
         .child(h_flex().gap(4).items_center().flex_none()
           // Answer can't wait: it stays on the row whenever the seat has an open request.
-          .when(!!seatNeed, (el) => el.child(quickBtn(`seat-answer-${s.session}`, "Answer", () => {
-            openNeed(setShared, { section: "needs", id: seatNeed.id });
-            openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" });
-          }, { primary: true })))
+          .when(!!seatNeed && !compact, (el) => el.child(answer()))
           // A terminal seat is a person's shell, not an agent: no message or work to give it.
-          .when(selected && !s.terminal, (el) => el
+          .when(selected && !s.terminal && !compact, (el) => el
             .child(quickBtn(`seat-send-${s.session}`, "Send…", send, { disabled: !!sendReason, tooltip: sendReason }))
             .child(quickBtn(`seat-queue-${s.session}`, "Queue…", queue, { disabled: !!queueReason, tooltip: queueReason })))
           .child(this.moreButton(t, `seat-more-${s.session}`, () => menu(seatTarget)))))
+      .when(!!seatNeed && compact, el => el.child(h_flex().id(`seat-answer-line-${s.session}`).pl(18).pb(4).child(answer())))
       .children(openHelpers ? helpers.map((child, idx) =>
         h_flex().id(`topo-helper-${s.session}-${idx}`).pl(36).pr(8).h(24).gap(6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
           .on_click(() => run("terminal.peek", { terminal: child.address }))
@@ -1326,10 +1421,10 @@ export default class RigView extends View {
     const queueWarnings = [qGot.error, finishedGot.error].filter(Boolean);
     const depthText = queue.partial ? `at least ${queue.count}` : formatHonestCount(queue.count, { unknown: !queue.available });
     const ownedText = depthText;
-    const basisText = qGot.error ? (queue.available ? `last successful read · ${asOf(qGot.at)}` : "unavailable") : queue.available ? "live queue" : "reading…";
+    const basisText = qGot.error ? (queue.available ? `last successful read · ${`as of ${this.time(qGot.at)}`}` : "unavailable") : queue.available ? "live queue" : "reading…";
     const queueEmpty = (text) => queue.available ? text : qGot.error ? "Queue unavailable." : "Reading queue…";
-    const activity = seatActivityDetails(n);
-    const activityWords = seatActivityWords(n);
+    const activity = seatActivityDetails(n,Date.now(),this.uiTimezone);
+    const activityWords = seatActivityWords(n,Date.now(),this.uiTimezone);
 
     const attGot = this.read(cx, "/api/attention");
     const allNeeds = (attGot.data?.items ?? shared("rig.data")?.attention?.items ?? []).map(needTarget);
@@ -1391,39 +1486,34 @@ export default class RigView extends View {
       oneClick(target, "open-seat", "seat-focus-pane");
     };
 
-    return v_flex().id(`seat-page-${entry.name}`).gap(12)
-      // The chair marks a seat; its status has its own mark beside the name.
-      .child(h_flex().id("seat-title").gap(6).items_center()
-        .child(svg(icon("rig-seat")).size(15).flex_none().text_color(t.foreground))
-        .child(this.title(t, entry.name))
-        .child(this.dot(t, rawStatus,14,n.canonicalSessionName,seatNeeds.map(it=>it.id)))
-        .child(div().text_size(13).text_color(t[statusMark(rawStatus).word] ?? t.muted).child(look.word))
-        .child(div().text_size(13).text_color(t.muted).child(`· ${entry.rig}`)))
-      .when(!isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && push(fileEntry(transcript, `${entry.name} transcript`)))))
-      .child(h_flex().gap(6).items_center().flex_wrap()
-        .child(this.button(t, "seat-attach", "Attach", doAttach, { primary: !stoppedSeat, small: true, iconName: "terminal", disabled: stoppedSeat, tooltip: attachReason }))
-        .child(this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason }))
-        .child(this.button(t, "seat-open-terminal", "Open terminal", () => oneClick(target, "open-seat", "seat-open-terminal"), { small: true, iconName: "rig-view", disabled: !!seatViewReason, tooltip: seatViewReason, actionKey: "open-seat" }))
+    const tab=entry.seatTab??"activity";
+    this.pageHeading={title:entry.name,tone:seatNeeds.length?"needs_input":rawStatus,session:n.canonicalSessionName,status:[seatNeeds.length?"needs you":look.word,n.runtime,n.model??n.resolvedModel,entry.rig].filter(Boolean).join(" · ")};
+    this.inPageActions=true;
+    this.pageActions=h_flex().gap(6).items_center().flex_none()
+        .when((this.pageWidth??960)<320,el=>el.flex_wrap().max_w(Math.max(100,this.pageWidth-28)))
+        .child(live.kind !== "card"
+          ? this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { primary: true, small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason })
+          : this.button(t, "seat-attach", "Attach", doAttach, { primary: !stoppedSeat, small: true, iconName: "terminal", disabled: stoppedSeat, tooltip: attachReason }))
         // A terminal seat is a person's shell, not an agent: no message, work or model to give it.
         .when(!isTerminalSeat(n), (el) => el
           .child(this.button(t, "seat-act-send", "Send…", () => dialog({ input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }, 260), { small: true, iconName: "rig-send", disabled: !!sendReason, tooltip: sendReason }))
-          .child(this.button(t, "seat-act-queue", "Queue…", () => dialog({ input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), { small: true, iconName: "rig-queue", disabled: !!queueReason, tooltip: queueReason }))
-          .child(this.button(t, "seat-act-model", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), { small: true, iconName: "rig-swap", disabled: !!modelReason, tooltip: modelReason })))
-        .child(this.button(t, "seat-act-view", "Show in worker view", () => oneClick(target, "open-seat", "seat-act-view"), { small: true, iconName: "rig-view", disabled: !!seatViewReason, tooltip: seatViewReason, actionKey: "open-seat" }))
-        .when(live.kind !== "card", (el) => el.child(this.button(t, "seat-act-keyboard", "Take keyboard", () => oneClick({ ...target, kind: "cell", terminal: live.terminal }, "keyboard", "seat-act-keyboard"), { small: true, iconName: "rig-keyboard", actionKey: "keyboard" })))
-        .child(div().flex_1()).child(this.button(t, "seat-act-more", "⋯", () => menu(target), { small: true })))
+          .child(this.button(t, "seat-act-queue", "Queue…", () => dialog({ input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), { small: true, iconName: "rig-queue", disabled: !!queueReason, tooltip: queueReason })))
+        .child(this.button(t, "seat-act-more", "⋯", () => menu(target), { small: true }));
+    this.inPageActions=false;
+    return v_flex().id(`seat-page-${entry.name}`).gap(12)
+      .when(tab === "activity" && !isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && push(fileEntry(transcript, `${entry.name} transcript`)))))
       .when(!!seatViewReason, (el) => el.child(this.workerCapabilityNote(t, seatViewReason)))
       // 1. CONTEXT section
-      .child(v_flex().id("seat-section-context").child(this.card(t, ctx != null ? `CONTEXT · ${ctx}%` : "CONTEXT", [
-        h_flex().id("seat-context-bar").gap(10).items_center()
-          .child(div().w(120).text_size(12).text_color(t.dim).child("Context"))
+      .when(tab === "activity", el => el.child(v_flex().id("seat-section-context").child(this.card(t, ctx != null ? `CONTEXT · ${ctx}%` : "CONTEXT", [
+        (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("seat-context-bar").gap(10).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center())
+          .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.w(120)).text_size(12).text_color(t.dim).child("Context"))
           .child(ctx == null
             ? div().text_size(12.5).child("Not reported by this runtime")
-            : h_flex().gap(8).items_center()
-                .child(div().w(160).h(6).rounded(3).bg(t.raised).child(div().h_full().rounded(3).w(Math.max(2, Math.min(160, 1.6 * rawCtx))).bg(ctxWarn ? t.blocked : t.accent)))
+            : h_flex().gap(8).items_center().when(pageBodyLayout(this.pageWidth).compact, el => el.w_full().flex_wrap())
+                .child(div().w(pageBodyLayout(this.pageWidth).compact ? 80 : 160).h(6).rounded(3).bg(t.raised).child(div().h_full().rounded(3).w(Math.max(2, Math.min(pageBodyLayout(this.pageWidth).compact ? 80 : 160, (pageBodyLayout(this.pageWidth).compact ? .8 : 1.6) * rawCtx))).bg(ctxWarn ? t.blocked : t.accent)))
                 .child(div().id("seat-context-pct").text_size(12).text_color(ctxWarn ? t.blocked : t.muted).when(ctxWarn, (d) => d.font_semibold()).child(`${ctx}%`))
                 // One bar: the token counts sit on its row.
-                .when(contextWindow != null, (el) => el.child(div().id("seat-context-tokens").text_size(12).text_color(t.muted).child(
+                .when(contextWindow != null, (el) => el.child(div().id("seat-context-tokens").when(pageBodyLayout(this.pageWidth).compact, e => e.w_full()).text_size(12).text_color(t.muted).child(
                   `${fmtTok(contextWindow)} token window${inputTokens != null ? ` · ${fmtTok(inputTokens)} input` : ""}${outputTokens != null ? ` · ${fmtTok(outputTokens)} output` : ""}`)))),
         this.kv(t, [
           ["Runtime", n.runtime],
@@ -1436,13 +1526,13 @@ export default class RigView extends View {
           ? div().id("seat-open-terminal-link").text_size(12).text_color(t.dim)
             .tooltip(seatViewReason ?? "")
             .child("This seat has no running terminal to attach.")
-          : h_flex().id("seat-open-terminal-link").gap(6).items_center().cursor_pointer()
+          : (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("seat-open-terminal-link").gap(6).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center()).cursor_pointer()
               .on_click(() => oneClick(target, "open-seat", "seat-open-terminal"))
-              .child(div().w(120).text_size(12).text_color(t.dim).child("Terminal"))
+              .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.w(120)).text_size(12).text_color(t.dim).child("Terminal"))
               .child(div().text_size(12.5).text_color(t.accent).child("Open terminal ▸"))]),
-      ])))
+      ]))))
       // 2. CURRENT ACTIVITY section
-      .child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
+      .when(tab === "activity", el => el.child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
         div().text_size(12.5).child(activityWords.line),
         ...[activityWords.note, activityWords.changed, activityWords.stale].filter(Boolean).map(text => this.dim(t, text)),
         h_flex().id("seat-evidence-fold").gap(5).items_center().cursor_pointer().text_color(t.muted)
@@ -1458,26 +1548,26 @@ export default class RigView extends View {
           ["signal", activity.signal],
           ["changed", activity.changed],
         ].map(([key, value]) => [key, value, true]))] : []),
-      ])))
+      ]))))
       // 3. HEALTH section
-      .child(v_flex().id("seat-section-health").child(this.card(t, "HEALTH", seatFindings.length
+      .when(tab === "activity", el => el.child(v_flex().id("seat-section-health").child(this.card(t, "HEALTH", seatFindings.length
         ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => push({ section: "system", subview: "health" }))
             .child(div().text_size(12).text_color(t.blocked).child(`[${f.severity ?? "warn"}]`))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(singleLineText(f.summary ?? f.id ?? "finding")))
             .child(div().text_size(11.5).text_color(t.dim).child(f.status ?? "open"))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim)))
-        : [this.dim(t, "No health findings for this seat.")])))
+        : [this.dim(t, "No health findings for this seat.")]))))
       // 4. CURRENT WORK section
-      .child(v_flex().id("seat-section-current-work").child(this.card(t, `CURRENT WORK · ${currentWork.length}`, currentWork.length
+      .when(tab === "queue", el => el.child(v_flex().id("seat-section-current-work").child(this.card(t, `CURRENT WORK · ${currentWork.length}`, currentWork.length
         ? currentWork.map((it, i) => h_flex().id(`seat-work-current-${i}`).gap(8).items_center().text_size(12.5)
             .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `work-${i}`)))
             .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(singleLineText(it.summary ?? it.title ?? "—")))
             .when(!!it.sourceSession, (el) => el.child(div().text_size(11.5).text_color(t.muted).child(singleLineText(`from ${it.sourceSession}`))))
             .when(!!it.priority, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(String(it.priority)))))
-        : [this.dim(t, queueEmpty("No active claimed work."))])))
+        : [this.dim(t, queueEmpty("No active claimed work."))]))))
       // 5. QUEUE section (warnings, depth, basis, UP NEXT, NEEDS YOU, RECENTLY FINISHED)
-      .child(v_flex().id("seat-section-queue").child(this.card(t, "QUEUE", [
+      .when(tab === "queue", el => el.child(v_flex().id("seat-section-queue").child(this.card(t, "QUEUE", [
         ...queueWarnings.map((w, i) => div().id(`seat-queue-warn-${i}`).text_size(12).text_color(t.blocked).child(String(w))),
         this.kv(t, [
           ["Owned work", ownedText],
@@ -1518,9 +1608,9 @@ export default class RigView extends View {
                 .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `done-${i}`)))
                 .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(singleLineText(it.summary ?? it.title ?? "—"))))
             : [this.dim(t, queue.finishedAvailable ? "None recent." : finishedGot.error ? "Finished work unavailable." : "Reading finished work…")]),
-      ])))
+      ]))))
       // 6. SEAT section (host, rig, pod, cwd + placement)
-      .child(v_flex().id("seat-section-seat").child(this.card(t, "SEAT", [
+      .when(tab === "files", el => el.child(v_flex().id("seat-section-seat").child(this.card(t, "SEAT", [
         this.kv(t, [
           ["Host", hostOf(n) ?? "this machine"],
           ["Rig", entry.rig],
@@ -1538,9 +1628,9 @@ export default class RigView extends View {
             .on_click(() => push({ section: "topology", kind: "pod", rig: entry.rig, rigId: entry.rigId, pod: podName, name: podName }))
             .child(div().text_size(11.5).text_color(t.accent).child(`pod ${podName} ▸`))),
         this.nativePart(t, cx, entry.rig, n.canonicalSessionName),
-      ])))
+      ]))))
       // 7. SPEC section (linked spec or (not in library), profile, version, source hash, basis)
-      .child(v_flex().id("seat-section-spec").child(this.card(t, "SPEC", [
+      .when(tab === "files", el => el.child(v_flex().id("seat-section-spec").child(this.card(t, "SPEC", [
         n.resolvedSpecName
           ? h_flex().id("seat-spec").gap(8).items_center().cursor_pointer()
               .on_click(() => push({ section: "specs", specOf: n.logicalId, name: `spec of ${n.logicalId}` }))
@@ -1554,9 +1644,9 @@ export default class RigView extends View {
           ["source hash", n.resolvedSpecHash ?? n.sourceHash ?? "—", true],
           ["basis", n.resolvedSpecBasis ?? n.specBasis ?? (n.resolvedSpecName ? "resolved at launch" : "none")],
         ]),
-      ])))
-      .child(this.helpersPart(t, cx, entry.rig, n.canonicalSessionName))
-      .when(!!transcript, (el) => el.child(this.card(t, "Files", [this.fileRow(t, "seat-transcript", transcript, `Transcript · ${entry.name}`)])));
+      ]))))
+      .when(tab === "activity", el => el.child(this.helpersPart(t, cx, entry.rig, n.canonicalSessionName)))
+      .when(tab === "files" && !!transcript, (el) => el.child(this.card(t, "Files", [this.fileRow(t, "seat-transcript", transcript, `Transcript · ${entry.name}`)])));
   }
 
   /** Placement: a native seat's terminal and how it ends. */
@@ -1619,7 +1709,9 @@ export default class RigView extends View {
       if (wait) return wait;
       const known = lib.data.find((s) => s.id === entry.id);
       if (!known) return this.dim(t, `${entry.name ?? entry.id} isn't in the spec library.`);
-      return v_flex().gap(12).child(this.title(t, known.name))
+      this.pageSpec=known;
+      this.activePageView=selectedPageView(entry,this.pageViewMemory??={},known);
+      return v_flex().gap(12)
         .when(!!entry.specFor, (el) => el.child(this.dim(t, `Spec for ${entry.specFor}`)))
         .child(this.specBody(t, cx, known, true));
     }
@@ -1709,7 +1801,7 @@ export default class RigView extends View {
     const mac = window()?.platform === "macos";
     const dirty = this.specDirty(box);
     const editing = Boolean(box.editing) && !isBuiltin;
-    const rigSpec=s.kind==="rig",graphView=rigSpec&&(box.view??(editing?"yaml":"graph"))==="graph";
+    const rigSpec=s.kind==="rig",graphView=rigSpec&&(single&&this.activePageView?this.activePageView:box.view??(editing?"yaml":"graph"))==="graph";
     if(graphView)this.wideGraph=true;
     if(rigSpec&&!box.graph&&!box.graphLoading&&!box.graphError)this.loadSpecGraph(cx,s,box);
     const pills = this.runningRigsOf(cx, s);
@@ -1718,18 +1810,18 @@ export default class RigView extends View {
       : (editing ? "Cancel edit" : "Edit");
     const copyReason = isBuiltin ? personDisableReason("specs-add", this.config) : null;
     const remoteEdit = !isBuiltin && Boolean(this.config?.daemonMachine);
-    const guidance = box.note || (remoteEdit ? this.specRefusal() : null);
-    const saveDisabled = isBuiltin || !editing || !dirty || Boolean(box.saving);
-    const openDisabled = !s.sourcePath;
+    const guidance = [box.note || (remoteEdit ? this.remoteSpecGuidance() : null), this.specCopyNotes?.[s.id]].filter(Boolean).join(" ") || null;
+    const saveDisabled = isBuiltin || !editing || !dirty || Boolean(box.saving || box.awaitingPermission);
+    const openDisabled = !s.sourcePath || Boolean(this.config?.daemonMachine);
     const toolbar = h_flex().gap(8).items_center().flex_wrap()
-      .when(rigSpec,el=>el.child(h_flex().rounded(6).border_1().border_color(t.border).children(["graph","yaml"].map(view=>
+      .when(rigSpec&&!single,el=>el.child(h_flex().rounded(6).border_1().border_color(t.border).children(["graph","yaml"].map(view=>
         this.button(t,`spec-view-${view}-${s.id}`,view==="graph"?"Graph":"YAML",(_e,cx)=>{box.view=view;cx.notify();},{small:true})
           .when((view==="graph")===graphView,el=>el.bg(t.accent).text_color(t.solid_foreground)
             .hover(st=>st.bg(t.accent)))))))
       .child(this.button(t, sfx(isBuiltin ? "spec-copy" : "spec-edit", true), editLabel, (_e, cx) => this.toggleEditSpec(cx, s, isBuiltin), {
-        primary: !editing && !copyReason && !remoteEdit,
+        primary: !editing && !copyReason,
         iconName: editing ? "x" : "layers",
-        disabled: Boolean(box.loading || box.copying || box.saving || copyReason || remoteEdit),
+        disabled: Boolean(box.loading || box.copying || box.saving || box.awaitingPermission || copyReason),
         tooltip: remoteEdit ? `Edit on ${this.config.daemonMachine}` : copyReason,
       }))
       .when(!graphView,el=>el.child(this.button(t, sfx("spec-save", true), box.saving ? "Saving…" : `Save ${mac ? "⌘↵" : "Ctrl+↵"}`, (_e, cx) => this.saveSpec(cx, s), {
@@ -1738,11 +1830,11 @@ export default class RigView extends View {
         disabled: saveDisabled,
       })))
       .child(this.button(t, sfx("spec-open", true), "Open file", () => {
-        if (s.sourcePath) push(fileEntry(s.sourcePath, `${s.name} · spec`));
+        if (s.sourcePath && !this.config?.daemonMachine) push(fileEntry(s.sourcePath, `${s.name} · spec`));
       }, {
         iconName: "file-text",
         disabled: openDisabled,
-        tooltip: openDisabled ? "Built-in spec has no file path on disk" : null,
+        tooltip: this.config?.daemonMachine ? `This file is on ${this.config.daemonMachine}.` : openDisabled ? "Built-in spec has no file path on disk" : null,
       }))
       .children(pills.map((r) => h_flex().id(`spec-rig-pill-${s.id}-${r.name}`).px(8).h(24).gap(5).items_center().rounded(12).text_size(12).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((e) => e.bg(t.hover)).on_click(() => this.openRigFromSpec(r))
@@ -1752,12 +1844,14 @@ export default class RigView extends View {
       .when(dirty, (el) => el.child(div().text_size(11.5).text_color(t.working).child("● Unsaved changes")))
       .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:460,height:300,
         props:{target:{kind:"spec",id:s.id,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{primary:true,iconName:"rig-play"})))
-      .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().child(div().text_size(11.5).text_color(t.dim).child("Restored unsaved edits"))
-        .child(this.button(t, `spec-discard-draft-${s.id}`, "Discard", (_e, cx) => this.discardDraft(cx, s), { small: true }))));
+      .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().flex_wrap().child(div().text_size(11.5).text_color(t.muted).child(this.config?.daemonMachine
+        ? `Restored your unsaved edits from ${this.time(box.draftAt??Date.now())}.` : "Restored unsaved edits"))
+        .child(this.button(t, `spec-discard-draft-${s.id}`, this.config?.daemonMachine?"Discard edits":"Discard", (_e, cx) => this.discardDraft(cx, s), { small: true }))));
     const errors = box.errors ?? [];
+    if(single){this.pageActions=toolbar;this.pageHeading={title:s.name,status:`${s.kind??"spec"}${s.version?` · ${s.version}`:""}`};}
     return v_flex().gap(8)
       .child(this.kv(t, [["Kind", s.kind], ["Version", s.version], ["Summary", s.summary], ["File", `${s.sourcePath ?? "not a file on disk"}${this.config?.daemonMachine ? ` · on ${this.config.daemonMachine}` : ""}`, true]]))
-      .child(toolbar)
+      .when(!single,el=>el.child(toolbar))
       .when(!!box.builtinEditNote && !guidance, (el) => el.child(this.dim(t, box.builtinEditNote)))
       .when(Boolean(box.confirmDiscardEdit || box.confirmRevert), (el) => el.child(
         h_flex().id(`spec-discard-bar-${s.id}`).gap(8).items_center()
@@ -1767,9 +1861,10 @@ export default class RigView extends View {
       ))
       .when(!!box.savedText && !dirty, (el) => el.child(this.dim(t, box.savedText)))
       .when(!!guidance, (el) => el.child(this.specNoteView(t, guidance, s.id)))
-      .when(!!box.conflict, (el) => el.child(h_flex().gap(8).items_center().child(div().text_size(12).text_color(t.blocked).child(box.conflict))
+      .when(!!box.conflict, (el) => el.child(v_flex().gap(6).min_w(0).child(div().text_size(12).text_color(t.blocked).child(box.conflict))
+        .child(h_flex().gap(8).items_center().flex_wrap()
         .child(this.button(t, `spec-reload-${s.id}`, box.confirmReload ? "Click Reload again to discard edits" : "Reload", (_e, cx) => this.reloadSpec(cx, s, isBuiltin)))
-        .child(this.button(t, `spec-keep-editing-${s.id}`, "Keep editing", (_e, cx) => this.keepEditing(cx, s)))))
+        .child(this.button(t, `spec-keep-editing-${s.id}`, "Keep editing", (_e, cx) => this.keepEditing(cx, s))))))
       .children(errors.map((e, i) => div().id(`spec-error-${s.id}-${i}`).text_size(12).text_color(t.blocked).child(String(e))))
       .when(graphView&&dirty,el=>el.child(this.dim(t,"Showing the saved spec. Save to update the graph.")))
       .child(graphView ? (box.graph?this.graphFor(`spec:${s.id}`).render(t,cx,box.graph,{id:`spec-graph-${s.id}`,assets:ASSETS})
@@ -1785,7 +1880,7 @@ export default class RigView extends View {
 
   /** Creates and wires an EditorState for a spec box with the requested `readonly` state. */
   makeSpecEditorState(s, box, value, readonly) {
-    const key = specDraftKey(s.id);
+    const key = specDraftKey(s.id,this.config);
     box.state?.release?.();
     const state = EditorState.new({ language: "yaml", value, readonly: Boolean(readonly), font_family: settings().font_family });
     state.on("change", (_e, cx) => {
@@ -1812,8 +1907,15 @@ export default class RigView extends View {
   }
 
   specNoteView(t, note, id) {
+    const machine=this.config?.daemonMachine,command=`hc machine login ${machine}`;
+    if(machine&&note.startsWith(`${machine} is unreachable, so nothing was saved.`)&&note.includes(command)){
+      const [before,after]=note.split(command);
+      return h_flex().gap(4).items_center().flex_wrap().text_size(12).text_color(t.blocked)
+        .child(div().child(before)).child(div().id(`spec-reconnect-${id}`).font_family(settings()?.font_family??"monospace").child(command))
+        .child(this.copyButton(t,command,`spec-reconnect-${id}`,"reconnect command")).child(div().child(after));
+    }
     const marker = "daemonMachine";
-    const guidance = note === this.specRefusal();
+    const guidance = note === this.specRefusal() || note === this.remoteSpecGuidance();
     const tone = guidance ? t.muted : t.blocked;
     if (!guidance || !note.includes(marker)) return div().text_size(12).text_color(tone).child(note);
     const [before, after] = note.split(marker);
@@ -1823,12 +1925,23 @@ export default class RigView extends View {
       .child(div().child(after));
   }
 
+  remoteSpecGuidance(){
+    const machine=this.config?.daemonMachine;
+    return `Save writes this spec on ${machine}.`+(this.specConsentMachine===machine?"":" The first save asks for permission.");
+  }
+
+  specConflictMessage(){
+    const machine=this.config?.daemonMachine;
+    return machine?`The spec changed on ${machine} since you opened it. Reload shows the new version and discards your unsaved edits. Keep editing keeps your version; saving then replaces the change on ${machine}.`:"The file changed on disk since you opened it.";
+  }
+
   /** Toggle editable mode; Copy & edit copies a built-in into the user library. */
   toggleEditSpec(cx, s, isBuiltin) {
     const box = this.specBoxes?.[s.id];
     if (!box) return;
-    if (!isBuiltin && this.config?.daemonMachine) { box.note = this.specRefusal(); cx.notify(); return; }
     box.view="yaml";
+    const current=nav().stack?.at(-1);
+    if(current?.section==="specs"&&(current.id===s.id||current.name===s.name))push({...current,specTab:"yaml"});
     if (isBuiltin) {
       box.builtinEditNote = "Copy & edit makes your own copy; the built-in stays unchanged.";
       this.copySpec(cx, s);
@@ -1857,7 +1970,7 @@ export default class RigView extends View {
   confirmDiscardEditSpec(cx, s, isBuiltin) {
     const box = this.specBoxes?.[s.id];
     if (!box) return;
-    setDraft(specDraftKey(s.id), null);
+    setDraft(specDraftKey(s.id,this.config), null);
     box.editing = false;
     box.confirmDiscardEdit = false;
     box.confirmRevert = false;
@@ -1877,17 +1990,18 @@ export default class RigView extends View {
       await Promise.resolve();
       try {
         const text = await this.specText(s);
-        const key = specDraftKey(s.id), raw = (shared("rig.drafts") ?? {})[key];
+        const key = specDraftKey(s.id,this.config), raw = (shared("rig.drafts") ?? {})[key];
         const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
         let initial = text;
         box.loaded = text; box.diskText = null; box.restoredDraft = false;
         if (draft && !isBuiltin && draft.text !== text) {
+          box.draftAt=draft.at;
           initial = draft.text;
           box.editing = true;
           if (draft.baseText === text || (draft.baseHash && draft.baseHash === simpleHash(text))) box.restoredDraft = true;
           else {
             box.loaded = draft.baseText ?? text; box.diskText = text;
-            box.conflict = "The file changed on disk since you opened it.";
+            box.conflict = this.specConflictMessage();
           }
         }
         box.editing = Boolean(box.editing) && !isBuiltin;
@@ -1903,7 +2017,7 @@ export default class RigView extends View {
   reloadSpec(cx, s, isBuiltin) {
     const box = this.specBoxes[s.id];
     if (this.specDirty(box) && !box.confirmReload) { box.confirmReload = true; cx.notify(); return; }
-    setDraft(specDraftKey(s.id), null);
+    setDraft(specDraftKey(s.id,this.config), null);
     this.specBoxes[s.id] = { loading: true, editing: false, view:box.view };
     this.loadSpec(cx, s, isBuiltin, this.specBoxes[s.id]);
     box.state?.release?.();
@@ -1916,7 +2030,7 @@ export default class RigView extends View {
     if (!box) return;
     box.conflict = null; box.confirmReload = false; box.editing = true;
     box.loaded = box.diskText ?? box.loaded; box.diskText = null;
-    if (box.state) setDraft(specDraftKey(s.id), this.specDirty(box) ? { text: box.state.value(), baseText: box.loaded, baseHash: simpleHash(box.loaded) } : null);
+    if (box.state) setDraft(specDraftKey(s.id,this.config), this.specDirty(box) ? { text: box.state.value(), baseText: box.loaded, baseHash: simpleHash(box.loaded) } : null);
     cx.notify();
   }
 
@@ -1924,7 +2038,7 @@ export default class RigView extends View {
   discardDraft(cx, s) {
     const box = this.specBoxes?.[s.id];
     if (!box?.state) return;
-    setDraft(specDraftKey(s.id), null);
+    setDraft(specDraftKey(s.id,this.config), null);
     box.restoredDraft = false; box.confirmRevert = false; box.confirmDiscardEdit = false; box.editing = false;
     this.makeSpecEditorState(s, box, box.loaded, true);
     cx.notify();
@@ -1936,7 +2050,7 @@ export default class RigView extends View {
     if (!box?.state) return;
     if (this.specDirty(box) && !box.confirmRevert) { box.confirmRevert = true; cx.notify(); return; }
     box.state.set_value(box.loaded);
-    setDraft(specDraftKey(s.id), null);
+    setDraft(specDraftKey(s.id,this.config), null);
     box.confirmRevert = false; box.confirmDiscardEdit = false; box.errors = null; box.conflict = null; box.restoredDraft = false;
     cx.notify();
   }
@@ -1949,7 +2063,9 @@ export default class RigView extends View {
     const edited = box.state.value();
     box.errors = null; box.conflict = null; box.note = null; box.savedText = null;
     const refused = this.specRefusal();
-    if (this.config?.daemonMachine) { box.note = refused; cx.notify(); return; }
+    if (this.config?.daemonMachine) {
+      this.remoteSpecWrite(cx,s,{verb:"save",target:s.sourcePath,baseText:box.loaded,content:edited});return;
+    }
     if (unsafeSpecWritePath(s.sourcePath)) { box.note = refused; cx.notify(); return; }
     if (!this.config) { box.note = "The daemon address isn't known yet."; cx.notify(); return; }
     box.saving = true; cx.notify();
@@ -1981,7 +2097,7 @@ export default class RigView extends View {
         box.savedText = synced?.ok ? "Saved." : "Saved; library re-index failed.";
         if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
-        const key = specDraftKey(s.id), now = box.state.value();
+        const key = specDraftKey(s.id,this.config), now = box.state.value();
         setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
         if (now === edited) {
           box.editing = false;
@@ -1998,7 +2114,7 @@ export default class RigView extends View {
    *  the daemon's own copy, even when their sourcePath happens to name a local spec. */
   async specText(s) {
     const path=rigSpecLibraryPath(s);if(!path)throw new Error("This library entry has no usable spec id.");
-    const file = s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
+    const file = !this.config?.daemonMachine && s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
     let text = file ? await readTextFile(file).catch(() => null) : null;
     if (text == null && this.config) {
       const daemonUrl = await this.resolveDaemonUrl();
@@ -2041,10 +2157,17 @@ export default class RigView extends View {
     const box = this.specBoxes?.[s.id];
     if (!box || box.copying) return;
     if (!this.config?.person) { box.note = NO_PERSON; cx.notify(); return; }
+    if(this.config.daemonMachine){
+      this.remoteSpecWrite(cx,s,{verb:"copy",name:s.name});return;
+    }
     box.copying = true; box.note = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const text = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s) : await this.specText(s);
+        const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s) : await this.specText(s);
+        // Agent refs relative to the original's folder are made absolute (text only); a copy that couldn't find its agents is never written.
+        const prepared = copyableSpecText(source, s.sourcePath);
+        if (prepared.refused) { box.note = prepared.refused; return; }
+        const text = prepared.text;
         const written = await this.writeSpecCopy(s, text);
         // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
         const file = await resolveInSpecRoots(written, this.specRoots, exec);
@@ -2068,6 +2191,8 @@ export default class RigView extends View {
         if (made !== s.id) {
           delete this.specBoxes?.[made];
           (this.specAutoEdit ??= new Set()).add(made);
+          const lacking = s.sourceType === "user_file" ? null : siblingFileNote(siblingFileNames(text));
+          if (lacking) (this.specCopyNotes ??= Object.create(null))[made] = lacking;
         }
         setOpen(`spec:${made}`, true);
         // On the one-spec page the page itself moves to the copy.
@@ -2075,6 +2200,77 @@ export default class RigView extends View {
         if (copy && top?.section === "specs" && top.id === s.id) setShared("rig.nav", { stack: [...stack.slice(0, -1), { section: "specs", id: made, name: copy.name ?? s.name }] });
       } catch (e) { box.note = String(e?.message ?? e); }
       finally { box.copying = false; cx.notify(); }
+    });
+  }
+
+  remoteSpecController(cx) {
+    const bridge=attachRelayPath(appHome(),MOD_IDS.view).replace(/rig-attach-relay\.cjs$/,"rig-spec-transport.cjs");
+    return new RemoteSpecs({exec,hc,machines,wait:waitWith(cx),appHome:appHome(),specBridgePath:bridge,
+      health:async url=>{const r=await fetch(`${url}/healthz`);if(!r.ok)throw Error("OpenRig isn't answering.");return JSON.parse(await r.text());},
+      currentConfig:async()=>preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())),this.config),
+      writeText:writeTextFile,
+      readSpecConsent:async()=>{const text=await readTextFile(`${appHome()}/openrig/spec-consent.json`);return text?JSON.parse(text):null;},
+      writeSpecConsent:async value=>{
+        const path=`${appHome()}/openrig/spec-consent.json`,previous=await readTextFile(path);
+        return writeTextFile(path,JSON.stringify(value),previous??null);
+      },
+    });
+  }
+
+  /** Remote targets go only to the pinned box helper; registration is HTTP-only. */
+  remoteSpecWrite(cx,s,request,consent=null) {
+    const box=this.specBoxes?.[s.id];if(!box||box.saving||box.copying||box.awaitingPermission)return;
+    const config={...this.config};box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
+    cx.spawn(async cx=>{
+      try{
+        const daemonUrl=await this.resolveDaemonUrl();if(!daemonUrl)throw Error("The daemon address isn't known yet.");
+        let content=request.content??await this.specText(s);
+        if(request.verb==="copy"){
+          const prepared=copyableSpecText(content,s.sourcePath);
+          if(prepared.refused)throw Error(prepared.refused);
+          content=prepared.text;
+        }
+        const operation={...request,content};
+        const route=s.kind==="agent"?"/api/agents/validate":"/api/rigs/import/validate";
+        const checked=await fetch(`${daemonUrl}${route}`,{method:"POST",headers:{"content-type":"text/yaml"},body:content});
+        let validation;try{validation=JSON.parse(await checked.text());}catch{}
+        if(!checked.ok||validation?.valid===false){box.errors=validation?.errors??[validation?.error??"Validation failed."];return;}
+        const result=await this.remoteSpecController(cx).perform(config,operation,consent);
+        if(result.needsConsent){
+          if(this.specPermission)throw Error("Finish the open spec permission dialog first.");
+          const token=`spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          box.awaitingPermission=true;
+          this.specPermission={token,spec:s,request:operation,box,confirmation:result.confirmation,expires:Date.now()+300000};
+          openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:560,height:340,props:{target:{kind:"spec",id:s.id},step:{action:"confirm-spec-write",token,confirmation:result.confirmation}}});return;
+        }
+        if(!result.ok)throw Error(result.reason??"The box did not confirm the write.");
+        this.specConsentMachine=config.daemonMachine;
+        const synced=await fetch(`${daemonUrl}/api/specs/library/sync`,{method:"POST"}).catch(()=>null);
+        if(request.verb==="save"){
+          box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
+          box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
+          const now=box.state.value();setDraft(specDraftKey(s.id,this.config),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
+          if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true);}
+        }else{
+          if(!synced?.ok)throw Error(`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
+          const response=await fetch(`${daemonUrl}/api/specs/library`);if(!response.ok)throw Error("The copy was saved, but the library couldn't be read. Refresh before copying again.");
+          const list=JSON.parse(await response.text()),copy=list.find(x=>x.sourceType==="user_file"&&x.sourcePath===result.path);
+          if(!copy)throw Error("The copy was saved, but isn't indexed yet. Refresh before copying again.");
+          this.cache["/api/specs/library"]={data:list,at:Date.now()};
+          (this.specAutoEdit??=new Set()).add(copy.id);delete this.specBoxes[copy.id];
+          const lacking=s.sourceType==="user_file"?null:siblingFileNote(siblingFileNames(content));
+          if(lacking)(this.specCopyNotes??=Object.create(null))[copy.id]=lacking;
+          push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml"});
+        }
+        this.read(cx,"/api/specs/library",true);run("rig.refresh");
+      }catch(error){
+        if(error.code==="conflict"){
+          box.conflict=this.specConflictMessage();
+          try{box.diskText=await this.specText(s);}catch{}
+        }else if(error.machineNotice&&String(error.message).startsWith(`${config.daemonMachine} is unreachable.`)){
+          box.note=`${config.daemonMachine} is unreachable, so nothing was saved. Your edits are still here. Run hc machine login ${config.daemonMachine}, then save again.`;
+        }else box.note=String(error.message??error);
+      }finally{box.saving=false;box.copying=false;cx.notify();}
     });
   }
 
@@ -2087,7 +2283,7 @@ export default class RigView extends View {
   scopes(t, cx, entry) {
     const projectsRes = this.read(cx, "/api/scopes/projects");
     const projList = Array.isArray(projectsRes.data?.projects) ? projectsRes.data.projects : [];
-    const activeProject = entry.project ?? shared("rig.project") ?? null;
+    const activeProject = effectiveScopeProject(entry.project,shared('rig.project'),projectsRes.data);
     // `/api/scopes?detail=1`: { missions: [{ mission, slices: [{ dirName, displayName, status, stage, intent,
     // miniRequirements, proofContract, narrative (PROGRESS.md) }] }] }.
     const scopePath = activeProject ? `/api/scopes?detail=1&project=${encodeURIComponent(activeProject)}` : "/api/scopes?detail=1";
@@ -2150,6 +2346,28 @@ export default class RigView extends View {
         const missing = this.dim(t, `${entry.mission} isn't in this project any more.`);
         return projectBar ? v_flex().gap(12).child(projectBar).child(missing) : missing;
       }
+    }
+    let workflowUnavailable=null;
+    if(entry.mission&&!entry.slice){
+      const project=selectedProjId,root=selectedProj?.root??scopes.data?.project?.root;
+      const path=workflowPath({mission:entry.mission,project,projectRoot:root}),got=this.read(cx,path);
+      const model=workflowView(got.data,{mission:entry.mission,project});
+      const selectedWorkflow=model.instances.find(w=>w.id===entry.workflow);
+      if(selectedWorkflow)this.pageCrumbEntry={...entry,workflowName:selectedWorkflow.title,...(!entry.packet?{name:selectedWorkflow.title}:{})};
+      this.workflowCounts={workflowsSupported:model.supported,workflows:model.instances.length};
+      this.activePageView=selectedPageView(entry,this.pageViewMemory??={},null,this.workflowCounts);
+      if(got.loading&&got.data===undefined)return this.dim(t,'Reading workflows…');
+      const resolved={...entry,project:project??entry.project};
+      if(entry.workflow||this.activePageView==='workflows'){
+        const panel=new WorkflowPanel(this,{navigate:push,monoFamily:settings()?.font_family??'JetBrains Mono',ownerEntry:session=>{
+          const found=resolveAskerSeat(session,this.currentTopology(cx));if(!found.found)return null;
+          const s=found.seat;return {section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,name:s.logicalId,session:s.session,pod:s.pod};
+        },queueEntry:id=>validHealthQitemId(id)?{section:'system',subview:'health',healthQitem:id}:null,
+        time:(value,exact=false)=>value==='INDETERMINATE'?'unknown':value==null?'not reported':this.time?this.time(value,{exact}):asOf(value).replace(/^as of /,'')});
+        if(!entry.workflow)this.pageHeading={title:entry.mission,status:`${model.instances.length} workflow${model.instances.length===1?'':'s'}`};
+        return panel.render(t,cx,resolved,model);
+      }
+      if(!model.supported)workflowUnavailable=this.dim(t,"This OpenRig doesn't serve workflow views.");
     }
     // A proof item is checked only when evidence cites it (ProofContractItem.paired).
     const checklist = (items) => v_flex().gap(4).children((items ?? []).map((x) => {
@@ -2266,11 +2484,12 @@ export default class RigView extends View {
         .child(v_flex()
           .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).text_size(11).text_color(t.dim)
             .child(div().w(12)).child(div().flex_1().child("Slice")).child(div().w(100).flex_none().child("Status")).child(div().w(100).flex_none().child("Stage")))
-          .children(rows.length ? rows : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : "No missions or slices in this project.")]));
+          .children(rows.length ? rows : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : "No slices in this mission.")]));
     };
     return v_flex().gap(12)
       .when(!!projectBar, (el) => el.child(projectBar))
-      .children(missions.length ? missions.map((m, i) => renderMissionCard(m, i)) : [this.dim(t, "No missions or slices in this project.")]);
+      .when(!!workflowUnavailable,el=>el.child(workflowUnavailable))
+      .children(missions.length ? missions.filter(m=>!entry.mission||[m.mission,m.id,m.name].includes(entry.mission)).map((m, i) => renderMissionCard(m, i)) : [this.dim(t, "No missions or slices in this project.")]);
   }
 
   terminalPreviewBody(t, cx, viewKey, isFirstExpanded = true) {
@@ -2278,7 +2497,7 @@ export default class RigView extends View {
     if (caps.probed === false) return this.dim(t, "Checking OpenRig's view-preview support…");
     const capReason = capabilityDisableReason("open-view", caps);
     if (capReason) return this.workerCapabilityNote(t, capReason);
-    const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app&appHome=${encodeURIComponent(appHome())}`;
+    const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app${caps.hostWorkerViews?"&viewportColumns=160":`&appHome=${encodeURIComponent(appHome())}`}`;
     const preview = this.read(cx, fullPath);
     if (preview.status === 401 || /\b401\b/.test(String(preview.error ?? ""))) {
       return this.dim(t, TERMINAL_TOKEN_PROTECTED);
@@ -2315,15 +2534,17 @@ export default class RigView extends View {
     };
     const openWrapperId = isFirstExpanded ? "open-view" : `open-view-wrap-${viewKey}`;
     const pagePrefix = isFirstExpanded ? "page" : `page-${viewKey}`;
+    const workerLine=this.hostWorkerLine(t,rigEntry??{id:encodeURIComponent(viewKey),name:viewKey},viewKey);
     return v_flex().gap(8)
+      .when(!!workerLine,el=>el.child(workerLine))
       .child(h_flex().gap(10).items_center().flex_wrap()
-        .child(this.dim(t, `${opened.length} attachable · ${absent.length} absent · ${pages.length} page(s)`))
+        .child(this.dim(t, `${opened.length} attachable · ${absent.length} absent · ${pages.length} page${pages.length===1?"":"s"}`))
         .child(div().flex_1())
         .when(opened.length === 0 && Boolean(rigName) && Boolean(normalized.rigStopped), (el) => el.child(
           this.button(t, `resume-terminal-rig-${rigName}`, "Rig is stopped · Resume…", doResume, { primary: true, small: true, iconName: "rig-play" }),
         ))
         .child(div().id(openWrapperId).on_click((_e, cx) => { if (!openReason) doOpen(_e, cx); }).child(
-          this.button(t, `open-view-${viewKey}`, "Open", doOpen, { primary: opened.length > 0, small: true, iconName: "rig-view", disabled: !!openReason, tooltip: openReason, actionKey: "open-view" }),
+          this.button(t, `open-view-${viewKey}`, caps.hostWorkerViews?"Worker view":"Open", doOpen, { primary: opened.length > 0, small: true, iconName: "rig-view", disabled: !!openReason, tooltip: openReason, actionKey: "open-view" }),
         )))
       .when(!!openReason, (el) => el.child(this.dim(t, openReason)))
       .when(absent.length > 0, (el) => el.child(this.card(t, `Absent seats (${absent.length})`, [
@@ -2531,7 +2752,7 @@ export default class RigView extends View {
       endedModeDecisions = this.read(cx, decPath).data ?? null;
     }
     const digest = sinceYouWereAwaySummary(items, {
-      lastSeenNeedsAt,
+      lastSeenNeedsAt, timezone:this.uiTimezone,
       endedModeAccount,
       endedModeDecisions,
     });
@@ -2643,17 +2864,20 @@ export default class RigView extends View {
     const awayCard = this.sinceYouWereAwayCard(t, cx, items);
     const actionableItems = sortNeedsByTier(items.filter((n) => !n.update));
     const updateItems = items.filter((n) => n.update);
+    this.pageNeedsCounts={requests:needsRequestCount(this.currentTopology(cx),items),updates:updateItems.length};
+    const requestsView=(entry.needsTab??"requests")==="requests";
+    if(requestsView){this.selectedUpdate=null;this.visibleUpdates=[];}
     const updateDisplay = [...updateItems];
     const receipts = dismissals.receiptRows();
     for (const receipt of receipts.filter((r) => r.keys.length === 1)) updateDisplay.splice(Math.min(receipt.position, updateDisplay.length), 0, { receipt });
     return v_flex().gap(12)
       .when(!!whoseRow, (el) => el.child(whoseRow))
-      .when(!!awayCard, (el) => el.child(awayCard))
+      .when(!!awayCard&&requestsView, (el) => el.child(awayCard))
       .when(!!entry.notice, (el) => el.child(div().id("need-expired-notice").text_size(12).text_color(t.muted).child(entry.notice)))
-      .child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
+      .when(requestsView,el=>el.child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
         .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(a.text ?? a.summary))),
-        this.needRows(t, cx, "needs", actionableItems, att.data?.perspective)]))
-      .child(this.card(t, `Updates (${updateItems.length})`, [
+        this.needRows(t, cx, "needs", actionableItems, att.data?.perspective)])))
+      .when(!requestsView,el=>el.child(this.card(t, `Updates (${updateItems.length})`, [
         ...receipts.filter((r) => r.keys.length > 1).map((r) => this.updateReceipt(t, r)),
         this.needRows(t, cx, "updates", updateDisplay, att.data?.perspective),
         ...(dismissals.show && dismissals.hidden().length ? [this.dim(t, "Dismissed"),
@@ -2662,7 +2886,7 @@ export default class RigView extends View {
       ], h_flex().gap(8).items_center()
         .when(updateItems.length > 0, (el) => el.child(this.updateButton(t, "dismiss-all-updates", "Dismiss all", () => this.updateAction("dismiss", updateItems))))
         .when(dismissals.hidden().length > 0, (el) => el.child(div().id("show-dismissed-updates").text_size(12).text_color(t.accent).cursor_pointer()
-          .on_click(() => this.updateAction("show")).child(`${dismissals.show ? "Hide" : "Show"} dismissed (${dismissals.hidden().length})`)))))
+          .on_click(() => this.updateAction("show")).child(`${dismissals.show ? "Hide" : "Show"} dismissed (${dismissals.hidden().length})`))))))
       .children(coverage.errors.map((s, i) => div().id(`need-source-${i}`).text_size(11.5).text_color(t.blocked).child(`${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`)))
       .when(coverage.incomplete, (el) => el.child(v_flex().gap(4)
         .child(h_flex().id("need-coverage-toggle").gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
@@ -2671,7 +2895,7 @@ export default class RigView extends View {
           .child("Coverage · results may be incomplete"))
         .when(Boolean((shared("rig.open.page") ?? {})["needs:coverage"]), (fold) => fold.children(coverage.partial.map((s, i) =>
           this.plain(t, `${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`, `need-coverage-${i}`).text_color(t.dim))))))
-      .child(this.dim(t, `Read ${relativeTimeText(att.data.readAt)}. Viewing is not approval.`).id("needs-read-time").tooltip(String(att.data.readAt ?? "Time not reported")));
+      .child(this.dim(t, `Read ${relativeTimeText(att.data.readAt)}. Viewing is not approval.`).id("needs-read-time").tooltip(this.time(att.data.readAt,{exact:true})));
   }
 
   /** Needs-You rows: a click opens the Decision Card in place (`shared("rig.open.page")`, `needs:<id>`, so the palette and the
@@ -2726,7 +2950,7 @@ export default class RigView extends View {
               cx.stop_propagation(); this.updateAction(n.dismissed ? "restore" : "dismiss", n.dismissed ? updateKey(n) : n);
             })))
             .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); }))
-            .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).tooltip(String(n.at ?? "Time not reported")).child(relativeTimeText(n.at))))
+            .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).tooltip(this.time(n.at,{exact:true})).child(relativeTimeText(n.at))))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(n.dismissed ? this.dim(t, n.dismissalNote ?? "Hidden here only.") : this.needBody(t, cx, n, perspective))));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")]);
   }
@@ -2757,7 +2981,7 @@ export default class RigView extends View {
         .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(text.headline))
         .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).child(String(owner ?? "")))
-        .child(div().text_size(11).text_color(t.dim).tooltip(String(n.at ?? "")).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
+        .child(div().text_size(11).text_color(t.dim).tooltip(this.time(n.at,{exact:true})).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
         .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); })))
         .when(shown, el => el.child(this.decisionCard(t, cx, n, { perspective })));
     }) : [this.dim(t, filter ? "No matching requests." : "No pending Needs-You requests.")]);
@@ -2775,7 +2999,7 @@ export default class RigView extends View {
       .child(div().w(12).text_color(t.blocked).child("◆"))
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(n.summary))
       .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).child("health · critical"))
-      .child(div().text_size(11.5).text_color(t.dim).tooltip(n.healthFinding?.startedAt ?? "Start time not reported").child(minutes === null ? "—" : minutes < 1 ? "<1m" : `${minutes}m`))
+      .child(div().text_size(11.5).text_color(t.dim).tooltip(this.time(n.healthFinding?.startedAt,{exact:true})).child(minutes === null ? "—" : minutes < 1 ? "<1m" : `${minutes}m`))
       .child(div().text_size(11.5).text_color(t.accent).child("System → Health"));
   }
 
@@ -2896,7 +3120,7 @@ export default class RigView extends View {
       .when(Boolean(text.opening), el => el.child(div().id(`need-opening-${id}`).max_h(76).overflow_hidden().child(markDown(text.opening, `need-opening-text-${id}`))))
       .child(h_flex().id(`need-context-${id}`).gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted)
         .child(svg(icon("rig-seat")).size(12).flex_none()).child(`${logical}${rig ? ` · ${rig}` : ""}`)
-        .child(div().tooltip(String(at ?? "")).child(`· waiting ${age}`))
+        .child(div().tooltip(this.time(at,{exact:true})).child(`· waiting ${age}`))
         .when(Boolean(owner), el => el.child(div().id(`need-open-asker-${id}`).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { cx.stop_propagation(); this.openAskerSeat(cx, { ...n, asker: owner }); }).child("Open seat")))
         .when(Boolean(project), el => el.child(`· ${project}`)))
       .when(Boolean(this.askerNotes[id]), el => el.child(div().id(`need-asker-note-${id}`).text_size(11.5).text_color(t.muted).child(this.askerNotes[id])))
@@ -3413,7 +3637,7 @@ export default class RigView extends View {
           .child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(11).text_color(h.error ? t.blocked : t.muted).child(String(h.status ?? "online")))
           .when(!!h.usageReason, (el) => el.child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(11).text_color(t.dim).child(h.usageReason)))
           .child(div().flex_1())
-          .when(!!h.readAt, (el) => el.child(this.dim(t, `as of ${h.readAt}`))))
+          .when(!!h.readAt, (el) => el.child(this.dim(t, `as of ${this.time(h.readAt,{exact:true})}`))))
         .when(!!h.error, (el) => el.child(h_flex().id(`usage-host-error-${hid}`).gap(8).items_center()
           .child(div().flex_1().text_size(12).text_color(t.blocked).child(String(h.error)))
           .child(this.button(t, `usage-host-retry-${hid}`, "Retry", (_e, cx) => this.refreshUsageHosts(cx), { small: true }))))
@@ -3432,14 +3656,14 @@ export default class RigView extends View {
             .child(div().w(150).flex_none().truncate().text_color(color).child(bar))
             .when(!!a.sharedAcrossProviders, (rowEl) => rowEl.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.background).text_size(10.5).text_color(t.muted).child("shared")))
             .when(isConflict, (rowEl) => rowEl.child(this.chip(t, { tone: "blocked", word: "conflict" })))
-            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).child(String(a.resetsAt ?? "")));
+            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).child(this.time(a.resetsAt,{exact:true})));
         }))))
         .when(observations.length > 0, (el) => el.child(v_flex().gap(2).pt(2).border_t(1).border_color(t.border).children(observations.map((o, oi) =>
           h_flex().id(`usage-obs-${hid}-${oi}`).gap(8).items_center().text_size(11.5).text_color(t.muted)
             .child(div().w(100).flex_none().truncate().text_color(t.foreground).child(String(o.runtime ?? "")))
             .child(div().w(140).flex_none().truncate().child(String(o.accountLabel ?? o.account ?? "")))
             .child(div().w(90).flex_none().truncate().text_color(t.dim).child(String(o.status ?? "")))
-            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).child(String(o.lastObservedAt ?? o.updatedAt ?? "")))
+            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).child(this.time(o.lastObservedAt ?? o.updatedAt,{exact:true})))
         ))));
     }));
   }
@@ -3586,7 +3810,7 @@ export default class RigView extends View {
     const readinessLabel = readinessObj?.state === "not-ready" && !hasBindingOnPerson
       ? "Feed & Steering only (no connector)"
       : (readinessObj?.state ?? (readiness?.loading ? "reading…" : "unconfigured"));
-    const chip = quietModeHeaderChip({ quiet: quiet?.data, mode: mode?.data });
+    const chip = quietModeHeaderChip({ quiet: quiet?.data, mode: mode?.data, timezone:this.uiTimezone });
     const rawRoom = curMode?.settings?.decisionRoom?.words
       ?? curMode?.settings?.decision?.room
       ?? curMode?.decisionRoom?.words
@@ -3598,9 +3822,9 @@ export default class RigView extends View {
     const decisionRoomWords = typeof rawRoom === "string" && rawRoom.trim() ? rawRoom.trim() : null;
 
     return v_flex().id("system-people-section").child(
-      v_flex().id("system-people-card").rounded(10).bg(t.background).border_1().border_color(t.border).p(12).gap(10)
-        .child(h_flex().gap(8).items_center()
-          .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child("People · Quiet Hours & Modes"))
+      v_flex().id("system-people-card").min_w(0).rounded(10).bg(t.background).border_1().border_color(t.border).p(pageBodyLayout(this.pageWidth).tight ? 10 : 12).gap(10)
+        .child((pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("people-title-row").gap(8).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center())
+          .child(div().min_w(0).when(pageBodyLayout(this.pageWidth).compact, el => el.w_full()).when(!pageBodyLayout(this.pageWidth).compact, el => el.flex_1()).text_size(12.5).font_semibold().text_color(t.foreground).child("People · Quiet Hours & Modes"))
           .when(!!chip, (el) => el.child(div().id("people-active-chip").px(8).h(20).rounded(5).flex().items_center().bg(t.selected).text_size(11).font_medium().text_color(t.foreground).child(`${chip.glyph} ${chip.label}`))))
         .child(this.kv(t, [
           ["Acting as", configPersonId ? `${configPersonId}@external` : "this terminal (human@host (unattributed))"],
@@ -3629,9 +3853,9 @@ export default class RigView extends View {
           div().id("people-no-person-note").text_size(11.5).text_color(t.dim).child(personReason)
         ))
         .when(!!activeId, (el) => el.child(
-          v_flex().id("people-quiet-card").rounded(8).bg(t.raised).border_1().border_color(t.border).p(10).gap(8)
-            .child(h_flex().gap(8).items_center()
-              .child(div().flex_1().text_size(12).font_semibold().text_color(t.foreground).child("Quiet hours"))
+          v_flex().id("people-quiet-card").rounded(8).bg(t.raised).border_1().border_color(t.border).p(pageBodyLayout(this.pageWidth).tight ? 6 : 10).gap(8)
+            .child((pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("people-quiet-title").gap(8).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center())
+              .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.flex_1()).text_size(12).font_semibold().text_color(t.foreground).child("Quiet hours"))
               .child(div().text_size(11.5).text_color(isQuietActive ? t.accent : t.muted).child(
                 isQuietActive
                   ? (chip?.kind === "quiet" ? chip.label : "Quiet active")
@@ -3669,9 +3893,9 @@ export default class RigView extends View {
               )))
         ))
         .when(!!activeId, (el) => el.child(
-          v_flex().id("people-modes-card").rounded(8).bg(t.raised).border_1().border_color(t.border).p(10).gap(8)
-            .child(h_flex().gap(8).items_center()
-              .child(div().flex_1().text_size(12).font_semibold().text_color(t.foreground).child("Modes"))
+          v_flex().id("people-modes-card").rounded(8).bg(t.raised).border_1().border_color(t.border).p(pageBodyLayout(this.pageWidth).tight ? 6 : 10).gap(8)
+            .child((pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("people-mode-title").gap(8).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center())
+              .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.flex_1()).text_size(12).font_semibold().text_color(t.foreground).child("Modes"))
               .child(div().text_size(11.5).text_color(curMode ? t.accent : t.muted).child(
                 curMode?.modeName
                   ? `${curMode.modeName}${curMode.settings?.decision?.policy ? ` · ${curMode.settings.decision.policy}` : ""}`
@@ -3764,7 +3988,7 @@ export default class RigView extends View {
     const partial = (Array.isArray(data.coverage) ? data.coverage : data.coverage ? [data.coverage] : []).filter(c => c.partial);
     const coverage = partial.map(c => Number.isFinite(c.evaluated) && Number.isFinite(c.total) ? `partial check (${c.evaluated} of ${c.total})` : "partial check").join(" · ");
     const age = Math.max(...records.map(r => r.freshness?.ageSeconds).filter(Number.isFinite));
-    const checked = typeof data.evaluatedAt === "string" ? `checked ${data.evaluatedAt.slice(11, 16)} · ${healthAge(age)}` : "Check time not reported";
+    const checked = typeof data.evaluatedAt === "string" ? `checked ${this.time(data.evaluatedAt)} · ${healthAge(age)}` : "Check time not reported";
     const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
     const worstContext = groups.find(g => g.worst)?.records.find(r => r.detector === "context.pressure");
     const worstContextText = worstContext ? `${healthScopeTarget(worstContext, rigs, nodes).label.replace(/^Seat /, "")} at ${healthContextPercentage(worstContext)} context` : null;
@@ -3796,7 +4020,7 @@ export default class RigView extends View {
             .child(div().flex_1().min_w(0).text_size(12.5).text_color(t.foreground).child(g.title))
             .child(div().text_size(11).text_color(tone).child(g.cleared ? "history" : g.worst === 2 ? "critical" : g.worst === 1 ? "warning" : "note"))
             .child(div().text_size(11.5).text_color(t.dim).child(String(g.records.length)))
-            .when(Boolean(g.startedAt), el => el.child(div().text_size(11).text_color(t.dim).tooltip(g.startedAt).child(`since ${g.startedAt.slice(5, 16).replace("T", " ")}`))))
+            .when(Boolean(g.startedAt), el => el.child(div().text_size(11).text_color(t.dim).tooltip(this.time(g.startedAt,{exact:true})).child(`since ${this.time(g.startedAt,{date:true})}`))))
           .when(shown, el => el.child(v_flex().ml(24).gap(8)
             .child(this.plain(t, g.what, `health-what-${index}`))
             .child(h_flex().gap(6).items_center().flex_wrap().children(scopes.map((scope, i) => div().id(`health-scope-${index}-${i}`).text_size(12)
@@ -3806,7 +4030,7 @@ export default class RigView extends View {
             .when(g.records[0].detector === "context.pressure" || !(g.records.length === 1 && g.records[0].scope?.type === "seat" && !healthQueueId(g.records[0])), el => el.child(v_flex().ml(8).pl(10).border_l(1).border_color(t.border).gap(4).children(g.records.map((r, i) => {
               const qid = healthQueueId(r), target = healthScopeTarget(r, rigs, nodes), subject = qid ?? target.label ?? r.id;
               const count = String(r.explanation ?? "").match(/^(\d+) coordination transitions\b/)?.[1];
-              const time = [r.startedAt, r.lastObservedAt].filter(Boolean).map(s => String(s).slice(5, 16).replace("T", " ")).join(" – ");
+              const time = [r.startedAt, r.lastObservedAt].filter(Boolean).map(s => this.time(s,{date:true})).join(" – ");
               return h_flex().id(`health-item-${index}-${i}`).gap(8).items_center().flex_wrap()
                 .when(!g.cleared && r.detector === "context.pressure", el => el.child(svg(icon("rig-info")).size(11).text_color(tone)))
                 .child(div().text_size(12).text_color(qid || target.entry ? t.accent : t.muted)
@@ -3833,6 +4057,8 @@ export default class RigView extends View {
     // The daemon's settings, as `rig config` resolves them (the TUI's :config). `config <category>` and
     // `setting <key>` narrow this card only, with their own ×; the other cards stay whole.
     const config = this.read(cx, "/api/config?view=browser");
+    const configProbe = this.read(cx, "/api/config/daemon.port");
+    this.configPanel ??= new ConfigPanel(this);
     const conn = this.read(cx, "/api/gateway/connections");
     const usage = this.read(cx, "/api/provider/usage");
     const hostsList = this.read(cx, "/api/hosts");
@@ -3842,20 +4068,6 @@ export default class RigView extends View {
       .text_color(/crit|error|high/i.test(s) ? t.blocked : /warn|medium/i.test(s) ? t.ansi3 : t.dim).child(String(s ?? ""));
     const seats = cost.data?.seats ?? [];
     const total = seats.reduce((sum, s) => sum + (typeof s.costUsd === "number" ? s.costUsd : 0), 0);
-    const notifyOn = (shared("rig.settings")?.notifications ?? true) !== false;
-    const showNotifyRow = (!entry.category || entry.category === "all" || entry.category === "display" || entry.category === "waiting")
-      && (!entry.settingKey || "notifications".includes(String(entry.settingKey).toLowerCase()));
-    const notifyRow = showNotifyRow
-      ? h_flex().id("system-notify-toggle").px(8).h(28).gap(10).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => this.toggleNotifications(cx))
-        .child(div().w(260).flex_none().text_size(12.5).text_color(t.foreground).child("Notifications"))
-        .child(h_flex().flex_1().min_w(0).gap(6).items_center()
-          .child(div().w(13).h(13).flex_none().rounded(3).border_1().border_color(notifyOn ? t.accent : t.border).flex().items_center().justify_center()
-            .when(notifyOn, (box) => box.bg(t.accent).child(svg(icon("check")).size(10).text_color(t.solid_foreground ?? t.background))))
-          .child(div().min_w(0).truncate().text_size(12.5).text_color(notifyOn ? t.foreground : t.muted).child(notifyOn ? "on (Needs-You toasts)" : "off")))
-        .child(div().w(90).flex_none().text_size(12.5).text_color(t.muted).child("display"))
-        .child(div().w(80).flex_none().text_size(12.5).text_color(t.muted).child("window"))
-      : null;
     const capDetail = capabilitiesSummaryDetail(this.caps());
     const versionLine = shared("rig.data")?.versionLine || formatOpenRigVersionLine({
       healthz: healthz.data,
@@ -3891,35 +4103,25 @@ export default class RigView extends View {
     };
     const sysRecentOpen = open["sys:recent"] !== undefined ? Boolean(open["sys:recent"]) : entry.openRecent === "instance";
     const sysRecentFocused = focus === "sys:recent";
-    const activeSubview = entry.subview === "usage-hosts" ? "usage" : (entry.subview ?? null);
-    const subviewTabs = [
-      [null, "All"],
-      ["people", "People"],
-      ["config", "Configuration"],
-      ["health", "Health"],
-      ["connections", "Connections"],
-      ["usage", "Usage"],
-      ["cost", "Cost"],
-    ];
-    const subviewStrip = h_flex().id("system-subviews").gap(4).items_center().flex_wrap().children(subviewTabs.map(([subKey, label]) => {
-      const onSub = activeSubview === subKey;
-      const btnId = `sys-subview-${subKey ?? "all"}`;
-      return h_flex().id(btnId).px(8).h(22).rounded(5).items_center().cursor_pointer()
-        .bg(onSub ? t.accent : t.raised).border_1().border_color(onSub ? t.accent : t.border).hover((s) => s.bg(onSub ? t.accent : t.hover))
-        .text_size(11.5).text_color(onSub ? (t.solid_foreground ?? t.background) : t.muted)
-        .on_click(() => push({ section: "system", ...(subKey ? { subview: subKey } : {}) }))
-        .child(div().id(`system-subview-${subKey ?? "all"}`).child(label));
-    }));
+    const activeSubview = entry.subview === "usage-hosts" ? "usage" : entry.subview === "overview" ? null : (entry.subview ?? null);
     const configCard = this.card(t, "Configuration", [
-      ...(notifyRow ? [notifyRow] : []),
-      this.status(t, cx, "/api/config?view=browser", config) ?? this.table(t, "sys-config", [["Setting", 260], ["Value"], ["Group", 90], ["Source", 80]],
-        configRows(config.data, { category: entry.category, settingKey: entry.settingKey }).map((r) => ({ cells: [r.key, r.value, r.group, r.source] }))),
+      this.status(t, cx, "/api/config?view=browser", config) ?? (entry.category === "sources"
+        ? this.table(t,"sys-config",[["Setting",260],["Value"],["Group",90],["Source",80]],configRows(config.data,{category:"sources"}).map(r=>({cells:[r.key,r.value,r.group,r.source]})))
+        : v_flex().id("sys-config").gap(4).children(this.configPanel.render(t,cx,config.data,configProbe,{category:entry.category,settingKey:entry.settingKey}))),
     ],
       entry.settingKey || entry.category ? h_flex().id("rig-clear-config").px(8).h(22).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
         .bg(t.selected).text_size(11.5).text_color(t.foreground).on_click(() => clearConfigScope())
         .child(entry.settingKey ? `setting ${entry.settingKey}` : `category ${entry.category}`).child(svg(icon("x")).size(11).text_color(t.muted)) : null);
     const healthCard = this.healthFindingsCard(t, cx, health, entry);
     const connectionsCard = this.card(t, "Connections", [
+      v_flex().id("system-herdr-machine").gap(5)
+        .child(div().text_size(12).child(`Herdr machine: ${this.config?.daemonMachine??"this computer"}`))
+        .when(!!this.config?.daemonMachine&&shared("rig.machineSetup")?.machine===this.config.daemonMachine
+          &&shared("rig.machineSetup")?.origin===this.config.daemonUrl&&!!shared("rig.machineSetup")?.verifiedAt,
+          el=>el.child(div().text_size(11).text_color(t.muted).child(machineSetupReceiptLabel(shared("rig.machineSetup"),this.uiTimezone))))
+        .child(div().id("system-choose-machine").text_color(t.accent).cursor_pointer().child(this.config?.daemonMachine?`Stop using ${this.config.daemonMachine}…`:"Choose machine…")
+          .on_click(()=>{if(this.config?.daemonMachine)openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:560,height:400,
+            props:{target:{kind:"machine"},step:{action:"stop-machine",machine:this.config.daemonMachine}}});else run("rig.choose-machine");})),
       this.kv(t, [
         ["Herdrig Version", `herdrig v${HERDRIG_VERSION}`],
         ["OpenRig Version", versionLine],
@@ -3945,13 +4147,13 @@ export default class RigView extends View {
                     r.provider,
                     r.window,
                     div().text_size(12.5).text_color(color).child(r.usedText),
-                    r.resetsAt || "—",
+                    this.time(r.resetsAt,{exact:true}),
                   ],
                   match: [r.host, r.provider, r.window, r.usedText, r.resetsAt, r.asOf],
                 };
               }))
             : this.dim(t, "No usage readings yet."))
-          .when(!!usageAsOf && usageRows.length > 0, (el) => el.child(this.dim(t, `as of ${usageAsOf}`)))
+          .when(!!usageAsOf && usageRows.length > 0, (el) => el.child(this.dim(t, `as of ${this.time(usageAsOf,{exact:true})}`)))
           .when(hostCount > 1 || hostsOpen, (el) => el.child(v_flex().gap(6).when(hostsFocused, (d) => d.rounded(6).border_1().border_color(t.accent).p(6))
             .child(h_flex().id("usage-hosts-toggle").gap(4).items_center().cursor_pointer().on_click(toggleUsageHosts)
               .child(svg(icon(hostsOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
@@ -3978,12 +4180,12 @@ export default class RigView extends View {
       ["usage", usageCard],
       ["cost", costCard],
       ["recent", recentCard],
+      ["notifications", this.card(t,"Notifications",[this.notifyTogglePill(t,"system-notifications-toggle")])],
     ];
     const visibleCards = activeSubview
       ? orderedCards.filter(([k]) => k === activeSubview).map(([, c]) => c)
       : orderedCards.map(([, c]) => c);
     return v_flex().gap(12)
-      .child(subviewStrip)
       .children(visibleCards);
   }
 
@@ -4042,45 +4244,57 @@ export default class RigView extends View {
   }
 
   header(t, cx, stack, entry) {
-    // Where the page sits, never the pages visited before it: at most section › parent › child › file.
-    const crumbs = crumbsFor(entry);
-    const target = this.targetFor(cx, entry);
-    // Decided from herdr's live terminals (a labelled TUI in the active space): no process is started to find out.
-    const tuiLabel = labelledTui(terminals(), spaces(), this.config) ? "Switch to TUI" : "Open in TUI";
-    const chevron = () => svg(icon("chevron-right")).size(10).flex_none().text_color(t.dim);
+    const crumbs = compactLocationCrumbs(crumbsFor(entry), this.pageWidth ?? 960);
+    const target = this.targetFor(cx, entry), backTo = backTarget({ stack });
     const status = this.statusLine(t);
-    // Back names where it goes; with nowhere to go it isn't drawn.
-    const backTo = backTarget({ stack });
-    const backTitle = backTo ? entryTitle(backTo) : null;
-    return h_flex().h(42).px(14).gap(8).items_center().border_b(1).border_color(t.border).flex_none()
-      .when(!!backTo, (el) => el
-        .child(h_flex().id(`rig-back-${simpleHash(JSON.stringify(backTo))}`).px(6).h(26).gap(3).rounded(6).items_center().flex_none().cursor_pointer().hover((s) => s.bg(t.hover))
-          .tooltip(`Back to ${backTitle} (Alt+←)`).on_click(() => this.back())
-          .child(svg(icon("chevron-left")).size(13).flex_none().text_color(t.muted))
-          .child(div().id("rig-back-title").max_w(180).truncate().text_size(12).text_color(t.muted).child(backTitle)))
-        .child(div().w(1).h(16).flex_none().bg(t.border)))
-      .child(h_flex().flex_1().min_w(0).gap(6).items_center().overflow_hidden().children(crumbs.flatMap((c, i) => {
-        const last = i === crumbs.length - 1;
-        const el = div().id(`crumb-${i}`).truncate().text_size(12).text_color(last ? t.foreground : t.muted).when(last, (d) => d.font_medium())
-          .when(!last && !!c.entry, (d) => d.cursor_pointer().hover((s) => s.text_color(t.foreground)).on_click(() => push(c.entry)))
-          .child(String(c.text ?? ""));
-        const crumb = c.icon ? h_flex().gap(4).items_center().min_w(0).child(svg(icon(c.icon)).size(12).flex_none().text_color(last ? t.foreground : t.muted)).child(el) : el;
-        return i ? [chevron(), crumb] : [crumb];
-      })))
-      // A filter narrowing the page's tables shows here, with its own ×; Filter… (or /) types one.
-      .when(!!entry.filter, (el) => el.child(h_flex().id("rig-clear-filter").px(8).h(24).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
-        .bg(t.selected).text_size(12).text_color(t.foreground).on_click(() => clearFilter())
-        .child(`/${entry.filter}`).child(svg(icon("x")).size(11).text_color(t.muted))))
-      .when(!!status, (el) => el.child(status))
-      .when(entry.section === "needs", (el) => el.child(this.notifyTogglePill(t, "needs-notify-toggle")))
-      .when(entry.section !== "file", (el) => el.child(this.button(t, "rig-filter-btn", "Filter…", () => palette(entry.filter ? `/${entry.filter}` : "/"), { iconName: "search" })))
-      .when(!!target, (el) => el.child(this.button(t, "rig-actions", "Actions", () => menu(target), { iconName: "chevron-down" })))
-      .when(!!this.config, (el) => el.child(this.button(t, "rig-open-tui", tuiLabel, (_e, cx) => this.tui(cx), { iconName: "terminal" })))
-      .child(div().id("rig-close").cursor_pointer().on_click(() => closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)));
+    const narrow = (this.pageWidth ?? 960) < 480;
+    const tiny = (this.pageWidth ?? 960) < 320;
+    const tuiLabel = labelledTui(terminals(), spaces(), this.config) ? "Switch to TUI" : "Open in TUI";
+    return v_flex().flex_none()
+      .child(h_flex().id("page-location-bar").h(38).px(14).gap(8).items_center()
+        .when(!tiny, row => row.child(div().id("rig-back").size(24).flex().items_center().justify_center().flex_none()
+          .text_color(backTo ? t.muted : t.dim).when(!!backTo, el => el.cursor_pointer().on_click(() => this.back()))
+          .tooltip("Back (Backspace)").child(svg(icon("chevron-left")).size(13))))
+        .child(h_flex().flex_1().min_w(0).gap(6).items_center().overflow_hidden().children(crumbs.flatMap((c,i) => {
+          const last=i===crumbs.length-1;
+          const crumb=div().id(`crumb-${i}`).min_w(0).when(tiny&&crumbs.length>2&&i===0,el=>el.max_w(48)).when(last,el=>el.flex_1()).truncate().text_size(12).text_color(last?t.foreground:t.muted)
+            .when(i===0,el=>el.cursor_pointer().on_click(()=>this.sectionMenu()).tooltip("Sections (Alt+S)"))
+            .when(i>0&&!!c.ancestors,el=>el.cursor_pointer().on_click(()=>this.navigationMenu(c.ancestors.map(c=>({label:c.text,entry:c.entry})),"Location")))
+            .when(i>0&&!last&&!!c.entry,el=>el.cursor_pointer().on_click(()=>push(c.entry)))
+            .child(`${c.text??""}${i===0?" ▾":""}`);
+          return i?[svg(icon("chevron-right")).size(10).flex_none().text_color(t.dim),crumb]:[crumb];
+        })))
+        .when(!!entry.filter,el=>el.child(div().id("rig-clear-filter").text_size(12).text_color(t.accent).cursor_pointer()
+          .on_click(()=>clearFilter()).child(`/${entry.filter} ×`)))
+        .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"})))
+        .when(!tiny&&!!this.config,el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel})))
+        .when(!tiny,el=>el.child(div().id("rig-close").size(24).flex_none().flex().items_center().justify_center().cursor_pointer().tooltip("Close")
+          .on_click(()=>closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)))))
+      // Below 320 px, controls get their own row so the remaining location links still take clicks.
+      .when(tiny,el=>el.child(h_flex().id("page-compact-controls").px(14).pb(6).gap(6).items_center()
+        .child(this.button(t,"rig-back","",()=>this.back(),{iconName:"chevron-left",tooltip:"Back (Backspace)",disabled:!backTo}).px(6))
+        .child(this.button(t,"rig-filter-btn","",()=>palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"}).px(6))
+        .when(!!this.config,row=>row.child(this.button(t,"rig-open-tui","",(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel}).px(6)))
+        .child(div().id("rig-close").size(20).flex_none().cursor_pointer().tooltip("Close").on_click(()=>closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)))))
+      .child(h_flex().id("page-title-bar").px(14).pb(10).gap(12).items_center().flex_wrap()
+        .child(v_flex().flex_1().min_w(Math.min(240, Math.max(80, (this.pageWidth ?? 960) - 28))).gap(3)
+          .child(h_flex().gap(6).items_center().min_w(0)
+            .when(!!this.pageHeading?.icon,el=>el.child(svg(icon(this.pageHeading.icon)).size(16).text_color(t.foreground)))
+            .when(!!this.pageHeading?.tone,el=>el.child(this.dot(t,this.pageHeading.tone,14,this.pageHeading.session)))
+            .child(div().id("page-title").truncate().text_size(18).font_semibold().text_color(t.foreground).child(this.pageHeading?.title??entryTitle(entry))))
+          .when(!!this.pageHeading?.status,el=>el.child(this.pageHeading.statusView??div().id("page-status").truncate().text_size(12).text_color(t.muted).tooltip(this.pageHeading.status).child(this.pageHeading.status))))
+        .when(!!this.pageActions,el=>el.child(this.pageActions))
+        .when(!!target&&!this.pageActions,el=>el.child(this.button(t,"rig-actions","⋯",()=>menu(target),{tooltip:"Page actions"}))))
+      .when(!!status,el=>el.child(div().px(14).pb(6).child(status)));
   }
-
   render(cx) {
     this.wideGraph=false;
+    this.pageHeading=null;
+    this.pageCrumbEntry=null;
+    this.pageActions=null;
+    this.pageSpec=null;
+    this.pageNeedsCounts={};
+    this.workflowCounts={};
     const graphNav=navKey(nav().stack?.at(-1))+":"+(nav().stack?.at(-1)?.tab??"");
     if(this.graphNav!==graphNav){for(const graph of this.graphs?.values()??[])graph.reset();this.graphNav=graphNav;}
     this.textSeq = 0;
@@ -4095,6 +4309,7 @@ export default class RigView extends View {
     this.ticking = false;
     this.statusAt = shared("rig.status")?.at;
     this.reading = new Set();
+    this.uiTimezone=timezoneValue(this.read(cx,'/api/config/ui.timezone').data);
     // The sidebar re-reads on every activity event: mark this page's copies of what it re-read stale, so a card never
     // lags it. Stale, not deleted: a deleted read draws the skeleton in place of the page until the fetch lands, which
     // collapsed the scroll to the top, dropped a focused text box and flashed the page on every event (the reported flash bug).
@@ -4105,13 +4320,21 @@ export default class RigView extends View {
     }
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
-    const entry = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null);
+    let entry = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null);
+    const library=this.cache?.["/api/specs/library"]?.data??[];
+    const spec=entry?.section==="specs"?library.find(s=>s.id===entry.id)??library.filter(s=>s.name===entry.name).find((s,_,a)=>a.length===1):null;
+    if(spec&&!entry.id)entry={...entry,id:spec.id};
+    this.activePageView=selectedPageView(entry??{},this.pageViewMemory??= {},spec);
+    // Mission workflow support is discovered by its body read; do not replace
+    // an explicit Workflows choice with Slices before that shape is known.
+    if(entry&&this.activePageView&&pageViewKind(entry)!=='mission')entry=entryWithPageView(entry,this.activePageView,{preserveScope:true});
     if (this.previousSection === "needs" && entry?.section !== "needs") this.updateAction("leave");
     if (this.previousUpdateEntry !== navKey(entry)) this.selectedUpdate = null;
     this.previousUpdateEntry = navKey(entry);
     this.previousSection = entry?.section;
     this.filter = entry?.filter ?? null;
     this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,navKey(entry)]),cx,{
+      reducedMotion:this.config?.reducedMotion===true,
       attention: this.cache["/api/attention"]?.data?.items ?? shared("rig.data")?.attentionItems,
     });
     let body;
@@ -4129,16 +4352,17 @@ export default class RigView extends View {
     const note = file ? null : this.refreshNote(t);
     this.refreshNowTails(cx);
     return v_flex().id("rig-view-root").size_full().bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).track_focus(this.handle)
-      // A click inside takes the keyboard, so Esc and Alt+Left work after it.
+      .on_size_change((size,cx)=>{if(size.width>0&&this.pageWidth!==size.width){this.pageWidth=size.width;cx.notify();}})
+      // A click outside text takes the page keyboard, so Esc and Backspace work after it.
       .on_mouse_down("left", () => this.handle.focus())
       .on_key_down((e, cx) => {
         // A key typed in a reply box is the reply's (replyBox marks it on the way up).
         if (this.typing) { this.typing = false; return; }
-        // Alt+Left goes back (the modifiers are on e.modifiers); Esc closes the inspection.
-        if (e.key === "left" && e.modifiers?.alt) this.back();
-        // Alt+1..6: the sections, in the switch's order.
-        else if (e.modifiers?.alt && /^[1-6]$/.test(e.key)) this.goSection(RIG_SECTIONS[Number(e.key) - 1]);
+        // Herdr owns Alt+Left for pane navigation; Backspace is history outside text.
+        if (e.key === "backspace" && !e.modifiers?.control && !e.modifiers?.platform && !e.modifiers?.alt) this.back();
+        else if (e.modifiers?.alt && String(e.key).toLowerCase()==="s")this.sectionMenu();
         else if (entry?.section === "needs" && this.routeNeedKey(e, cx, entry)) { /* open card consumes its shortcuts */ }
+        else if (entry?.section === "system" && this.configPanel?.keyDown(e,cx)) { /* configuration editor owns its Enter/Esc */ }
         else if (e.key === "escape" && entry?.section === "topology" && !entry.kind && this.pulseFilter) { this.pulseFilter = null; cx.notify(); }
         else if (e.key === "escape") closeInspection();
         else if (e.key === "delete" && entry?.section === "needs" && !entry.id && dismissible(this.selectedUpdate) && !this.selectedUpdate.dismissed
@@ -4149,9 +4373,10 @@ export default class RigView extends View {
         // Otherwise the rows' keys: ↑/↓, ←/→, Home/End, Enter, S, Q, the Menu key or Shift+F10.
         else this.pageTreeKey(e, cx);
       })
-      .child(file ? this.fileHeader(t, entry) : this.header(t, cx, stack, entry ?? { section: "topology" }))
-      .when(!file, (el) => el.child(this.sectionBar(t, entry ?? { section: "topology" })))
+      .child(file ? this.fileHeader(t, entry) : this.header(t, cx, stack, this.pageCrumbEntry??entry??{ section: "topology" }))
+      .when(!file, (el) => {const resolved=this.pageSpec?{...entry,id:this.pageSpec.id}:entry;
+        const tabs=this.objectTabs(t,resolved??{section:"topology"},this.pageSpec??spec);return tabs?el.child(tabs):el;})
       .child(file ? v_flex().id("rig-view-body").flex_1().min_h(0).child(body)
-        : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(14).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!note, (el) => el.child(note)).child(body)));
+        : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(pageBodyLayout(this.pageWidth).padding).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!note, (el) => el.child(note)).child(body)));
   }
 }

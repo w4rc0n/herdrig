@@ -6,6 +6,35 @@ export const graphPodOf=ref=>String(ref).startsWith("pod:")?ref.slice(4):String(
 const key=(...parts)=>JSON.stringify(parts);
 const round=n=>Math.round(n*10)/10;
 const unique=xs=>[...new Set(xs)];
+export function graphHeaderChips(p){
+  const count=`${p.seats.length} seat${p.seats.length===1?"":"s"}`,budget=p.w-12-40;
+  const label=Math.min(10+7.2*String(p.label??p.id).length,CARD_W+POD_PAD-6-40);
+  let rightWidth=8+6.3*p.id.length+6+6.2*count.length,rightText=`${p.id} · ${count}`;
+  if(label+rightWidth>budget){rightWidth=8+6.3*p.id.length;rightText=p.id;}
+  if(label+rightWidth>budget){rightWidth=0;rightText=null;}
+  return{labelWidth:Math.max(0,Math.min(label,budget)),rightWidth,rightText};
+}
+export const graphChipZones=p=>{
+  const {labelWidth,rightWidth}=graphHeaderChips(p),y=(p.y??0)+5;
+  return [[p.x+6,y,p.x+6+labelWidth,y+16],...(rightWidth?[[p.x+p.w-6-rightWidth,y,p.x+p.w-6,y+16]]:[])];
+};
+export function graphFreeInterval(en,side){
+  if(en.isPod)return[en.x+en.w*.25,en.x+en.w*.75];
+  let a=en.x+en.w*.14,b=en.x+en.w*.86;
+  if(side==="top"&&en.prow===0)for(const[x0,,x1]of graphChipZones(en.pod)){
+    if(x1<=a||x0>=b)continue;
+    const left=[a,Math.min(b,x0-6)],right=[Math.max(a,x1+6),b];
+    [a,b]=left[1]-left[0]>=right[1]-right[0]?left:right;
+  }
+  return[a,b];
+}
+export function simplifyGraphPoints(points){
+  const out=[];for(const p of points){const a=out.at(-2),b=out.at(-1);
+    if(b&&b[0]===p[0]&&b[1]===p[1])continue;
+    if(a&&((a[0]===b[0]&&b[0]===p[0])||(a[1]===b[1]&&b[1]===p[1])))out[out.length-1]=p;
+    else out.push(p);
+  }return out;
+}
 
 export function rankGraphPods(graph){
   const ids=graph.pods.map(p=>p.id),succ=new Map(ids.map(id=>[id,[]]));
@@ -69,12 +98,15 @@ export function routeGraph(graph,width){
     p.seats.forEach((s,i)=>{ent[s.lid]={...s,pod:p,isPod:false,col:i%p.cols,prow:Math.floor(i/p.cols),x:p.x+POD_PAD+(i%p.cols)*(CARD_W+CARD_GAP),w:CARD_W};});}
   const{edges,dense}=drawnGraphEdges(graph);
   for(const e of edges){
-    const s=ent[e.from],t=ent[e.to];if(!s||!t)continue;
+    let s=ent[e.from],t=ent[e.to];if(!s||!t)continue;
     const rs=s.pod.row,rt=t.pod.row;
     const how=s.pod===t.pod?(!s.isPod&&!t.isPod&&s.prow===t.prow&&Math.abs(s.col-t.col)===1?"side":"under")
       :Math.abs(rs-rt)===1?"adj":rs===rt?"same":"skip";
     const down=rt>rs,[sside,tside]=how==="side"?[null,null]:["under","same"].includes(how)?["bottom","bottom"]:down?["bottom","top"]:["top","bottom"];
-    plans.push({e,s,t,how,rs,rt,sside,tside});
+    const reach=(en,side)=>!["side","under"].includes(how)&&!en.isPod&&
+      ((side==="top"&&en.prow>0)||(side==="bottom"&&en.prow<en.pod.prows-1))?ent["pod:"+en.pod.id]:en;
+    s=reach(s,sside);t=reach(t,tside);
+    plans.push({e,s,t,sref:s.isPod?"pod:"+s.pod.id:e.from,tref:t.isPod?"pod:"+t.pod.id:e.to,how,rs,rt,sside,tside});
   }
   const gutters={left:new Map(),right:new Map()},gx=new Map();
   for(const pl of plans.filter(p=>p.how==="skip")){
@@ -88,18 +120,42 @@ export function routeGraph(graph,width){
   for(const pl of plans)if(pl.how==="skip")pl.gx=gx.get(pl.gkey);
 
   const sides=new Map(),ports=new Map(),center=en=>en.x+en.w/2;
-  const sideItem=(ref,side,k,far)=>{const id=key(ref,side);if(!sides.has(id))sides.set(id,{ref,items:new Map()});const items=sides.get(id).items;
+  const sideItem=(ref,side,k,far)=>{const id=key(ref,side);if(!sides.has(id))sides.set(id,{ref,side,items:new Map()});const items=sides.get(id).items;
     if(!items.has(k))items.set(k,[]);items.get(k).push(far);};
   for(const pl of plans){if(pl.how==="side")continue;
     pl.skey=key("out",pl.e.kind);pl.tkey=key("in",pl.e.from,pl.e.kind);
-    sideItem(pl.e.from,pl.sside,pl.skey,pl.how==="skip"?pl.gx:center(pl.t));
-    sideItem(pl.e.to,pl.tside,pl.tkey,pl.how==="skip"?pl.gx:center(pl.s));}
-  for(const[id,{ref,items}]of sides){
+    sideItem(pl.sref,pl.sside,pl.skey,pl.how==="skip"?pl.gx:center(pl.t));
+    sideItem(pl.tref,pl.tside,pl.tkey,pl.how==="skip"?pl.gx:center(pl.s));}
+  for(const[id,{ref,side,items}]of sides){
     const average=values=>values.reduce((a,b)=>a+b,0)/values.length;
-    const keys=[...items.keys()].sort((a,b)=>average(items.get(a))-average(items.get(b))),en=ent[ref],span=en.w*(en.isPod?.5:.72);
-    keys.forEach((k,i)=>ports.set(key(id,k),Math.round(en.x+(en.w-span)/2+span*(i+1)/(keys.length+1))));}
+    const keys=[...items.keys()].sort((a,b)=>average(items.get(a))-average(items.get(b))),[a,b]=graphFreeInterval(ent[ref],side);
+    keys.forEach((k,i)=>ports.set(key(id,k),Math.round(a+(b-a)*(i+1)/(keys.length+1))));}
   for(const pl of plans)if(pl.how!=="side"){
-    pl.sx=ports.get(key(key(pl.e.from,pl.sside),pl.skey));pl.tx=ports.get(key(key(pl.e.to,pl.tside),pl.tkey));}
+    pl.sx=ports.get(key(key(pl.sref,pl.sside),pl.skey));pl.tx=ports.get(key(key(pl.tref,pl.tside),pl.tkey));}
+  const outgoing=new Map(),incoming=new Map();
+  for(const pl of plans)if(pl.how!=="side"){
+    const a=key(pl.sref,pl.sside),b=key(pl.tref,pl.tside);outgoing.set(a,(outgoing.get(a)??0)+1);incoming.set(b,(incoming.get(b)??0)+1);
+  }
+  for(const pl of plans)if(pl.how==="adj"&&outgoing.get(key(pl.sref,pl.sside))===1&&incoming.get(key(pl.tref,pl.tside))===1){
+    const[a,b]=graphFreeInterval(pl.t,pl.tside);if(a<=pl.sx&&pl.sx<=b)pl.tx=pl.sx;
+  }
+  const used=new Map();
+  for(const pl of plans)if(!["side","under"].includes(pl.how))for(const[end,side,xk,ref,k]of[
+    ["s",pl.sside,"sx",pl.sref,pl.skey],["t",pl.tside,"tx",pl.tref,pl.tkey]]){
+    const en=pl[end],channel=en.pod.row-(side==="top"?1:0),owner=key(ref,side,k);
+    if(!used.has(channel))used.set(channel,new Map());const columns=used.get(channel);let x=pl[xk];
+    // A lone straight edge's two stems meet, rather than overlap. Do not separate it from itself.
+    const ownStraightStem=xk==="tx"&&pl.how==="adj"&&pl.sx===x&&outgoing.get(key(pl.sref,pl.sside))===1&&incoming.get(key(pl.tref,pl.tside))===1
+      &&columns.get(x)===key(pl.sref,pl.sside,pl.skey);
+    if(columns.has(x)&&columns.get(x)!==owner&&!ownStraightStem){
+      const[a,b]=graphFreeInterval(en,side);
+      for(const d of [LANE,-LANE,2*LANE,-2*LANE,3*LANE,-3*LANE])if(a<=x+d&&x+d<=b&&(!columns.has(x+d)||columns.get(x+d)===owner)){x+=d;break;}
+      for(const q of plans)if(!["side","under"].includes(q.how)){
+        if(key(q.sref,q.sside,q.skey)===owner)q.sx=x;
+        if(key(q.tref,q.tside,q.tkey)===owner)q.tx=x;
+      }
+    }columns.set(x,owner);
+  }
 
   const buses=rows.map(()=>new Map()),lanes=new Map(),nlanes={};
   const bus=(c,k,a,b)=>{if(!buses[c].has(k))buses[c].set(k,[]);buses[c].get(k).push([a,b]);};
@@ -134,7 +190,8 @@ export function routeGraph(graph,width){
       }else if(["adj","same"].includes(pl.how)){const ly=laneY(pl.ch[0]);points=[[pl.sx,sy],[pl.sx,ly],[pl.tx,ly],[pl.tx,ty]];}
       else{const l1=laneY(pl.ch[0]),l2=laneY(pl.ch[1]);points=[[pl.sx,sy],[pl.sx,l1],[pl.gx,l1],[pl.gx,l2],[pl.tx,l2],[pl.tx,ty]];}
     }
-    pl.pts=points.map(([x,y])=>[round(x),round(y)]);
+    pl.routePoints=points.map(([x,y])=>[round(x),round(y)]);
+    pl.pts=simplifyGraphPoints(pl.routePoints);
   }
   return{pods,ent,plans,dense,height:y+MARGIN,width,lanes:nlanes,laneSpans,gutterLanes:Object.fromEntries(Object.entries(gutters).map(([k,v])=>[k,v.size]))};
 }
@@ -144,13 +201,14 @@ export function graphSeatPath(layout,from,to){
   if(plan)return{points:plan.pts,plan};
   plan=layout.plans.find(pl=>pl.e.members.some(m=>m.from===from&&m.to===to));
   if(!plan)return null;
-  const points=plan.pts.map(p=>[...p]),s=layout.ent[from],t=layout.ent[to];if(!s||!t)return null;
-  const port=(en,refs,ref)=>Math.round(en.x+en.w*(.3+.4*(refs.indexOf(ref)+1)/(refs.length+1)));
-  if(plan.s.isPod){const refs=unique(plan.e.members.map(m=>m.from)).sort((a,b)=>layout.ent[a].x-layout.ent[b].x),x=port(s,refs,from),y=plan.sside==="bottom"?s.y+s.h:s.y;
+  const points=plan.routePoints.map(p=>[...p]),s=layout.ent[from],t=layout.ent[to];if(!s||!t)return null;
+  const reachable=(en,side)=>en.isPod||(side==="top"?en.prow===0:en.prow===en.pod.prows-1);
+  const port=(en,side,refs,ref)=>{const[a,b]=graphFreeInterval(en,side);return Math.round(a+(b-a)*(.3+.4*(refs.indexOf(ref)+1)/(refs.length+1)));};
+  if(plan.s.isPod&&reachable(s,plan.sside)){const refs=unique(plan.e.members.map(m=>m.from)).sort((a,b)=>layout.ent[a].x-layout.ent[b].x),x=port(s,plan.sside,refs,from),y=plan.sside==="bottom"?s.y+s.h:s.y;
     points.splice(0,2,[x,y],[x,points[1][1]]);}
-  if(plan.t.isPod){const refs=unique(plan.e.members.map(m=>m.to)).sort((a,b)=>layout.ent[a].x-layout.ent[b].x),x=port(t,refs,to),y=plan.tside==="bottom"?t.y+t.h:t.y;
+  if(plan.t.isPod&&reachable(t,plan.tside)){const refs=unique(plan.e.members.map(m=>m.to)).sort((a,b)=>layout.ent[a].x-layout.ent[b].x),x=port(t,plan.tside,refs,to),y=plan.tside==="bottom"?t.y+t.h:t.y;
     points.splice(points.length-2,2,[x,points.at(-2)[1]],[x,y]);}
-  return{points,plan};
+  return{points:simplifyGraphPoints(points),plan};
 }
 
 /** Arrow keys select the nearest card in that half-plane, with transverse distance as a tie breaker. */

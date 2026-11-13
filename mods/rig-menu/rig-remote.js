@@ -1,6 +1,6 @@
 // The person's configured Herdr machine is the only remote authority. Daemon data never selects it.
 import { isLoopbackDaemonUrl, parseDaemonStatusJson } from "./rig-lib.js";
-export const RELAY_SHA256 = "e6f9710022795f7642a8af6ca1daf172fa6eccac2d405d225c831efe09af1ef5";
+export const RELAY_SHA256 = "6372063b2566489fef1c7a3a547800d57382c95c48935e5c7bbe92b1ba03ce60";
 const MACHINE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 // Attach and every rig space create separate callers. Serialize the whole preparation across them;
 // each queued caller still rechecks its own config, consent, profile and bytes instead of sharing readiness.
@@ -141,7 +141,9 @@ export class RemoteMachine {
       return {ok:true,machine:config.daemonMachine,profileId:record.id??record.name,home:info.home,searchPath:info.searchPath,daemonUrl:status.daemonUrl,selfHostId:localHealth.selfHostId};
     }catch(error){return remoteFailure(error,config.daemonMachine);}
   }
-  async prepareExclusive(config, { consent = null, install = true } = {}) {
+  /** Full setup checks without installing the helper or persisting an approval. */
+  review(config) { return this.prepare(config,{review:true}); }
+  async prepareExclusive(config, { consent = null, install = true, review = false, onProgress = null } = {}) {
     try {
       const host=this.host,machine=config.daemonMachine;
       const {record,info,status,localHealth,remoteHealth,remoteExec}=await this.readIdentity(config);
@@ -151,16 +153,21 @@ export class RemoteMachine {
       const shipped = parse(await host.exec(localNode, [fileHelper, "inspect"]), "Verify shipped relay");
       if (shipped.sha256 !== RELAY_SHA256) throw new Error("The relay hash does not match this release. Reinstall the mod.");
       const identity = { machine, target: record.target ?? "", id: record.id ?? "", via: record.via ?? "", session: record.session ?? "", home: info.home, daemonUrl: config.daemonUrl, selfHostId: localHealth.selfHostId };
-      const key = JSON.stringify(identity);
+      const key = JSON.stringify({ ...identity, sha256: RELAY_SHA256 });
       const stored = await host.readConsent();
+      const confirmation={key,machine,target:record.target||info.user,user:info.user,folder:info.path.slice(0,info.path.lastIndexOf("/")),
+        sha256:RELAY_SHA256,fileState:!info.sha256?"missing":info.sha256===RELAY_SHA256?"same":"older",
+        profileId:record.id??record.name,selfHostId:localHealth.selfHostId,origin:config.daemonUrl};
+      if(review)return {ok:true,confirmation,approved:stored?.key===key};
       if (stored?.key !== key && consent?.key !== key) return { ok: false, needsConsent: true,
-        confirmation: { key, machine, target: record.target || info.user, user: info.user, folder: info.path.slice(0, info.path.lastIndexOf("/")), sha256: RELAY_SHA256 },
-        reason: `Confirm first use of ${machine} before opening seats there.` };
+        confirmation,
+        reason: `${machine} needs your approval before seats open there.` };
       if (consent && consent.key !== key) throw new Error("The machine changed since confirmation. Review its details again.");
       // Re-read availability after the asynchronous identity and consent checks, immediately before writes.
       const current = await this.ready(machine);
       if (JSON.stringify([current.target, current.id, current.via, current.session]) !== JSON.stringify([record.target, record.id, record.via, record.session])) throw new Error("The Herdr machine changed during preparation. Retry and review it again.");
       if (install && info.sha256 !== RELAY_SHA256) {
+        onProgress?.("install");
         const written = parse(await host.exec(localNode, [fileHelper, "install", machine, info.home]), `Install relay on ${machine}`);
         if (written.path !== info.path) throw new Error("Remote relay write returned an unexpected path.");
       }
@@ -169,7 +176,7 @@ export class RemoteMachine {
         const verified = await inspectRemote(remoteExec, info.home);
         if (verified.path !== info.path || verified.sha256 !== RELAY_SHA256) throw new Error("Remote relay verification failed. No terminal was started.");
       };
-      await verify();
+      onProgress?.("verify");await verify();
       if (consent && stored?.key !== key) { await host.writeConsent({ key }); await verify(); }
       return { ok: true, machine, node: info.node, relayPath: info.path, daemonUrl: status.daemonUrl, selfHostId: localHealth.selfHostId };
     } catch (e) { return remoteFailure(e, config.daemonMachine); }

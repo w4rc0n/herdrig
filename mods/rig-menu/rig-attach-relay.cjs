@@ -5,8 +5,10 @@
 // the session name, an optional tmux server flag pair, and what to show. The relay never runs a command string: it
 // validates the session and the server flags again here and starts `tmux` directly with an argv (no shell). Polling
 // the daemon reads the seat's state for the status dot; nothing it returns is executed.
+// An explicit grid mode uses the shared sizing viewer below, without OSC or daemon requests. No other mode is accepted.
+// Encoded payloads must be canonical base64 containing a UTF-8 JSON object, at most 16 KiB decoded.
 "use strict";
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -129,14 +131,29 @@ function mapNode(n) {
 function tmuxFailureMessage(session) {
   return `Couldn't open ${session}'s tmux session here. Check that the seat is running (rig ps) and that this account can open OpenRig's tmux.\n`;
 }
+const MAX_PAYLOAD_BYTES = 16384;
+function decodeRelayPayload(value) {
+  if (typeof value !== "string" || !value || value.length > 4 * Math.ceil(MAX_PAYLOAD_BYTES / 3)) throw new Error("payload is missing or too large");
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length > MAX_PAYLOAD_BYTES || bytes.toString("base64") !== value) throw new Error("payload is not canonical base64");
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes)) throw new Error("payload is not UTF-8");
+  const cfg = JSON.parse(text);
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) throw new Error("payload is not an object");
+  if (Object.hasOwn(cfg, "mode") && cfg.mode !== "grid") throw new Error("unsupported relay mode");
+  if(cfg.mode==="grid"&&Object.hasOwn(cfg,"readOnly")&&typeof cfg.readOnly!=="boolean")throw new Error("readOnly must be a boolean");
+  if(cfg.mode==="grid"&&Object.hasOwn(cfg,"title")&&typeof cfg.title!=="string")throw new Error("title must be text");
+  return cfg;
+}
 function main(payloadArg) {
   let cfg;
   try {
-    cfg = JSON.parse(Buffer.from(String(payloadArg || ""), "base64").toString("utf8"));
+    cfg = decodeRelayPayload(payloadArg);
   } catch (_) {
     process.stderr.write("rig-attach-relay: the payload isn't readable\n");
     return process.exit(2);
   }
+  if (cfg.mode === "grid") return gridMain(payloadArg);
   let argv;
   try {
     // OpenRig's own server flag when it named one; else the private server beside the configured OpenRig home.
@@ -222,5 +239,106 @@ function main(payloadArg) {
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { cleanup(); try { child.kill(sig); } catch (_) {} });
 }
 
-module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage };
+// Grid mode shares the local viewer implementation; it has no OSC or daemon polling.
+function ignoreSizeArgs(version) {
+  const match = /^tmux (\d+)\.(\d+)(?:[a-z]|\b)/.exec(String(version ?? "").trim());
+  return match && (+match[1] > 3 || +match[1] === 3 && +match[2] >= 2) ? ["-f", "ignore-size"] : [];
+}
+const SIZING_INTERVAL_MS = 5000;
+// tmux replaces control characters in format output; use printable separators.
+const CLIENT_FORMAT = "#{client_pid}|#{client_tty}|#{client_flags}";
+const runTmux = args => new Promise((resolve,reject)=>{
+  const env={...process.env};delete env.TMUX;
+  const command=spawn("tmux",args,{stdio:["ignore","pipe","pipe"],shell:false,env});
+  let stdout="",stderr="",settled=false;
+  const finish=(error)=>{if(settled)return;settled=true;clearTimeout(timer);error?reject(error):resolve({stdout});};
+  const timer=setTimeout(()=>{command.kill("SIGKILL");finish(new Error("tmux metadata timed out"));},1000);
+  command.stdout.on("data",data=>{stdout+=data;if(stdout.length>65536){command.kill("SIGKILL");finish(new Error("tmux metadata too large"));}});
+  command.stderr.on("data",data=>{stderr=(stderr+data).slice(0,4096);});
+  command.on("error",finish);command.on("close",code=>finish(code===0?null:new Error(stderr||"tmux metadata failed")));
+});
+function sizingClients(stdout) {
+  return String(stdout ?? "").trim().split("\n").flatMap(line => {
+    const [pid,tty,flags] = line.split("|");
+    return /^[1-9][0-9]*$/.test(pid) && /^\/dev\/(?:pts\/[0-9]+|tty[a-zA-Z0-9]+)$/.test(tty ?? "")
+      ? [{pid:Number(pid),tty,ignore:String(flags ?? "").split(",").includes("ignore-size")}] : [];
+  });
+}
+function sizingChange(stdout, ownPid) {
+  const clients=sizingClients(stdout), own=clients.find(c=>c.pid===ownPid);
+  if(!own)return null;
+  const ignore=clients.some(c=>c.pid!==ownPid&&!c.ignore);
+  return own.ignore===ignore?null:{tty:own.tty,ignore};
+}
+function viewerArgs(cfg, version, clients = "") {
+  if(Object.hasOwn(cfg,"readOnly")&&typeof cfg.readOnly!=="boolean")throw new Error("readOnly must be a boolean");
+  const named = validServerArgs(cfg.serverArgs);
+  const argv = tmuxArgv(cfg.session, named && named.length ? named : (named ? localServerArgs(cfg.openrigHome) : cfg.serverArgs));
+  if(cfg.readOnly===true)argv.splice(argv.indexOf("attach-session")+1,0,"-r");
+  if(sizingClients(clients).some(c=>!c.ignore))argv.splice(argv.indexOf("attach-session") + 1, 0, ...ignoreSizeArgs(version));
+  return argv;
+}
+async function gridMain(payload) {
+  let argv, cfg, child, parked = false;
+  try { cfg = decodeRelayPayload(payload); }
+  catch (e) { process.stderr.write(`Rig grid: ${e.message}\n`); process.exitCode = 2; return; }
+  // Remote grids accept checked session/server flags, an explicit read-only bit and a display title only.
+  if (cfg.mode === "grid") cfg = { session: cfg.session, serverArgs: cfg.serverArgs,
+    ...(Object.hasOwn(cfg,"readOnly")?{readOnly:cfg.readOnly}:{}),
+    title:String(cfg.title??"").replace(/[\u0000-\u001f\u007f-\u009f]/g," ").slice(0,256) };
+  let sizingTimer, resizeTimer, sizingBusy=false, sizingSupported=false;
+  // Herdr keeps adopted terminals: exiting would replace this viewer with an interactive shell.
+  // Keep an inert notice instead, including when stdin is closed or the tmux client exits successfully.
+  const park = (message) => {
+    if (parked) return; parked = true;
+    clearInterval(sizingTimer);clearTimeout(resizeTimer);
+    process.stderr.write(`${message.trimEnd()}\nClose this pane, then reopen the rig space to retry.\n`);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+    process.stdin.pause();
+    setInterval(() => {}, 2147483647);
+  };
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => {
+    try { child?.kill(sig); } catch (_) {}
+    process.exit(0);
+  });
+  try {
+    argv = viewerArgs(cfg, null); // Validate before probing anything.
+    // One bounded startup probe (up to 3 s), never repeated by the sizing timer.
+    const version = spawnSync("tmux", ["-V"], { encoding: "utf8", timeout: 3000, shell: false });
+    const value=version.status===0?version.stdout:null;sizingSupported=ignoreSizeArgs(value).length>0;
+    let clients="";
+    if(sizingSupported){try{clients=(await runTmux([...argv.slice(0,argv.indexOf("attach-session")),"list-clients","-t",`=${cfg.session}`,"-F",CLIENT_FORMAT])).stdout;}catch{}}
+    argv = viewerArgs(cfg, value, clients);
+  }
+  catch (e) { park(`Rig grid: ${e.message}`); return; }
+  if (argv[0] === "-S" && !fs.existsSync(argv[1])) {
+    park(tmuxFailureMessage(cfg.session)); return;
+  }
+  const env = { ...process.env }; delete env.TMUX; env.TERM = termFor(env.TERM);
+  if(cfg.title)process.stdout.write(`\x1b]0;${cfg.title}\x07`);
+  child = spawn("tmux", argv, { stdio: "inherit", env, shell: false });
+  // Only this wrapper's child PID is eligible. Its inherited tty remains held by
+  // this live wrapper, and tmux targets client tty names exactly (no prefix match).
+  const server=argv.slice(0,argv.indexOf("attach-session"));
+  let sizingError=false,lastSizingAt=0;
+  const reconcile=async()=>{
+    if(sizingBusy||parked||child.exitCode!==null||Date.now()-lastSizingAt<1000)return;
+    sizingBusy=true;lastSizingAt=Date.now();
+    try{
+      const result=await runTmux([...server,"list-clients","-t",`=${cfg.session}`,"-F",CLIENT_FORMAT]);
+      const change=sizingChange(result.stdout,child.pid);
+      if(change&&!parked&&child.exitCode===null)await runTmux([...server,"refresh-client","-t",change.tty,"-f",change.ignore?"ignore-size":"!ignore-size"]);
+      sizingError=false;
+    }catch{
+      if(!sizingError&&!parked){process.stderr.write("Grid sizing could not be refreshed; reopen this tile to retry.\n");sizingError=true;}
+    }finally{sizingBusy=false;}
+  };
+  if(sizingSupported){
+    sizingTimer=setInterval(reconcile,SIZING_INTERVAL_MS);
+    process.on("SIGWINCH",()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(reconcile,250);});
+  }
+  child.on("error", (e) => park(`Rig grid: tmux did not start (${e.message})\n${tmuxFailureMessage(cfg.session)}`));
+  child.on("exit", (code) => park(code ? tmuxFailureMessage(cfg.session) : `The viewer for ${cfg.session} ended. Its tmux session may have stopped.`));
+}
+module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage, decodeRelayPayload, MAX_PAYLOAD_BYTES, gridMain, viewerArgs, ignoreSizeArgs, sizingClients, sizingChange, SIZING_INTERVAL_MS };
 if (require.main === module) main(process.argv[2]);

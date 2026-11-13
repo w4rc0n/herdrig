@@ -86,6 +86,51 @@ export function acceptRigOpen(host, id) {
 }
 
 const paneIdentity = panes => JSON.stringify(panes.map(p=>[p.pane,p.mod,p.terminal]));
+const pageMoveJobs = new Map();
+/** Herdr may finish its last-tab confirmation after our bounded wait. Observe, never retry the close. */
+export function migrationReportNow(host,result) {
+  if(!result)return result;
+  const completed=(result.left??[]).filter(item=>item.pendingClose
+    &&!list(host,"spaces").find(s=>s.id===result.spaceId)?.tabs?.some(t=>t.id===item.tabId));
+  if(!completed.length)return result;
+  return {...result,reason:null,left:result.left.filter(item=>!completed.includes(item)),moved:[...(result.moved??[]),...completed]};
+}
+function pageMigration(host,config,spaceId,tabId) {
+  const source=contexts(host).find(c=>c.id===spaceId);
+  const panes=list(host,"panes").filter(p=>p.tab===tabId),pages=panes.filter(p=>p.mod===MOD_IDS.view);
+  if(!configUnchanged(host,config)||!needsTabMigration(source,config)||!source.space.tabs?.some(t=>t.id===tabId)||!pages.length||pages.length===panes.length
+    ||pages.some(p=>!p.pane||p.terminal)||new Set(panes.map(p=>p.pane)).size!==panes.length)return null;
+  return {pages,panes,pageOnly:true,pageFingerprint:JSON.stringify([paneIdentity(panes),configIdentity(config)])};
+}
+
+/** Explicit page-only Move never closes a terminal or its tab, even when the terminal cannot be identified. */
+export async function moveMigrationPages(host,config,request) {
+  const key=JSON.stringify([request.spaceId,request.tabId]);
+  if(pageMoveJobs.has(key))return pageMoveJobs.get(key);
+  const task=(async()=>{
+    try{
+      const checked=pageMigration(host,config,request.spaceId,request.tabId);
+      if(!checked||checked.pageFingerprint!==request.pageFingerprint)return fail("The tab changed. Review it again before moving its Rig page.");
+      const entry=host.shared?.("rig.pageRoutes")?.[request.tabId]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+      const destination=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
+      if(!destination.ok)return destination;
+      const current=pageMigration(host,config,request.spaceId,request.tabId);
+      if(!current||current.pageFingerprint!==checked.pageFingerprint)return fail("The original tab changed while its destination opened. Its panes were left here.");
+      const remaining=[...checked.panes];
+      for(const page of checked.pages){
+        if(!configUnchanged(host,config)||paneIdentity(list(host,"panes").filter(p=>p.tab===request.tabId))!==paneIdentity(remaining))
+          return fail("The original tab changed. Its remaining panes were left here.");
+        host.run("pane.close",{pane:page.pane});
+        if(!await adopted(host,()=>!list(host,"panes").some(p=>p.pane===page.pane)))
+          return fail("The destination opened, but closing the original Rig page was not confirmed. Its terminal panes were left here.");
+        remaining.splice(remaining.findIndex(p=>p.pane===page.pane),1);
+      }
+      return {ok:true,space:destination.space,terminalPanesKept:true};
+    }catch(error){return fail(String(error?.message??error));}
+  })();
+  pageMoveJobs.set(key,task);
+  try{return await task;}finally{if(pageMoveJobs.get(key)===task)pageMoveJobs.delete(key);}
+}
 const shellArgv = argv => Array.isArray(argv) && argv.length===1 && /^(?:-)?(?:ba|z|da|k|c|tc|fi)?sh$/.test(String(argv[0]).split("/").at(-1));
 
 /** Read each actual core, including machine-qualified addresses; a label alone never proves a live TUI. */
@@ -93,12 +138,12 @@ export async function inspectMigrationTab(host,config,spaceId,tabId) {
   const tab=list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.find(t=>t.id===tabId);
   const panes=list(host,"panes").filter(p=>p.tab===tabId);
   const result={spaceId,tabId,name:tab?.name||tabId,replaceable:false};
-  const left=reason=>({...result,ok:false,reason});
+  const left=(reason,blockedPane=null)=>({...result,ok:false,reason,...(blockedPane?{blockedPane}:{})});
   if(!configUnchanged(host,config))return left("OpenRig's connection changed; review the tab again");
   if(!tab||!panes.length)return left("the tab is no longer open");
   const expected=paneIdentity(panes),records=[];let stale=false;
   for(const pane of panes){
-    if(pane.mod===MOD_IDS.view)continue;
+    if(pane.mod===MOD_IDS.view){if(pane.terminal)return left("it includes another terminal pane");continue;}
     const terminal=list(host,"terminals").find(t=>t.address===pane.terminal);
     if(!terminal||!host.hc)return left("it includes a personal pane OpenRig didn't open");
     let record;
@@ -115,7 +160,11 @@ export async function inspectMigrationTab(host,config,spaceId,tabId) {
     // Older tab.new fallback TUIs had no role label; recognise only the actual TUI argv, never its tab name.
     if(!isTuiArgv(argv,config)){
       if(labelled&&record.keep===true&&shellArgv(argv)){stale=true;}
-      else return left(labelled?"its TUI command changed or isn't running":"it includes a personal pane OpenRig didn't open");
+      else {
+        const program=Array.isArray(argv)?argv[0]:null;
+        const name=String(record.foreground?.name||program||"terminal").split("/").at(-1).replace(/[\u0000-\u001f\u007f-\u009f]/g,"").slice(0,64)||"terminal";
+        return left(labelled?"its TUI command changed or isn't running":"it includes another terminal pane",name);
+      }
     }
     records.push([terminal.address,terminal.labels,record.labels,record.state,record.pid,record.created_ms,record.argv,record.foreground?.pid,record.foreground?.argv??null]);
   }
@@ -140,7 +189,11 @@ export async function migrateRigTabs(host, config, spaceId) {
   for(const tab of candidates){
     try {
       const checked=await inspectMigrationTab(host,config,spaceId,tab);
-      if(!checked.ok){left.push(checked);continue;}
+      if(!checked.ok){
+        const page=pageMigration(host,config,spaceId,tab);
+        left.push({...checked,...(page?{pageOnly:true,pageFingerprint:page.pageFingerprint,
+          reason:checked.blockedPane?`${checked.blockedPane} in ${checked.name} stays here; you can move just the Rig page`:"other panes stay here; you can move just the Rig page"}:{})});continue;
+      }
       const entry=host.shared?.("rig.pageRoutes")?.[tab]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
       const result=await routeOpen({...host,routeOwner:true},config,checked.panes.some(p=>p.mod===MOD_IDS.view)
         ?{kind:"page",entry,home:true}:{kind:"tui"});
@@ -149,7 +202,7 @@ export async function migrateRigTabs(host, config, spaceId) {
       if(!current.ok||current.fingerprint!==checked.fingerprint){left.push({...checked,ok:false,replaceable:false,reason:"the original tab changed while opening its destination"});continue;}
       host.run("tab.close",{id:tab});
       if(!await adopted(host,()=>!list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.some(t=>t.id===tab))){
-        left.push({...checked,ok:false,replaceable:false,reason:"its destination opened, but closing the original tab was not confirmed"});continue;
+        left.push({...checked,ok:false,replaceable:false,pendingClose:true,destination:result.space,reason:"its destination opened, but closing the original tab was not confirmed"});continue;
       }
       moved.push({...checked,destination:result.space});
     }catch(error){left.push({tabId:tab,name:list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.find(t=>t.id===tab)?.name||tab,replaceable:false,reason:String(error?.message??error)});}

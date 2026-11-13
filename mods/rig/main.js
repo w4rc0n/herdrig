@@ -15,15 +15,21 @@
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
 import { View, div, svg } from "gpui-kit";
+import { effectiveScopeProject } from './rig-project.js';
+import { workflowPath,workflowView,workflowEntry,workflowWord } from './rig-workflow.js';
+import { resolveAskerSeat,relativeTimeText } from './rig-lib.js';
+import { timezoneValue } from './rig-time.js';
 import { healthCounts } from "./rig-health.js";
 
 import { filterAttentionHealth } from "./rig-lib.js";
 import { h_flex, v_flex } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, closeOverlay, setShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands, machines } from "herdr";
 import { RemoteMachine, detectDaemonMachine } from "./rig-remote.js";
+import { HostWorkerViews } from "./rig-worker-controller.js";
+import {workerViewDetails} from "./rig-worker-views.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
-import { RigSpaces, RebuildConfirmations } from "./rig-spaces.js";
-import { acceptRigOpen, migrateRigTabs, replaceMigrationTab, needsTabMigration, migrationChoice, migrationChoices } from "./rig-routing.js";
+import { RigSpaces, RebuildConfirmations, rigSpaceRelocation } from "./rig-spaces.js";
+import { acceptRigOpen, migrateRigTabs, replaceMigrationTab, moveMigrationPages, migrationReportNow, needsTabMigration, migrationChoice, migrationChoices } from "./rig-routing.js";
 import { openRigSpaceContext, SidebarSpaceFold, rigOrigin } from "./rig-space-context.js";
 import { publishGraphActivity } from "./rig-graph-state.js";
 import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest, requestDismissal, dismissible } from "./rig-dismiss.js";
@@ -37,7 +43,7 @@ import {
   asOf, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, requestCardText,
   readCommand, writeCommand, writeOutcome, actionArgs, actionTitle, doneWords, startOneClick, ONE_CLICK, RIG_SECTIONS, SECTION_TITLES, CONFIG_CATEGORIES,
   navPush, navBack, navKey,
-  probeCapabilities, currentCapabilities, capabilityDisableReason, isNeedsVisible, openNeed, worstHealthChip,
+  probeCapabilities, currentCapabilities, capabilityDisableReason, herdrAppAvailability, isNeedsVisible, openNeed, worstHealthChip,
   isRigStopped, expandAllTopology, collapseAllTopology,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, selectWorkerView, findRigTab,
   selectSidebarNode, isSelectionElsewhere, orderSiblings, applySiblingDrop, resetGroupOrder,
@@ -182,16 +188,24 @@ export default class RigSidebar extends View {
           openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, fallbackEntry);
         }
         else if (cmdName.startsWith("update-action:")) this.updateAction(cx, cmdName.slice(14));
-        else if (cmdName === "refresh") { this.forceCapabilityProbe = true; cx.spawn(async (cx) => this.refresh(cx)); }
+        else if (cmdName === "refresh") { this.forceCapabilityProbe = true; cx.spawn(async (cx) => { await this.reloadConfig(cx); await this.refresh(cx); }); }
+        else if(cmdName==="choose-machine"){
+          this.machineChoiceAvailable=true;this.machineSearchComplete=false;this.showMachineOffer(cx);
+        }
         else if (cmdName === "confirm-machine") {
           const token = shared("rig.machineConfirmation"); setShared("rig.machineConfirmation", null);
           const pending = this.machineConfirmations?.get(token);
-          if (pending) { this.machineConfirmations.delete(token); pending.resume(cx, pending.confirmation); }
+          if (pending) { this.machineConfirmations.delete(token); cx.spawn(async cx=>{await this.reloadConfig(cx);this.daemonMachineOffer=null;this.machineChoiceAvailable=false;pending.resume(cx, pending.confirmation);cx.notify();}); }
         }
         else if (cmdName === "rebuild-space") {
           const request = shared("rig.rebuildRequest"); setShared("rig.rebuildRequest", null);
           const approved = this.rebuildConfirmations?.take(request);
-          if (approved) this.openRigSpace(cx, approved.rigId, approved.recovery);
+          if (approved) this.openRigSpace(cx, approved.rigId, approved.recovery,null,approved.continuation?.relocation,approved.continuation?.worker);
+        }
+        else if (cmdName === "move-grid") {
+          const request=shared("rig.gridMoveRequest");setShared("rig.gridMoveRequest",null);
+          const approved=this.gridMoveConfirmations?.take(request);
+          if(approved)this.openRigSpace(cx,approved.rigId,approved.continuation?.rebuild??null,null,approved.recovery,approved.continuation?.worker);
         }
         else if (cmdName.startsWith("space:")) this.openRigSpace(cx, cmdName.slice(6));
         else if (cmdName === "space" || cmdName === "rig.space") this.openRigSpace(cx, cmdArgs?.rigId ?? cmdArgs?.rig ?? shared("rig.sel")?.entry?.rigId);
@@ -249,14 +263,19 @@ export default class RigSidebar extends View {
   async loadSidebarState() {
     if (typeof appHome !== "function" || typeof readTextFile !== "function") return;
     try {
+      const receipt=JSON.parse(await readTextFile(`${appHome()}/openrig/machine-consent.json`).catch(()=>"null")??"null");
+      setShared("rig.machineSetup",receipt);
+    }catch{setShared("rig.machineSetup",null);}
+    try {
       const raw = await readTextFile(`${appHome()}/openrig/state.json`);
       if (!raw) return;
       const parsed = parseSidebarState(raw);
       try {
         const saved = JSON.parse(raw);
         const spaceState = { homeSpace: saved.homeSpace, homeSpaces:saved.homeSpaces, machineDeclined:saved.machineDeclined,machineSearchDeclined:saved.machineSearchDeclined,
-          sidebarSize: saved.sidebarSize, tabMigration: saved.tabMigration };
+          sidebarSize: saved.sidebarSize, tabMigration: saved.tabMigration,workerViews:saved.workerViews };
         setShared("rig.spaceState", { ...spaceState, ...(shared("rig.spaceState") ?? {}) });
+        setShared("rig.workerViews",shared("rig.spaceState")?.workerViews??{});
         if (this.spaceFold && !this.spaceFold.savedSize) this.spaceFold.savedSize = spaceState.sidebarSize;
       } catch (_) {}
       try { this.dismissalOrigins = JSON.parse(raw).dismissedUpdates ?? {}; } catch (_) {}
@@ -518,13 +537,23 @@ export default class RigSidebar extends View {
   }
 
   migrationResultHere() {
-    const result=this.migrationResult,id=this.activeSpaceContext?.id;
+    const result=migrationReportNow({spaces},this.migrationResult),id=this.activeSpaceContext?.id;
     return !!result&&!!id&&(result.spaceId===id||result.moved?.some(item=>item.destination===id));
   }
 
   migrationCard(t) {
     if(this.migrationResultHere())return this.migrationReport(t);
     const context=this.activeSpaceContext;
+    const rig=context?.id?this.data?.topology?.find(r=>rigSpaceRelocation({spaces,panes,terminals},r,this.config)?.source===context.id):null;
+    if(rig&&!migrationChoice(shared("rig.spaceState"),this.config,context.id))return v_flex().id("rig-grid-move-card").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
+      .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}'s rig space is on this computer, but its seats now open on ${this.config.daemonMachine}.`))
+      .child(h_flex().gap(8)
+        .child(div().id("rig-grid-move").text_size(11.5).text_color(t.accent).cursor_pointer().child(`Move ${rig.name} to ${this.config.daemonMachine}`)
+          .on_click((_e,cx)=>this.openRigSpace(cx,rig.id)))
+        .child(div().id("rig-grid-keep").text_size(11.5).text_color(t.muted).cursor_pointer().child("Keep here").on_click((_e,cx)=>{
+          cx.spawn(async cx=>{try{await this.saveSpaceState({tabMigration:migrationChoices(shared("rig.spaceState"),this.config,context.id,"keep")});}
+            catch(error){notify({title:"Rig space",body:String(error?.message??error),level:"warning"});}cx.notify();});
+        })));
     if(!needsTabMigration(context,this.config) || migrationChoice(shared("rig.spaceState"),this.config,context.id)) return null;
     const choose=(choice,cx)=>{
       if(this.migratingTabs) return;
@@ -603,6 +632,9 @@ export default class RigSidebar extends View {
         .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.spawn(cx=>this.findDaemonMachine(cx));}})
         .child(this.machineFinding?"Finding…":"Find where OpenRig runs"));
     const act=(use,cx)=>{
+      if(use){
+        this.reviewMachine({confirmation:{machine:offer.machine}},()=>{});return;
+      }
       if(this.machineOfferBusy)return;this.machineOfferBusy=true;
       cx.spawn(async cx=>{
         try{
@@ -610,18 +642,6 @@ export default class RigSidebar extends View {
             await this.saveSpaceState({machineDeclined:{...(shared("rig.spaceState")?.machineDeclined??{}),[offer.key]:true},
               machineSearchDeclined:{...(shared("rig.spaceState")?.machineSearchDeclined??{}),[rigOrigin(this.config.daemonUrl)]:true}});
             this.daemonMachineOffer=null;this.machineChoiceAvailable=false;
-          }else{
-            const remote=await new RemoteMachine(this.attachHost(cx)).home({...this.config,daemonMachine:offer.machine});
-            if(!remote.ok)throw new Error(remote.reason);
-            if(this.config?.daemonMachine||this.config?.daemonUrl!==offer.origin||remote.selfHostId!==offer.selfHostId||remote.profileId!==offer.profileId)
-              throw new Error("OpenRig or the Herdr machine changed. Check the connection again.");
-            const path=`${appHome()}/openrig/config.json`,prev=await readTextFile(path);
-            const raw=JSON.parse(prev??"{}");
-            const fileOrigin=raw?.daemonUrl==null?this.config.daemonUrl:parseConfig(prev).daemonUrl;
-            if(!raw||typeof raw!=="object"||Array.isArray(raw)||raw.daemonMachine||fileOrigin!==offer.origin)
-              throw new Error("OpenRig's configuration changed. Refresh before choosing a machine.");
-            await writeTextFile(path,JSON.stringify({...raw,daemonMachine:offer.machine},null,2)+"\n",prev);
-            this.daemonMachineOffer=null;this.machineChoiceAvailable=false;await this.reloadConfig(cx);
           }
         }catch(error){this.machineOfferError=String(error?.message??error);}
         finally{this.machineOfferBusy=false;cx.notify();}
@@ -644,7 +664,7 @@ export default class RigSidebar extends View {
   }
 
   migrationReport(t) {
-    const result=this.migrationResult;
+    const result=migrationReportNow({spaces},this.migrationResult);
     const quiet=(id,label,click)=>div().id(id).px(6).py(3).rounded(4).text_size(11.5).text_color(t.accent)
       .cursor_pointer().hover(s=>s.bg(t.hover)).on_click(click).child(label);
     const report=v_flex().id("rig-move-result").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
@@ -658,6 +678,20 @@ export default class RigSidebar extends View {
         .child(quiet(`rig-show-left-${item.tabId}`,"Show tab",()=>{
           run("space.select",{id:result.spaceId});run("tab.select",{id:item.tabId});
         }))
+        .when(!!item.pageOnly,el=>el.child(quiet(`rig-move-page-${item.tabId}`,"Move the Rig page only",(_e,cx)=>{
+          if(this.migratingTabs)return;
+          this.migratingTabs=result.spaceId;
+          const config=this.config;
+          cx.spawn(async cx=>{
+            try{
+              const opened=await moveMigrationPages(this.routeHost(cx),config,{...item,spaceId:result.spaceId});
+              this.migrationResult=opened.ok?{...result,reason:null,left:result.left.filter(row=>row.tabId!==item.tabId),
+                moved:[...(result.moved??[]),{name:`${item.name} (Rig page only; other panes stayed here)`,destination:opened.space}]}:
+                {...result,left:result.left.map(row=>row.tabId===item.tabId?{...row,reason:opened.reason,pageOnly:false}:row)};
+            }catch(error){this.migrationResult={...result,error:String(error?.message??error)};}
+            finally{this.migratingTabs=null;cx.notify();}
+          });
+        })))
         .when(!!item.replaceable,el=>el.child(quiet(`rig-replace-left-${item.tabId}`,"Replace…",(_e,cx)=>{
           this.migrationConfirmations??=new RebuildConfirmations();
           const recovery={...item,origin:this.config?.daemonUrl,machine:this.config?.daemonMachine??null};
@@ -748,12 +782,15 @@ export default class RigSidebar extends View {
     this.machineConfirmations.clear();
     const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     this.machineConfirmations.set(token, { confirmation: result.confirmation, resume });
-    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 540, height: 420,
+    setShared("rig.machineSetupToken",token);
+    if(this.machineSetupOverlay)closeOverlay(this.machineSetupOverlay);
+    this.machineSetupOverlay=openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 600, height: 680,
       props: { target: { kind: "machine" }, step: { action: "confirm-machine", token, confirmation: result.confirmation } } });
   }
 
   spaceController(cx, consent = null) {
     if (!this.rigSpaces) this.rigSpaces = new RigSpaces({ spaces, panes, terminals, focused, commands, hc, run,
+      currentConfig:()=>this.config,
       recoveryShell: async () => {
         const node = this.config?.rig?.[0]?.match(/(?:^|\/)node$/) ? this.config.rig[0] : "node";
         const result = await exec(node, [`${appHome()}/mods/${MOD_IDS.sidebar}/rig-shell-config.cjs`]);
@@ -774,25 +811,65 @@ export default class RigSidebar extends View {
 
   reviewRigRebuild(rig, result) {
     this.rebuildConfirmations ??= new RebuildConfirmations();
-    const token = this.rebuildConfirmations.issue(rig.id, result.recovery);
+    const token = this.rebuildConfirmations.issue(rig.id, result.recovery,result.relocation||result.worker?{...(result.relocation?{relocation:result.relocation}:{}),...(result.worker?{worker:result.worker}:{})}:null);
     const focusedTile = panes().some((p) => result.recovery.tiles.some((tile) => tile.pane === p.pane)
       && (p.focused || p.terminal === focused()?.terminal));
     openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 480, height: Math.min(440, 250 + result.recovery.tiles.length * 20),
       props: { target: { kind: "rig", rig: rig.name, rigId: rig.id }, step: { action: "rebuild-space", recovery: result.recovery,
-        token, focusedTile,
+        token, focusedTile, continueMove:!!result.relocation,
         tileNames: result.recovery.tiles.map((tile) => this.gridSeatName(rig, tile.labels["herdr-openrig.seat"])) } } });
   }
 
-  openRigSpace(cx, id, rebuild = null, consent = null) {
+  reviewGridMove(rig,relocation,rebuild=null,worker=null) {
+    this.gridMoveConfirmations??=new RebuildConfirmations();
+    const token=this.gridMoveConfirmations.issue(rig.id,relocation,rebuild||worker?{...(rebuild?{rebuild}:{}),...(worker?{worker}:{})}:null);
+    openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:520,height:380,
+      props:{target:{kind:"rig",rig:rig.name,rigId:rig.id},step:{action:"move-grid",relocation,token}}});
+  }
+
+  gridMoveResultHere() {
+    const r=this.gridMoveResult;
+    return !!r&&[r.oldSpace,r.space].includes(this.activeSpaceContext?.id);
+  }
+
+  gridMoveReport(t) {
+    const r=this.gridMoveResult;
+    if(!this.gridMoveResultHere())return null;
+    const oldOpen=spaces().some(s=>s.id===r.oldSpace);
+    const action=(id,text,click)=>div().id(id).text_size(11.5).text_color(t.accent).cursor_pointer().child(text).on_click(click);
+    return v_flex().id("rig-grid-move-report").mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
+      .child(div().text_size(12).font_semibold().child(`Move ${r.name}`))
+      .child(div().text_size(11.5).child(`Opened ${r.name} on ${r.machine}.`))
+      .when(r.count>0,el=>el.child(div().text_size(11.5).child(`Closed ${r.count} old viewer${r.count===1?"":"s"}.`)))
+      .when(!oldOpen,el=>el.child(div().text_size(11.5).child("The old space closed.")))
+      .when(oldOpen&&!!r.keptTabs,el=>el.child(div().text_size(11.5).child(r.keptTabs===1?"Kept the old space for your tab.":`Kept the old space for your ${r.keptTabs} tabs.`)))
+      .when(oldOpen&&!r.keptTabs&&!!r.changed?.length,el=>el.child(div().text_size(11.5).child("Kept the old space because a tile there changed.")))
+      .when(oldOpen&&!!r.failed?.length,el=>el.child(div().text_size(11.5).child(`Old viewers didn't close: ${r.failed.join(", ")}.`))
+        .child(action("rig-grid-move-retry","Close them again",(_e,cx)=>this.openRigSpace(cx,r.rigId))))
+      .when(oldOpen&&!!r.changed?.length,el=>el.children((r.changedRows??r.changed.map(name=>({name,reason:"it changed"}))).map(row=>
+        div().text_size(11.5).child(`Left ${row.name} here: ${row.reason}. Close it yourself if you don't need it.`))))
+      .when(!!r.namingError,el=>el.child(div().text_size(11.5).text_color(t.blocked).child(r.namingError)))
+      .when(oldOpen,el=>el.child(action("rig-grid-move-show","Show old space",()=>{
+        if(spaces().some(s=>s.id===r.oldSpace))run("space.select",{id:r.oldSpace});
+      })))
+      .child(action("rig-grid-move-dismiss","Dismiss",(_e,cx)=>{this.gridMoveResult=null;cx.notify();}));
+  }
+
+  openRigSpace(cx, id, rebuild = null, consent = null, relocation = null, continueWorker = null) {
     const rig = this.data?.topology?.find((r) => r.id === id || r.name === id);
     if (!rig || this.error) { notify({ title: "Rig space", body: this.error ? String(this.error) : "OpenRig hasn't loaded this rig yet. Try again in a moment.", level: "warning" }); return; }
     setShared("rig.sel", { key: rigKey(rig.id), entry: { section: "topology", kind: "rig", rigId: rig.id, name: rig.name }, at: Date.now() });
     cx.spawn(async (cx) => {
-      const result = await routeRigOpen(this.routeHost(cx, consent), this.config, { kind: "grid", rigId: rig.id, options: { rebuild } });
+      const result = await routeRigOpen(this.routeHost(cx, consent), this.config, { kind: "grid", rigId: rig.id, options: { rebuild, relocation } });
       setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
-      if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval));
-      else if (result.recovery) this.reviewRigRebuild(rig, result);
+      if (result.needsRelocation) this.reviewGridMove(rig,result.relocation,rebuild,continueWorker);
+      else if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval,relocation,continueWorker));
+      else if (result.relocated)this.gridMoveResult={...result,name:rig.name,rigId:rig.id,machine:this.config.daemonMachine,
+        changedRows:(result.changed??[]).map(session=>({name:this.gridSeatName(rig,session),reason:result.changedReasons?.[session]??"it changed"})),
+        failed:(result.failed??[]).map(session=>this.gridSeatName(rig,session))};
+      else if (result.recovery) this.reviewRigRebuild(rig, {...result,worker:continueWorker});
       else this.notifyResult(`${rig.name} space`, result);
+      if(result.ok&&continueWorker)await this.hostWorkerAction(cx,continueWorker.id,continueWorker.target,continueWorker.action);
       cx.notify();
     });
   }
@@ -820,6 +897,8 @@ export default class RigSidebar extends View {
           if (this.error) break;
           const result = await routeRigOpen(this.routeHost(cx), this.config, { kind: "grid", rigId: rig.id, background: true });
           const statuses = shared("rig.spaceStatus") ?? {};
+          // A background skip means "nothing to update here". It must not wipe the card of a failed explicit open.
+          if (result.skipped && statuses[rig.id] && !statuses[rig.id].ok && !statuses[rig.id].skipped) continue;
           this.notifyResult(`${rig.name} space`, result, statuses[rig.id]?.reason !== result.reason);
           setShared("rig.spaceStatus", { ...statuses, [rig.id]: result });
         }
@@ -859,6 +938,11 @@ export default class RigSidebar extends View {
   }
 
   async oneClick(cx, id, target, action, actionKey = null) {
+    const workerCaps=currentCapabilities(shared,terminals());
+    if(workerCaps.hostWorkerViews&&workerCaps.herdrAppAvailable===false&&["open-view","follow","unfollow","prune"].includes(action)){
+      setShared("rig.busyAction",null);return this.hostWorkerAction(cx,id,target,action);
+    }
+
     const title = actionTitle(target, action);
     const busyKey = actionKey ?? target?.actionKey ?? `${action}:${target?.rig ?? target?.view ?? target?.session ?? ""}:${target?.viewId ?? ""}:${target?.cellId ?? ""}`;
     const clearBusy = () => {
@@ -907,6 +991,52 @@ export default class RigSidebar extends View {
     else if (r.ok) notify({ title, body: r.warning ? `${words} ${r.warning}` : words, level: "success" });
     else notify({ title, body: words, level: "warning" });
     cx.notify();
+  }
+
+  workerController(cx,consent=null){
+    if(!this.workerViews){
+      this.workerViews=new HostWorkerViews({spaces,panes,terminals,hc,run,currentConfig:()=>this.config,
+        routeState:()=>shared("rig.spaceState"),loadViews:()=>shared("rig.spaceState")?.workerViews??{},
+        saveViews:views=>this.saveSpaceState({workerViews:views}),changed:views=>{setShared("rig.workerViews",views);cx.notify();},
+        preview:(config,view)=>this.workerPreview(config,view),
+        nodes:async config=>{const rigs=await this.workerRead(config,"/api/rigs/summary");
+          return (await Promise.all(rigs.filter(r=>!r.archivedAt).map(r=>this.workerRead(config,`/api/rigs/${encodeURIComponent(r.id)}/nodes`)))).flat();},
+      });
+    }
+    this.workerViews.host.prepareRemote=this.attachHost(cx,consent).prepareRemote;
+    this.workerViews.host.wait=ms=>new Promise(resolve=>cx.timer.after(ms,resolve));
+    this.workerViews.host.after=(ms,fn)=>cx.timer.after(ms,next=>(next??cx).spawn(async()=>{try{await fn();}catch(error){notify({title:"Worker view",body:String(error?.message??error),level:"warning"});}}));
+    return this.workerViews;
+  }
+  async workerPreview(config,view){
+    const preview=await this.workerRead(config,`/api/terminal/preview?provider=herdr-app&view=${encodeURIComponent(view)}&viewportColumns=160`);
+    if(!view.startsWith("saved:"))return preview;
+    const views=await this.workerRead(config,"/api/terminal/views"),members=views.saved?.find(v=>v.id===view.slice(6))?.members??[];
+    const names=new Map(members.map(m=>[m.seat,m.label]));
+    return {...preview,composed:{...preview.composed,absent:preview.composed?.absent?.map(item=>({...item,label:names.get(item.seat)??item.label??item.seat}))}};
+  }
+  async workerRead(config,path){
+    const response=await fetch(config.daemonUrl+path);
+    if(!response.ok)throw new Error(`Couldn't read the worker view (${response.status}). Tiles kept.`);
+    return response.json();
+  }
+  async hostWorkerAction(cx,id,target,action,consent=null){
+    const view=target.view??target.target??(target.rig?`rig:${target.rig}`:null),controller=this.workerController(cx,consent);
+    const rig=(this.data?.topology??[]).find(r=>r.id===target.rigId||r.name===target.rig);
+    let result;
+    if(action==="unfollow")result=await controller.stop(this.config,view);
+    else result=await controller.sync(this.config,view,{explicit:true,target:rig?{id:rig.id,name:rig.name}:null,
+      ...(target.plan?{expectedPlan:target.plan}:{}),...(action==="follow"?{following:true}:{}),
+      ...(action==="prune"?{pruneMs:({"5m":300000,"10m":600000,"30m":1800000,"never":0})[target.prune]??0}:{}),
+    });
+    if(result.needsConsent)this.reviewMachine(result,(cx,approval)=>cx.spawn(cx=>this.hostWorkerAction(cx,id,target,action,approval)));
+    else if(result.needsRelocation)this.reviewGridMove(rig,result.relocation,null,{id,target,action});
+    else{
+      const words=result.ok?(result.reason??`Worker view open here: ${result.pages?.length??0} pages.`):result.reason;
+      setShared("rig.status",{id,ok:result.ok,busy:false,text:words,at:Date.now()});
+      if(!result.ok)notify({title:"Worker view",body:words,level:"warning"});
+    }
+    cx.notify();return result;
   }
 
   /** Resolve the active worker view and its focused cell for `rig.zoom` / `rig.close-cell`. */
@@ -1026,6 +1156,7 @@ export default class RigSidebar extends View {
 
   async close() {
     this.closed = true;
+    this.workerViews?.dispose();
     this.statusMotion.close();
     const receivers={...(shared("rig.routeReceivers")??{})};delete receivers[this.routeReceiverId];setShared("rig.routeReceivers",receivers);
     try { this.sock?.close(); } catch (_) {}
@@ -1149,6 +1280,7 @@ export default class RigSidebar extends View {
         }
       }
       if (!unreachableState) {
+        this.uiTimezone=timezoneValue(await this.get('/api/config/ui.timezone').catch(()=>null));
         const summary = await this.get("/api/rigs/summary");
         const nodesByRig = Object.create(null); // keyed by the daemon's rig ids: no prototype keys
         await Promise.all(summary.filter((r) => !r.archivedAt).map(async (r) => { nodesByRig[r.id] = await this.get(`/api/rigs/${encodeURIComponent(r.id)}/nodes`); }));
@@ -1180,7 +1312,7 @@ export default class RigSidebar extends View {
             this.get(`/api/gateway/human/${encodeURIComponent(personId)}/mode`).catch(() => null),
           ]);
         }
-        const quietModeChip = quietModeHeaderChip({ quiet: quietRes, mode: modeRes });
+        const quietModeChip = quietModeHeaderChip({ quiet: quietRes, mode: modeRes, timezone:this.uiTimezone });
         const native = await this.get("/api/native-seats").catch(() => null);
         if (hasExplicitConfigUrl && typeof fetch === "function") {
           const hzRes = await fetch(`${this.config.daemonUrl}/healthz`).catch(() => null);
@@ -1209,6 +1341,19 @@ export default class RigSidebar extends View {
           capabilities = currentCapabilities(shared, terminals?.() ?? []);
         }
         capabilities = await probeCapabilities({ ...this.config, capabilities }, { exec, providerAppHome: appHome() });
+        if(this.config.daemonMachine){
+          const provider=await this.get("/api/terminal/status?provider=herdr-app").catch(()=>null);
+          const measured=herdrAppAvailability(provider,this.config.daemonMachine);
+          if(measured.herdrAppAvailable!==null)capabilities={...capabilities,herdrAppProvider:true,...measured};
+          this.workerPreviewSupport??=new Map();
+          if(forceProbe)this.workerPreviewSupport.delete(this.config.daemonUrl);
+          if(measured.herdrAppAvailable===false&&!this.workerPreviewSupport.has(this.config.daemonUrl)&&summary.length){
+            const preview=await this.get(`/api/terminal/preview?provider=herdr-app&view=${encodeURIComponent("rig:"+summary[0].name)}`).catch(()=>null);
+            this.workerPreviewSupport.set(this.config.daemonUrl,!!preview?.planId&&["fixed","following"].includes(preview?.viewDescriptor?.kind)
+              &&Array.isArray(preview?.composed?.pages)&&Array.isArray(preview?.grids));
+          }
+          capabilities.hostWorkerViews=measured.herdrAppAvailable===false&&this.workerPreviewSupport.get(this.config.daemonUrl)===true;
+        }else capabilities.hostWorkerViews=false;
         setShared("rig.capabilities", capabilities);
         const topology = buildTopology(summary, nodesByRig, native?.seats);
         if (attentionItems !== null) {
@@ -1344,11 +1489,12 @@ export default class RigSidebar extends View {
             this.toast(ev);
             if (pending) return;
             pending = true;
-            cx.timer.after(500, (cx) => { pending = false; cx.spawn(async (cx) => this.refresh(cx)); });
+            cx.timer.after(500, (cx) => { pending = false; cx.spawn(async (cx) => {await this.refresh(cx);await this.workerController(cx).event(this.config);}); });
           });
           this.live = true; this.delay = 1000;
           if (this.hadDisconnect) { this.hadDisconnect = false; this.forceCapabilityProbe = true; }
           await this.refresh(cx);
+          await this.workerController(cx).event(this.config);
           if(opened.initial.length){let text;[text,carry]=utf8(opened.initial,carry);feed(text);}
           for (;;) {
             const chunk = await this.sock.read(65536);
@@ -1479,6 +1625,7 @@ export default class RigSidebar extends View {
     const iconButton = (id, name, onClick, label = null) => h_flex().id(id).flex_none().px(compact ? 2 : 4).h(20).gap(3).rounded(4).items_center().text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click(onClick).child(svg(icon(name)).size(compact ? 10 : 12).flex_none()).when(!!label, (el) => el.child(div().text_size(10.5).child(label)));
     return h_flex().id("rig-header").px(compact ? 6 : 10).h(30).items_center().justify_between().flex_none()
+      .on_mouse_down("right",()=>openOverlay({mod:MOD_IDS.menu,kind:"popup",width:260,height:210,props:{target:{kind:"sidebar-header"}}}))
       .on_size_change((size, cx) => { if (this.headerWidth !== size.width) { this.headerWidth = size.width; cx.notify(); } })
       .child(h_flex().flex_1().min_w(0).overflow_hidden().gap(6).items_center()
         .when(showTitle, el => el.child(div().id("rig-header-title").flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.muted).child("OpenRig")))
@@ -1507,16 +1654,6 @@ export default class RigSidebar extends View {
         ))
         .child(iconButton("rig-palette", "search", () => run("mod.open", { name: MOD_IDS.palette }))
           .tooltip(key ? `Search rigs, seats, commands (${key})` : "Search rigs, seats, commands"))
-        .child(iconButton("rig-open-page", "rig-popout", (_e, cx) => {
-          cx.stop_propagation();
-          const fallbackEntry = shared("rig.sel")?.entry ?? shared("rig.nav")?.stack?.at(-1) ?? { section: "topology" };
-          openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, fallbackEntry);
-          cx.notify();
-        }).tooltip("Open the Rig page"))
-        .child(iconButton("rig-open-tui", "rig-terminal-prompt", (_e, cx) => {
-          cx.stop_propagation();
-          this.tui(cx);
-        }).tooltip("Open the TUI"))
         .child(iconButton("rig-expand-all", "chevron-down", (_e, cx) => {
           cx.stop_propagation();
           const nextOpen = expandAllTopology(shared("rig.open.sidebar"), this.data?.topology ?? []);
@@ -1531,7 +1668,7 @@ export default class RigSidebar extends View {
           this.persistSidebarState(nextOpen, shared("rig.order"));
           cx.notify();
         }).tooltip("Collapse all"))
-        .child(iconButton("rig-refresh", "rig-refresh", (_e, cx) => cx.spawn(async (cx) => { this.forceCapabilityProbe = true; await this.reloadConfig(cx); await this.refresh(cx); })).tooltip("Refresh")));
+        .child(iconButton("rig-header-menu","rig-more",()=>openOverlay({mod:MOD_IDS.menu,kind:"popup",width:260,height:210,props:{target:{kind:"sidebar-header"}}})).tooltip("OpenRig actions and settings")));
   }
 
   /** Render S5a–S5d banner above the tree when the daemon is up and the operator is not ready. */
@@ -2091,11 +2228,12 @@ export default class RigSidebar extends View {
       items: filterAttentionHealth(result.data.items, this.data?.attentionHealth ?? []) } } : result;
   }
 
-  treeLeafRow(t, { id, rowKey, label, detail = "", entry = null, onClick = null, onRight = null, indent = treeIndent(1), parentKey = null, groupKey = null, itemId = null, siblingIds = null, textColor = null } = {}) {
+  treeLeafRow(t, { id, rowKey, label, detail = "", tooltip = null, entry = null, onClick = null, onRight = null, indent = treeIndent(1), parentKey = null, groupKey = null, itemId = null, siblingIds = null, textColor = null } = {}) {
     this.visibleTreeRows.push({ key: rowKey ?? id, expandable: false, parentKey, entry });
     let el = h_flex().id(id).pl(indent).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
       .on_click(onClick ?? (() => entry && selectRow(entry, rowKey ?? id)));
     if (onRight) el = el.on_mouse_down("right", onRight);
+    if (tooltip) el = el.tooltip(tooltip);
     el = el
       .child(leafCell())
       .child(div().flex_1().truncate().text_size(12).text_color(textColor ?? t.foreground).child(label))
@@ -2182,6 +2320,10 @@ export default class RigSidebar extends View {
     return out;
   }
 
+  /** Keep sidebar counts, rows and their workflow reads on one effective project. */
+  scopesProject(cx) {
+    return effectiveScopeProject(null,shared('rig.project'),this.list(cx,'/api/scopes/projects').data);
+  }
   /** Render the children of `Specs`, `Scopes`, `Terminals`, `Needs`, or `System` when expanded. */
   sectionBranchChildren(t, cx, section) {
     const folds = shared("rig.open.sidebar") ?? {};
@@ -2259,7 +2401,8 @@ export default class RigSidebar extends View {
       return out;
     }
 
-    const path = { specs: "/api/specs/library", scopes: "/api/scopes?counts=1", terminals: "/api/terminal/views", needs: "/api/attention" }[section];
+    const selectedProject=section==='scopes'?this.scopesProject(cx):null;
+    const path = { specs: "/api/specs/library", scopes: "/api/scopes?counts=1"+(selectedProject?`&project=${encodeURIComponent(selectedProject)}`:''), terminals: "/api/terminal/views", needs: "/api/attention" }[section];
     const got = section === "needs" && Array.isArray(this.data?.attentionItems) && !this.lists[path]
       ? { data: { items: this.data.attentionItems }, at: this.data.at }
       : this.list(cx, path);
@@ -2350,13 +2493,14 @@ export default class RigSidebar extends View {
         }
       }
     } else if (section === "scopes") {
-      const folders = new Map((this.list(cx, "/api/slices").data?.slices ?? []).filter((x) => typeof x.slicePath === "string").map((x) => [x.slicePath.split(/[\\/]/).pop(), x.slicePath]));
+      const folders = new Map((this.list(cx, '/api/slices'+(selectedProject?`?project=${encodeURIComponent(selectedProject)}`:'')).data?.slices ?? []).filter((x) => typeof x.slicePath === "string").map((x) => [x.slicePath.split(/[\\/]/).pop(), x.slicePath]));
       const missions = orderSiblings(d.missions ?? [], "scopes:missions", orderMap, (m) => m.mission);
       const missionIds = missions.map((m) => m.mission);
       for (const m of missions) {
         const mKey = `mission:${m.mission}`;
         const openMission = branchFoldOpen(folds, mKey, true);
-        const missionEntry = { section: "scopes", mission: m.mission, name: m.mission };
+        const context={mission:m.mission,project:selectedProject??d.project?.id,projectRoot:d.project?.root};
+        const missionEntry = { section: "scopes", ...(context.project?{project:context.project}:{}), mission: m.mission, name: m.mission };
         this.visibleTreeRows.push({ key: mKey, foldKey: mKey, expandable: true, isOpen: openMission, parentKey: parentBranchKey, entry: missionEntry });
         const slices = Array.isArray(m.slices) ? m.slices : [];
         const mRow = h_flex().id(`mission-${m.mission}`).pl(treeIndent(1)).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
@@ -2376,11 +2520,52 @@ export default class RigSidebar extends View {
           siblingIds: missionIds,
         }));
         if (!openMission) continue;
+        const workflowGot=this.list(cx,workflowPath(context));
+        const workflows=workflowView(workflowGot.data,context);
+        const workflowGroup=`workflow-group:${context.project??''}:${m.mission}`,workflowOpen=branchFoldOpen(folds,workflowGroup,true);
+        if(workflows.instances.length){
+          const groupEntry={...missionEntry,missionTab:'workflows'};
+          this.visibleTreeRows.push({key:workflowGroup,foldKey:workflowGroup,expandable:true,isOpen:workflowOpen,parentKey:mKey,entry:groupEntry});
+          out.push(this.decorateRow(t,h_flex().id(`workflows-${m.mission}`).pl(treeIndent(2)).pr(8).h(22).gap(6).items_center().cursor_pointer()
+            .on_click(()=>selectRow(groupEntry,workflowGroup))
+            .child(div().w(12).on_click((_e,ctx)=>{ctx.stop_propagation();this.fold(workflowGroup,!workflowOpen);ctx.notify();})
+              .child(svg(icon(workflowOpen?'chevron-down':'chevron-right')).size(11).text_color(t.dim)))
+            .child(div().flex_1().text_size(11.5).text_color(t.muted).child('Workflows'))
+            .child(div().text_size(10.5).text_color(t.dim).child(String(workflows.instances.length))),{rowKey:workflowGroup,entry:groupEntry}));
+          if(workflowOpen)for(const [index,wf] of workflows.instances.entries()){
+            const key=`workflow:${context.project??''}:${m.mission}:${wf.id}`,expanded=branchFoldOpen(folds,key,true),entry=workflowEntry(context,wf);
+            const menuTarget=owner=>{
+              const found=resolveAskerSeat(owner,this.data?.topology),s=found.seat;
+              return {kind:'workflow',id:wf.id,name:wf.title,ownerEntry:found.found?{section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,name:s.logicalId,session:s.session}:null};
+            };
+            const owners=[...new Set(wf.packets.map(p=>p.owner).filter(Boolean))];
+            this.visibleTreeRows.push({key,foldKey:key,expandable:wf.packets.length>0,isOpen:expanded,parentKey:workflowGroup,entry});
+            out.push(this.decorateRow(t,h_flex().id(`workflow-row-${m.mission}-${index}`).pl(treeIndent(3)).pr(8).h(22).gap(6).items_center().cursor_pointer()
+              .on_click(()=>selectRow(entry,key)).on_mouse_down('right',()=>this.menu(menuTarget(owners.length===1?owners[0]:null),120))
+              .child(div().w(12).when(wf.packets.length>0,el=>el.on_click((_e,ctx)=>{ctx.stop_propagation();this.fold(key,!expanded);ctx.notify();})
+                .child(svg(icon(expanded?'chevron-down':'chevron-right')).size(11).text_color(t.dim))))
+              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(wf.finished?t.dim:t.foreground).child(wf.title))
+              .child(div().text_size(10.5).text_color(t.dim).child(wf.status)),{rowKey:key,entry}));
+            if(expanded)for(const [pi,p] of wf.packets.entries())out.push(this.treeLeafRow(t,{
+              id:`workflow-packet-${m.mission}-${index}-${pi}`,rowKey:`${key}:packet:${p.packet_id}`,
+              label:`${workflowWord(p.step_id)}${typeof p.owner==='string'&&p.owner.trim()?' · '+workflowWord(p.owner):''}`,detail:relativeTimeText(p.latest_transition?.ts),
+              entry:workflowEntry(context,wf,p),onRight:()=>this.menu(menuTarget(p.owner),120),indent:treeIndent(4),parentKey:key
+            }));
+          }
+        }
         const sliceGroupKey = `mission:${m.mission}:slices`;
+        const slicesOpen=branchFoldOpen(folds,sliceGroupKey,true);
+        this.visibleTreeRows.push({key:sliceGroupKey,foldKey:sliceGroupKey,expandable:true,isOpen:slicesOpen,parentKey:mKey,entry:{...missionEntry,missionTab:'slices'}});
+        out.push(this.decorateRow(t,h_flex().id(`slices-group-${m.mission}`).pl(treeIndent(2)).pr(8).h(22).gap(6).items_center().cursor_pointer()
+          .on_click(()=>selectRow({...missionEntry,missionTab:'slices'},sliceGroupKey))
+          .child(div().w(12).on_click((_e,ctx)=>{ctx.stop_propagation();this.fold(sliceGroupKey,!slicesOpen);ctx.notify();})
+            .child(svg(icon(slicesOpen?'chevron-down':'chevron-right')).size(11).text_color(t.dim)))
+          .child(div().flex_1().text_size(11.5).text_color(t.muted).child('Slices')).child(div().text_size(10.5).text_color(t.dim).child(String(slices.length))),{rowKey:sliceGroupKey,entry:{...missionEntry,missionTab:'slices'}}));
+        if(!slicesOpen)continue;
         const orderedSlices = orderSiblings(slices, sliceGroupKey, orderMap, (s) => s.dirName);
         const sliceIds = orderedSlices.map((s) => s.dirName);
         for (const s of orderedSlices) {
-          const sliceEntry = { section: "scopes", mission: m.mission, slice: s.dirName, name: s.displayName ?? s.dirName };
+          const sliceEntry = { ...missionEntry, slice: s.dirName, name: s.displayName ?? s.dirName };
           out.push(this.treeLeafRow(t, {
             id: `slice-${m.mission}-${s.dirName}`,
             rowKey: `slice:${m.mission}/${s.dirName}`,
@@ -2388,8 +2573,8 @@ export default class RigSidebar extends View {
             detail: s.status ?? "",
             entry: sliceEntry,
             onRight: () => this.menu({ kind: "slice", mission: m.mission, slice: s.dirName, name: s.displayName ?? s.dirName, id: s.id, slicePath: folders.get(s.dirName) ?? null, orderGroupKey: sliceGroupKey }, 220),
-            indent: treeIndent(2),
-            parentKey: mKey,
+            indent: treeIndent(3),
+            parentKey: sliceGroupKey,
             groupKey: sliceGroupKey,
             itemId: s.dirName,
             siblingIds: sliceIds,
@@ -2403,6 +2588,7 @@ export default class RigSidebar extends View {
         const entry = { section: "terminals", view: `saved:${s.id}`, name: s.name ?? s.id };
         out.push(this.treeLeafRow(t, {
           id: `view-saved-${s.id}`,
+          tooltip:workerViewDetails(Object.values(shared("rig.workerViews")??{}).find(v=>v.view===`saved:${s.id}`&&v.config?.daemonMachine===this.config?.daemonMachine&&rigOrigin(v.config?.daemonUrl)===rigOrigin(this.config?.daemonUrl)))||null,
           rowKey: `view:saved:${s.id}`,
           label: s.name ?? s.id,
           detail: "saved",
@@ -2420,6 +2606,7 @@ export default class RigSidebar extends View {
         const entry = { section: "terminals", view: `rig:${r}`, name: `rig:${r}` };
         out.push(this.treeLeafRow(t, {
           id: `view-rig-${r}`,
+          tooltip:workerViewDetails(Object.values(shared("rig.workerViews")??{}).find(v=>v.view===`rig:${r}`&&v.config?.daemonMachine===this.config?.daemonMachine&&rigOrigin(v.config?.daemonUrl)===rigOrigin(this.config?.daemonUrl)))||null,
           rowKey: `view:rig:${r}`,
           label: `rig:${r}`,
           detail: "derived",
@@ -2489,7 +2676,7 @@ export default class RigSidebar extends View {
         }[section]
       ));
     }
-    if (got.error) out.push(div().px(18).py(4).text_size(10.5).text_color(t.dim).child(asOf(got.at)));
+    if (got.error) out.push(div().px(18).py(4).text_size(10.5).text_color(t.dim).child(asOf(got.at,this.uiTimezone)));
     return out;
   }
 
@@ -2575,7 +2762,8 @@ export default class RigSidebar extends View {
           out.push(...this.sectionBranchChildren(t, cx, "system"));
         }
       } else {
-        const path = { specs: "/api/specs/library", scopes: "/api/scopes?counts=1", terminals: "/api/terminal/views" }[section];
+        const project=section==='scopes'?this.scopesProject(cx):null;
+        const path = { specs: "/api/specs/library", scopes: '/api/scopes?counts=1'+(project?`&project=${encodeURIComponent(project)}`:''), terminals: "/api/terminal/views" }[section];
         const cached = this.lists[path]?.data;
         const badge = section === "specs" && Array.isArray(cached)
           ? cached.length
@@ -2596,7 +2784,7 @@ export default class RigSidebar extends View {
     }
 
     if (this.error) {
-      out.push(div().px(10).py(4).text_size(10.5).text_color(t.dim).child(`${asOf(this.data.at)} · ${STATE_COPY.S3.headline} · ${this.error}`));
+      out.push(div().px(10).py(4).text_size(10.5).text_color(t.dim).child(`${asOf(this.data.at,this.uiTimezone)} · ${STATE_COPY.S3.headline} · ${this.error}`));
     }
     return out;
   }
@@ -2651,9 +2839,10 @@ export default class RigSidebar extends View {
   }
 
   render(cx) {
+    this.workerViews?.focusChanged(this.config,focused());
     const t = theme();
     this.observeDaemonMachines(cx);
-    this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,shared("rig.topology.view"),narrow()]),cx,{attention:this.data?.attentionItems});
+    this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,shared("rig.topology.view"),narrow()]),cx,{attention:this.data?.attentionItems,reducedMotion:this.config?.reducedMotion===true});
     this.spaceFold ??= new SidebarSpaceFold(shared("rig.spaceState")?.sidebarSize);
     const active = spaces().find(s => s.active);
     const context = openRigSpaceContext(spaces(), terminals(), panes(), shared("rig.spaceState") ?? {}, MOD_IDS.view)
@@ -2707,11 +2896,16 @@ export default class RigSidebar extends View {
           if(Number.isFinite(previous)&&size.height<previous){this.listScrollVersion=(this.listScrollVersion??0)+1;cx.notify();}
         })
         .when(!!this.machineChoiceAvailable,el=>el.child(this.machineOfferCard(t)))
-        .when(this.migrationResultHere() || needsTabMigration(this.activeSpaceContext,this.config) && !migrationChoice(shared("rig.spaceState"),this.config,this.activeSpaceContext.id), el=>el.child(this.migrationCard(t)))
+        .when(this.gridMoveResultHere(),el=>el.child(this.gridMoveReport(t)))
+        .when(this.migrationResultHere() || (needsTabMigration(this.activeSpaceContext,this.config)
+          ||this.activeSpaceContext?.id&&this.data?.topology?.some(r=>rigSpaceRelocation({spaces,panes,terminals},r,this.config)?.source===this.activeSpaceContext.id))
+          && !migrationChoice(shared("rig.spaceState"),this.config,this.activeSpaceContext?.id), el=>el.child(this.migrationCard(t)))
         .children((this.data?.topology ?? []).flatMap((rig) => {
           const status = shared("rig.spaceStatus")?.[rig.id];
           if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}: ${status.reason}`))
+            .when(!!status.needsConsent,el=>el.child(div().id(`review-grid-machine-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer().child("Review")
+              .on_click(()=>this.reviewMachine(status,(cx,approval)=>this.openRigSpace(cx,rig.id,null,approval)))))
             .when(!!status.closeAvailable, el => el.child(div().id(`close-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
               .on_click((_e, cx) => this.closeRigTiles(cx, rig)).child("Close all viewer tiles")))];
           if (!status?.stale?.length) return [];

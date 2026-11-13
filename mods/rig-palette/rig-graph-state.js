@@ -1,7 +1,6 @@
 // Public graph projection and bounded native-motion state. No frame loop or periodic timer.
 import {seatStatus} from "./rig-lib.js";
-export const GRAPH_TRAVEL_MS=1100,GRAPH_CROSS_MS=1600,GRAPH_MAX_PACKETS=8;
-export const GRAPH_START_MS=16,GRAPH_TARGET_FADE_MS=900;
+export const GRAPH_HOLD_MS=1600,GRAPH_FADE_MS=500,GRAPH_MAX_PATHS=8;
 export function normalizeRunningGraph(data,fallback=[]){
   const nodes=Array.isArray(data?.nodes)?data.nodes:[],pods=[],byId=new Map(),refs=new Map();
   const group=(id,label)=>{if(!byId.has(id)){const p={id,label:label||id,seats:[]};byId.set(id,p);pods.push(p);}return byId.get(id);};
@@ -31,34 +30,31 @@ export function publishGraphActivity(shared,setShared,origin,event){
   setShared("rig.graphActivity",{origin,serial,events:[...(same?old.events??[]:[]),{...item,serial}].slice(-64)});return true;
 }
 export class GraphMotion{
-  constructor(){this.epoch=0;this.sequence=0;this.packets=new Map();this.flashes=new Map();this.seen=new Set();this.generations=new Map();}
-  enter(schedule,notify,count){
+  constructor(){this.epoch=0;this.sequence=0;this.paths=new Map();this.flashes=new Map();this.seen=new Set();this.generations=new Map();}
+  enter(schedule,notify,count,{reducedMotion=false}={}){
+    if(reducedMotion){this.epoch++;this.entering=false;this.started=true;return;}
     const epoch=++this.epoch;this.entering=true;this.started=false;
     schedule(16,()=>{if(this.epoch!==epoch)return;this.started=true;notify();});
     schedule(Math.min(count*50+100,2000)+316,()=>{if(this.epoch!==epoch)return;this.entering=false;notify();});
   }
-  leave(){this.epoch++;this.packets.clear();this.flashes.clear();this.generations.clear();this.entering=false;this.started=true;}
-  handoff(event,graph,pathFor,schedule,notify,{notifyStart=true}={}){
+  leave(){this.epoch++;this.paths.clear();this.flashes.clear();this.generations.clear();this.entering=false;this.started=true;}
+  handoff(event,graph,pathFor,schedule,notify,{notifyStart=true,reducedMotion=false}={}){
     const identity=JSON.stringify([event.type,event.from,event.to,event.at]);if(this.seen.has(identity))return false;
     this.seen.add(identity);if(this.seen.size>256)this.seen.delete(this.seen.values().next().value);
     const seats=graph.pods.flatMap(p=>p.seats),source=seats.find(s=>s.session===event.from),target=seats.find(s=>s.session===event.to);
     if(!source&&!target)return false;
     const key=JSON.stringify([event.from,event.to]),epoch=this.epoch,version=++this.sequence,cross=!source||!target;
     const route=source&&target?pathFor(source.lid,target.lid):null;
-    const duration=cross?GRAPH_CROSS_MS:route?GRAPH_TRAVEL_MS:0;
-    const packet={key,version,event,source:source?.lid,target:target?.lid,cross,route,started:false,arrived:false,duration};
+    const path={key,version,event,source:source?.lid,target:target?.lid,cross,route,fading:false,reducedMotion};
     this.generations.set(key,version);
-    const travel=Boolean(cross||route);
-    if(travel&&(this.packets.has(key)||this.packets.size<GRAPH_MAX_PACKETS))this.packets.set(key,packet);
+    if((cross||route)&&(this.paths.has(key)||this.paths.size<GRAPH_MAX_PATHS))this.paths.set(key,path);
     this.last={...event,source:source?.lid,target:target?.lid};
-    if(source)this.flashes.set(source.lid,{version,phase:"source",started:false});
-    if(target)this.flashes.set(target.lid,{version,phase:"target",started:false,delay:duration});
+    if(source)this.flashes.set(source.lid,path);
+    if(target)this.flashes.set(target.lid,path);
     if(notifyStart)notify();
     const valid=()=>epoch===this.epoch&&this.generations.get(key)===version;
-    schedule(GRAPH_START_MS,()=>{if(!valid())return;packet.started=true;for(const lid of [source?.lid,target?.lid]){const flash=this.flashes.get(lid);if(flash?.version===version)flash.started=true;}notify();});
-    schedule(duration+GRAPH_START_MS,()=>{if(!valid())return;packet.arrived=true;notify();});
-    // Target fade is native from a newly drawn target ring; one cleanup after the longest flash.
-    schedule(duration+GRAPH_START_MS+GRAPH_TARGET_FADE_MS,()=>{if(!valid())return;if(this.packets.get(key)?.version===version)this.packets.delete(key);
+    schedule(GRAPH_HOLD_MS,()=>{if(!valid())return;path.fading=true;notify();});
+    schedule(GRAPH_HOLD_MS+GRAPH_FADE_MS,()=>{if(!valid())return;if(this.paths.get(key)?.version===version)this.paths.delete(key);
       for(const lid of [source?.lid,target?.lid])if(this.flashes.get(lid)?.version===version)this.flashes.delete(lid);this.generations.delete(key);notify();});
     return true;
   }

@@ -1,6 +1,6 @@
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
 import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8 } from "./rig-lib.js";
-import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
+import { machineId, machineLocalId, remoteFailure, goodHome } from "./rig-remote.js";
 import { resolveRigSpace, rigOrigin } from "./rig-space-context.js";
 
 const ROLE = "rig-grid";
@@ -18,19 +18,41 @@ const shell = (t, configured) => Array.isArray(t.argv) && (
 const tileSnapshot = (t, p) => ({ terminal: addr(t), pane: p.pane, tab: p.tab,
   argv: [...(t.argv ?? [])], pid: t.pid, created: t.created_ms,
   labels: Object.fromEntries(Object.entries(labels(t)).filter(([k]) => k.startsWith("herdr-openrig.") || k === "herdr.space" || k === "herdr.tab").sort(([a], [b]) => a.localeCompare(b))) });
+const localViewerProgram=(host,argv)=>{
+  const actual=argv?.[0]==="env"&&/^HERDR_OPENRIG_GRID_TILE=[a-z0-9-]+$/.test(argv[1]??"")?argv.slice(2):argv;
+  return actual?.[0]==="node"&&(host.viewerPath&&actual[1]===host.viewerPath&&actual.length===3
+    ||host.padPath&&actual[1]===host.padPath&&actual.length===2);
+};
 
 export function ownedRigSpace(host, rig, config) {
   // Background grid activation still requires its explicit marker; recognising legacy Attach alone never starts a grid.
   return resolveRigSpace(host,config,[rig.id,rig.name],{markedOnly:true});
 }
 
+/** Only a marked, same-origin Local grid can precede a configured box grid; display names prove nothing. */
+export function rigSpaceRelocation(host,rig,config) {
+  if(!config?.daemonMachine)return null;
+  const source=ownedRigSpace(host,rig,{...config,daemonMachine:null});if(!source)return null;
+  const terms=get(host,"terminals"),panes=get(host,"panes").filter(p=>source.tabs?.some(t=>t.id===p.tab));
+  const tiles=panes.flatMap(p=>{
+    const t=terms.find(t=>addr(t)===p.terminal&&!addr(t)?.includes("/")&&belongs(t,rig,origin(config))
+      &&labels(t)["herdr-openrig.role"]===ROLE&&labels(t)["herdr.space"]===source.id&&labels(t)["herdr.tab"]===p.tab);
+    return t?[tileSnapshot(t,p)]:[];
+  });
+  if(!tiles.length)return null;
+  return {source:source.id,sourceName:source.name||rig.name,rig:rig.id,name:rig.name,machine:config.daemonMachine,origin:origin(config),tiles,
+    panes:panes.map(p=>({pane:p.pane,tab:p.tab,terminal:p.terminal??null,mod:p.mod??null})),
+    keptTabs:(source.tabs??[]).filter(tab=>panes.some(p=>p.tab===tab.id&&!tiles.some(t=>t.pane===p.pane)))
+      .map(tab=>tab.name||"a terminal you opened")};
+}
+
 /** The sidebar issues consent for one exact dialog; shared-state callers cannot supply their own snapshot. */
 export class RebuildConfirmations {
   constructor() { this.requests = new Map(); }
-  issue(rigId, recovery) {
+  issue(rigId, recovery, continuation = null) {
     for (const [token, value] of this.requests) if (value.rigId === rigId) this.requests.delete(token);
     const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-    this.requests.set(token, { rigId, recovery: JSON.parse(JSON.stringify(recovery)) }); return token;
+    this.requests.set(token, { rigId, recovery: JSON.parse(JSON.stringify(recovery)), continuation: continuation ? JSON.parse(JSON.stringify(continuation)) : null }); return token;
   }
   take(request) {
     const value = this.requests.get(request?.token);
@@ -39,7 +61,7 @@ export class RebuildConfirmations {
   }
 }
 
-export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome, remote = false } = {}) {
+export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome, remote = false, remoteViewer = null } = {}) {
   const local = (host) => !host || host === "local" || host === selfHostId;
   if (!selfHostId && (rig.host && rig.host !== "local" || (rig.pods ?? []).some((p) => p.seats?.some((s) => s.host && s.host !== "local")))) {
     throw new Error("Couldn't confirm this machine: OpenRig didn't report its own host ID. Refresh before opening a rig space.");
@@ -52,7 +74,9 @@ export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome,
     if (!isValidSessionName(s.session)) throw new Error("A grid seat has no valid session address.");
     const flags = tmuxServerArgsFrom(s.tmuxAttachCommand, s.session);
     if (!flags || !s.tmuxAttachCommand) throw new Error(serverArgsRefusal(s.tmuxAttachCommand, s.session));
-    const argv = viewerPath ? ["node", viewerPath, base64EncodeUtf8(JSON.stringify({ session: s.session, serverArgs: flags, openrigHome }))]
+    if (remote && (!goodHome(remoteViewer?.node) || !goodHome(remoteViewer?.path))) throw new Error("The remote grid relay has not been prepared and verified. No viewer was started.");
+    const argv = remote ? [remoteViewer.node, remoteViewer.path, base64EncodeUtf8(JSON.stringify({ mode: "grid", session: s.session, serverArgs: flags }))]
+      : viewerPath ? ["node", viewerPath, base64EncodeUtf8(JSON.stringify({ session: s.session, serverArgs: flags, openrigHome }))]
       : ["env", "-u", "TMUX", "TERM=xterm-256color", "tmux", ...flags, "attach-session", "-t", `=${s.session}`];
     return { session: s.session, serverArgs: flags, argv };
   });
@@ -75,7 +99,7 @@ export async function localGridPreflight(host, plan) {
 
 export class RigSpaces {
   constructor(host) { this.host = host; this.done = new Map(); this.pending = new Map(); this.closed = new Set(); this.failures = new Map(); }
-  sync(rig, config, { explicit = false, rebuild = null, closeAll = false } = {}) {
+  sync(rig, config, { explicit = false, rebuild = null, closeAll = false, relocation = null } = {}) {
     if (config?.daemonMachine !== undefined && config.daemonMachine !== ""
       && (typeof config.daemonMachine !== "string" || !/^[a-z0-9][a-z0-9._-]{0,31}$/.test(config.daemonMachine))) {
       return Promise.resolve({ ok: false, reason: "daemonMachine must name a Herdr machine. No local terminal was started or closed." });
@@ -86,12 +110,75 @@ export class RigSpaces {
         && labels(t)["herdr-openrig.role"] === ROLE && labels(t)["herdr-openrig.viewer-argv"] !== JSON.stringify(t.argv));
       if (!explicit && !closeAll && !changedProgram && this.failures.has(key) && this.ownedPanes(rig, config).length) return this.failures.get(key);
       this.failures.delete(key);
-      const result = await (closeAll ? this.closeAll(rig, config, key) : this.update(rig, config, explicit, key, rebuild));
+      const result = await (closeAll ? this.closeAll(rig, config, key) : relocation
+        ?this.relocate(rig,config,key,relocation,explicit,rebuild):this.update(rig, config, explicit, key, rebuild));
       if (result.closeAvailable && !result.retryable) this.failures.set(key, result);
       return result;
     });
     this.pending.set(key, job);
     return job.finally(() => { if (this.pending.get(key) === job) this.pending.delete(key); });
+  }
+  async relocate(rig,config,key,approved,explicit,rebuild=null) {
+    const host=this.host,current=rigSpaceRelocation(host,rig,config);
+    if(!explicit||!current||JSON.stringify(current)!==JSON.stringify(approved))
+      return {ok:false,reason:"The old grid or OpenRig connection changed. Review the move again. Nothing was closed."};
+    const result=await this.update(rig,config,true,key,rebuild,true);
+    if(!result.ok||!result.space){
+      const unfinished=ownedRigSpace(host,rig,config);
+      if(unfinished)try{host.run("space.rename",{id:unfinished.id,name:`${rig.name} · move incomplete`});}catch{}
+      return {...result,...(result.recovery?{relocation:approved}:{}),reason:result.reason||"The box grid did not open. Nothing on this computer changed."};
+    }
+    // The grid controller has adopted, labelled and sized every tile before returning success.
+    const closed=[],changed=[],failed=[],changedReasons={};
+    const keepChanged=(name,reason)=>{changed.push(name);changedReasons[name]=reason;};
+    const configMatches=()=>!host.currentConfig||origin(host.currentConfig())===origin(config)
+      &&host.currentConfig()?.daemonMachine===config.daemonMachine;
+    const liveTile=snapshot=>{
+      const pane=get(host,"panes").find(p=>p.pane===snapshot.pane&&p.terminal===snapshot.terminal&&p.tab===snapshot.tab);
+      const terminal=get(host,"terminals").find(t=>addr(t)===snapshot.terminal);
+      const splitChanged=get(host,"panes").filter(p=>p.tab===snapshot.tab).some(p=>!approved.panes.some(prior=>prior.pane===p.pane
+        &&prior.tab===p.tab&&prior.terminal===(p.terminal??null)&&prior.mod===(p.mod??null)));
+      return !splitChanged&&pane&&terminal&&JSON.stringify(tileSnapshot(terminal,pane))===JSON.stringify(snapshot)?{pane,terminal}:null;
+    };
+    for(const snapshot of approved.tiles){
+      const name=snapshot.labels["herdr-openrig.seat"]||"Empty tile";
+      let live=liveTile(snapshot);
+      if(!live){keepChanged(name,"its pane or split changed");continue;}
+      if(!localViewerProgram(host,snapshot.argv)){keepChanged(name,"it is no longer a recognised viewer");continue;}
+      if(snapshot.labels["herdr-openrig.viewer-argv"]!==JSON.stringify(snapshot.argv)){keepChanged(name,"its viewer labels changed");continue;}
+      try{
+        const response=await host.hc(["get","--json","--",snapshot.terminal]);
+        const record=JSON.parse(response.stdout);
+        if(!configMatches()||response.code!==0||!record||JSON.stringify(record.argv)!==JSON.stringify(snapshot.argv)
+          ||snapshot.pid!==undefined&&record.pid!==snapshot.pid||snapshot.created!==undefined&&record.created_ms!==snapshot.created
+          ||Object.entries(snapshot.labels).some(([key,value])=>record.labels?.[key]!==value)||!liveTile(snapshot)){
+          keepChanged(name,!configMatches()?"OpenRig's connection changed":JSON.stringify(record?.argv)!==JSON.stringify(snapshot.argv)
+            ?"its command changed":"its terminal identity, labels or split changed");continue;
+        }
+        const oldSpace=get(host,"spaces").find(s=>s.id===approved.source);
+        const lastTab=oldSpace?.tabs?.length===1&&oldSpace.tabs[0].id===snapshot.tab;
+        const lastPane=get(host,"panes").filter(p=>p.tab===snapshot.tab);
+        if(lastTab&&lastPane.length===1&&lastPane[0].pane===snapshot.pane&&liveTile(snapshot)&&configMatches())
+          host.run("tab.close",{id:snapshot.tab,confirmed:true});
+        else host.run("pane.close",{pane:snapshot.pane});
+        for(let n=0;n<60&&get(host,"panes").some(p=>p.pane===snapshot.pane);n++){
+          if(!host.wait)break;await host.wait(100);
+        }
+        if(get(host,"panes").some(p=>p.pane===snapshot.pane))failed.push(name);else closed.push(name);
+      }catch{failed.push(name);}
+    }
+    const old=get(host,"spaces").find(s=>s.id===approved.source);
+    const kept=get(host,"panes").filter(p=>old?.tabs?.some(t=>t.id===p.tab));
+    let namingError=null;
+    try{
+      if(old&&kept.length)host.run("space.rename",{id:old.id,name:`${rig.name} · this computer`});
+      const collision=get(host,"spaces").some(s=>s.id!==approved.source&&s.id!==result.space&&s.name===rig.name);
+      host.run("space.rename",{id:result.space,name:collision?`${rig.name} · ${config.daemonMachine}`:rig.name});
+    }catch(error){namingError=String(error?.message??error);}
+    this.closed.add(`${origin(config)}||${rig.name}`); // Polling must never rebuild the retired Local grid.
+    const personal=kept.filter(p=>!approved.tiles.some(t=>t.pane===p.pane));
+    return {...result,relocated:true,oldSpace:approved.source,count:closed.length,changed,changedReasons,failed,
+      keptTabs:new Set(personal.map(p=>p.tab)).size,namingError};
   }
   ownedPanes(rig, config) {
     const machine = config?.daemonMachine || null;
@@ -122,10 +209,14 @@ export class RigSpaces {
     }
     return { ok: true, closed: true, count: closed };
   }
-  async update(rig, config, explicit, key, rebuild) {
+  async update(rig, config, explicit, key, rebuild, moving = false) {
     if (this.closed.has(key) && !explicit) return { ok: true, closed: true };
     if (explicit) this.closed.delete(key);
     const host = { ...this.host }, url = origin(config), machine = config?.daemonMachine || null;
+    if(explicit&&!moving){
+      const relocation=rigSpaceRelocation(host,rig,config);
+      if(relocation)return {ok:false,needsRelocation:true,relocation,reason:"Move the existing Local rig space before opening its box grid."};
+    }
     const localId = (id) => machineLocalId(id, machine), qualified = (id) => machineId(id, machine);
     let space = ownedRigSpace(host, rig, config);
     // A closed space is never recreated by polling, even when membership changes.
@@ -145,7 +236,8 @@ export class RigSpaces {
         if (!host.prepareRemote) throw new Error("Open the Rig sidebar to use the configured Herdr machine. No local terminal was started.");
         remote = await host.prepareRemote(config); if (!remote.ok) return { ...remote, retryable: true, preparationFailed: true };
       }
-      plan = rigGridPlan(rig, host.padPath, { selfHostId: remote?.selfHostId ?? host.selfHostId?.(), viewerPath: machine ? null : host.viewerPath, openrigHome: machine ? null : config.openrigHome, remote: !!machine });
+      plan = rigGridPlan(rig, host.padPath, { selfHostId: remote?.selfHostId ?? host.selfHostId?.(), viewerPath: machine ? null : host.viewerPath, openrigHome: machine ? null : config.openrigHome, remote: !!machine,
+        remoteViewer: machine ? { node: remote.node, path: remote.relayPath } : null });
       if (machine) for (const tile of plan.tiles.filter((t) => t.session)) {
         const flags = tile.serverArgs;
         const probe = await host.exec("tmux", [...flags, "has-session", "-t", `=${tile.session}`], { on: machine, timeout: 10000 });
@@ -214,6 +306,7 @@ export class RigSpaces {
       await waitFor(() => !panes().some((n) => n.pane === p.pane), "pane close");
     };
     try {
+      if(moving&&space)host.run("space.rename",{id:space.id,name:`${rig.name} · moving`});
       if (tabPanes().some((p) => !terms().some((t) => addr(t) === p.terminal && (own(t) || confirmed(t, p))))) throw new Error("The grid tab contains a personal pane; it was left alone.");
       if (!plan.tiles.length) {
         for (const p of tabPanes()) await close(p);
@@ -257,8 +350,9 @@ export class RigSpaces {
         if (!space) throw new Error("Herdr returned no rig space.");
         if (created) {
           const title = String(rig.name ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, 80).trim() || "Rig";
-          let name = title, suffix = 2;
-          while (get(host, "spaces").some((s) => s.id !== spaceId && s.name === name)) name = `${title} ${suffix++}`;
+          const base=moving?`${title} · moving`:title;
+          let name = base, suffix = 2;
+          while (get(host, "spaces").some((s) => s.id !== spaceId && s.name === name)) name = `${base} ${suffix++}`;
           host.run("space.rename", { id: spaceId, name });
         }
       }

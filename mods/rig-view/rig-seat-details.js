@@ -1,5 +1,6 @@
 /** The public /api/rigs/:id/nodes activity contract (captured from OpenRig 0.7.11). */
-export function seatActivityDetails(node, now = Date.now()) {
+import { formatAbsoluteTime } from './rig-time.js';
+export function seatActivityDetails(node, now = Date.now(), timezone = null) {
   const activity = node?.activityState ?? {}, agent = node?.agentActivity ?? {};
   const text = (value) => typeof value === "string" && value ? value : null;
   const changedAt = text(agent.eventAt) ?? text(node?.lastActivityAt);
@@ -13,13 +14,13 @@ export function seatActivityDetails(node, now = Date.now()) {
     reason: text(agent.reason) ?? text(activity.needsInput?.reason) ?? "—",
     decidedBy: text(activity.decidedBy) ?? "—",
     signal: [text(agent.rawEvent), text(agent.rawSubtype)].filter(Boolean).join(" · ") || "—",
-    changed: ago ? `${stamp.toLocaleString()} · ${ago}` : "—",
+    changed: ago ? `${formatAbsoluteTime(stamp,{timezone,exact:true})} · ${ago}` : "—",
     flags: [agent.stale === true ? "stale" : null, agent.fallback === true ? "fallback" : null].filter(Boolean),
   };
 }
 
 /** Plain presentation of the public activity fields; raw evidence remains available separately. */
-export function seatActivityWords(node, now = Date.now()) {
+export function seatActivityWords(node, now = Date.now(), timezone = null) {
   const a = node?.agentActivity ?? {}, s = node?.activityState ?? {};
   const state = String(s.display ?? s.activity ?? a.state ?? "unknown").replace(/_/g, " ");
   const label = /needs.?input|attention/.test(state) ? "Needs you" : state === "working" || state === "running" ? "Working"
@@ -30,7 +31,7 @@ export function seatActivityWords(node, now = Date.now()) {
   const age = Number.isFinite(stamp) ? Math.max(0, Math.floor((now - stamp) / 60000)) : null;
   const ago = age === null ? "" : age < 1 ? "less than a minute ago" : age < 60 ? `${age} min ago` : `${Math.floor(age / 60)} h ago`;
   return { line: `${label}${source ? ` · ${source}` : ""}`, changed: Number.isFinite(stamp)
-    ? `Changed ${new Date(stamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · ${ago}` : "",
+    ? `Changed ${formatAbsoluteTime(stamp,{timezone})} · ${ago}` : "",
     note: a.reason === "generation_unverifiable" ? "OpenRig couldn't confirm the latest turn" : "",
     stale: a.stale === true && ago ? `Last confirmed ${ago}` : "" };
 }

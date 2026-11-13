@@ -3,6 +3,7 @@
 // folder works after a plain copy. Pure: no `herdr` import, so tests import it directly. Everything a mod
 // needs from the host (fetch, exec, terminals) is passed in.
 import { attachRemoteSeat } from "./rig-remote-attach.js";
+import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin } from "./rig-space-context.js";
@@ -318,6 +319,7 @@ export function parseConfig(text) {
     ...(daemonState ? { daemonState } : {}),
     ...(daemonMessage ? { daemonMessage } : {}),
     ...(capabilities ? { capabilities } : {}),
+    ...(raw.reducedMotion === true ? { reducedMotion: true } : {}),
   };
 }
 
@@ -1883,7 +1885,9 @@ export function seatStatus(node) {
     if (act.display === "working") return "active";
     if (act.display === "idle") return "idle";
     if (node.terminalActive === true || (node.terminalActive == null && node.agentActivity?.state === "running")) return "active";
-    return node.communityHarness ? "unknown" : "idle";
+    // OpenRig 0.7.13 TUI hydrate: a served activity object owns the fallback,
+    // even when empty or stale. Only an absent word retains legacy screen-idle.
+    return node.communityHarness || node.activityState ? "unknown" : "idle";
   }
   return node.sessionStatus ?? "unknown";
 }
@@ -1897,6 +1901,7 @@ export function statusLook(status) {
     case "blocked": return { tone: "blocked", word: "blocked" };
     case "active": return { tone: "working", word: "working" };
     case "idle": return { tone: "idle", word: "idle" };
+    case "unknown": return { tone: "done", word: "not reported" };
     // Neutral: not counted as working, needs you or idle, and never raises a rig's dot.
     case "terminal": return { tone: "done", word: "terminal" };
     case "detached": return { tone: "done", word: "detached" };
@@ -1947,6 +1952,7 @@ export function statusMark(key) {
     // The tone "done" is statusLook's for every seat that isn't running, so as a tone it reads stopped, not finished.
     case "done": case "stopped": case "detached": case "exited": return { shape: "square", color: "muted", word: "muted" };
     case "terminal": return { shape: "prompt", color: "muted", word: "muted" };
+    case "unknown": return { shape: "dashed-ring", color: "muted", word: "dim" };
     default: return { shape: "ring", color: "muted", word: "muted" };
   }
 }
@@ -1974,6 +1980,8 @@ export function statusMarkElement(ui, t, key, { cell = 14, iconOf, pulse = null 
     case "check": return box.child(svg(iconOf("check")).size(Math.round(cell * 0.8)).text_color(c));
     case "square": return box.child(div().size(Math.round(cell / 2)).rounded(1).border(1.5).border_color(c));
     case "prompt": return box.child(svg(iconOf("rig-terminal-prompt")).size(Math.round(cell * 0.8)).text_color(c));
+    case "dashed-ring": return box.tooltip("OpenRig is running this seat but hasn't reported whether it's working.")
+      .child(svg(iconOf("rig-unreported")).size(dot+2).text_color(c));
     default: return box.child(div().size(dot).rounded(dot).border(1.5).border_color(c));
   }
 }
@@ -2163,7 +2171,7 @@ export function rigModel(rig, nodes, nativeSeats = []) {
 /** Seat counts by status for a header or pod line: working, needs you (blocked), idle. */
 export function statusCounts(seats) {
   const n = (tone) => seats.filter((s) => s.tone === tone).length;
-  return { working: n("working"), needs: n("blocked"), idle: n("idle") };
+  return { working: n("working"), needs: n("blocked"), idle: n("idle"), unreported: seats.filter(s=>s.status==="unknown").length };
 }
 
 /** A rig starts open when it runs or any seat needs the person; a stopped rig with no needs is one line. */
@@ -2608,9 +2616,8 @@ export function viewsForRig(stripProps, sessions, rigName = null) {
 }
 
 /** "as of 12:04" for rows from the last good read, after a failed refresh. */
-export function asOf(date) {
-  const d = new Date(date);
-  return `as of ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+export function asOf(date,timezone=null) {
+  return `as of ${formatAbsoluteTime(date,{timezone})}`;
 }
 
 /** Relative UI time with the exact source timestamp retained by the caller's tooltip. */
@@ -3307,9 +3314,10 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
   const rawPerson = typeof config?.person === "string" ? config.person.trim() : "";
   const validExternalPerson = /^[^@\s]+@external$/.test(rawPerson) ? rawPerson : null;
   const actorLabel = validExternalPerson ?? (typeof act?.actorSession === "string" && /^[^@\s]+@external$/.test(act.actorSession) ? act.actorSession : "human@host (unattributed)");
+  const answerMessage = typeof resData?.answer?.message === "string" && resData.answer.message.trim() ? ` ${resData.answer.message}` : "";
   if (resData?.answer?.outcome === "recorded") {
     const openList = Array.isArray(resData.answer.unanswered) ? resData.answer.unanswered : [];
-    return `Recorded as ${actorLabel}. ${openList.length} question${openList.length === 1 ? "" : "s"} still open${openList.length ? `: ${openList.join("; ")}` : ""}.`;
+    return `Recorded as ${actorLabel}. ${openList.length} question${openList.length === 1 ? "" : "s"} still open${openList.length ? `: ${openList.join("; ")}` : ""}.${answerMessage}`;
   }
   if (verb === "approve") {
     return `Recorded as ${actorLabel}: approved. Closed as done.`;
@@ -3322,7 +3330,7 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
     return `Recorded as ${actorLabel}. Unparked; ${owner} still owns it.`;
   }
   if (verb === "answer") {
-    return `Recorded as ${actorLabel}: your answer. The asking seat has it.`;
+    return `Recorded as ${actorLabel}: your answer.${answerMessage}`;
   }
   return `Recorded as ${actorLabel}.`;
 }
@@ -3531,12 +3539,7 @@ function formatShortTime(isoOrTime, timezone = null) {
   if (/^\d{2}:\d{2}$/.test(s)) return s;
   const d = new Date(s);
   if (!Number.isNaN(d.getTime())) {
-    try {
-      if (timezone) {
-        return new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: timezone }).format(d);
-      }
-    } catch (_) { /* fallback below */ }
-    if (s.includes("T") && s.length >= 16) return s.slice(11, 16);
+    return formatAbsoluteTime(d,{timezone});
   }
   return s;
 }
@@ -3552,6 +3555,7 @@ export function sinceYouWereAwaySummary(items = [], {
   quietEnded = false,
   endedModeAccount = null,
   endedModeDecisions = null,
+  timezone = null,
 } = {}) {
   const acct = endedModeAccount?.account ?? endedModeAccount ?? null;
   const rawDecisions = Array.isArray(endedModeDecisions?.decisions)
@@ -3577,7 +3581,7 @@ export function sinceYouWereAwaySummary(items = [], {
 
   const requests = sorted.filter((i) => tierOf(i) !== "update").length;
   const updates = sorted.filter((i) => tierOf(i) === "update").length;
-  const sinceTime = formatShortTime(stamp) ?? "you were away";
+  const sinceTime = formatShortTime(stamp,timezone) ?? "you were away";
   const header = `Since ${sinceTime}: ${requests} request${requests === 1 ? "" : "s"}, ${updates} update${updates === 1 ? "" : "s"}`;
 
   const groups = {
@@ -3630,14 +3634,14 @@ export function sinceYouWereAwaySummary(items = [], {
  * - Quiet on: `Quiet until <HH:MM>`
  * - At desk with no active quiet: `null` (no chip)
  */
-export function quietModeHeaderChip({ quiet = null, mode = null } = {}) {
+export function quietModeHeaderChip({ quiet = null, mode = null, timezone = null } = {}) {
   const curMode = mode?.current ?? (mode?.modeName ? mode : null);
   if (curMode && curMode.modeName) {
     const name = String(curMode.modeName);
     const tz = curMode.settings?.delivery?.quiet?.timezone ?? null;
     const expectedBack = curMode.settings?.availability?.expectedBack
       ?? curMode.availability?.expectedBack
-      ?? (curMode.scheduledEnd ? formatShortTime(curMode.scheduledEnd, tz) : null);
+      ?? (curMode.scheduledEnd ? formatShortTime(curMode.scheduledEnd, timezone) : null);
     const shortLabel = expectedBack ? `${name} · ${expectedBack}` : name;
     const label = expectedBack ? `${name} · back ${expectedBack}` : name;
     return { kind: "mode", modeName: name, expectedBack: expectedBack ?? null, shortLabel, label, tooltip: label, glyph: "☾" };
@@ -3647,7 +3651,7 @@ export function quietModeHeaderChip({ quiet = null, mode = null } = {}) {
   if (quietState?.active) {
     const tz = quietWindow?.timezone ?? null;
     const boundaryAt = quietState.nextBoundary?.at ?? quietWindow?.until ?? quietWindow?.end ?? null;
-    const until = formatShortTime(boundaryAt, tz) ?? "later";
+    const until = formatShortTime(boundaryAt, timezone) ?? "later";
     const label = `Quiet until ${until}`;
     const tooltip = `Quiet until ${until}${tz ? ` (${tz})` : ""}. This mod holds routine toasts until then; escalations still show.`;
     return { kind: "quiet", until, timezone: tz, shortLabel: until, label, tooltip, glyph: "☾" };
@@ -3796,7 +3800,13 @@ export function isTuiArgv(argv, config) {
   const entries = new Set((config?.rig ?? ["rig"]).slice(-1));
   for (let i = 0; i + 1 < a.length; i++) {
     const base = a[i].split("/").pop();
-    if (a[i + 1] === "tui" && (base === "rig" || entries.has(a[i]))) return true;
+    // The installed `rig` symlink resolves to this Node entry in core's live
+    // foreground argv. Require the package path and Node position, not merely
+    // any script named bin-wrapper.js or a path after Node evaluation flags.
+    const installedEntry = i === 1 && /^(?:node|nodejs)(?:\.exe)?$/.test(a[0].split("/").pop())
+      && a[i].startsWith("/") && !a[i].split("/").includes("..")
+      && /\/@openrig\/cli\/dist\/bin-wrapper\.js$/.test(a[i]);
+    if (a[i + 1] === "tui" && (base === "rig" || entries.has(a[i]) || installedEntry)) return true;
   }
   return false;
 }
@@ -3897,6 +3907,7 @@ export function navKey(entry) {
     return "specs";
   }
   if (e.section === "scopes") {
+    if(e.workflow)return `workflow:${e.project??''}:${e.mission}:${e.workflow}${e.packet?`:packet:${e.packet}`:''}`;
     if (e.slice) return `slice:${e.mission}/${e.slice}`;
     if (e.mission) return `mission:${e.mission}`;
     if (e.project) return `project:${e.project}`;
@@ -3938,6 +3949,11 @@ export function crumbsFor(entry) {
     return [section("topology")];
   }
   if (e.section === "scopes") {
+    if(e.workflow){
+      const mission={section:'scopes',...(e.project?{project:e.project}:{}),mission:e.mission,name:e.mission,missionTab:'workflows'};
+      const workflow={...e};delete workflow.packet;workflow.name=e.workflowName??e.workflow;
+      return [section('scopes'),{text:e.mission,entry:mission},{text:e.workflowName??e.workflow,entry:workflow},...(e.packet?[{text:e.name??e.packet,entry:e}]:[])];
+    }
     if (e.slice) return [section("scopes"), { text: e.mission, entry: { section: "scopes", mission: e.mission, name: e.mission } }, { text: e.name ?? e.slice, entry: e }];
     if (e.mission) return [section("scopes"), { text: e.name ?? e.mission, entry: e }];
     if (e.project) return [section("scopes"), { text: e.name ?? e.project, entry: e }];
@@ -3962,7 +3978,7 @@ export function crumbsFor(entry) {
   if (e.section === "system") {
     if (e.settingKey) return [section("system"), { text: "Configuration", entry: { section: "system", subview: "config", name: "Configuration" } }, { text: e.settingKey, entry: e }];
     if (e.category) return [section("system"), { text: "Configuration", entry: { section: "system", subview: "config", name: "Configuration" } }, { text: e.category, entry: e }];
-    if (e.subview) return [section("system"), { text: e.name ?? e.subview, entry: e }];
+    if (e.subview) return [section("system"), { text: e.name ?? ({ overview: "Overview", people: "People", config: "Configuration", health: "Health", connections: "Connections", usage: "Usage", cost: "Cost", notifications: "Notifications" }[e.subview] ?? e.subview), entry: e }];
     if (e.openUsageHosts) return [section("system"), { text: "Usage · all hosts", entry: e }];
     return [section("system")];
   }
@@ -4355,7 +4371,8 @@ export function recentTransitionRows(data, topologyOrOpts = [], extraOpts = {}) 
   const list = Array.isArray(data) ? data : (data?.transitions ?? data?.entries ?? data?.items ?? []);
   return (Array.isArray(list) ? list : []).slice(0, 10).map((tr) => {
     const rawTs = singleLineText(tr?.ts ?? tr?.at ?? "");
-    const ts = rawTs.includes("T") ? rawTs.slice(11, 19) : (rawTs || "—");
+    const opts=Array.isArray(topologyOrOpts)?extraOpts:topologyOrOpts;
+    const ts = rawTs.includes("T") ? formatAbsoluteTime(rawTs,{timezone:opts?.timezone,seconds:true}) : (rawTs || "—");
     const actor = singleLineText(tr?.actorSession ?? tr?.actor ?? "—");
     const change = singleLineText(tr?.change ?? (tr?.fromState && tr?.toState ? `${tr.fromState} → ${tr.toState}` : (tr?.toState ?? tr?.state ?? "")));
     const bodyLine = String(tr?.bodyPreview ?? "").split(/\r\n|[\n\r\u2028\u2029]/).map(singleLineText).find(Boolean);
@@ -4398,7 +4415,7 @@ function isPulseBlockedSeat(s) {
 export function computePulseCounts(models, attentionItems = []) {
   const modelList = Array.isArray(models) ? models : [];
   const allSeats = modelList.flatMap((m) => m?.seats ?? []);
-  let working = 0, blocked = 0, needs = 0, idle = 0;
+  let working = 0, blocked = 0, needs = 0, idle = 0, unreported = 0;
   for (const m of modelList) {
     const rigObj = { ...(m?.rig ?? {}), ...m, name: m?.name ?? m?.rig?.name ?? m?.id ?? "" };
     // Pod headers may count a subset while retaining the whole rig for ask attribution/fallback.
@@ -4407,18 +4424,20 @@ export function computePulseCounts(models, attentionItems = []) {
       if (matchesPulseFilter(s, rigObj, "blocked", attentionItems, allSeats)) blocked++;
       if (matchesPulseFilter(s, rigObj, "needs", attentionItems, allSeats)) needs++;
       if (matchesPulseFilter(s, rigObj, "idle", attentionItems, allSeats)) idle++;
+      if (matchesPulseFilter(s, rigObj, "unreported", attentionItems, allSeats)) unreported++;
     }
   }
-  return { working, blocked, needs, idle };
+  return { working, blocked, needs, idle, unreported };
 }
 
-/** Whether a seat matches the page-session pulse filter. Buckets partition seats; neutral states live in Idle. */
+/** Buckets partition seats; unreported activity is separate from known idle and stopped states. */
 export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], _allSeats = []) {
   if (!pulseFilter) return true;
   // Neutral lifecycle states have a home in Idle; their individual row marks stay unchanged.
   if (seat.terminal || ["terminal", "detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
   const actionableNeeds = (Array.isArray(attentionItems) ? attentionItems : []).filter((i) => i && !i.update && i.kind !== "update");
   const rigName = rig?.name ?? rig?.id ?? "";
+  if(pulseFilter==="unreported")return seat.status==="unknown"&&!matchesPulseFilter(seat,rig,"needs",attentionItems);
   if (pulseFilter === "working") {
     return !matchesPulseFilter(seat, rig, "needs", attentionItems) && !isPulseBlockedSeat(seat)
       && (seat.tone === "working" || seat.status === "active" || seat.word === "working");
@@ -4439,7 +4458,7 @@ export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], 
     return false;
   }
   if (pulseFilter === "idle") {
-    return !["working", "blocked", "needs"].some(key => matchesPulseFilter(seat, rig, key, attentionItems));
+    return !["working", "blocked", "needs", "unreported"].some(key => matchesPulseFilter(seat, rig, key, attentionItems));
   }
   return true;
 }
@@ -5103,6 +5122,7 @@ export function currentCapabilities(sharedOrData, terminals = [], measured = nul
     base.herdrAppAvailable = measured.herdrAppAvailable;
     base.herdrAppAvailabilityReason = measured.herdrAppAvailabilityReason;
   }
+  if(Object.hasOwn(measured??{},"hostWorkerViews"))base.hostWorkerViews=measured.hostWorkerViews;
   const hasLiveSeat = (terminals ?? []).some((t) => t?.labels?.["openrig.role"] === "seat");
   return base.herdrAppProvider && hasLiveSeat && !base.nativeSeats ? { ...base, nativeSeats: true } : base;
 }
@@ -5121,6 +5141,9 @@ export function currentCapabilities(sharedOrData, terminals = [], measured = nul
  */
 export function capabilityDisableReason(action, caps = DEFAULT_CAPABILITIES) {
   const c = caps ?? DEFAULT_CAPABILITIES;
+  if(c.hostWorkerViews===true&&c.herdrAppAvailable===false&&["open-view","follow","unfollow","prune"].includes(action))return null;
+  if(c.hostWorkerViews===true&&c.herdrAppAvailable===false&&["design-view","open-designed-view"].includes(action))return "Design view needs a Herdr window on OpenRig's machine.";
+  if(c.hostWorkerViews===true&&c.herdrAppAvailable===false&&action==="close-view")return "Close these worker pages with Herdr's tab close controls; their seats keep running.";
   if (action === "tui-resolve" && c.tuiResolve === false) {
     return TUI_RESOLVE_REASON;
   }
