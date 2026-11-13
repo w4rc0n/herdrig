@@ -1,6 +1,6 @@
 // All explicit opens and background grid reconciliation pass through this coordinator.
-import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat } from "./rig-lib.js";
-import { openRigSpaceContext, resolveRigSpace, rigOrigin } from "./rig-space-context.js";
+import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers } from "./rig-lib.js";
+import { openRigSpaceContext, resolveRigSpace, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
 
 const jobs = new Map(), homeJobs = new Map(), pageJobs = new Map();
@@ -253,7 +253,7 @@ function requestRig(host, request) {
   return {rig,key};
 }
 function rigSpace(host,config,rig,key){
-  return resolveRigSpace(host,config,[key,rig?.id,rig?.name]);
+  return resolveRigSpace(host,config,[key,rig?.id,rig?.name],{sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:typeof host?.selfHostId==="function"?host.selfHostId():host?.selfHostId});
 }
 
 async function save(host,patch){
@@ -282,11 +282,23 @@ async function home(host,config,needTui=true){
     const scoped=state(host).homeSpaces?.[key];
     let known=contexts(host).find(c=>c.home&&spaceMachine(c.space)===machine
       &&(!scoped||c.id===scoped)&&(!c.tuis.length||c.tuis.some(t=>!t.labels?.["herdr-openrig.origin"]||rigOrigin(t.labels["herdr-openrig.origin"])===rigOrigin(config.daemonUrl)))), space=known?.space;
+    // A home made with another spelling of this daemon's address (127.0.0.1 then, 127.0.0.3 now) is the same home only when vouched for;
+    // otherwise no second home is built.
+    const adopt=new Set();
+    if(!space&&machine){
+      const found=homeCandidate(contexts(host),config,{hostId:remote?.selfHostId});
+      if(found.unconfirmed)return fail(`OpenRig's home space on ${machine} was made with the address ${found.unconfirmed.origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${config.daemonUrl}, so no second home was opened. Close that space and open OpenRig again, or set daemonUrl to ${found.unconfirmed.origin??"that address"}.`);
+      if(found.context){
+        try{await markHomeSpace(host,config,found.terminals,{hostId:remote?.selfHostId});}catch(error){return fail(String(error?.message??error));}
+        known=found.context;space=known.space;for(const t of found.terminals)adopt.add(t.address);
+        await save(host,{homeSpace:space.id,homeSpaces:{...(state(host).homeSpaces??{}),[key]:space.id}});
+      }
+    }
     if(space && !needTui) return {ok:true,space:space.id};
     if(space){
       // Reuse only a live TUI still represented by a pane in this home, never retained terminal history.
       for(const terminal of known.tuis){
-        if(terminal.labels?.["herdr-openrig.origin"] && rigOrigin(terminal.labels["herdr-openrig.origin"])!==rigOrigin(config.daemonUrl)) continue;
+        if(!adopt.has(terminal.address) && terminal.labels?.["herdr-openrig.origin"] && rigOrigin(terminal.labels["herdr-openrig.origin"])!==rigOrigin(config.daemonUrl)) continue;
         const pane=list(host,"panes").find(p=>p.terminal===terminal.address && space.tabs?.some(t=>t.id===p.tab));
         if(!pane) continue;
         let record=null;
@@ -307,7 +319,7 @@ async function home(host,config,needTui=true){
     const started=await host.hc(["run",...(machine?["--on",machine]:[]),"--bg","--json","--no-parent",
       "--label",`herdr.space=${machineLocalId(id,machine)}`,"--label",`herdr.tab=${machineLocalId(tab,machine)}`,
       "--label","herdr-openrig.role=tui","--label","herdr-openrig.home=1",
-      "--label",`herdr-openrig.origin=${origin(config)}`,"--",...argv]);
+      "--label",`herdr-openrig.origin=${origin(config)}`,...(hostLabelValue(remote?.selfHostId)?["--label",`herdr-openrig.host=${hostLabelValue(remote.selfHostId)}`]:[]),"--",...argv]);
     let address;try{address=JSON.parse(started?.stdout??"null")?.address;}catch{}
     if(!address || (machine?!String(address).startsWith(machine+"/"):String(address).includes("/")) || (started.code!==undefined && started.code!==0))
       return fail(`Herdr could not start OpenRig's TUI${machine?" on "+machine:" locally"}. No fallback tab was opened.`);

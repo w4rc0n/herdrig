@@ -1,2 +1,2 @@
 // Runtime release metadata. Generated from mod/VERSION.
-export const HERDRIG_VERSION = "0.4.2";
+export const HERDRIG_VERSION = "0.4.3";

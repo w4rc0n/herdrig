@@ -1,6 +1,6 @@
 import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, layoutHasMod, MOD_IDS } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
-import { resolveRigSpace, markRigSpace, rigOrigin } from "./rig-space-context.js";
+import { resolveRigSpace, markRigSpace, rigOrigin, hostLabelValue } from "./rig-space-context.js";
 
 const list = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
 
@@ -83,7 +83,8 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
       "--label", `herdr.space=${local(spaceId)}`, "--label", `herdr.tab=${local(tab)}`,
       "--label", "herdr-openrig.space=1", "--label", `herdr-openrig.rig=${rig}`,
       "--label", `herdr-openrig.origin=${origin}`, "--label", "herdr-openrig.role=attach",
-      "--label", `herdr-openrig.attach=${session}`, "--label", `herdr-openrig.seat=${session}`, "--", ...argv]);
+      "--label", `herdr-openrig.attach=${session}`, "--label", `herdr-openrig.seat=${session}`,
+      ...(hostLabelValue(checked.selfHostId) ? ["--label", `herdr-openrig.host=${hostLabelValue(checked.selfHostId)}`] : []), "--", ...argv]);
     if (started.code !== 0) throw new Error(started.stderr || `Could not start the seat on ${machine}.`);
     const address = JSON.parse(started.stdout).address;
     if (!address?.startsWith(`${machine}/`)) throw new Error("Herdr returned an unexpected remote terminal address.");

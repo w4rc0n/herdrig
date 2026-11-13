@@ -1,7 +1,7 @@
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
-import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8 } from "./rig-lib.js";
+import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8, rigSeatServers } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure, goodHome } from "./rig-remote.js";
-import { resolveRigSpace, rigOrigin } from "./rig-space-context.js";
+import { resolveRigSpace, unconfirmedRigSpace, markRigSpace, rigSessions, rigOrigin, hostLabelValue } from "./rig-space-context.js";
 
 const ROLE = "rig-grid";
 const get = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
@@ -24,9 +24,10 @@ const localViewerProgram=(host,argv)=>{
     ||host.padPath&&actual[1]===host.padPath&&actual.length===2);
 };
 
+const daemonHostId = (host) => typeof host?.selfHostId === "function" ? host.selfHostId() : host?.selfHostId;
 export function ownedRigSpace(host, rig, config) {
   // Background grid activation still requires its explicit marker; recognising legacy Attach alone never starts a grid.
-  return resolveRigSpace(host,config,[rig.id,rig.name],{markedOnly:true});
+  return resolveRigSpace(host,config,[rig.id,rig.name],{markedOnly:true,sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:daemonHostId(host)});
 }
 
 /** Only a marked, same-origin Local grid can precede a configured box grid; display names prove nothing. */
@@ -219,6 +220,15 @@ export class RigSpaces {
     }
     const localId = (id) => machineLocalId(id, machine), qualified = (id) => machineId(id, machine);
     let space = ownedRigSpace(host, rig, config);
+    if (space && machine) {
+      // Found across a different loopback spelling of the same daemon (confirmed by its own session list): label it with today's address.
+      try { await markRigSpace(host, config, [rig.id, rig.name], space, { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) }); }
+      catch (error) { return { ok: false, reason: String(error?.message ?? error) }; }
+    }
+    if (!space && explicit && machine) {
+      const other = unconfirmedRigSpace(host, config, [rig.id, rig.name], { markedOnly: true, sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) });
+      if (other) return { ok: false, unconfirmedSpace: true, reason: `${rig.name} already has a space on ${machine}, made with the address ${other.origin ?? "an earlier one"}. Herdr could not confirm it is the same OpenRig as ${config.daemonUrl}, so nothing new was opened. Close that space and open ${rig.name} again, or set daemonUrl to ${other.origin ?? "that address"}.` };
+    }
     // A closed space is never recreated by polling, even when membership changes.
     if (!space && !explicit) { this.done.delete(key); return { ok: true, closed: true }; }
     if (!isLoopbackDaemonUrl(url)) return { ok: false, reason: "Rig spaces need a local OpenRig daemon." };
@@ -292,9 +302,12 @@ export class RigSpaces {
       if (res?.code !== 0) throw new Error(res?.stderr || "Herdr core command failed.");
       return res.stdout;
     };
+    // New spaces carry the configured daemon's host id, so a later lookup compares an exact id instead of inferring.
+    const hostStamp = hostLabelValue(remote?.selfHostId ?? host.selfHostId?.());
     const mark = async (terminal, tile, argv) => hc(["label", terminal,
       "herdr-openrig.space=1", `herdr-openrig.rig=${rig.name}`, `herdr-openrig.origin=${url}`,
-      `herdr-openrig.role=${ROLE}`, `herdr-openrig.seat=${tile.session}`, `herdr-openrig.viewer-argv=${JSON.stringify(argv)}`]);
+      `herdr-openrig.role=${ROLE}`, `herdr-openrig.seat=${tile.session}`, `herdr-openrig.viewer-argv=${JSON.stringify(argv)}`,
+      ...(hostStamp ? [`herdr-openrig.host=${hostStamp}`] : [])]);
     const close = async (p) => {
       await ready();
       guard();
@@ -341,7 +354,7 @@ export class RigSpaces {
           "--label", `herdr.space=${localId(spaceId)}`, "--label", `herdr.tab=${localId(tab)}`,
           "--label", "herdr-openrig.space=1", "--label", `herdr-openrig.rig=${rig.name}`, "--label", `herdr-openrig.origin=${url}`,
           "--label", `herdr-openrig.role=${ROLE}`, "--label", `herdr-openrig.seat=${first.session}`,
-          "--label", `herdr-openrig.viewer-argv=${JSON.stringify(first.argv)}`, "--", ...first.argv]);
+          "--label", `herdr-openrig.viewer-argv=${JSON.stringify(first.argv)}`, ...(hostStamp ? ["--label", `herdr-openrig.host=${hostStamp}`] : []), "--", ...first.argv]);
         const terminal = JSON.parse(out)?.address;
         if (!terminal) throw new Error("Herdr returned no viewer terminal address.");
         anchor = await waitFor(() => panes().find((p) => p.terminal === terminal && p.tab === tab), "viewer adoption");

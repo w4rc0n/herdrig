@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.2
+Version: v0.4.3
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, and handoff routes light briefly then turn off without fading.

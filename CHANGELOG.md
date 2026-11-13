@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.3
+
+- Opening a rig that already has its own space on your configured machine finds that space again even when the tunnel address was written differently when the space was made (127.0.0.1, 127.0.0.3 or localhost, same port). Before, a second space was built. herdrig only reuses it when it can show it is the same OpenRig (the space carries the OpenRig's host id, or every seat in it is one that OpenRig lists for that rig); otherwise it opens nothing and says what to do. Spaces it builds now carry the host id. The OpenRig home space gets the same treatment, so a changed tunnel address no longer builds a second OpenRig home.
+
+- Spaces made before v0.4.3 are matched by their seat session names and tmux server flags rather than a recorded daemon identity. If you run two OpenRig daemons on the same machine sharing one tmux socket, herdrig cannot tell their spaces apart and may adopt the wrong one; close the space and reopen it to stamp it. Spaces made by v0.4.3 or later carry the daemon identity and are matched exactly.
+
 ## v0.4.2
 
 - **Security:** Remote spec writes use a separate verified helper and folder permission. Worker tiles enforce their read-only flag; setup approval includes the helper checksum and is renewed when it changes.

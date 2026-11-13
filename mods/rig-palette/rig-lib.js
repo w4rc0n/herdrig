@@ -5694,6 +5694,20 @@ export function tmuxServerArgsFrom(tmuxAttachCommand, session) {
   return [];
 }
 
+/** Session -> tmux server flags for the seats the configured daemon lists for a rig (topology rig: flat `seats` or `pods[].seats`), parsed
+ *  with `tmuxServerArgsFrom`. A seat with no attach command, or one that is not the plain attach OpenRig writes, is left out (nothing to compare). */
+export function rigSeatServers(rig) {
+  const seats = Array.isArray(rig?.seats) ? rig.seats : (rig?.pods ?? []).flatMap((pod) => pod?.seats ?? []);
+  const out = new Map();
+  for (const seat of seats) {
+    const session = seat?.session ?? seat?.canonicalSessionName;
+    if (!session || !seat?.tmuxAttachCommand) continue;
+    const serverArgs = tmuxServerArgsFrom(seat.tmuxAttachCommand, session);
+    if (serverArgs) out.set(session, serverArgs);
+  }
+  return out;
+}
+
 /** Why `tmuxServerArgsFrom` refused, in the person's words: a socket path with a character it doesn't pass on (a space or
  *  `@` in a home folder's name) says so; anything else isn't the plain attach OpenRig writes. */
 export function serverArgsRefusal(tmuxAttachCommand, session) {

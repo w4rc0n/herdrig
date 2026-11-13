@@ -507,7 +507,7 @@ export default class RigSidebar extends View {
   }
 
   routeHost(cx, consent = null) {
-    return { ...this.attachHost(cx, consent), currentConfig:()=>this.config, topology: () => this.data?.topology ?? [],
+    return { ...this.attachHost(cx, consent), currentConfig:()=>this.config, topology: () => this.data?.topology ?? [], selfHostId: () => this.healthz?.selfHostId,
       saveRouteState: patch => this.saveSpaceState(patch),
       syncGrid: (rig, options) => this.spaceController(cx, consent).sync(rig, this.config, options) };
   }
