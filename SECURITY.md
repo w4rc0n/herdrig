@@ -44,7 +44,7 @@ Please keep the details private until a fixed release is out, or 90 days after y
 
 ## Scope
 
-In scope: everything in this repository, including the four mods (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`), `rig-attach-relay.cjs`, and the steps `RECIPE.md` has an agent run.
+In scope: everything in this repository, including the four mods (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`), the helper scripts `rig-attach-relay.cjs`, `rig-spec-files.cjs` and `rig-spec-transport.cjs`, and the steps `RECIPE.md` has an agent run.
 
 Herdrig treats data from the OpenRig daemon as untrusted. Reports in these areas are especially welcome:
 
@@ -59,6 +59,12 @@ Out of scope:
 - Vulnerabilities in Herdr (`herdr-app`, `hc`) or its mod system: report them to Herdr
 - Setups the README lists as unsupported
 - Attacks that need an attacker who already controls your user account
+
+## Security safeguards in v0.4.2
+
+- Saving a spec on another machine uses a separate, hash-pinned helper, with its own permission naming the machine, the account and the allowed spec folders. The helper resolves those folders itself, refuses built-in and unsafe locations, and checks the file's previous contents before replacing it. Copy creates a new file and never overwrites one.
+- Herdrig's worker-view relay enforces each tile's read-only setting through tmux. Session names, server arguments and titles are checked before use, and commands are passed as arguments, never through a shell.
+- The permission for setting up a box includes the helper's SHA-256. A changed helper needs permission again, and the installed copy is verified before any viewer starts.
 
 ## Past security fixes
 
