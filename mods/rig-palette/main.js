@@ -80,7 +80,7 @@ export default class RigPalette extends View {
       line: `change-model ${s.logicalId}`,
       hint: `Change harness, model, or effort · ${rig.name}`,
     }))));
-    const own = q ? [...ownRows, ...designs, ...overviews, ...recents, ...changeModels].filter((o) => o.line.startsWith(q) || q.startsWith(o.line.split(" ")[0])) : [];
+    const own = q ? [...ownRows, ...designs, ...overviews, ...recents, ...changeModels].filter((o) => o.line.startsWith(q) || q.startsWith(o.line.split(" ")[0]) || o.label?.toLowerCase().includes(q)) : [];
     // `/text` is the grammar's page filter: offer it as a row, so typing it never reads as "No matches" before Enter applies it.
     const typed = this.input.value().trim();
     const filter = typed.length > 1 && typed.startsWith("/") ? [{ line: typed, label: `Filter this page: ${typed}`, hint: "Enter applies it" }] : [];
@@ -105,13 +105,17 @@ export default class RigPalette extends View {
   selectionIndex(rows = this.rows()) {
     if (this.selected >= 0) return this.selected;
     const line = this.input.value().trim();
-    return line && !resolveTuiLineFallback(line) && rows[0]?.navigation ? 0 : -1;
+    return line && !resolveTuiLineFallback(line) && rows.length ? 0 : -1;
   }
 
   /** Local palette commands (`operator`, `open-page`, `open-tui`, `tui`, `refresh`, `expand-all`, `collapse-all`, `view-design`, `change-model`, `notifications`). */
   own(cx, line) {
     const [verbRaw, arg] = line.trim().split(/\s+/);
     const verb = (verbRaw ?? "").toLowerCase();
+    if ((verb === "focus-sidebar" || verb === ":focus-sidebar") && !arg) {
+      this.dismiss(); run("rig.focus-sidebar"); return true;
+    }
+    if((verb==='all-seats'||verb===':all-seats')&&!arg){this.applyRoute({entry:{section:'topology',topologyTab:'seats'}});return true;}
     if ((verb === "help" || verb === "?") && !arg) {
       this.input.set_value(""); this.selected = -1; this.error = null; this.note = null; this.input.focus(); cx.notify(); return true;
     }
@@ -165,6 +169,7 @@ export default class RigPalette extends View {
     }
     if (
       verb === "usage-hosts" || verb === ":usage-hosts" ||
+      verb === "spaces-list" || verb === ":spaces-list" ||
       verb === "pulse" || verb === ":pulse" ||
       verb === "overview" || verb === ":overview" ||
       verb === "recent" || verb === ":recent" ||
@@ -243,7 +248,7 @@ export default class RigPalette extends View {
       if (this.caps().tuiResolve === false) {
         res = resolveTuiLineFallback(line);
         this.busy = false;
-        if (!res) { this.note = TUI_RESOLVE_REASON; cx.notify(); return; }
+        if (!res) { this.note = `No matches for “${line.trim()}”. Try a section name or choose a result above.`; cx.notify(); return; }
       } else {
         const r = await exec(...this.cli(["tui", "resolve", ...line.trim().split(/\s+/), "--json"]));
         try { res = JSON.parse(r.stdout); } catch (_) { res = null; }
@@ -252,7 +257,7 @@ export default class RigPalette extends View {
           const errText = String(res?.error?.message ?? res?.error ?? (r.stderr || r.stdout || "rig tui resolve gave no answer")).trim();
           if (/(unknown command|too many arguments|unknown option)/i.test(errText)) {
             res = resolveTuiLineFallback(line);
-            if (!res) { this.note = TUI_RESOLVE_REASON; cx.notify(); return; }
+            if (!res) { this.note = `No matches for “${line.trim()}”. Try a section name or choose a result above.`; cx.notify(); return; }
           } else {
             this.error = errText; cx.notify(); return;
           }
@@ -467,7 +472,7 @@ export default class RigPalette extends View {
       .child(v_flex().id("rig-palette-rows").flex_1().overflow_y_scrollbar().children(rows.map((r, i) => h_flex().id(`row-${i}`).px(6).h(24).gap(10).items_center()
         .rounded(5).when(i === this.selectionIndex(rows), (el) => el.bg(t.selected).text_color(t.foreground)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.selected = i; this.choose(cx); })
         .child(div().w(r.label ? 280 : 200).truncate().text_size(12.5).tooltip(r.label ?? r.line).child(r.label ?? r.line))
-        .child(div().flex_1().truncate().text_size(11.5).text_color(t.dim).child(r.hint ?? "")))))
+        .child(div().flex_1().truncate().text_size(11.5).text_color(t.dim).tooltip(String(r.hint ?? ""??"")).child(r.hint ?? "")))))
       .when(!rows.length && !!this.input.value().trim(), el => el.child(v_flex().id("palette-no-matches").px(6).gap(4)
         .child(div().text_size(12).child(`No matches for “${this.input.value().trim()}”.`))
         .child(div().text_size(11.5).text_color(t.dim).child("Searches commands, rigs, seats and specs."))))

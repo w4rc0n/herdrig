@@ -24,17 +24,17 @@ import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, h
 
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, window, notify, machines } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, layouts, window, notify, machines } from "herdr";
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
   configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, needsRequestCount,
+  rowStatusGlyph, formatHonestCount, attachToSeat, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount,
   tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath, waitWith,
-  localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, isValidSessionName, newRigOverlay } from "./rig-lib.js";
+  localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
 import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { dismissible, dismissalSnapshot, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
@@ -43,12 +43,16 @@ import { registerRigRouting, workerCapabilityText } from "./rig-lib.js";
 import { NowTailCache, nowTailPresentation } from "./rig-now.js";
 import { RigGraph, GRAPH_EDGE_LOOK } from "./rig-graph.js";
 import { pageBodyLayout } from "./rig-page-layout.js";
+import {allSeatsView} from './rig-all-seats-view.js';
 import { normalizeRunningGraph } from "./rig-graph-state.js";
 import { pageViewKind, pageViewOptions, selectedPageView, entryWithPageView, compactLocationCrumbs, visiblePageTabs, pageSectionChoices } from "./rig-page-nav.js";
 import { readRigSpecPreview, groupSpecLibrary } from "./rig-lib.js";
 import { ConfigPanel } from "./rig-config-view.js";
 import { RemoteSpecs, SPEC_SHA256 } from "./rig-spec-remote.js";
 import { copyableSpecText, siblingFileNames, siblingFileNote } from "./rig-spec-copy.js";
+import { detectMode, planMode, describeChange, isShippedLayout, shippedSpacesHasReveal, MODES, MODE_LABEL, BASE_HERDR } from "./rig-spaces-mode.js";
+import { applySpacesMode, freeCopyName } from "./rig-spaces-apply.js";
+import { copyBuiltinFolder, findExistingCopy, folderCopyable } from "./rig-spec-folder.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.view` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.view}`;
@@ -168,13 +172,14 @@ export default class RigView extends View {
     });
     // The header's status line and a reply's confirmation come and go by time: redraw while one shows or a new one arrives.
     cx.timer.every(1000, (cx) => { if (this.ticking || shared("rig.status")?.at !== this.statusAt) cx.notify(); });
+    cx.timer.every(250, (cx) => this.pollSpacesDecision(cx));
     cx.timer.every(250, (cx) => {
       const pending=this.specPermission;if(!pending)return;
       const decisions=shared("rig.specWriteDecisions")??{},decision=decisions[pending.token];
       if(!decision&&Date.now()<pending.expires)return;
       this.specPermission=null;const rest={...decisions};delete rest[pending.token];setShared("rig.specWriteDecisions",rest);
       pending.box.awaitingPermission=false;
-      if(decision==="allow")this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation);
+      if(decision==="allow"){if(pending.request?.verb==="copy-folder")this.copyFolder(cx,pending.spec,pending.confirmation);else this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation);}
       else {pending.box.note="Nothing was saved on the box.";cx.notify();}
     });
     cx.spawn(async (cx) => {
@@ -204,7 +209,8 @@ export default class RigView extends View {
   updateReceipt(t, receipt) {
     this.ticking = true;
     return h_flex().id(`dismiss-receipt-${receipt.id}`).px(8).py(6).gap(8).items_center()
-      .child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(receipt.keys.length === 1
+      .child(div().flex_1().truncate().text_size(12).text_color(t.muted).tooltip(String((receipt.keys.length === 1
+        ? `✓ Dismissed: ${receipt.summary ?? "update"}` : `✓ Dismissed ${receipt.keys.length} updates`)??"")).child(receipt.keys.length === 1
         ? `✓ Dismissed: ${receipt.summary ?? "update"}` : `✓ Dismissed ${receipt.keys.length} updates`))
       .child(div().id(`undo-${receipt.id}`).text_size(12).text_color(t.accent).cursor_pointer()
         .on_click(() => this.updateAction("undo", receipt.id)).child("Undo"));
@@ -266,6 +272,11 @@ export default class RigView extends View {
     return entry&&entry.pages?.some(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)))?entry:null;
   }
   hostWorkerLine(t,rig,view=`rig:${rig.name}`){
+    const progress=shared("rig.workerProgress");
+    if(progress?.view===view&&progress.machine===this.config?.daemonMachine
+      &&rigOrigin(progress.daemonUrl)===rigOrigin(this.config?.daemonUrl))
+      return div().id(`host-worker-progress-${rig.id}`).text_size(11.5).text_color(t.muted)
+        .child(`Updating ${view.startsWith("rig:")?`Workers · ${view.slice(4)}`:this.hostWorkerEntry(view)?.name??"worker view"}…`);
     const entry=this.hostWorkerEntry(view);if(!entry)return null;
     const pages=entry.pages.filter(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)));
     const details=workerViewDetails(entry);
@@ -327,7 +338,7 @@ export default class RigView extends View {
     const { tabs, more } = visiblePageTabs(options, this.pageWidth ?? 960);
     const choose = view => push(entryWithPageView(entry, view));
     const keyChoose=(e,cx,act)=>{if(e.key==="enter"){cx.stop_propagation();act();}};
-    return h_flex().id(`${prefix}-object-tabs`).px(14).gap(16).h(34).items_center().border_b(1).border_color(t.border).flex_none()
+    const bar=h_flex().id(`${prefix}-object-tabs`).px(14).gap(16).h(34).items_center().border_b(1).border_color(t.border).flex_none()
       .when((this.pageWidth??960)<320,el=>el.h(68).flex_wrap().gap(8))
       .children(tabs.map(([id, label]) => div().id(`${prefix}-tab-${id}`).tab_stop(true).h(34).flex_none().flex().items_center().cursor_pointer()
         .border_b(active === id ? 2 : 0).border_color(t.accent).text_size(12.5).text_color(active === id ? t.foreground : t.muted)
@@ -338,6 +349,14 @@ export default class RigView extends View {
         .on_click(() => this.navigationMenu(more.map(([id,label]) => ({ label, entry:entryWithPageView(entry,id) })), "Views"))
         .on_key_down((e,cx)=>keyChoose(e,cx,()=>this.navigationMenu(more.map(([id,label])=>({label,entry:entryWithPageView(entry,id)})),"Views")))
         .child(`${more.find(([id])=>id===active)?.[1]??"More"} ▾`)));
+    if(pageViewKind(entry)==='topology'&&active==='seats'){
+      const choices=[['rig','By rig'],['status','By status']].map(([id,label])=>({label,entry:{...entry,topologyTab:'seats',seatsOrder:id}}));
+      bar.child(div().flex_1());
+      if((this.pageWidth??960)-28<460)bar.child(this.moreButton(t,'all-seats-order-menu',()=>this.navigationMenu(choices,'Seat order')));
+      else bar.child(h_flex().id('all-seats-order').gap(8).items_center().children(choices.map(({label,entry:e})=>div().id(`all-seats-order-${e.seatsOrder}`)
+        .text_size(12).text_color((this.allSeatsOrder??'rig')===e.seatsOrder?t.foreground:t.muted).cursor_pointer().on_click(()=>push(e)).child(label))));
+    }
+    return bar;
   }
 
   async resolveDaemonUrl() {
@@ -480,7 +499,8 @@ export default class RigView extends View {
       .when(!primary, (el) => el.border_1().border_color(t.border)).hover((s) => s.bg(primary && !disabled ? t.solid : disabled ? t.raised : t.hover))
       .when(!!tooltip, (el) => el.tooltip(tooltip))
       .on_click((e, cx) => { if (!disabled) onClick?.(e, cx); })
-      .when(busy, (el) => el.child(svg(icon("rig-refresh")).size(11).flex_none().text_color(t.accent).spin(900)))
+      .when(busy, (el) => el.child(svg(icon("rig-refresh")).size(11).flex_none().text_color(t.accent)
+        .when(this.config?.reducedMotion !== true, icon => icon.spin(900))))
       .when(!busy && !!iconName, (el) => el.child(svg(icon(iconName)).size(13).flex_none()))
       .child(label);
   }
@@ -542,13 +562,17 @@ export default class RigView extends View {
       const [, w, align] = cols[i] ?? [];
       return div().when(!w, (d) => d.flex_1().min_w(0)).when(!!w, (d) => d.w(w).flex_none()).truncate().when(align === "right", (d) => d.text_right())
         .text_size(header ? 11 : 12.5).text_color(header ? t.dim : i === 0 ? t.foreground : t.muted)
+        .when(c === null || typeof c !== "object", el => el.tooltip(String(c??"")))
         .child(c && typeof c === "object" ? c : header ? String(c ?? "") : this.plain(t, String(c ?? ""), `cell-${idPrefix}-${rowId}-${i}`));
     };
     return v_flex()
       .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).children(cols.map(([label], i) => cell(label, i, true))).child(div().w(12)))
       .children(rows.length ? rows.map((r, i) => {
-        let el = h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover));
-        if (r.onClick) el = el.on_click(r.onClick);
+        const key = `table:${idPrefix}:${i}`;
+        this.pageRows?.push({ key, open: r.onClick ? () => r.onClick() : null });
+        let el = h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover))
+          .when(this.pageSel === key, row => row.bg(t.selection ?? `${t.accent}1f`))
+          .on_click(r.onClick ?? ((_e, cx) => this.selectPageRow(key, cx)));
         if (r.onRight) el = el.on_mouse_down("right", r.onRight);
         return el.children(r.cells.map((c, j) => cell(c, j, false, i)))
           .child(r.onClick ? svg(icon("chevron-right")).size(12).flex_none().text_color(t.dim) : div().w(12));
@@ -557,7 +581,7 @@ export default class RigView extends View {
   fileRow(t, id, path, label) {
     return h_flex().id(id).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover)).on_click(() => push(fileEntry(path, label)))
       .child(svg(icon("file-text")).size(14).flex_none().text_color(t.muted))
-      .child(div().flex_1().min_w(0).truncate().text_size(12.5).child(path.split(/[\\/]/).pop()))
+      .child(div().flex_1().min_w(0).truncate().text_size(12.5).tooltip(String(path.split(/[\\/]/).pop()??"")).child(path.split(/[\\/]/).pop()))
       .child(this.copyButton(t, path, `path-${id}`, "path"))
       .child(div().text_size(11.5).text_color(t.dim).child("Open"));
   }
@@ -608,7 +632,7 @@ export default class RigView extends View {
       .child(div().font_semibold().text_size(13).child("Files"))
       .child(div().id("rig-file-reload").cursor_pointer().on_click((_e, cx) => { this.files[path]?.state?.release?.(); delete this.files[path]; cx.notify(); })
         .child(svg(icon("rig-refresh")).size(12).text_color(t.dim)))
-      .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(path))
+      .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).tooltip(String(path??"")).child(path))
       .child(this.copyButton(t, path, "file-path", "path"))
       .child(div().id("rig-close").cursor_pointer().on_click(() => closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)));
   }
@@ -634,16 +658,26 @@ export default class RigView extends View {
       return one ? this.rigBlock(t, cx, one, { entry, rigCount: rigs.length, attentionItems }) : this.dim(t, `No rig ${entry.name} on this daemon.`);
     }
     const focusTarget = entry.focusRig ?? shared("rig.focusRig") ?? shared("rig.focus") ?? entry.focus ?? null;
-    const modelList = orderRigs(rigs.map((r) => ({ rig: r, ...rigModel(r, this.nodesOf(cx, r.id).data) })), focusTarget);
+    const loadedModels=rigs.map((r)=>{const nodesState=this.nodesOf(cx,r.id);return {rig:r,...rigModel(r,nodesState.data),nodesState};});
+    const modelList = orderRigs(loadedModels, focusTarget);
     const allSeats = modelList.flatMap((m) => m.seats);
     const models = modelList.map((m) => m.rig);
-    const strip = this.pulseStrip(t, modelList, attentionItems, summary.at, entry);
+    // A failed node read has its own group error; retained cache rows are not live chip counts.
+    const strip = this.pulseStrip(t, modelList.filter(m=>!m.nodesState?.error), attentionItems, summary.at, entry);
+    this.topologyStrip=strip;
+    if((entry.topologyTab??this.activePageView)==='seats'){
+      this.allSeatsOrder=entry.seatsOrder??this.allSeatsOrder??'rig';
+      return allSeatsView(this,t,cx,loadedModels,attentionItems,{navigate:push,menu,orderMap:shared('rig.order')??{},openSpecs:()=>push({section:'specs'}),
+        attach:(target,cx)=>cx.spawn(async cx=>{
+          const result=await attachToSeat({exec,run,hc,spaces,panes,terminals,layout,shared,setShared,wait:waitWith(cx),relayPath:attachRelayPath(appHome(),MOD_IDS.view)},target,this.config);
+          if(result?.ok===false)notify({title:`Attach ${target.logicalId}`,body:result.reason,level:'warning'});
+        })});
+    }
     const missingFocusRig = entry.focusRig && !rigs.some((r) => r.id === entry.focusRig || r.name === entry.focusRig)
       ? div().id("topology-missing-rig").text_size(12).text_color(t.blocked).child(`No rig "${entry.focusRig}" found.`)
       : null;
     const blocks = models.map((r) => this.rigBlock(t, cx, r, { entry, rigCount: rigs.length, attentionItems, allSeats, allowPulseFilter: true })).filter(Boolean);
     return v_flex().gap(12)
-      .child(strip)
       .when(Boolean(this.pulseFilter), el => el.child(this.pulseFilterBar(t, modelList, attentionItems, cx)))
       .child(this.topologyRecent(t, cx, rigs))
       .when(!!missingFocusRig, (el) => el.child(missingFocusRig))
@@ -687,8 +721,8 @@ export default class RigView extends View {
               .child(svg(icon(selected ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
               .child(div().min_w(70).flex_none().text_size(11).text_color(t.dim).child(this.time(row.ts,{seconds:true})))
               .child(v_flex().flex_1().min_w(0).gap(2)
-                .child(div().truncate().text_size(12).text_color(t.muted).child(`${row.actorSession || "Actor unknown"} · ${row.change || "Change unknown"}`))
-                .child(div().truncate().text_size(12.5).text_color(t.foreground).child(summary))))
+                .child(div().truncate().text_size(12).text_color(t.muted).tooltip(`${row.actorSession || "Actor unknown"} · ${row.change || "Change unknown"}`).child(`${row.actorSession || "Actor unknown"} · ${row.change || "Change unknown"}`))
+                .child(div().truncate().text_size(12.5).text_color(t.foreground).tooltip(String(summary??"")).child(summary))))
             .when(selected, (el) => el.child(this.kv(t, [
               ["Event", key], ["When", this.time(row.ts,{exact:true})], ["Actor", row.actorSession], ["Change", row.change],
               ["Work", row.summary || row.bodyPreview || "No work served"], ["Queue item", row.qitemId],
@@ -806,9 +840,10 @@ export default class RigView extends View {
         .child(div().text_size(11.5).text_color(active ? (t.solid_foreground ?? t.background) : color).font_medium().child(label));
     };
     const ageSec = updatedAt ? Math.max(0, Math.round((Date.now() - updatedAt) / 1000)) : 0;
-    return h_flex().id("topology-pulse-strip").px(10).h(34).gap(8).items_center().rounded(8)
+    const seatsTab=(entry.topologyTab??this.activePageView)==='seats';
+    return h_flex().id("topology-pulse-strip").px(10).py(6).min_h(34).gap(8).flex_wrap().items_center().rounded(8)
       .bg(t.background).border_1().border_color(focused ? t.accent : t.border)
-      .child(h_flex().id("pulse-filter-group").gap(0).rounded(6).border_1().border_color(t.border).items_center()
+      .child(h_flex().id("pulse-filter-group").gap(0).flex_wrap().rounded(6).border_1().border_color(t.border).items_center()
         .child(seg("pulse-filter-all", null, "All", t.foreground))
         .child(seg("pulse-filter-working", "working", `${counts.working} working`, t.ansi2, "working"))
         .child(seg("pulse-filter-blocked", "blocked", `${counts.blocked} blocked`, t.blocked, "blocked"))
@@ -816,14 +851,14 @@ export default class RigView extends View {
         .child(seg("pulse-filter-idle", "idle", `${counts.idle} idle`, t.muted, "idle"))
         .when(counts.unreported>0,el=>el.child(seg("pulse-filter-unreported","unreported",`${counts.unreported} not reported`,t.dim,"unknown"))))
       .child(div().flex_1())
-      .child(h_flex().id("topology-expand-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
+      .when(!seatsTab,el=>el.child(h_flex().id("topology-expand-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
         .on_click(() => setShared("rig.open.page", expandAllTopology(shared("rig.open.page"), topoForFold)))
-        .child(div().text_size(11.5).text_color(t.foreground).child("Expand all")))
-      .child(h_flex().id("topology-collapse-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
+        .child(div().text_size(11.5).text_color(t.foreground).child("Expand all"))))
+      .when(!seatsTab,el=>el.child(h_flex().id("topology-collapse-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
         .on_click(() => setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), topoForFold)))
-        .child(div().text_size(11.5).text_color(t.foreground).child("Collapse all")))
+        .child(div().text_size(11.5).text_color(t.foreground).child("Collapse all"))))
       .child(div().text_size(11).text_color(t.dim).child(`updated ${ageSec}s ago`));
   }
 
@@ -893,6 +928,7 @@ export default class RigView extends View {
     const working = state.working && !state.stale ? state.line.split(" · ")[0] : "";
     const rowWorking = working ? rowText.split(" · ")[0] : "";
     if (rowWorking) line.child(div().flex_none().text_color(t.ansi2 ?? t.working).child(rowWorking));
+    // The existing HoverCard below reveals the full line and transcript; keep one hover channel.
     line.child(div().flex_1().min_w(0).truncate().text_color(state.stale ? t.dim : t.muted).child(rowWorking ? rowText.slice(rowWorking.length) : rowText));
     const link = (id, label, act) => div().id(id).text_size(12).text_color(act ? t.accent : t.dim)
       .when(!!act, el => el.cursor_pointer()).on_click((_e, cx) => { cx.stop_propagation(); act?.(); }).child(label);
@@ -1160,9 +1196,9 @@ export default class RigView extends View {
       }
       return el
         .child(div().min_w(70).flex_none().text_color(t.dim).child(r.ts))
-        .child(div().w(140).flex_none().truncate().text_color(t.muted).child(r.actor))
-        .child(div().w(120).flex_none().truncate().text_color(t.accent).child(r.change))
-        .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(r.label))
+        .child(div().w(140).flex_none().truncate().text_color(t.muted).tooltip(String(r.actor??"")).child(r.actor))
+        .child(div().w(120).flex_none().truncate().text_color(t.accent).tooltip(String(r.change??"")).child(r.change))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).tooltip(String(r.label??"")).child(r.label))
         .when(!!r.navEntry, (rowEl) => rowEl.child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim)));
     }));
   }
@@ -1335,7 +1371,7 @@ export default class RigView extends View {
           .on_click(() => run("terminal.peek", { terminal: child.address }))
           .child(div().w(12).flex_none())
           .child(svg(icon("rig-helper")).size(12).flex_none().text_color(t.dim))
-          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(child.name || (Array.isArray(child.argv) ? child.argv.join(" ") : "") || child.address))
+          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).tooltip(String((child.name || (Array.isArray(child.argv) ? child.argv.join(" ") : "") || child.address)??"")).child(child.name || (Array.isArray(child.argv) ? child.argv.join(" ") : "") || child.address))
           .child(div().text_size(11).text_color(t.dim).child(child.status ?? ""))) : []);
   }
 
@@ -1554,7 +1590,7 @@ export default class RigView extends View {
         ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => push({ section: "system", subview: "health" }))
             .child(div().text_size(12).text_color(t.blocked).child(`[${f.severity ?? "warn"}]`))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(singleLineText(f.summary ?? f.id ?? "finding")))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(singleLineText(f.summary ?? f.id ?? "finding")??"")).child(singleLineText(f.summary ?? f.id ?? "finding")))
             .child(div().text_size(11.5).text_color(t.dim).child(f.status ?? "open"))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim)))
         : [this.dim(t, "No health findings for this seat.")]))))
@@ -1562,7 +1598,7 @@ export default class RigView extends View {
       .when(tab === "queue", el => el.child(v_flex().id("seat-section-current-work").child(this.card(t, `CURRENT WORK · ${currentWork.length}`, currentWork.length
         ? currentWork.map((it, i) => h_flex().id(`seat-work-current-${i}`).gap(8).items_center().text_size(12.5)
             .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `work-${i}`)))
-            .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(singleLineText(it.summary ?? it.title ?? "—")))
+            .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).tooltip(String(singleLineText(it.summary ?? it.title ?? "—")??"")).child(singleLineText(it.summary ?? it.title ?? "—")))
             .when(!!it.sourceSession, (el) => el.child(div().text_size(11.5).text_color(t.muted).child(singleLineText(`from ${it.sourceSession}`))))
             .when(!!it.priority, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(String(it.priority)))))
         : [this.dim(t, queueEmpty("No active claimed work."))]))))
@@ -1580,7 +1616,7 @@ export default class RigView extends View {
             ? [
                 ...upNext.slice(0, 3).map((it, i) => h_flex().id(`seat-up-next-${i}`).gap(8).items_center().text_size(12)
                   .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `q-${i}`)))
-                  .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(singleLineText(it.summary ?? it.title ?? "—")))),
+                  .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).tooltip(String(singleLineText(it.summary ?? it.title ?? "—")??"")).child(singleLineText(it.summary ?? it.title ?? "—")))),
                 ...(upNext.length > 3 ? [div().id("seat-up-next-more").text_size(11.5).text_color(t.dim).child(`+${upNext.length - 3} more`)] : []),
               ]
             : [this.dim(t, queueEmpty("None queued."))]),
@@ -1597,7 +1633,7 @@ export default class RigView extends View {
                 ...seatNeeds.slice(0, 3).map((it, i) => h_flex().id(`seat-need-item-${i}`).px(6).h(24).overflow_hidden().gap(8).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
                   .on_click(() => push({ section: "needs", id: it.id, name: it.summary }))
                   .child(div().text_size(11.5).text_color(t.blocked).child(`[${it.urgency ?? "normal"}]`))
-                  .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).child(singleLineText(it.summary ?? it.id)))),
+                  .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).tooltip(String(singleLineText(it.summary ?? it.id)??"")).child(singleLineText(it.summary ?? it.id)))),
                 ...(seatNeeds.length > 3 ? [div().id("seat-needs-more").text_size(11.5).text_color(t.dim).child(`+${seatNeeds.length - 3} more`)] : []),
               ]
             : [this.dim(t, "None pending.")]),
@@ -1606,7 +1642,7 @@ export default class RigView extends View {
           .children(recentlyFinished.length
             ? recentlyFinished.slice(0, 3).map((it, i) => h_flex().id(`seat-finished-${i}`).gap(8).items_center().text_size(12)
                 .child(div().font_family(settings().font_family).text_size(11.5).text_color(t.dim).child(String(it.qitemId ?? `done-${i}`)))
-                .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(singleLineText(it.summary ?? it.title ?? "—"))))
+                .child(div().flex_1().min_w(0).truncate().text_color(t.muted).tooltip(String(singleLineText(it.summary ?? it.title ?? "—")??"")).child(singleLineText(it.summary ?? it.title ?? "—"))))
             : [this.dim(t, queue.finishedAvailable ? "None recent." : finishedGot.error ? "Finished work unavailable." : "Reading finished work…")]),
       ]))))
       // 6. SEAT section (host, rig, pod, cwd + placement)
@@ -1671,7 +1707,7 @@ export default class RigView extends View {
       ? v_flex().children(kids.map((c, i) => h_flex().id(`native-child-${i}`).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
         .on_click(() => run("terminal.peek", { terminal: c.address }))
         .child(svg(icon("rig-helper")).size(13).flex_none().text_color(t.dim))
-        .child(div().flex_1().truncate().text_size(12.5).child(c.name || c.argv.join(" ") || c.address))
+        .child(div().flex_1().truncate().text_size(12.5).tooltip(String((c.name || c.argv.join(" ") || c.address)??"")).child(c.name || c.argv.join(" ") || c.address))
         .child(div().text_size(11.5).text_color(t.dim).child(c.status ?? ""))
         .child(div().text_size(11.5).text_color(t.dim).font_family(settings().font_family).child(c.address))
         .child(this.copyButton(t, c.address, `helper-${c.address}`, "terminal address"))))
@@ -1745,10 +1781,10 @@ export default class RigView extends View {
           .child(h_flex().id(`specs-${lib.data.indexOf(s)}`).pl(24).pr(8).h(30).gap(10).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover((x) => x.bg(t.hover))
             .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => menu({ kind: "spec", id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(s.name))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(s.name??"")).child(s.name))
             .when(this.specDirty(box), (el) => el.child(div().text_size(11.5).text_color(t.working).flex_none().child("● Unsaved changes")))
             .when(builtin, el => el.child(div().text_size(10.5).text_color(t.dim).child("built-in")))
-            .child(div().w(80).flex_none().truncate().text_size(12.5).text_color(t.muted).child(s.version ?? "")))
+            .child(div().w(80).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(String(s.version ?? ""??"")).child(s.version ?? "")))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(t.border).child(this.specBody(t, cx, s, false))));
       })));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : "No specifications found.")])]);
@@ -2157,6 +2193,8 @@ export default class RigView extends View {
     const box = this.specBoxes?.[s.id];
     if (!box || box.copying) return;
     if (!this.config?.person) { box.note = NO_PERSON; cx.notify(); return; }
+    // A built-in rig spec that has a folder of its own is copied as that whole folder, so the copy can launch.
+    if (folderCopyable(s)) { this.copyFolder(cx, s); return; }
     if(this.config.daemonMachine){
       this.remoteSpecWrite(cx,s,{verb:"copy",name:s.name});return;
     }
@@ -2201,6 +2239,216 @@ export default class RigView extends View {
       } catch (e) { box.note = String(e?.message ?? e); }
       finally { box.copying = false; cx.notify(); }
     });
+  }
+
+  // ---- herdrig's Spaces list: System > Layout ------------------------------------------------------------------------
+  /** Reads, at most every few seconds, what the Layout card needs from files: the way back herdrig recorded, whether herdr's shipped
+   *  Spaces mod already keeps the active space in view (by shape), and whether our own copy is installed. */
+  refreshSpacesList(cx) {
+    const info = (this.spacesList ??= {});
+    if (info.reading || Date.now() - (info.at ?? 0) < 5000) return;
+    info.reading = true;
+    cx.spawn(async (cx) => {
+      try {
+        const saved = await readTextFile(`${appHome()}/openrig/spaces-list.json`);
+        info.state = saved ? JSON.parse(saved) : null;
+        info.reveal = shippedSpacesHasReveal((await readTextFile(`${appHome()}/mods/spaces/main.js`)) ?? "");
+        info.installed = (await readTextFile(`${appHome()}/mods/rig-spaces/main.js`)) != null;
+      } catch (_) { /* the card shows what it has */ }
+      info.at = Date.now(); info.reading = false; cx.notify();
+    });
+  }
+
+  /** The opt-in screen for one change. Nothing is sent until its button; the layout shown now is what it names. */
+  chooseSpacesMode(cx, target) {
+    const info = (this.spacesList ??= {});
+    if (info.busy || this.spacesPending) return;
+    if (info.at && info.installed === false) { info.note = "herdrig's Spaces list isn't installed. Reinstall herdrig."; cx.notify(); return; }
+    const name = shared("layout"), tree = layout(), plan = planMode(tree, target);
+    if (!plan.ok) { info.note = plan.reason; cx.notify(); return; }
+    const token = `spaces-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    this.spacesPending = { token, target, shown: { layout: name, tree: JSON.parse(JSON.stringify(tree)) }, expires: Date.now() + 300000 };
+    info.note = null;
+    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 540,
+      props: { target: { kind: "spaces-list" }, step: { action: "spaces-list", token, copy: describeChange({ layout: name, shipped: isShippedLayout(name), copy: isShippedLayout(name) ? freeCopyName(name, layouts()) : null, from: plan.from, to: target, lines: plan.lines }) } } });
+    cx.notify();
+  }
+
+  pollSpacesDecision(cx) {
+    const pending = this.spacesPending;
+    if (!pending) return;
+    const decisions = shared("rig.spacesListDecisions") ?? {}, decision = decisions[pending.token];
+    if (!decision && Date.now() < pending.expires) return;
+    this.spacesPending = null;
+    const rest = { ...decisions }; delete rest[pending.token]; setShared("rig.spacesListDecisions", rest);
+    if (decision === "allow") this.runSpacesChange(cx, pending);
+    else { (this.spacesList ??= {}).note = "Nothing was changed."; cx.notify(); }
+  }
+
+  async runSpacesChange(cx, pending) {
+    const info = (this.spacesList ??= {});
+    info.busy = true; info.note = null; cx.notify();
+    const host = {
+      layout: () => layout(), layoutName: () => shared("layout"), layouts: () => layouts(), run, wait: waitWith(cx),
+      writeState: async (state) => { const path = `${appHome()}/openrig/spaces-list.json`, previous = await readTextFile(path); await writeTextFile(path, JSON.stringify({ ...state, keep: info.state?.keep === true }), previous ?? null); },
+    };
+    let result;
+    try { result = await applySpacesMode(host, pending.shown, pending.target); }
+    catch (error) { result = { ok: false, reason: String(error?.message ?? error) }; }
+    info.busy = false; info.at = 0; info.noteLayout = result.layout ?? pending.shown.layout;
+    info.note = result.ok
+      ? (pending.target === "herdr" ? `✓ ${result.layout} uses Herdr's Spaces list again.` : `✓ ${result.layout} now shows ${pending.target === "both" ? "Herdr's list and the Rig spaces block" : "herdrig's Spaces list"}. The way back is on this row.`)
+      : result.reason;
+    cx.notify();
+  }
+
+  /** The Layout card: which Spaces list this layout shows and the choice between Herdr's, herdrig's and both. */
+  layoutCard(t, cx) {
+    this.refreshSpacesList(cx);
+    const info = (this.spacesList ??= {}), name = shared("layout"), now = detectMode(layout());
+    const mode = now.mode;
+    const why = info.at && info.installed === false ? "herdrig's Spaces list isn't installed. Reinstall herdrig."
+      : mode === "none" ? "This layout has no Spaces block, so there's nothing to change."
+      : mode === "custom" ? "This layout mixes Herdr's Spaces list and herdrig's in a way herdrig didn't make, so it leaves it alone." : null;
+    const current = MODES.includes(mode) ? MODE_LABEL[mode] : "Not set up";
+    const kept = info.state?.keep === true;
+    const card = [
+      v_flex().id("system-spaces-list").gap(6)
+        .child(h_flex().gap(8).items_center().flex_wrap()
+          .child(div().text_size(12).child(`Spaces list: ${current}`))
+          .children(MODES.map((m) => this.button(t, `spaces-list-${m}`, MODE_LABEL[m], () => this.chooseSpacesMode(cx, m), { small: true, disabled: !!why || !!info.busy || !!this.spacesPending || m === mode }))))
+        .when(!!why, (el) => el.child(div().id("spaces-list-why").text_size(11.5).text_color(t.muted).child(why)))
+        .when(mode === "herdrig" || mode === "both", (el) => el.child(div().id("spaces-list-where").text_size(11.5).text_color(t.muted)
+          .child(`herdrig's copy of Herdr's list, in layout ${name} · based on Herdr ${BASE_HERDR}`)))
+        .when(!!info.busy, (el) => el.child(div().text_size(11.5).text_color(t.muted).child("Changing the layout…")))
+        .when(!!info.note && (!info.noteLayout || info.noteLayout === name), (el) => el.child(div().id("spaces-list-note").text_size(11.5).text_color(/^✓/.test(info.note) ? t.muted : t.blocked).child(info.note)))
+        .when((mode === "herdrig" || mode === "both") && info.reveal === true && !kept, (el) => el.child(v_flex().id("spaces-list-upstream").gap(6).p(8).rounded(6).bg(t.raised)
+          .child(div().text_size(11.5).child("Herdr now keeps the active space in view itself. herdrig's list adds rig marks and actions; keep it, or switch back to Herdr's."))
+          .child(h_flex().gap(8)
+            .child(this.button(t, "spaces-list-keep", "Keep", () => this.keepSpacesList(cx), { small: true }))
+            .child(this.button(t, "spaces-list-switch-back", "Switch back", () => this.chooseSpacesMode(cx, "herdr"), { small: true }))))),
+    ];
+    return this.card(t, "Layout", card);
+  }
+
+  /** "Keep" on the card that says herdr now has the fix: remembered, and the row's choices stay. */
+  keepSpacesList(cx) {
+    const info = (this.spacesList ??= {});
+    cx.spawn(async (cx) => {
+      try {
+        const path = `${appHome()}/openrig/spaces-list.json`, previous = await readTextFile(path);
+        const next = { ...(previous ? JSON.parse(previous) : {}), keep: true };
+        await writeTextFile(path, JSON.stringify(next), previous ?? null);
+        info.state = next;
+      } catch (error) { info.note = String(error?.message ?? error); }
+      cx.notify();
+    });
+  }
+
+  /** What the folder-copy steps need from this page (see rig-spec-folder.js). The folder is copied on the box when a machine is
+   *  configured, else on this computer; the daemon only ever supplies text. */
+  folderHost(cx, config, daemonUrl) {
+    const post = (path, init) => fetch(`${daemonUrl}${path}`, { method: "POST", ...init });
+    return {
+      specText: (spec) => this.specText(spec),
+      validate: async (text) => {
+        const checked = await post("/api/rigs/import/validate", { headers: { "content-type": "text/yaml" }, body: text });
+        let v; try { v = JSON.parse(await checked.text()); } catch (_) { v = null; }
+        return { ok: checked.ok && v?.valid !== false, errors: v?.errors ?? (v?.error ? [v.error] : undefined) };
+      },
+      addFolder: (request, grant) => config.daemonMachine
+        ? this.remoteSpecController(cx).perform(config, { verb: "copy-folder", ...request }, grant)
+        : this.localAddFolder(request, daemonUrl),
+      library: async (fresh) => {
+        if (fresh) await post("/api/specs/library/sync").catch(() => null);
+        const res = await fetch(`${daemonUrl}/api/specs/library`);
+        if (!res.ok) throw new Error("The copy was made, but the library couldn't be read. Refresh before copying again.");
+        const list = JSON.parse(await res.text());
+        this.cache["/api/specs/library"] = { data: list, at: Date.now() };
+        return list;
+      },
+      rename: async (id, name) => {
+        const res = await post(`/api/specs/library/${encodeURIComponent(id)}/rename`, { headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+        let data; try { data = JSON.parse(await res.text()); } catch (_) { data = null; }
+        if (!res.ok) throw new Error(`The copy was made but couldn't be renamed: ${data?.error ?? data?.message ?? `HTTP ${res.status}`}`);
+        return data?.entry ?? null;
+      },
+    };
+  }
+
+  /** No machine configured: this computer's own OpenRig copies the folder through the shipped helper, after checking the
+   *  daemon this page talks to is this computer's (a copy made here is invisible to another machine's daemon). */
+  async localAddFolder(request, daemonUrl) {
+    const status = parseDaemonStatusJson((await exec("rig", ["status", "--json"], { timeout: 15000 })).stdout);
+    if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
+    const health = async (url) => { const r = await fetch(`${url}/healthz`); if (!r.ok) throw new Error("OpenRig isn't answering."); return JSON.parse(await r.text()); };
+    const [here, there] = await Promise.all([health(status.daemonUrl), health(daemonUrl)]);
+    if (!here?.selfHostId || here.selfHostId !== there?.selfHostId)
+      throw new Error("The OpenRig this page reads isn't this computer's own, so a copy made here would never be seen by it. Set up the machine first.");
+    const helper = attachRelayPath(appHome(), MOD_IDS.view).replace(/rig-attach-relay\.cjs$/, "rig-spec-files.cjs");
+    const r = await exec("node", [helper, "copy-folder", "--local", "--", request.sourcePath], { timeout: 150000 });
+    let out; try { out = JSON.parse(r.stdout); } catch (_) { throw new Error(r.stderr || "The copy helper gave no answer."); }
+    if (out.error) throw Object.assign(new Error(out.error), { code: out.code, folder: out.folder });
+    const file = await resolveInSpecRoots(out.path, this.specRoots, exec);
+    if (!file) throw new Error(this.specRefusal());
+    const current = await readTextFile(file);
+    if (current == null) throw new Error("The copied spec couldn't be read back.");
+    await writeTextFile(file, request.content, current);
+    return { ok: true, path: out.path, folder: out.folder };
+  }
+
+  /** Copy & edit of a built-in rig spec as a whole folder, then open the copy in edit mode. */
+  copyFolder(cx, s, consent = null) {
+    const box = this.specBoxes?.[s.id];
+    if (!box || box.copying || box.awaitingPermission) return;
+    const config = { ...this.config };
+    box.copying = true; box.note = null; box.errors = null; cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const daemonUrl = await this.resolveDaemonUrl();
+        if (!daemonUrl) throw new Error("The daemon address isn't known yet.");
+        const host = this.folderHost(cx, config, daemonUrl);
+        const out = await copyBuiltinFolder(host, s, consent);
+        if (out.needsConsent) {
+          if (this.specPermission) throw new Error("Finish the open spec permission dialog first.");
+          const token = `spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          box.awaitingPermission = true;
+          this.specPermission = { token, spec: s, request: { verb: "copy-folder" }, box, confirmation: out.confirmation, expires: Date.now() + 300000 };
+          openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 420, props: { target: { kind: "spec", id: s.id }, step: { action: "confirm-spec-write", token, confirmation: out.confirmation } } });
+          return;
+        }
+        if (out.exists) { await this.openExistingCopy(cx, s, host, out.folder, box); return; }
+        if (!out.ok) { box.errors = out.errors ?? null; box.note = out.reason; return; }
+        if (config.daemonMachine) this.specConsentMachine = config.daemonMachine;
+        this.showSpecCopy(cx, out.copy);
+      } catch (error) {
+        box.note = error?.machineNotice && String(error.message).startsWith(`${config.daemonMachine} is unreachable.`)
+          ? `${config.daemonMachine} is unreachable, so nothing was copied. Run hc machine login ${config.daemonMachine}, then try again.`
+          : String(error?.message ?? error);
+      } finally { box.copying = false; cx.notify(); }
+    });
+  }
+
+  /** The copy's page, in edit mode, with an optional note above its editor. */
+  showSpecCopy(cx, copy, note = null) {
+    delete this.specBoxes?.[copy.id];
+    (this.specAutoEdit ??= new Set()).add(copy.id);
+    if (note) (this.specCopyNotes ??= Object.create(null))[copy.id] = note;
+    push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml" });
+    this.read(cx, "/api/specs/library", true); run("rig.refresh");
+  }
+
+  /** The built-in's folder already has a copy: open a finished one, finish an unfinished one (its fixed text is put in the editor;
+   *  the person's Save is the write), and never overwrite or delete anything. */
+  async openExistingCopy(cx, s, host, folder, box) {
+    const found = await findExistingCopy(host, s, folder);
+    if (found.state === "unindexed") {
+      box.note = found.reason ?? "You already have a copy folder for this built-in, but the spec library doesn't list it yet. Refresh the library, then try again.";
+      return;
+    }
+    if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`); return; }
+    setDraft(specDraftKey(found.entry.id, this.config), { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
+    this.showSpecCopy(cx, found.entry, `An earlier copy of ${s.name} wasn't finished: its agent paths still point at the built-in's folder. The fixed text is in the editor; press Save to finish it.`);
   }
 
   remoteSpecController(cx) {
@@ -2383,6 +2631,9 @@ export default class RigView extends View {
     const renderMissionCard = (m, mi) => {
       const mKey = m.id ?? m.mission ?? m.name ?? `m-${mi}`;
       const mTitle = m.mission ?? m.name ?? m.id ?? mKey;
+      const workflowProject=selectedProjId,workflowRoot=selectedProj?.root??scopes.data?.project?.root;
+      const missionWorkflows=this.read(cx,workflowPath({mission:mTitle,project:workflowProject,projectRoot:workflowRoot}));
+      const hasWorkflows=workflowView(missionWorkflows.data,{mission:mTitle,project:workflowProject}).instances.length>0;
       const firstSlicePath = (m.slices ?? []).map((s) => s.slicePath ?? paths.get(s.dirName) ?? paths.get(s.id)).find(Boolean);
       const missionFolder = m.missionPath ?? (firstSlicePath ? firstSlicePath.split(/[\\/]/).slice(0, -2).join("/") : null);
       const missionFiles = Array.isArray(m.files)
@@ -2407,7 +2658,7 @@ export default class RigView extends View {
             .child(svg(icon("file-text")).size(11).flex_none().text_color(t.muted))
             .child(div().text_size(11).text_color(t.foreground).child(name))
             .child(this.copyButton(t, filePath, `mission-file-${mKey}-${name}`, "path"))))
-        .child(div().text_size(11.5).text_color(t.dim).child(`${(m.slices ?? []).length} slices`));
+        .child(div().text_size(11.5).text_color(t.dim).child(`${(m.slices ?? []).length} slice${m.slices?.length===1?"":"s"}`));
       const rows = slices.map((s, si) => {
         const sKey = s.id ?? s.slug ?? s.dirName ?? `s-${si}`;
         const sDir = s.dirName ?? sKey;
@@ -2445,10 +2696,10 @@ export default class RigView extends View {
             .on_click(toggleSlice)
             .on_mouse_down("right", () => menu(sliceTarget(m, s)))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(sName))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(sName??"")).child(sName))
             .child(this.copyButton(t, sKey, `slice-id-${sKey}`, "slice id"))
-            .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).child(s.status ?? ""))
-            .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).child(s.stage ?? "")))
+            .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(String(s.status ?? ""??"")).child(s.status ?? ""))
+            .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(String(s.stage ?? ""??"")).child(s.stage ?? "")))
           .when(shown, (el) => el.child(v_flex().id(`slice-expand-${sKey}`).ml(22).pl(10).py(8).gap(8).border_l(1).border_color(sliceFocused ? t.accent : t.border)
             .on_click((_e, cx) => cx?.stop_propagation?.())
             .child(h_flex().gap(10).items_center().child(div().text_size(11.5).font_semibold().text_color(t.muted).child("Readiness")).child(div().text_size(12.5).font_semibold().child(s.status ?? "—")).child(this.dim(t, s.stage ?? "")))
@@ -2477,7 +2728,8 @@ export default class RigView extends View {
       });
       return v_flex().id(`mission-card-${mKey}`).rounded(10).bg(t.background).border_1().border_color(missionFocused ? t.accent : t.border).p(12).gap(8)
         .child(h_flex().gap(8).items_center().flex_wrap()
-          .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child(mTitle))
+          .child(div().id(`mission-open-${mKey}`).flex_1().text_size(12.5).font_semibold().text_color(t.accent).cursor_pointer()
+            .tooltip("Open mission").on_click(()=>push({section:"scopes",...(workflowProject?{project:workflowProject}:{}),mission:mTitle,missionTab:hasWorkflows?"workflows":"slices"})).child(mTitle))
           .child(this.copyButton(t, mKey, `mission-${mKey}`, "mission id"))
           .child(headerMeta))
         .when(!!m.error, (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(m.error)))
@@ -2600,9 +2852,9 @@ export default class RigView extends View {
             .on_click(toggleRow)
             .on_mouse_down("right", () => menu({ kind: "terminal", view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(r.name))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(r.name??"")).child(r.name))
             .child(this.copyButton(t, r.view, `view-id-${r.view}`, "view id"))
-            .child(div().w(90).flex_none().truncate().text_size(12.5).text_color(t.muted).child(r.kind)))
+            .child(div().w(90).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(String(r.kind??"")).child(r.kind)))
           .when(shown, (el) => el.child(v_flex().id(`term-preview-${r.view}`).ml(22).pl(10).py(8).border_l(1).border_color(t.border)
             .on_click((_e, cx) => cx?.stop_propagation?.())
             .child(this.terminalPreviewBody(t, cx, r.view, isFirstExpanded))));
@@ -2686,7 +2938,7 @@ export default class RigView extends View {
         .child(label);
     };
     return h_flex().id("needs-whose-queue").px(10).h(26).gap(8).items_center().rounded(6).bg(t.background).border_1().border_color(t.border)
-      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(
+      .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).tooltip(String((whose.onSomeoneElsesAsk ? `${whose.headline} · ${whose.onSomeoneElsesAsk}` : whose.headline)??"")).child(
         whose.onSomeoneElsesAsk ? `${whose.headline} · ${whose.onSomeoneElsesAsk}` : whose.headline
       ))
       .child(h_flex().gap(4).items_center()
@@ -2774,7 +3026,7 @@ export default class RigView extends View {
       .children(tierOrder.filter(([k]) => (digest.groups[k] ?? []).length > 0).map(([k, label, color]) =>
         h_flex().id(`needs-away-group-${k}`).gap(8).items_center().text_size(12)
           .child(div().w(95).flex_none().font_semibold().text_color(color).child(`${label} (${digest.groups[k].length})`))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(digest.groups[k].map((x) => x.summary).join(" · ")))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.muted).tooltip(String(digest.groups[k].map((x) => x.summary).join(" · ")??"")).child(digest.groups[k].map((x) => x.summary).join(" · ")))
       ))
       .when(digest.decisions.length > 0, (el) => el.child(v_flex().id("needs-coming-back-account").gap(6).pt(6).border_t(1).border_color(t.border)
         .child(div().text_size(12).font_semibold().text_color(t.foreground).child(digest.modeHeading ?? "Decided for you while away"))
@@ -2782,7 +3034,7 @@ export default class RigView extends View {
           v_flex().id(`needs-away-decision-${i}`).rounded(6).bg(t.raised).p(8).gap(3).cursor_pointer()
             .on_click(() => { if (d.qitemId) push({ section: "needs", id: `queue:${d.qitemId}`, name: d.summary ?? d.qitemId }); })
             .child(h_flex().gap(8).items_center()
-              .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.foreground).child(d.summary ?? d.qitemId))
+              .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.foreground).tooltip(String(d.summary ?? d.qitemId??"")).child(d.summary ?? d.qitemId))
               .child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(10.5).text_color(d.reversible ? t.muted : t.blocked).child(d.reversibilityLabel))
               .child(div().text_size(11).text_color(t.dim).child(`by ${d.decidedBy}`)))
             .when(!!d.choices, (c) => c.child(div().text_size(11.5).text_color(t.foreground).child(`Chose: ${d.choices}`)))
@@ -2875,7 +3127,7 @@ export default class RigView extends View {
       .when(!!awayCard&&requestsView, (el) => el.child(awayCard))
       .when(!!entry.notice, (el) => el.child(div().id("need-expired-notice").text_size(12).text_color(t.muted).child(entry.notice)))
       .when(requestsView,el=>el.child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
-        .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(a.text ?? a.summary))),
+        .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).tooltip(String(a.text ?? a.summary??"")).child(a.text ?? a.summary))),
         this.needRows(t, cx, "needs", actionableItems, att.data?.perspective)])))
       .when(!requestsView,el=>el.child(this.card(t, `Updates (${updateItems.length})`, [
         ...receipts.filter((r) => r.keys.length > 1).map((r) => this.updateReceipt(t, r)),
@@ -2943,8 +3195,8 @@ export default class RigView extends View {
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(rowTheme.dim))
             .when(isEscalation, (el) => el.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.blocked + "26").text_color(t.blocked).text_size(10).font_semibold().child("ESCALATION")))
             .when(!isEscalation && tier !== "update", (el) => el.child(this.plainDot(t, isAlert ? "blocked" : "accent")))
-            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(n.dismissed ? dismissedTone : tier === "update" ? t.muted : t.foreground).when(isEscalation || isAlert, (d) => d.font_semibold()).child(singleLineText(n.summary)))
-            .child(div().w(140).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).child(actionLabel))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(n.dismissed ? dismissedTone : tier === "update" ? t.muted : t.foreground).when(isEscalation || isAlert, (d) => d.font_semibold()).tooltip(String(singleLineText(n.summary)??"")).child(singleLineText(n.summary)))
+            .child(div().w(140).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).tooltip(String(actionLabel??"")).child(actionLabel))
             .child(this.copyButton(rowTheme, n.qitemId ?? n.id, `need-id-${n.id}`, "request id"))
             .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.child(this.updateButton(t, `dismiss-${idPrefix}-${i}`, n.dismissed ? "Restore" : "Dismiss", (_e, cx) => {
               cx.stop_propagation(); this.updateAction(n.dismissed ? "restore" : "dismiss", n.dismissed ? updateKey(n) : n);
@@ -2980,7 +3232,7 @@ export default class RigView extends View {
         .on_click(() => toggle(n)).on_mouse_down("right", () => menu(n))
         .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(text.headline))
-        .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).child(String(owner ?? "")))
+        .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip(String(String(owner ?? "")??"")).child(String(owner ?? "")))
         .child(div().text_size(11).text_color(t.dim).tooltip(this.time(n.at,{exact:true})).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
         .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); })))
         .when(shown, el => el.child(this.decisionCard(t, cx, n, { perspective })));
@@ -2997,8 +3249,8 @@ export default class RigView extends View {
     return h_flex().id(`critical-health-${n.id}`).px(8).h(34).gap(8).items_center().text_size(12.5).cursor_pointer().hover(el => el.bg(t.hover))
       .on_click(() => push({ section: "system", subview: "health" }))
       .child(div().w(12).text_color(t.blocked).child("◆"))
-      .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(n.summary))
-      .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).child("health · critical"))
+      .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary??"")).child(n.summary))
+      .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip("health · critical").child("health · critical"))
       .child(div().text_size(11.5).text_color(t.dim).tooltip(this.time(n.healthFinding?.startedAt,{exact:true})).child(minutes === null ? "—" : minutes < 1 ? "<1m" : `${minutes}m`))
       .child(div().text_size(11.5).text_color(t.accent).child("System → Health"));
   }
@@ -3142,7 +3394,7 @@ export default class RigView extends View {
           .on_click((_e, cx) => { cx.stop_propagation(); setOpen(detailsKey, !detailsOpen); })
           .child(svg(icon(detailsOpen ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
           .child(div().text_size(12).text_color(t.muted).child("Details"))
-          .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(text.detailHint)))
+          .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).tooltip(String(text.detailHint??"")).child(text.detailHint)))
         .when(detailsOpen, el => el.child(v_flex().id(`need-details-${id}`).gap(10)
           .when(Boolean(text.details), el => el.child(markDown(text.details, `need-details-text-${id}`)))
           .when(Boolean(humanDetail), el => el.child(this.dim(t, `More from ${asker ?? "the asker"}`)).child(markDown(typeof humanDetail === "string" ? humanDetail : JSON.stringify(humanDetail, null, 2), `need-human-detail-${id}`)))
@@ -3392,7 +3644,7 @@ export default class RigView extends View {
           if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
           const sentText = this.sentNeedConfirmation(itemForAction, queueRow, act);
           const confirmation = `${sentText} ${outcome.text}`;
-          this.answered[n.id] = { summary: requestCardText(n).headline, text: confirmation, at: Date.now() };
+          this.answered[n.id] = { summary: requestHeadline(n), text: confirmation, at: Date.now() };
           box.composerOpen = false; box.changedSinceAnswered = false;
           box.result = { ok: true, text: confirmation };
           box.receipt = { at: Date.now(), revision: outcome.decisionRevision, body: queueRow?.body,
@@ -3651,19 +3903,19 @@ export default class RigView extends View {
           const color = tone === "blocked" ? t.blocked : (tone === "warn" || tone === "warning") ? t.ansi3 : tone === "muted" ? t.muted : t.foreground;
           const isConflict = a.linkage === "conflict" || (Array.isArray(a.anomalies) && a.anomalies.includes("conflict"));
           return h_flex().id(`usage-allowance-${hid}-${ai}`).gap(8).items_center().text_size(12)
-            .child(div().w(100).flex_none().truncate().text_color(t.muted).child(String(a.provider ?? "")))
-            .child(div().w(90).flex_none().truncate().text_color(t.dim).child(String(a.windowLabel ?? a.window ?? a.id ?? "window")))
-            .child(div().w(150).flex_none().truncate().text_color(color).child(bar))
+            .child(div().w(100).flex_none().truncate().text_color(t.muted).tooltip(String(String(a.provider ?? "")??"")).child(String(a.provider ?? "")))
+            .child(div().w(90).flex_none().truncate().text_color(t.dim).tooltip(String(String(a.windowLabel ?? a.window ?? a.id ?? "window")??"")).child(String(a.windowLabel ?? a.window ?? a.id ?? "window")))
+            .child(div().w(150).flex_none().truncate().text_color(color).tooltip(String(bar??"")).child(bar))
             .when(!!a.sharedAcrossProviders, (rowEl) => rowEl.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.background).text_size(10.5).text_color(t.muted).child("shared")))
             .when(isConflict, (rowEl) => rowEl.child(this.chip(t, { tone: "blocked", word: "conflict" })))
-            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).child(this.time(a.resetsAt,{exact:true})));
+            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).tooltip(String(this.time(a.resetsAt,{exact:true})??"")).child(this.time(a.resetsAt,{exact:true})));
         }))))
         .when(observations.length > 0, (el) => el.child(v_flex().gap(2).pt(2).border_t(1).border_color(t.border).children(observations.map((o, oi) =>
           h_flex().id(`usage-obs-${hid}-${oi}`).gap(8).items_center().text_size(11.5).text_color(t.muted)
-            .child(div().w(100).flex_none().truncate().text_color(t.foreground).child(String(o.runtime ?? "")))
-            .child(div().w(140).flex_none().truncate().child(String(o.accountLabel ?? o.account ?? "")))
-            .child(div().w(90).flex_none().truncate().text_color(t.dim).child(String(o.status ?? "")))
-            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).child(this.time(o.lastObservedAt ?? o.updatedAt,{exact:true})))
+            .child(div().w(100).flex_none().truncate().text_color(t.foreground).tooltip(String(String(o.runtime ?? "")??"")).child(String(o.runtime ?? "")))
+            .child(div().w(140).flex_none().truncate().tooltip(String(String(o.accountLabel ?? o.account ?? "")??"")).child(String(o.accountLabel ?? o.account ?? "")))
+            .child(div().w(90).flex_none().truncate().text_color(t.dim).tooltip(String(String(o.status ?? "")??"")).child(String(o.status ?? "")))
+            .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).tooltip(String(this.time(o.lastObservedAt ?? o.updatedAt,{exact:true})??"")).child(this.time(o.lastObservedAt ?? o.updatedAt,{exact:true})))
         ))));
     }));
   }
@@ -3919,7 +4171,7 @@ export default class RigView extends View {
                 || m?.settings?.delivery?.quiet?.kind === "until-end"
                 || m?.quiet === "until-end";
               return h_flex().id(`people-mode-row-${mName}`).px(8).h(28).gap(8).items_center().rounded(6).bg(t.background).border_1().border_color(t.border)
-                .child(div().flex_1().min_w(0).truncate().text_size(12).font_medium().text_color(t.foreground).child(mName))
+                .child(div().flex_1().min_w(0).truncate().text_size(12).font_medium().text_color(t.foreground).tooltip(String(mName??"")).child(mName))
                 .child(div().text_size(11.5).text_color(t.muted).child(`policy: ${mPolicy}${mBack ? ` · back ${mBack}` : ""}`))
                 .child(this.button(t, `people-mode-preset-${activeId}-${mName}`, "Apply", (_e, cx) => {
                   const applyArgs = ["mode", "apply", activeId, mName];
@@ -4177,6 +4429,7 @@ export default class RigView extends View {
       ["config", configCard],
       ["health", healthCard],
       ["connections", connectionsCard],
+      ["layout", this.layoutCard(t, cx)],
       ["usage", usageCard],
       ["cost", costCard],
       ["recent", recentCard],
@@ -4220,7 +4473,8 @@ export default class RigView extends View {
     if (!s || (!s.busy && Date.now() - s.at >= ttl)) return null;
     this.ticking = true;
     return h_flex().id("rig-status").max_w(420).min_w(0).gap(6).items_center().flex_none()
-      .child(s.busy ? svg(icon("spinner")).size(12).flex_none().text_color(t.working).spin(900)
+      .child(s.busy ? svg(icon("spinner")).size(12).flex_none().text_color(t.working)
+        .when(this.config?.reducedMotion !== true, icon => icon.spin(900))
         : svg(icon(s.ok ? "check" : "rig-alert")).size(12).flex_none().text_color(s.ok ? t.working : t.blocked))
       .child(div().min_w(0).truncate().text_size(12).text_color(s.ok === false ? t.blocked : t.muted).when(Boolean(s.text), (el) => el.tooltip(s.text)).child(s.text))
       .when(s.ok === false && Boolean(s.canResume && s.rig), (el) => el.child(
@@ -4258,7 +4512,8 @@ export default class RigView extends View {
         .child(h_flex().flex_1().min_w(0).gap(6).items_center().overflow_hidden().children(crumbs.flatMap((c,i) => {
           const last=i===crumbs.length-1;
           const crumb=div().id(`crumb-${i}`).min_w(0).when(tiny&&crumbs.length>2&&i===0,el=>el.max_w(48)).when(last,el=>el.flex_1()).truncate().text_size(12).text_color(last?t.foreground:t.muted)
-            .when(i===0,el=>el.cursor_pointer().on_click(()=>this.sectionMenu()).tooltip("Sections (Alt+S)"))
+            .tooltip([String(c.text ?? ""), i === 0 ? "Sections (Alt+S)" : null].filter(Boolean).join("\n"))
+            .when(i===0,el=>el.cursor_pointer().on_click(()=>this.sectionMenu()))
             .when(i>0&&!!c.ancestors,el=>el.cursor_pointer().on_click(()=>this.navigationMenu(c.ancestors.map(c=>({label:c.text,entry:c.entry})),"Location")))
             .when(i>0&&!last&&!!c.entry,el=>el.cursor_pointer().on_click(()=>push(c.entry)))
             .child(`${c.text??""}${i===0?" ▾":""}`);
@@ -4281,13 +4536,14 @@ export default class RigView extends View {
           .child(h_flex().gap(6).items_center().min_w(0)
             .when(!!this.pageHeading?.icon,el=>el.child(svg(icon(this.pageHeading.icon)).size(16).text_color(t.foreground)))
             .when(!!this.pageHeading?.tone,el=>el.child(this.dot(t,this.pageHeading.tone,14,this.pageHeading.session)))
-            .child(div().id("page-title").truncate().text_size(18).font_semibold().text_color(t.foreground).child(this.pageHeading?.title??entryTitle(entry))))
+            .child(div().id("page-title").truncate().text_size(18).font_semibold().text_color(t.foreground).tooltip(String(this.pageHeading?.title??entryTitle(entry)??"")).child(this.pageHeading?.title??entryTitle(entry))))
           .when(!!this.pageHeading?.status,el=>el.child(this.pageHeading.statusView??div().id("page-status").truncate().text_size(12).text_color(t.muted).tooltip(this.pageHeading.status).child(this.pageHeading.status))))
         .when(!!this.pageActions,el=>el.child(this.pageActions))
         .when(!!target&&!this.pageActions,el=>el.child(this.button(t,"rig-actions","⋯",()=>menu(target),{tooltip:"Page actions"}))))
       .when(!!status,el=>el.child(div().px(14).pb(6).child(status)));
   }
   render(cx) {
+    this.topologyStrip=null;
     this.wideGraph=false;
     this.pageHeading=null;
     this.pageCrumbEntry=null;
@@ -4374,6 +4630,7 @@ export default class RigView extends View {
         else this.pageTreeKey(e, cx);
       })
       .child(file ? this.fileHeader(t, entry) : this.header(t, cx, stack, this.pageCrumbEntry??entry??{ section: "topology" }))
+      .when(!!this.topologyStrip,el=>el.child(div().px(14).pb(6).child(this.topologyStrip)))
       .when(!file, (el) => {const resolved=this.pageSpec?{...entry,id:this.pageSpec.id}:entry;
         const tabs=this.objectTabs(t,resolved??{section:"topology"},this.pageSpec??spec);return tabs?el.child(tabs):el;})
       .child(file ? v_flex().id("rig-view-body").flex_1().min_h(0).child(body)

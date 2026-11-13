@@ -2,12 +2,12 @@
 // configured machine and freshly resolved box roots, including after a dialog.
 import { RemoteMachine } from './rig-remote.js';
 import { specCopyName } from './rig-lib.js';
-export const SPEC_SHA256 = '162d0c552afc5c86e5d9918d9bbb51cf11c40fcb386ebb386efbc5e39ced2330';
+export const SPEC_SHA256 = '9482d10163b6dc9e033b328817dceb520a71246f77ee4188bb523c8d9d570a52';
 const jobs = new Map();
 const identity = r => [r.target ?? '', r.id ?? '', r.via ?? '', r.session ?? ''];
 const parse = r => {
  let data;try { data=JSON.parse(r.stdout); } catch { throw Error(r.stderr || 'Invalid spec helper response.'); }
- if(r.code!==0 || data.error)throw Object.assign(Error(data.error || r.stderr || 'The spec operation failed.'),{code:data.code});
+ if(r.code!==0 || data.error)throw Object.assign(Error(data.error || r.stderr || 'The spec operation failed.'),{code:data.code,folder:data.folder});
  return data;
 };
 export class RemoteSpecs {
@@ -16,7 +16,8 @@ export class RemoteSpecs {
   const node=config.rig?.[0]?.match(/(?:^|\/)node$/)?config.rig[0]:'node';
   return this.host.exec(node,[this.host.specBridgePath,mode,...args],{timeout:60000}).then(parse);
  }
- async checked(config, consent=null) {
+ // capability 'copy-folder' is its own grant: a save grant never satisfies it and it never satisfies a save.
+ async checked(config, consent=null, capability='save') {
   const host=this.host,machine=config.daemonMachine;
   const state=await new RemoteMachine(host).readIdentity(config);
   if(!state.localHealth?.selfHostId || state.localHealth.selfHostId!==state.remoteHealth?.selfHostId)
@@ -26,17 +27,18 @@ export class RemoteSpecs {
   if(shipped.sha256!==SPEC_SHA256)throw Error('The spec helper differs from this release. Reinstall the mod.');
   const preview=await this.call(config,'preview',[machine,info.home,info.searchPath,JSON.stringify(record)]);
   if(!Array.isArray(preview.roots)||!preview.roots.length)throw Error('No user spec folder was found on the box.');
+  const folder=capability==='copy-folder',field=folder?'folderKey':'key';
   const key=JSON.stringify({machine,profile:identity(record),home:info.home,user:info.user,daemonUrl:config.daemonUrl,
-   selfHostId:state.localHealth.selfHostId,sha256:SPEC_SHA256,roots:preview.roots});
+   selfHostId:state.localHealth.selfHostId,sha256:SPEC_SHA256,roots:preview.roots,...(folder?{capability}:{})});
   if(consent && consent.key!==key)throw Error('The machine, helper or spec folders changed since confirmation. Review spec-save permission again.');
   const stored=await host.readSpecConsent();
-  if(stored?.key!==key && consent?.key!==key)return{ok:false,needsConsent:true,confirmation:{key,machine,user:info.user,roots:preview.roots,sha256:SPEC_SHA256,helperPath:`${info.home}/.local/share/herdr-openrig/rig-spec-files.cjs`}};
+  if(stored?.[field]!==key && consent?.key!==key)return{ok:false,needsConsent:true,confirmation:{key,machine,user:info.user,roots:preview.roots,sha256:SPEC_SHA256,helperPath:`${info.home}/.local/share/herdr-openrig/rig-spec-files.cjs`,...(folder?{capability}:{})}};
   await this.unchanged(config,record);
   await this.call(config,'install',[machine,info.home,JSON.stringify(record)]);
   const prepared={config,machine,home:info.home,node:info.node,record,roots:preview.roots,key};
   const roots=await this.remote(prepared,'roots');
   if(JSON.stringify(roots.roots)!==JSON.stringify(preview.roots))throw Error('The spec folders changed. Review spec-save permission again.');
-  if(consent && stored?.key!==key)await host.writeSpecConsent({key});
+  if(consent && stored?.[field]!==key)await host.writeSpecConsent({...(stored??{}),[field]:key});
   return{ok:true,...prepared};
  }
  async unchanged(config,record){
@@ -61,9 +63,19 @@ export class RemoteSpecs {
  perform(config, request, consent=null){
   const key=this.host.appHome;
   const job=(jobs.get(key)??Promise.resolve()).catch(()=>{}).then(async()=>{
-   const p=await this.checked(config,consent);if(!p.ok)return p;
-   if(!['save','copy'].includes(request.verb))throw Error('Unknown spec operation.');
+   if(!['save','copy','copy-folder'].includes(request.verb))throw Error('Unknown spec operation.');
+   const p=await this.checked(config,consent,request.verb==='copy-folder'?'copy-folder':'save');
+   if(!p.ok){
+    // The dialog names the source and the destination; display only, never part of the grant's key.
+    if(request.verb==='copy-folder'&&p.confirmation&&typeof request.sourcePath==='string'){
+     const from=request.sourcePath.replace(/\/[^/]*$/,'');
+     p.confirmation={...p.confirmation,from,into:`${p.confirmation.roots[0]}/${from.split('/').pop()}`};
+    }
+    return p;
+   }
    await this.unchanged(config,p.record);
+   // A built-in's whole folder, with its agent paths made absolute in the same step (one grant, one helper call).
+   if(request.verb==='copy-folder')return this.transfer(config,request.content,()=>this.remote(p,'copy-folder',request.sourcePath));
    if(request.verb==='save'){
     const base=await this.transfer(config,request.baseText,()=>this.call(config,'digest',[key]));
     await this.unchanged(config,p.record);

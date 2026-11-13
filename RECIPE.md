@@ -1,15 +1,17 @@
 # Herdrig
 
-Version: v0.4.3
+Version: v0.4.4
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
-graphs skip their entrance, and handoff routes light briefly then turn off without fading.
+graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
+The busy words stay visible. Hover a shortened name or label to read the full text; existing read-only and other
+context stays below the full name. Graphs keep their header detail reveal, and Now keeps its transcript hover card.
 
 ## Updating
 
-Replace the four folders `rig`, `rig-view`, `rig-palette` and `rig-menu` in `<appHome>/mods/` with this
+Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with this
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
-Restart herdr-app after all four are copied. Folds and settings are kept outside those folders.
+Restart herdr-app after all five are copied. Folds and settings are kept outside those folders.
 Check the `Version:` line in the README you copied, or **Herdrig Version** in System.
 
 Herdrig brings OpenRig into the `herdr` window: a sidebar with six collapsible branches of a rig's live topology,
@@ -90,7 +92,8 @@ after you leave the grid or explicitly open it; personal programs and restored s
 Changed machine/daemon mappings need fresh confirmation.
 
 **Saving specs there** asks for separate permission: the machine, account, allowed spec folders and the pinned
-`rig-spec-files.cjs` helper are shown before the first Save or Copy & edit. A changed folder or helper asks again.
+`rig-spec-files.cjs` helper are shown before the first Save or single-file Copy & edit. Copying a built-in rig's
+whole folder has its own permission; an existing save or Attach grant does not grant it. A changed folder or helper asks again.
 The helper resolves roots on the box, refuses built-in and unsafe roots, compares the previous file bytes before
 Save, and creates copies without overwriting existing files. Content travels through `hc exec --stdin`, not a
 remote staging file. Local transfer state is removed after use. A failed save keeps the editor text; drafts are
@@ -126,10 +129,17 @@ in its spec editor (local edits stay in this machine's spec folders, symlinks re
 Configured remote edits use the separate permission and pinned helper described above, on that machine's own
 resolved folders. Connection and consent records stay under `<appHome>/openrig/`; drafts are kept in Herdr's
 shared state. The temporary local `spec-transfer.txt` is removed after use.
-**Copy & edit** on a built-in fetches only the daemon's YAML, ignoring local paths and cached text. It checks the new
-name in every resolved spec folder, creates the file in the first folder, and registers it with `rig specs add`;
-the CLI is never given a path the daemon named. It **runs the `rig` CLI, which uses the person's existing
-OpenRig setup** (its home, port and sign-in); it reads none of OpenRig's own files. With a click, **Start
+**Copy & edit** of a built-in rig supplied as a folder copies that folder, including `rig.yaml`, culture and
+startup files, through that machine's `rig specs add`. The helper checks that the source belongs to that machine's
+installed OpenRig built-ins; remote paths are never opened on this computer. The copy's agent references point
+back to the installed agents, and the built-in stays unchanged. On the box, this whole-folder operation asks for
+its own permission. An existing copy is opened rather than overwritten; an unfinished copy offers its fixed
+text for you to Save. Other single-file copies still use the YAML OpenRig served; if it names sibling files,
+the note says which files must exist beside the copy before it can launch.
+
+It **runs the `rig` CLI, which uses the person's existing OpenRig setup** (its home, port and sign-in).
+For connection discovery, it reads none of OpenRig's own files; the folder-copy helper reads validated shipped
+built-in content. With a click, **Start
 OpenRig** runs `rig daemon start`. Configured-machine operations use Herdr's existing SSH connection; approved
 spec content goes to that machine. No unrelated external service is contacted.
 
@@ -308,11 +318,17 @@ elsewhere, not a second selection.
 among its own siblings — rigs among rigs, pods among pods, seats within their pod, views within their rig. The
 dragged row dims and a 2 px `t.accent` line shows where it will land. **You cannot drag across groups**: a rig can
 never reorder a spec, and a drop in a different group is refused rather than ignored. Order is remembered across
-restarts and never changes your rig.
+restarts and never changes your rig. Esc cancels a drag without saving or showing a toast; releasing on the
+sidebar background cancels it too. The moving row is drawn at half opacity. Select a row and use its `⋯`
+or right-click menu for **Move up** and **Move down** within the same sibling group.
 
 **Keys.** `ctrl-alt-r` opens the command palette. In the tree: `up`/`down` move through visible rows (collapsed
 subtrees are skipped), `right` expands or enters a child, `left` collapses or goes to the parent, `enter` opens the
-page. `alt`+arrows move between Herdr's panes as usual.
+page. **OpenRig: Focus sidebar** in the palette focuses the tree and selects its first row; it adds no global
+shortcut or pane stop. PageUp and PageDown move ten visible rows in trees and tables, stopping at either end.
+Sidebar keyboard moves reveal the selected row with the smallest scroll needed; clamped keys and ordinary row clicks do not
+scroll it. Page trees and tables still need manual scrolling when the selected row moves out of view.
+Existing table click/open actions are unchanged. `alt`+arrows move between Herdr's panes as usual.
 
 **Attach.** On a live seat's page, **Attach** opens that seat's session interactively in its own tab named after
 the seat, and a second Attach focuses the first rather than opening another. Your keystrokes go to the agent. The
@@ -355,7 +371,7 @@ need a later restart, and Herdrig never restarts the daemon. Other actions run a
 ## Built from
 
 **Blocks.** Four mods, each a folder in `mods/`, each self-contained (its own `main.js`, `mod.json`, `rig-lib.js`, `rig-attach-relay.cjs`
-and the 24 `rig-*.svg` icons it draws) — this repo ships exactly these, and nothing else:
+and the 24 `rig-*.svg` icons it draws), and one more folder, `rig-spaces`, Herdr's own Spaces list with rig marks (below) — this repo ships exactly these, and nothing else:
 
 | Mod | `place` | Role |
 |---|---|---|
@@ -363,6 +379,19 @@ and the 24 `rig-*.svg` icons it draws) — this repo ships exactly these, and no
 | `rig-view` | `none`, `focusable` | the Page: rig block, seat card, spec editor, files viewer |
 | `rig-palette` | `none`, `overlay` 620×420 | the command palette |
 | `rig-menu` | `none` | right-click menus, dialogs, the worker-view designer |
+| `rig-spaces` | `none` | an optional Spaces list: Herdr's own list plus rig marks, status and a rig menu; chosen in System → Layout |
+
+**The Spaces list (optional).** `rig-spaces` is a copy of Herdr's own Spaces list with a few marked lines and a separate `rig.js`:
+a small rig mark on a rig space's avatar, the rig's own status at the row's right (the needs-you diamond or the working dot), the
+OpenRig icon on the OpenRig home space, and the rig menu on right-click, under Herdr's Rename and Close. It does nothing until the
+person chooses it: **System → Layout → Spaces list** offers Herdr's (the default), herdrig's, or Both (Herdr's list stays and a
+second block, **Rig spaces**, lists only rig spaces and the OpenRig home). Every change goes through one screen that names the
+layout and the block it changes, works only on the person's **personal** layout (on a layout Herdr ships, such as `main`, it first
+makes a copy with Herdr's own `layout.clone`, and says so), records the way back, and is undone from the same row. Installing never
+changes a layout; uninstalling puts Herdr's list back in every personal layout that shows ours and takes herdrig's own blocks (mods `rig` and `rig-spaces`) out of every personal layout before removing the folders, so the next start finds every mod a layout names (nothing else in a layout, and no layout Herdr ships, is touched; the file is written through a new temporary file, read back and compared, and the original is put back if it differs). The
+list reads only a Herdr shared key (`herdrig.spaces`) that the Rig sidebar fills in from what it already knows; it never calls
+OpenRig. The copy is pinned to a Herdr commit (shown on the row); Herdr's later changes to its own list reach it with a herdrig
+release.
 
 **Fitting it into the layout.** All four mods have `"place": "none"` (Herdr only auto-docks a newly seen mod when
 `place` is not `"none"`, and never into a shipped layout). After copying the four folders into `<appHome>/mods/`,
@@ -508,9 +537,9 @@ Remote pads remain a plain sleep: the grid copies no mod code there, so those pa
 
 Each of these is something this build really does:
 
-1. `herdr-app check mods/rig mods/rig-view mods/rig-palette mods/rig-menu` → all four pass, from the clone, with no
+1. `herdr-app check mods/rig mods/rig-view mods/rig-palette mods/rig-menu mods/rig-spaces` → all five pass, from the clone, with no
    install step.
-2. Copy **all four folders** — `mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu` — into a throwaway
+2. Copy **all five folders** — `mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`, `mods/rig-spaces` — into a throwaway
    `<appHome>/mods/`, clone `main` (`layout.clone`) and insert the `{ "mod": "rig" }` block as the first child of
    `sidebar-lists` in the `sidebar` column → a sidebar titled **OpenRig** opening on Topology's Priority view
    (Needs you, Working, Idle), with the other branches below it, and a `ctrl-alt-r`

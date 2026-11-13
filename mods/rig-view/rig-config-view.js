@@ -140,6 +140,7 @@ export class ConfigPanel {
         .child(this.page.copyButton(t,key,`config-key-${key}`,"setting key"))
         .child(div().id(`config-source-${key}`).text_size(10.5).text_color(entry.source==="env"?t.working:entry.source==="file"?t.accent:t.dim).child(sourceName(entry)));
       if(!editing){
+        const valueLabel = paired ? `${textValue(m.entry(PRESSURE_WARNING))}% / ${textValue(m.entry(PRESSURE_CRITICAL))}%` : textValue(entry);
         if(def.type==="bool"&&!readOnly&&def.risk!=="high") {
           const on=entry.value===true||entry.value==="true";
           line.child(h_flex().id(`config-toggle-${key}`).gap(5).items_center().cursor_pointer()
@@ -147,8 +148,7 @@ export class ConfigPanel {
             .child(div().size(13).rounded(3).border_1().border_color(on?t.accent:t.border).when(on,el=>el.bg(t.accent)
               .child(svg(icon("check")).size(10).text_color(t.solid_foreground))))
             .child(div().text_size(12).text_color(t.foreground).child(on?"On":"Off")));
-        }else line.child(div().max_w(340).truncate().text_size(12).text_color(t.foreground).child(paired
-          ? `${textValue(m.entry(PRESSURE_WARNING))}% / ${textValue(m.entry(PRESSURE_CRITICAL))}%` : textValue(entry)));
+        }else line.child(div().max_w(340).truncate().text_size(12).text_color(t.foreground).tooltip(valueLabel).child(valueLabel));
         if(readOnly)line.child(svg(icon("rig-lock")).size(12).text_color(t.dim));
         else line.child(this.action(t,`config-edit-${key}`,"Edit",(_e,ctx)=>this.open(key,ctx),{disabled:!this.detected||m.busy}));
       }

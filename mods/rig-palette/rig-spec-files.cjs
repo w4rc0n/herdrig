@@ -7,7 +7,7 @@ const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const absolute = s => typeof s === "string" && Buffer.byteLength(s) <= 4096 && s.startsWith("/") && s !== "/"
   && !/[\x00-\x1f\x7f]/.test(s) && s.split("/").slice(1).every(p => p && p !== "." && p !== "..");
 const targetName = s => absolute(s) && /\.ya?ml$/i.test(s);
-const failure = (message, code = "refused") => Object.assign(new Error(message), { code });
+const failure = (message, code = "refused", extra = {}) => Object.assign(new Error(message), { code }, extra);
 function utf8(bytes) {
   if (bytes.length > MAX_BYTES) throw failure("The spec exceeds 1 MiB.");
   const text = bytes.toString("utf8");
@@ -65,9 +65,75 @@ function readFd(fd, io) {
   const bytes=buffer.subarray(0,used);utf8(bytes);return bytes;
 }
 function same(a,b){return a.dev===b.dev&&a.ino===b.ino&&a.isFile()&&b.isFile();}
+
+// Copy & edit of a built-in: OpenRig's own `rig specs add` copies the built-in's whole folder (rig.yaml, CULTURE.md, guidance/...).
+// Everything that selects what is copied is derived HERE from the executable actually run; the request supplies only the
+// built-in rig.yaml path, and that path is accepted only when it is a real file in a real folder inside this machine's own
+// installed @openrig/cli (public shipped content), with no symlink on the way.
+function packageRootOf(rigReal, io) {
+  let dir = path.posix.dirname(rigReal);
+  for (;;) {
+    try { if (JSON.parse(io.readFileSync(path.posix.join(dir, "package.json"), "utf8")).name === "@openrig/cli") return dir; } catch {}
+    const next = path.posix.dirname(dir); if (next === dir) return null; dir = next;
+  }
+}
+function installedRig({ io, run, home, searchPath }) {
+  const found = run("which", ["rig"], { env: { HOME: home, PATH: searchPath }, encoding: "utf8", shell: false, timeout: 5000, maxBuffer: 65536 });
+  if (found.error || found.status !== 0) throw failure("OpenRig's rig command wasn't found on this machine.");
+  const exe = io.realpathSync(String(found.stdout).trim());
+  if (!absolute(exe)) throw failure("OpenRig's rig command has an unusable path.");
+  const pkg = packageRootOf(exe, io);
+  if (!pkg) throw failure("The rig command isn't from an installed @openrig/cli package, so its built-in specs can't be located.");
+  return { exe, builtinRoot: io.realpathSync(path.posix.join(pkg, "daemon/specs")) };
+}
+/** The built-in folder named by `sourcePath` (a built-in's rig.yaml), or a refusal. Takes nothing else from the request. */
+function builtinFolder(sourcePath, builtinRoot, io) {
+  if (!absolute(sourcePath) || !sourcePath.endsWith("/rig.yaml")) throw failure("Refused: a built-in is named by the absolute path of its rig.yaml.");
+  const folder = path.posix.dirname(sourcePath);
+  if (!folder.startsWith(builtinRoot + "/")) throw failure("That spec isn't a built-in of this machine's OpenRig install.");
+  let current = builtinRoot;
+  for (const part of folder.slice(builtinRoot.length + 1).split("/")) {
+    current += "/" + part;
+    const st = io.lstatSync(current);
+    if (st.isSymbolicLink() || !st.isDirectory()) throw failure("Refused a symlink or non-directory in the built-in's path.");
+  }
+  if (io.realpathSync(folder) !== folder) throw failure("The built-in's folder isn't its own real path.");
+  const yaml = io.lstatSync(sourcePath);
+  if (yaml.isSymbolicLink() || !yaml.isFile()) throw failure("The built-in's rig.yaml must be a regular file.");
+  return folder;
+}
+function copyFolder(sourcePath, input, options, io, roots) {
+  const run = options.run ?? spawnSync, home = options.home ?? process.env.HOME, searchPath = options.searchPath ?? process.env.PATH;
+  if (input?.expectedRoots !== undefined && JSON.stringify(input.expectedRoots) !== JSON.stringify(roots))
+    throw failure("The spec folders changed. Review the permission again.", "roots_changed");
+  const { exe, builtinRoot } = installedRig({ io, run, home, searchPath });
+  const folder = builtinFolder(sourcePath, builtinRoot, io);
+  // The destination is the helper's to check, never the CLI's: the library only looks in the user's own spec folders.
+  let userRoot;
+  try { userRoot = io.realpathSync(path.posix.join(home, ".openrig/specs")); } catch { userRoot = null; }
+  if (!userRoot || !roots.includes(userRoot)) throw failure("This machine's OpenRig keeps its specs somewhere other than the default spec folder in its home folder, so a built-in's folder isn't copied.");
+  const dest = path.posix.join(userRoot, path.posix.basename(folder));
+  try { io.lstatSync(dest); throw failure("A copy of this built-in already exists.", "copy_exists", { folder: dest }); }
+  catch (e) { if (e.code !== "ENOENT") throw e; }
+  const r = run(exe, ["specs", "add", "--json", "--", folder], { env: { HOME: home, PATH: searchPath }, encoding: "utf8", shell: false, timeout: 120000, maxBuffer: 262144 });
+  if (r.error || r.status !== 0) throw failure(String(r.stderr || r.stdout || "OpenRig could not add the built-in's folder.").replace(/[\r\n\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300));
+  let printed; try { printed = JSON.parse(r.stdout).path; } catch { throw failure("OpenRig's answer to specs add wasn't readable."); }
+  // Trust only what is on disk where we expect it, not the CLI's words.
+  if (typeof printed !== "string" || io.realpathSync(printed) !== dest) throw failure("OpenRig put the copy somewhere unexpected. Nothing more was done.");
+  const folderStat = io.lstatSync(dest);
+  if (folderStat.isSymbolicLink() || !folderStat.isDirectory()) throw failure("The copied folder isn't a regular folder.");
+  const file = path.posix.join(dest, "rig.yaml"), fileStat = io.lstatSync(file);
+  if (fileStat.isSymbolicLink() || !fileStat.isFile()) throw failure("The copy's rig.yaml isn't a regular file.");
+  const copied = io.readFileSync(file); utf8(copied);
+  if (typeof input?.content !== "string") return { ok: true, folder: dest, path: file, sha256: hash(copied) };
+  // The one rewrite (agent paths made absolute): only when the copy is exactly the built-in's rig.yaml.
+  if (!io.readFileSync(sourcePath).equals(copied)) throw failure("The copied rig.yaml differs from the built-in's, so it wasn't rewritten.", "refused", { folder: dest });
+  return operation("save", file, { content: input.content, expectedSha256: hash(copied), expectedRoots: roots }, options);
+}
 function operation(verb,target,input,options={}) {
   const io=options.io??fs,{roots,rejected}=rootState(options);
   if(verb==="roots") {if(target!==undefined)throw failure("roots takes no target.");return{ok:true,roots,rejected};}
+  if(verb==="copy-folder")return copyFolder(target,input,options,io,roots);
   if(!["save","copy"].includes(verb))throw failure("Unknown spec-helper operation.");
   const parent=safeParent(target,roots,io);
   if(!input||typeof input!=="object"||Array.isArray(input)||typeof input.content!=="string")throw failure("Missing spec content.");
@@ -108,18 +174,26 @@ function operation(verb,target,input,options={}) {
 }
 function parseArgs(args){
   if(args.length===1&&args[0]==="roots")return{verb:"roots"};
+  // copy-folder -- <rig.yaml>          the box: expected roots and the rewritten text arrive on stdin
+  // copy-folder --local -- <rig.yaml>  this computer: no stdin, no consent roots (the person's own machine and CLI)
+  if(args[0]==="copy-folder"){
+    const local=args[1]==="--local",rest=local?args.slice(2):args.slice(1);
+    if(rest.length!==2||rest[0]!=="--"||!targetName(rest[1])||!rest[1].endsWith("/rig.yaml"))throw failure("Expected copy-folder, optionally --local, then -- and one absolute rig.yaml path.");
+    return{verb:"copy-folder",target:rest[1],local};
+  }
   if(args.length!==3||!["save","copy"].includes(args[0])||args[1]!=="--"||!targetName(args[2]))throw failure("Expected save or copy, then -- and one absolute YAML target.");
   return{verb:args[0],target:args[2]};
 }
 if(require.main===module){
   try{
-    const{verb,target}=parseArgs(process.argv.slice(2));let input;
-    if(verb!=="roots"){
+    const parsed=parseArgs(process.argv.slice(2)),{verb,target}=parsed;let input;
+    // A local copy-folder reads no stdin (the page's exec can't supply one); every other verb but roots does.
+    if(verb!=="roots"&&!(verb==="copy-folder"&&parsed.local)){
       const chunks=[];let size=0;const buf=Buffer.alloc(8192);let n;
       while((n=fs.readSync(0,buf,0,buf.length,null))>0){size+=n;if(size>6*MAX_BYTES+65536)throw failure("Spec input is too large.");chunks.push(Buffer.from(buf.subarray(0,n)));}
       const raw=Buffer.concat(chunks),text=raw.toString("utf8");if(!Buffer.from(text).equals(raw))throw failure("Invalid UTF-8 input.");input=JSON.parse(text);
     }
     console.log(JSON.stringify(operation(verb,target,input)));
-  }catch(e){console.log(JSON.stringify({error:String(e.message??e).replace(/[\r\n\x00-\x1f\x7f]+/g," "),code:e.code??"refused"}));process.exitCode=1;}
+  }catch(e){console.log(JSON.stringify({error:String(e.message??e).replace(/[\r\n\x00-\x1f\x7f]+/g," "),code:e.code??"refused",...(typeof e.folder==="string"?{folder:e.folder}:{})}));process.exitCode=1;}
 }
 module.exports={MAX_BYTES,hash,absolute,targetName,utf8,rootState,rootsFor,safeParent,operation,parseArgs};

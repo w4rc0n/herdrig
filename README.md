@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.3
+Version: v0.4.4
 
 **OpenRig Mod for Herdr**
 
@@ -61,7 +61,7 @@ Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/w4rc0n/her
 ```
 
 Or give [`RECIPE.md`](RECIPE.md) to your `herdr` agent. It checks for OpenRig (and installs it with OpenRig's own guide
-only on your yes), copies the four mod folders (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`)
+only on your yes), copies the five mod folders (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`, `mods/rig-spaces`)
 into `<appHome>/mods/`, merges `ctrl-alt-r` into `keys.json`, and adds `{ "mod": "rig" }` to your layout after telling
 you.
 
@@ -69,9 +69,9 @@ Herdr doesn't review mods: check what your agent runs and which keys it changes.
 
 ## Updating
 
-Replace the four folders `rig`, `rig-view`, `rig-palette` and `rig-menu` in `<appHome>/mods/` with the new
+Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with the new
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
-Restart herdr-app after all four are copied. Your folds and settings are kept outside those folders.
+Restart herdr-app after all five are copied. Your folds and settings are kept outside those folders.
 Check the `Version:` line in the README you copied, or open System and read **Herdrig Version**.
 
 ## Requirements
@@ -171,7 +171,7 @@ adds the required support. The provider release alone will not enable them; no r
   modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
 - **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.
 - **The sidebar wants 260 px.** It's cramped between 160 and 260 px, and becomes a rail of rig chips below 160.
-- **The four folders go together.** Copying only some leaves menus and the palette opening nothing. Don't rename them
+- **The folders go together.** Copying only some leaves menus and the palette opening nothing (and, without `rig-spaces`, System → Layout says herdrig's Spaces list isn't installed). Don't rename them
   without editing the `MOD_IDS` map in each folder's `rig-lib.js` (see **Watch out** in the recipe).
 
 ## Contributing

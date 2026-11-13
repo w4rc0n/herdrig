@@ -4,7 +4,7 @@
 const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
 const {spawnSync}=require("node:child_process");
 const {MAX_BYTES,utf8,targetName,absolute,rootState}=require("./rig-spec-files.cjs");
-const SPEC_SHA256="162d0c552afc5c86e5d9918d9bbb51cf11c40fcb386ebb386efbc5e39ced2330";
+const SPEC_SHA256="9482d10163b6dc9e033b328817dceb520a71246f77ee4188bb523c8d9d570a52";
 const FOLDER=".local/share/herdr-openrig",FILE="rig-spec-files.cjs";
 const hash=b=>crypto.createHash("sha256").update(b).digest("hex");
 function transferPath(appHome){
@@ -87,7 +87,7 @@ function install(machine,home,expected,run=spawnSync){
  return{ok:true,path:info.path,sha256:SPEC_SHA256};
 }
 function execute({appHome,machine,home,node,verb,target,expectedSha256,expectedRoots,record},run=spawnSync){
- if(!["roots","save","copy"].includes(verb)||!absolute(node)||verb!=="roots"&&!targetName(target))throw Error("Invalid remote spec operation.");
+ if(!["roots","save","copy","copy-folder"].includes(verb)||!absolute(node)||verb!=="roots"&&!targetName(target)||verb==="copy-folder"&&!target.endsWith("/rig.yaml"))throw Error("Invalid remote spec operation.");
  profile(run,machine,record);const info=inspect(run,machine,home);
  if(info.sha256!==SPEC_SHA256)throw Error("The spec helper needs installation or approval for this release.");
  const nodeCheck=invoke(run,["exec","--on",machine,"--","which","node"]);
@@ -100,6 +100,7 @@ function execute({appHome,machine,home,node,verb,target,expectedSha256,expectedR
    input=JSON.stringify({content:transfer.bytes.toString("utf8"),expectedSha256,expectedRoots});
   }
   profile(run,machine,record);
+  // copy-folder names the built-in's rig.yaml; the helper derives the folder itself. Expected roots and the text go on stdin.
   const args=["exec","--on",machine,...(verb!=="roots"?["--stdin"]:[]),"--json","--",node,info.path,verb,...(verb==="roots"?[]:["--",target])];
   const r=invoke(run,args,input);let result;
   try{

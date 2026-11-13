@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.4.4
+
+- Long requests no longer interrupt sidebar redraws, and Needs cards avoid repeating work on the same message.
+- Sidebar row menus show both Move actions. Closing a row menu leaves no drag behind, and typing focus then Enter focuses the sidebar.
+
+- Menus support arrow keys, Home/End, Enter and Escape, with prefix typeahead and a visible selection that stays in view. Disabled actions show their reason.
+- Dialogs start on the safe control, show a clear focus ring, and wrap Tab/Shift+Tab within their controls. New rig selects its first spec and supports typeahead; Designer drags wait for three pixels of movement.
+- Keep the selected sidebar row in view while using the keyboard, without jumping back to the top.
+- Busy icons stay still with reduced motion. Hover shortened names and labels to read the full text.
+- A very long needs message (long runs of spaces or blank lines, or a long summary) no longer slows Herdr's window while it draws the need cards.
+- Cancel sidebar drags with Esc, reorder rows with Move up/down, and use the palette's Focus sidebar command.
+  PageUp and PageDown move ten rows in trees and tables.
+- Blocked seats in Priority keep their blocked mark and label instead of a working glow.
+- Topology's All seats tab shows seats across rigs, grouped by rig or status, with filters, rig links and selected-row actions. Unavailable rigs have their own Retry row.
+- If one rig's seats cannot load, the sidebar keeps your other rigs visible and offers Retry for that rig.
+- Empty worker-view tiles look empty, with a quiet title and no cursor. Reopening updates old blanks
+  without restarting your seat viewers; the helper update asks for approval.
+- Worker views show update progress and readable tab names, with one connection warning per machine. Mission titles open their workflows or slices, and palette no-match guidance stays actionable.
+- See which space and machine are opening while a rig grid is built.
+- Copy & edit of a built-in rig spec includes its whole folder, so culture and startup files stay with the copy. Copying a folder on the box asks for separate permission.
+- Choose herdrig's own Spaces list in System → Layout: Herdr's list with a rig mark on rig spaces, each rig's status at the row's right,
+  the OpenRig icon on its home space and the rig menu on right-click, or Both (Herdr's list plus a **Rig spaces** block with only rig
+  spaces). Herdr's list stays the default. Each change goes through one screen, touches only your personal layout (a copy is made first
+  when you are on a layout Herdr ships), records the way back and is undone from the same row; uninstalling switches back first.
+- Uninstalling takes herdrig's own blocks (the Rig sidebar and, if used, its Spaces blocks) out of your personal layouts before removing the mods, so the next start stays on your layout instead of falling back to Herdr's. Every other block, your sizes and Herdr's own layouts are left as they are; a layout that changed meanwhile or does not read back as planned is put back or left alone and reported.
+
 ## v0.4.3
 
 - Opening a rig that already has its own space on your configured machine finds that space again even when the tunnel address was written differently when the space was made (127.0.0.1, 127.0.0.3 or localhost, same port). Before, a second space was built. herdrig only reuses it when it can show it is the same OpenRig (the space carries the OpenRig's host id, or every seat in it is one that OpenRig lists for that rig); otherwise it opens nothing and says what to do. Spaces it builds now carry the host id. The OpenRig home space gets the same treatment, so a changed tunnel address no longer builds a second OpenRig home.
@@ -21,6 +47,11 @@
 - Copy & edit of a built-in spec keeps the copy's agents reachable: the copy points at the built-in's agents by their full path instead of a path
   that only worked beside the original. If the built-in also lists files beside itself (such as CULTURE.md), Specs names them and says plainly
   that the copy will not launch until they exist beside it. A spec whose agents can't be located is not copied.
+
+- Copy & edit of a built-in rig spec copies the spec's whole folder (its CULTURE.md and guidance files too), uses OpenRig's own `rig specs add`,
+  and names the copy `<name>-copy`, so a starter, factory, kernel or pm copy can launch. On OpenRig's machine this needs its own permission
+  (separate from saving specs), naming the folder copied and where it goes. If you already have a copy, Specs opens it; an unfinished one is
+  renamed and its fixed text is put in the editor for you to save. The spec helper changes, so setup asks once more.
 
 - Choose OpenRig's Herdr machine in one setup screen that names the account, helper file and checksum.
   It verifies the helper before saving the choice, asks again for a changed helper, and offers Stop using in Connections.

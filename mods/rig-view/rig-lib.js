@@ -6,7 +6,7 @@ import { attachRemoteSeat } from "./rig-remote-attach.js";
 import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
-import { resolveRigSpace, markRigSpace, rigOrigin } from "./rig-space-context.js";
+import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
 
 /** The single space-routing entry point for pages, the TUI, Attach and rig grids. */
 let routingEnvironment = null;
@@ -28,7 +28,9 @@ export function routeRigOpen(host, config, request) {
  */
 export const MOD_IDS = Object.freeze({ sidebar: "rig", view: "rig-view", palette: "rig-palette", menu: "rig-menu" });
 
-const requestPlain = (s) => String(s ?? "").replace(/^\s*(?:#{1,6}\s+|>\s*|[-*]\s+|\d+\.\s+)/gm, "")
+// Queue text is daemon-supplied and drawn on every redraw, so these patterns must stay linear: `[^\S\n]` is whitespace that
+// can't cross a line, and no two adjacent quantifiers may match the same characters (njsscan regex_dos triage, v0.4.4).
+const requestPlain = (s) => String(s ?? "").replace(/^[^\S\n]*(?:#{1,6}[^\S\n]+|>[^\S\n]*|[-*][^\S\n]+|\d+\.[^\S\n]+)/gm, "")
   .replace(/\*\*([^*]+)\*\*/g, "$1").replace(/__([^_]+)__/g, "$1")
   .replace(/(^|\s)_([^_\n]+)_(?=$|\s|[.,!?])/g, "$1$2").replace(/`([^`\n]+)`/g, "$1").trim();
 const requestCap = (s, max) => {
@@ -56,25 +58,80 @@ export function requestFirstSentence(source, max = 140) {
     }
   }
   s = requestPlain(s.split(/\n\s*\n/)[0] ?? "");
+  const space = (c) => c !== undefined && /\s/.test(c);
   for (let i = 0; i < s.length; i++) {
     if (s[i] === ":" && (i === s.length - 1 || s[i + 1] === "\n")) return requestCap(singleLineText(s.slice(0, i + 1)), max);
     if (!/[.!?]/.test(s[i])) continue;
-    const tail = s.slice(i + 1);
-    if (tail && !/^(?:\n|\s+[A-Z0-9])/.test(tail)) continue;
-    const token = s.slice(0, i + 1).match(/\S+$/)?.[0] ?? "";
+    // A sentence ends here at the end of the text, before a newline, or before whitespace and then a capital or digit. Scanned by index,
+    // not by slicing the rest of the text, so a long run of initials ("A. A. …") stays linear.
+    if (i + 1 < s.length && s[i + 1] !== "\n") {
+      let j = i + 1;
+      while (j < s.length && space(s[j])) j++;
+      if (j === i + 1 || j >= s.length || !/[A-Z0-9]/.test(s[j])) continue;
+    }
+    let k = i;
+    while (k > 0 && !space(s[k - 1])) k--;
+    const token = s.slice(k, i + 1);
     if (/^(?:e\.g\.|i\.e\.|[A-Z]\.)$/i.test(token)) continue;
     return requestCap(singleLineText(s.slice(0, i + 1)), max);
   }
   return requestCap(singleLineText(s), max);
 }
 
-/** Presentation only: never rewrites ids, generates a decision, or drops the original body from Details. */
+/** A line that is only a "Details" heading (`## Details`, `**Details**:`, `Details:`), matched one line at a time. */
+const DETAILS_LINE = /^[^\S\n]*(?:#{1,6}[^\S\n]+Details[^\S\n]*|\*\*Details\*\*[^\S\n]*(?::[^\S\n]*)?|Details[^\S\n]*(?::[^\S\n]*)?)$/i;
+/** Where the first Details line is: `{ index, 0: line }` like a regex match, or null. */
+function detailsLine(source) {
+  let at = 0;
+  for (const line of source.split("\n")) {
+    if (DETAILS_LINE.test(line)) return { index: at, 0: line };
+    at += line.length + 1;
+  }
+  return null;
+}
+
+/** How much of a body (or a summary) a headline reads. A headline is at most 140 characters, so this leaves ample room for leading
+ *  headings, quotes and short code blocks, while a 100 KB request costs no more per redraw than a short one. */
+const HEADLINE_SCAN = 4096;
+/** A need's headline, for rows that show only that (the sidebar's needs rows and Priority list, notifications). It reads the body
+ *  only when the request has no summary, and then only its start. The same text as a parsed card's headline except for a
+ *  request whose first sentence starts after HEADLINE_SCAN characters (then it says who asked). */
+export function requestHeadline(item = {}, body = "") {
+  const raw = item.summaryIsFallback && item.summary === item.id ? "" : item.summary ?? item.title ?? "";
+  const summary = requestPlain(String(raw ?? "").slice(0, HEADLINE_SCAN));
+  const headline = summary
+    ? summary.length <= 140 ? singleLineText(summary) : requestFirstSentence(summary)
+    : requestFirstSentence(String(body || item.body || item.bodyPreview || "").slice(0, HEADLINE_SCAN).replace(/\r\n?/g, "\n").replace(/^\n+/, "").trimEnd());
+  return headline || `Request from ${item.asker ?? item.sourceSession ?? "the asking seat"}`;
+}
+
+/** Parsed cards by request, so a redraw with the same request and text doesn't parse a long body again. Each entry keeps the exact
+ *  inputs it was parsed from; any change parses again. A small bound: entries for requests that left the list fall out. */
+const CARD_CACHE = new Map(), CARD_CACHE_MAX = 64;
+
+/** Presentation only: never rewrites ids, generates a decision, or drops the original body from Details. The result is shared
+ *  between redraws and callers (frozen): read it, don't change it. */
 export function requestCardText(item = {}, body = "", { openingLimit = 320 } = {}) {
-  const source = String(body || item.body || item.bodyPreview || "").replace(/\r\n?/g, "\n").replace(/^\n+|\s+$/g, "");
+  const text = body || item.body || item.bodyPreview || "";
+  const inputs = [item.summary, item.title, item.summaryIsFallback, item.asker, item.sourceSession, text];
+  const key = typeof item.id === "string" && item.id ? `${item.id}\u0000${openingLimit}\u0000${String(text).length}` : null;
+  const hit = key ? CARD_CACHE.get(key) : null;
+  if (hit && hit.inputs.every((value, i) => value === inputs[i])) return hit.result;
+  const result = Object.freeze(parseRequestCard(item, text, openingLimit));
+  if (key) {
+    CARD_CACHE.delete(key);
+    CARD_CACHE.set(key, { inputs, result });
+    if (CARD_CACHE.size > CARD_CACHE_MAX) CARD_CACHE.delete(CARD_CACHE.keys().next().value);
+  }
+  return result;
+}
+
+function parseRequestCard(item, body, openingLimit) {
+  const source = String(body || item.body || item.bodyPreview || "").replace(/\r\n?/g, "\n").replace(/^\n+/, "").trimEnd();
   const summary = requestPlain(item.summaryIsFallback && item.summary === item.id ? "" : item.summary ?? item.title ?? "");
   const headline = (summary ? summary.length <= 140 ? singleLineText(summary) : requestFirstSentence(summary) : requestFirstSentence(source))
     || `Request from ${item.asker ?? item.sourceSession ?? "the asking seat"}`;
-  const match = /^(?:\s*#{1,6}\s+Details\s*|\s*\*\*Details\*\*\s*:?[ \t]*|\s*Details\s*:?[ \t]*)$/im.exec(source);
+  const match = detailsLine(source);
   let opening = match ? source.slice(0, match.index).trim() : source.split(/\n\s*\n/)[0] ?? "";
   let rest = match ? source.slice(match.index + match[0].length).trim() : source.slice(opening.length).trim();
   const first = requestFirstSentence(opening, 10000);
@@ -829,6 +886,8 @@ export async function probeOpenRigState(config, { exec, fetch: fetchFn, sidebarM
 }
 
 export const LOCAL_COMMANDS = [
+  { line: "focus-sidebar", label: "OpenRig: Focus sidebar", hint: "Select the first sidebar row" },
+  { line: "all-seats", label: "OpenRig: All seats", hint: "Seats across every rig", navigation: true },
   { line: "operator", hint: "Open the operator in a tab" },
   { line: "open-page", hint: "Open in Page tab" },
   { line: "open-tui", hint: "Open Rig TUI tab" },
@@ -849,6 +908,7 @@ export const LOCAL_COMMANDS = [
   { line: "show-sidebar-here", hint: "OpenRig: show sidebar here" },
   { line: "change-model", hint: "Switch a seat's harness, model, or effort via the lead (change-model <seat>)" },
   { line: "people", hint: "People, quiet hours, and modes on System" },
+  { line: "spaces-list", hint: "Choose Herdr's, herdrig's or both Spaces lists (System → Layout)" },
 ];
 
 /** Two configs that read the same (a re-read that changed nothing changes nothing). */
@@ -939,6 +999,7 @@ export function personDisableReason(action, config) {
     a === "change-model" ||
     a === "specs-add" ||
     a === "people" ||
+    a === "spaces-list" ||
     a === "quiet" ||
     a === "mode"
   ) {
@@ -2174,6 +2235,34 @@ export function statusCounts(seats) {
   return { working: n("working"), needs: n("blocked"), idle: n("idle"), unreported: seats.filter(s=>s.status==="unknown").length };
 }
 
+/** What herdrig's Spaces list shows for rig spaces, published as the shared key `herdrig.spaces`: space id -> `{ home: true }` for the
+ *  OpenRig home, or `{ rig, rigId, status, needs }` for a rig's own grid space (marked as ours, from the same OpenRig as `config`).
+ *  Recognised by the labels and the home record herdrig already keeps, never by a space's name. `status` is the rig's own: "needs" when
+ *  a seat needs the person, else "working" when one works, else "idle". Plain data: the list only reads it. */
+export function rigSpaceMarks({ spaces = [], terminals = [], panes = [], state = {}, topology = [], config = {}, hostId = null } = {}) {
+  const expected = rigOrigin(config?.daemonUrl), rigs = new Map((topology ?? []).map((r) => [r.name, r]));
+  const machine = config?.daemonMachine || null, out = {};
+  const machineOf = (context) => context.space.machine ?? (String(context.id ?? "").includes("/") ? String(context.id).split("/")[0] : null);
+  for (const context of openRigSpaceContext(spaces, terminals, panes, state)) {
+    if (context.home) { out[context.id] = { home: true }; continue; }
+    let links = context.markedRigLinks.filter((l) => !l.origin || rigOrigin(l.origin) === expected);
+    // The same vouching the open uses (v0.4.3), read-only: a space made under another loopback spelling of this daemon's address is
+    // the rig's own space when its host stamp equals the daemon's, or (older spaces) the daemon lists every seat in it. Nothing is written.
+    if (!links.length && expected && machine && machineOf(context) === machine) {
+      links = context.markedRigLinks.filter((l) => {
+        const rig = rigs.get(l.rig);
+        return rig && sameDaemonOrigin(l.origin, config.daemonUrl, machine)
+          && vouchedSpace({ terminals }, context.space, new Set([l.rig]), { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId }) === "same";
+      });
+    }
+    const link = links.find((l) => rigs.has(l.rig)) ?? links[0];
+    if (!link) continue;
+    const found = rigs.get(link.rig), counts = found ? statusCounts(found.seats ?? (found.pods ?? []).flatMap((p) => p.seats ?? [])) : { needs: 0, working: 0 };
+    out[context.id] = { rig: link.rig, rigId: found?.id ?? null, status: counts.needs ? "needs" : counts.working ? "working" : "idle", needs: counts.needs };
+  }
+  return out;
+}
+
 /** A rig starts open when it runs or any seat needs the person; a stopped rig with no needs is one line. */
 export function rigOpenDefault(rig, seats = []) {
   return !isRigStopped(rig.lifecycleState ?? rig.lifecycle, seats) || seats.some((s) => s.tone === "blocked");
@@ -2971,7 +3060,7 @@ export function needsToastFor(rawItem) {
   const title = reply === "native"
     ? `Seat ended · ${seat || rig || "OpenRig"}`
     : `${isEscalation ? "Escalation" : "Needs you"} · ${rig || "OpenRig"}`;
-  const body = requestCardText(rawItem, rawItem.body ?? "").headline;
+  const body = requestHeadline(rawItem, rawItem.body ?? "");
   const at = String(rawItem.at ?? rawItem.tsUpdated ?? rawItem.tsCreated ?? "");
   return {
     id: target.id,
@@ -3978,7 +4067,7 @@ export function crumbsFor(entry) {
   if (e.section === "system") {
     if (e.settingKey) return [section("system"), { text: "Configuration", entry: { section: "system", subview: "config", name: "Configuration" } }, { text: e.settingKey, entry: e }];
     if (e.category) return [section("system"), { text: "Configuration", entry: { section: "system", subview: "config", name: "Configuration" } }, { text: e.category, entry: e }];
-    if (e.subview) return [section("system"), { text: e.name ?? ({ overview: "Overview", people: "People", config: "Configuration", health: "Health", connections: "Connections", usage: "Usage", cost: "Cost", notifications: "Notifications" }[e.subview] ?? e.subview), entry: e }];
+    if (e.subview) return [section("system"), { text: e.name ?? ({ overview: "Overview", people: "People", config: "Configuration", health: "Health", connections: "Connections", layout: "Layout", usage: "Usage", cost: "Cost", notifications: "Notifications" }[e.subview] ?? e.subview), entry: e }];
     if (e.openUsageHosts) return [section("system"), { text: "Usage · all hosts", entry: e }];
     return [section("system")];
   }
@@ -4477,6 +4566,7 @@ export function resolveTuiLineFallback(line) {
     const raw = s.slice(1).trim().toLowerCase();
     if (raw === "usage-hosts") return { kind: "nav", line: s, area: "system", action: { type: "usage-hosts" } };
     if (raw === "people") return { kind: "nav", line: s, area: "system", action: { type: "people" } };
+    if (raw === "spaces-list") return { kind: "nav", line: s, area: "system", action: { type: "spaces-list" } };
     if (raw === "pulse") return { kind: "nav", line: s, area: "topology", action: { type: "pulse" } };
     if (raw === "overview") return { kind: "nav", line: s, area: "topology", action: { type: "overview", rig: null } };
     if (raw === "recent") return { kind: "nav", line: s, area: "topology", action: { type: "recent", target: null } };
@@ -4519,6 +4609,7 @@ export function resolveTuiLineFallback(line) {
   }
   if (verb === "usage-hosts" && !rest) return { kind: "nav", line: s, area: "system", action: { type: "usage-hosts" } };
   if (verb === "people" && !rest) return { kind: "nav", line: s, area: "system", action: { type: "people" } };
+  if (verb === "spaces-list" && !rest) return { kind: "nav", line: s, area: "system", action: { type: "spaces-list" } };
   if (verb === "pulse" && !rest) return { kind: "nav", line: s, area: "topology", action: { type: "pulse" } };
   if (verb === "overview") return { kind: "nav", line: s, area: "topology", action: { type: "overview", rig: rest || null } };
   if (verb === "recent") return { kind: "nav", line: s, area: rest === "instance" ? "system" : "topology", action: { type: "recent", target: rest || null } };
@@ -4636,6 +4727,9 @@ export function paletteRoute(res, top, topology = []) {
   }
   if (typed === "people" || typed === ":people" || a.type === "people" || resolved?.area === "people") {
     return { entry: { section: "system", subview: "people", name: "People" }, open: { "branch:system": true }, focus: "system:people" };
+  }
+  if (typed === "spaces-list" || typed === ":spaces-list" || a.type === "spaces-list" || resolved?.area === "spaces-list") {
+    return { entry: { section: "system", subview: "layout", name: "Layout" }, open: { "branch:system": true }, focus: "system:layout" };
   }
   if (typed === "pulse" || typed === ":pulse" || a.type === "pulse" || resolved?.area === "pulse") {
     return { entry: { section: "topology", focus: "pulse" }, focus: "pulse" };
@@ -5041,7 +5135,7 @@ export function rigCapabilities({
   const missing = (h) => answered(h) && /\bunknown command\b/i.test(String(h));
   const rigDelete = !answered(downHelp) || (!missing(downHelp) && String(downHelp).includes("--delete"));
   const rigArchive = !missing(archiveHelp);
-  const rigUnarchive = !answered(rigHelp) || /^\s*unarchive(?:\s|$)/m.test(rigHelp);
+  const rigUnarchive = !answered(rigHelp) || /^[^\S\n]*unarchive(?:\s|$)/m.test(rigHelp);
   const rigCreate = !missing(createHelp);
   return { herdrAppProvider, followPrune, gridGeometry, cellClose, nativeSeats, mcpTerminalTools, tuiResolve, rigDelete, rigArchive, rigUnarchive, rigCreate };
 }
@@ -5533,6 +5627,10 @@ export function treeKeyNav(visibleRows = [], selectedKey = null, key = "", { ope
   const idx = selectedKey ? rows.findIndex((r) => r?.key === selectedKey) : -1;
   const curIdx = idx >= 0 ? idx : 0;
   const cur = rows[curIdx];
+  if (["pageup", "pagedown", "page_up", "page_down"].includes(k)) {
+    const next = idx < 0 ? 0 : Math.max(0, Math.min(rows.length - 1, curIdx + (k === "pageup" || k === "page_up" ? -10 : 10)));
+    return { type: "move", key: rows[next].key, row: rows[next] };
+  }
   if (k === "down" || k === "arrowdown" || k === "j") {
     const nextIdx = idx < 0 ? 0 : Math.min(rows.length - 1, curIdx + 1);
     const row = rows[nextIdx];

@@ -98,6 +98,8 @@ function vouched(host,space,rigNames,{sessions=null,hostId=null,servers=null}={}
   }
   return "same";
 }
+/** The same vouching, for a caller that only reads (the Spaces list marks): "same", "other" or "unknown"; it never writes a label. */
+export const vouchedSpace=vouched;
 function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,servers=null}={}){
   const expected=rigOrigin(config?.daemonUrl);if(!expected)return {space:null,unconfirmed:null};
   const rigNames=nameSet(names),machine=config?.daemonMachine||null;
