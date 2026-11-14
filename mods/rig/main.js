@@ -1283,6 +1283,15 @@ export default class RigSidebar extends View {
     return stampConnection(await r.json(), this.config.connectionId);
   }
 
+  /** A `connections` list is refused in v0.4.5 (see parseConfig): no read, probe or stream, the old rows are not shown as live, and the
+   *  sidebar says one plain line. Called by every refresh and when the config changes into one. */
+  refuseConnectionsList(cx) {
+    try { this.sock?.close(); } catch (_) {}
+    this.sock = null; this.data = null; this.live = false; this.error = null; this.sidebarState = null;
+    setShared("rig.data", { topology: [], live: false, error: this.config.connectionsRefused, config: this.config });
+    cx.notify();
+  }
+
   async refresh(cx) {
     if (!this.config) {
       this.config = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
@@ -1292,6 +1301,7 @@ export default class RigSidebar extends View {
         this.config = reread;
       }
     }
+    if (this.config?.connectionsRefused) { this.refuseConnectionsList(cx); return; }
     if (!this.config || this.refreshing) { this.again = true; return; }
     this.refreshing = true;
     let probed = null;
@@ -1809,6 +1819,9 @@ export default class RigSidebar extends View {
   }
 
   states(t) {
+    if (this.config?.connectionsRefused) {
+      return v_flex().id("rig-state-connections-listed").p(10).gap(6).text_size(12).text_color(t.muted).child(div().child(this.config.connectionsRefused));
+    }
     const st = this.sidebarState ?? { id: "S0", headline: STATE_COPY.S0.headline };
     const renderS0 = () => v_flex().id("rig-state-s0").p(10).gap(6)
       .child(div().text_size(12).text_color(t.muted).child(STATE_COPY.S0.headline))

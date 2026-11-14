@@ -12,6 +12,11 @@ const HOST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 export const NO_CONNECTION = "This needs to know which OpenRig it is for, and it didn't say. Nothing was sent.";
 export const UNKNOWN_CONNECTION = "That OpenRig connection isn't set up any more. Nothing was sent.";
 export const HOME_NEEDED = "This OpenRig needs its own OpenRig home in its connection settings, and none is set. Nothing was sent.";
+/** Whether a `connections` list is read at all. False in v0.4.5: there is no setter and no config key for it (v0.5.0 removes this switch). Tests of the
+ *  multi-connection code read lists through `parseConfig(text, { connectionsList: true })`, or against a staged copy with this constant patched. */
+export const CONNECTIONS_LIST_SUPPORTED = false;
+/** v0.4.5 reads one OpenRig connection: a hand-written `connections` list is refused outright (v0.5.0 lifts this). Said as one plain line. */
+export const CONNECTIONS_LIST_REFUSED = "This herdrig reads one OpenRig connection. A connections list arrives in v0.5.0; remove it to continue.";
 export const EXPLICIT_ADDRESS_NEEDED = "With more than one OpenRig, each needs its own address. Nothing was sent.";
 
 const text = (value) => (typeof value === "string" && value !== "" ? value : null);

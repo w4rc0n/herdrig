@@ -2,7 +2,7 @@ import { div, svg } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input, Select, Popup } from "gpui-base";
 import { configRows, iconsAt } from "./rig-lib.js";
 import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-editor.js";
-import { configDefinition, validateConfigValue,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
+import { configDefinition, validateConfigValue,configPairPlan,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
 import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
 import { timezoneNote } from './rig-time.js';
 const icon = iconsAt("mods/rig-view");
@@ -181,7 +181,7 @@ export class ConfigPanel {
           if(model.row)model.row.error=CONFIG_SAVE_TIMEOUT;
         }
         request.finish();if(this.saves.get(identity)===request)this.saves.delete(identity);
-        if(request.expired()&&configWriteState(identity)?.uncertain){
+        if(configWriteState(identity)?.uncertain){
           const reason=configWriteState(identity).reason;model.error=reason;if(model.row)model.row.error=reason;
           this.watchWrites(cx,{origin,model,identity});
         }
@@ -210,8 +210,13 @@ export class ConfigPanel {
     this.more=null;if(this.saving||this.model.busy)return;
     if(this.pauseWrites(cx))return;
     this.open(entry.key,cx);if(!this.model.row?.keys.includes(entry.key))return;
-    const changes=this.model.row.keys.map(key=>[key,String(this.model.entry(key)?.defaultValue??'')]);
+    let changes=this.model.row.keys.map(key=>[key,String(this.model.entry(key)?.defaultValue??'')]);
     if(this.model.row.keys.every(key=>this.model.entry(key)?.source==='default')){this.cancel(cx);return;}
+    if(this.model.row.keys.length===2){
+      const value=key=>changes.find(v=>v[0]===key)?.[1],current=key=>String(this.model.entry(key)?.value??'');
+      const plan=configPairPlan(value(PRESSURE_WARNING),value(PRESSURE_CRITICAL),current(PRESSURE_WARNING),current(PRESSURE_CRITICAL));
+      if(plan.error){this.model.row.error=plan.error;this.focusField(entry.key,cx);cx.notify();return;}changes=plan.changes;
+    }
     for(const [key,value]of changes){this.model.change(key,value);this.inputs[key]?.set_value(value);}
     this.execute(cx,this.model.request(changes,true));
   }
@@ -305,7 +310,7 @@ export class ConfigPanel {
     if (!this.detected) out.push(div().id("config-edit-unavailable").text_size(11.5).text_color(t.dim)
       .child(probe?.status ? configWriteError(probe.status,probe.errorData)
         : "This OpenRig hasn't confirmed support for editing settings from Herdr. Use rig config set on that machine."));
-    if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(t.blocked).child(m.error));
+    if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(m.errorTone==='working'?t.working:t.blocked).child(m.error));
     if(this.reconciledModel===m)out.push(div().id('config-write-recovered').text_size(11.5).text_color(t.muted).child('OpenRig’s current settings were checked. Review your draft before saving again.'));
     let group=null,pair=false;
     for(const {entry,group:entryGroup} of [...rows.filter(r=>!this.definition(r.entry).readOnly),...rows.filter(r=>this.definition(r.entry).readOnly)]) {
@@ -367,12 +372,12 @@ export class ConfigPanel {
           const error=m.row.touched?.[field]?validateConfigValue(fieldDef,value):null;if(error)row.child(div().text_size(11.5).text_color(t.blocked).child(error));
         }
         if(m.row.error&&!writePause?.uncertain&&!m.row.keys.some(field=>m.row.touched?.[field]&&validateConfigValue(configDefinition(m.entry(field)),m.row.values[field])===m.row.error))
-          row.child(div().id("config-save-refusal").text_size(12).text_color(t.blocked).child(m.row.error));
+          row.child(div().id("config-save-refusal").text_size(12).text_color(m.row.errorTone==='working'?t.working:t.blocked).child(m.row.error));
       }
       const receipt=m.receipt(key);if(receipt){this.page.ticking=true;row.child(h_flex().gap(6).items_center()
         .child(div().id(`config-result-${key}`).text_size(11.5).text_color(t.muted).child(receipt.text))
         .when(receipt.undo!==null&&!readOnly,el=>el.child(this.action(t,`config-undo-${key}`,"Undo",(_e,ctx)=>{
-          this.execute(ctx,m.undo(key));},{disabled:this.saving||!!m.undoBlocked(key)}).tooltip(m.undoBlocked(key)??'Restore the previous setting'))));
+          this.execute(ctx,m.undo(key));},{disabled:this.saving||!!m.undoBlocked(key)}).tooltip(m.undoBlocked(key)??'Restore the previous setting after a fresh check. Another change during the write may still be overwritten.'))));
         if(receipt.undo!==null&&m.undoBlocked(key))row.child(div().id(`config-undo-reason-${key}`).text_size(11).text_color(t.dim).child(m.undoBlocked(key)));}
       if(reviewing){
         const confirmation=m.confirmation,confirmKey=confirmation.changes[0][0];

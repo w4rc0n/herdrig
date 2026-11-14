@@ -41,11 +41,11 @@ export class ConfigEditor {
   }
   plan() {
     if (!this.row) return { error: "Open a setting first" };
+    const value=key=>normalized(configDefinition(this.entry(key)),this.row.keys.length===2&&!this.row.touched[key]?valueOf(this.entry(key)):this.row.values[key]);
     for (const key of this.row.keys) {
-      const error = validateConfigValue(configDefinition(this.entry(key)), this.row.values[key]);
+      const error = validateConfigValue(configDefinition(this.entry(key)), value(key));
       if (error) return { error };
     }
-    const value=key=>normalized(configDefinition(this.entry(key)),this.row.values[key]);
     if (this.row.keys.length === 2) return configPairPlan(value(PRESSURE_WARNING), value(PRESSURE_CRITICAL), valueOf(this.entry(PRESSURE_WARNING)), valueOf(this.entry(PRESSURE_CRITICAL)));
     return { changes: [[this.row.key, value(this.row.key)]] };
   }
@@ -75,11 +75,19 @@ export class ConfigEditor {
     return pending;
   }
   confirm() { const pending = this.confirmation; if (!pending) return null; this.confirmation = null; this.approved.add(pending); return pending; }
-  async save(pending, write, refresh, now = Date.now, readCurrent = async key=>this.entry(key)) {
+  async save(pending, write, refresh, now = Date.now, readCurrent) {
     if (this.busy || !pending || !this.approved.has(pending)) return false;
     this.approved.delete(pending);
     if(!pending.undoOf){this.results.clear();this.latestReceipt=null;this.lastSavedText=null;}
-    this.busy = true; this.error = null; if(this.row)this.row.error=null; let completed = 0,finished=false;
+    this.busy = true; this.error = null;this.errorTone=null; if(this.row){this.row.error=null;this.row.errorTone=null;} let completed = 0,finished=false;
+    const checkUndo=async key=>{
+      if(typeof readCurrent!=='function')throw new Error('Undo requires a fresh settings read');
+      const current=await readCurrent(key),expected=pending.undoOf.expected.find(v=>v.key===key);
+      if(pending.connection!==this.connection)throw new Error('OpenRig connection changed; Undo is no longer available');
+      if(!restorable(this.entry(key))||!current||current.source!==expected?.source||JSON.stringify(current.value)!==JSON.stringify(expected?.value)){
+        pending.undoOf.changed=true;throw Object.assign(new Error("It changed since you saved, so it wasn't undone."),{changedKey:key,changedValue:current?.value,changedSource:current?.source});
+      }
+    };
     try {
       if(pending.connection!==this.connection)throw new Error('OpenRig connection changed; Undo is no longer available');
       if(pending.undoOf){
@@ -87,10 +95,7 @@ export class ConfigEditor {
         if(pending.undoOf!==this.latestReceipt||!this.receipt(pending.undoOf.keys[0],typeof now==='function'?now():now))throw new Error('Undo is no longer available');
         for(const key of pending.undoOf.keys){
           if(!restorable(this.entry(key))){pending.undoOf.changed=true;throw new Error("It changed since you saved, so it wasn't undone.");}
-          const current=await readCurrent(key),expected=pending.undoOf.expected.find(v=>v.key===key);
-          if(!restorable(this.entry(key))||!current||current.source!==expected?.source||JSON.stringify(current.value)!==JSON.stringify(expected?.value)){
-            pending.undoOf.changed=true;throw new Error("It changed since you saved, so it wasn't undone.");
-          }
+          await checkUndo(key);
         }
       }
       const expected=[];
@@ -98,6 +103,8 @@ export class ConfigEditor {
         // Re-check at the write boundary. A UI control or stale confirmation cannot add an unknown key.
         const def = configDefinition(this.entry(key));
         if (def.readOnly || !this.entry(key) || (!reset && validateConfigValue(def, value))) throw new Error("Setting changed; reopen it before saving");
+        // Best effort: the public config API has no atomic precondition. Re-read immediately before EACH Undo write.
+        if(pending.undoOf)await checkUndo(key);
         const result = await write(key, value, reset);
         if (!result.ok) throw new Error(result.error ?? "OpenRig refused the save");
         completed++;
@@ -120,8 +127,16 @@ export class ConfigEditor {
       finished=true;
       return true;
     } catch (error) {
-      if (this.row) this.row.error = `${completed ? `${completed} setting saved; the next was refused.\n` : ""}${error.message}`;
-      else this.error = error.message;
+      let message=`${completed ? `${completed} setting${completed===1?'':'s'} ${pending.undoOf?'restored':'saved'}; the next was refused.\n` : ""}${error.message}`;
+      if(pending.undoOf&&completed&&[PRESSURE_WARNING,PRESSURE_CRITICAL].includes(error.changedKey)){
+        const label=key=>key===PRESSURE_WARNING?'Warning':'Critical';
+        const restored=pending.operations.slice(0,completed).map(({key})=>`${label(key)} restored to ${this.entry(key)?.value}%.`).join(' ');
+        const expected=pending.undoOf.expected.find(v=>v.key===error.changedKey);
+        const change=JSON.stringify(error.changedValue)===JSON.stringify(expected?.value)?`its source changed (${error.changedValue}%)`:`it changed to ${error.changedValue}%`;
+        message=`${restored} ${label(error.changedKey)} wasn't undone: ${change} since you saved.`;this.errorTone='working';
+      }
+      if (this.row){this.row.error=message;this.row.errorTone=this.errorTone;}
+      else this.error = message;
       return false;
     } finally {
       if(!finished)try { await refresh(); } catch (error) { this.error = `Could not refresh configuration: ${error.message}`; }

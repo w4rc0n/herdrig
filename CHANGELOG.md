@@ -2,12 +2,14 @@
 
 ## v0.4.5
 
+- A connections list is not supported yet; herdrig says so and leaves it unchanged.
 - Opening a rig's page, Attach or worker views checks its existing space first. If OpenRig cannot confirm the match, the sidebar explains why and nothing opens, instead of creating a second space.
+- Paired settings keep changes made elsewhere and reset in a safe order. A lost save reply pauses further changes until settings are checked. Undo checks again before each restored value; a simultaneous change can still win or be overwritten because OpenRig offers no atomic settings update.
 - A slow settings save pauses further changes until OpenRig answers and its current values are checked. Undo preserves changes made elsewhere, and switching connections keeps their settings separate.
 - Find the Spaces list in **System → Layout**, in the sidebar and on the System page. The sidebar also includes Overview and Notifications; palette commands select their matching row.
 - All seats keeps connected assistants in order and shows each once when a rig cannot load. Reconnecting checks for assistants again, and the sidebar keeps the selected assistant in view.
 - Confirm setting changes beside the value you edited, with Cancel focused first. Saves show when they are still being checked, then offer Undo for a full ten seconds.
-- Click a setting to edit it, then press Enter or Tab or click away to save. Esc restores the old value; invalid text stays open. Undo restores your previous setting for ten seconds, and refuses if it changed elsewhere. Consequential changes still ask first.
+- Click a setting to edit it, then press Enter or Tab or click away to save. Esc restores the old value; invalid text stays open. Undo restores your previous setting for ten seconds after checking for changes elsewhere. Consequential changes still ask first.
 - See connected assistants under each rig and in All seats, with their check-in status. Queue work to them, copy their address, or read their queued work without mistaking them for terminal seats.
 
 - Settings use the controls and limits OpenRig reports, while older versions keep their existing controls. New settings ask for confirmation before saving. Empty fields show an error only after you edit them.

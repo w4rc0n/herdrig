@@ -17,7 +17,7 @@ export function configWriteState(identity){
   const reason=r.ownerClosed?`A save on ${r.daemonLabel||'this OpenRig'} was still unanswered when its Settings tab closed. Saving stays paused until Herdr restarts. You can still use rig config in a terminal on OpenRig’s machine.`
     :r.pending.size?'A save is waiting for OpenRig to answer. Saving is paused; reopening this page will not clear the pending request.'
     :r.failed&&!r.reconciling?'OpenRig’s current value could not be confirmed on this page. Reopen this page before saving again.'
-    :'The last save did not answer in time. Saving resumes once OpenRig confirms the current value.';
+    :'The last save was not confirmed. Saving resumes once OpenRig confirms the current value.';
   return {blocked:r.uncertain||r.pending.size>0,pending:r.pending.size,uncertain:r.uncertain,ownerClosed:r.ownerClosed===true,failed:r.failed&&!r.reconciling,reason};
 }
 export function waitForConfigWrites(identity){const r=configWrites.get(identity);return !r||!r.pending.size?Promise.resolve(r):new Promise(resolve=>r.idle.add(resolve));}
@@ -49,7 +49,7 @@ export function configOperationRequest(request, after, identity=null, owner=null
       const response=await request(...args);return {ok:response.ok,status:response.status,data:await response.json()};
     });
     const settled=()=>{if(record){record.pending.delete(raw);if(!record.pending.size){for(const resolve of record.idle)resolve(record);record.idle.clear();if(!record.uncertain&&configWrites.get(identity)===record)configWrites.delete(identity);}}};
-    raw.then(({ok,status,data})=>{settled();if(!expired&&!closed){waiting.delete(reject);resolve({ok,status,json:async()=>data});}},cause=>{settled();waiting.delete(reject);reject(cause);});
+    raw.then(({ok,status,data})=>{settled();if(!expired&&!closed){waiting.delete(reject);resolve({ok,status,json:async()=>data});}},cause=>{if(record)record.uncertain=true;settled();waiting.delete(reject);reject(cause);});
   });
   bounded.expired=()=>expired;
   bounded.finish=()=>{closed=true;waiting.clear();};

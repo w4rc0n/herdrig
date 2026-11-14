@@ -7,7 +7,7 @@ import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
-import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED } from "./rig-connections.js";
+import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, CONNECTIONS_LIST_REFUSED, CONNECTIONS_LIST_SUPPORTED } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
 const SYSTEM_VIEW_LABELS = new Map(SYSTEM_PAGE_VIEWS);
@@ -359,7 +359,7 @@ export const STATE_COPY = Object.freeze({
 });
 
 /** `<app home>/openrig/config.json`, optional overrides for `person`, `daemonUrl`, `rig`, and `openrigHome`. */
-export function parseConfig(text) {
+export function parseConfig(text, { connectionsList = CONNECTIONS_LIST_SUPPORTED } = {}) {
   let raw = null;
   try { raw = JSON.parse(text ?? "null"); } catch { raw = null; }
   if (!raw || typeof raw !== "object") { const { connections } = connectionsOf(null); return { person: null, daemonUrl: null, rig: ["rig"], openrigHome: null, missing: true, connectionId: connections[0].id, connections }; }
@@ -375,6 +375,12 @@ export function parseConfig(text) {
   const capabilities = raw.capabilities && typeof raw.capabilities === "object" && !Array.isArray(raw.capabilities) ? raw.capabilities : undefined;
   // The connections this config describes (v0.5.0): the legacy daemonUrl / daemonMachine keys are connection one of a list of one, and
   // nothing is rewritten. PR 1 runs the first connection only; the config below is that connection's, so a single-daemon setup is as it was.
+  // v0.4.5 reads one OpenRig connection: a `connections` list (any, even an empty or invalid one) is refused outright. The config is inert (no address,
+  // no home, no machine, not even the legacy keys next to the list) and says why; nothing is sent to any listed entry. v0.5.0 lifts this.
+  if (!connectionsList && raw.connections !== undefined && raw.connections !== null) {
+    return { person, daemonUrl: null, rig, openrigHome: null, missing: false, connectionId: LEGACY_CONNECTION_ID, connections: connectionsOf(null).connections,
+      connectionsRefused: CONNECTIONS_LIST_REFUSED, ...(raw.reducedMotion === true ? { reducedMotion: true } : {}) };
+  }
   const { connections, legacy } = connectionsOf(raw);
   const first = connections[0];
   return {
@@ -960,6 +966,7 @@ export function settleRead(prev, outcome, now = Date.now()) {
  */
 export function preserveCliDiscoveredConfig(next, prev) {
   if (!next || !prev) return next;
+  if (next.connectionsRefused) return next; // a refused list has no address, not even one the CLI found earlier
   if (!next.daemonUrl && prev.daemonUrlSource === "cli" && prev.daemonUrl) {
     const merged = {
       ...next,
@@ -982,6 +989,7 @@ export function preserveCliDiscoveredConfig(next, prev) {
  *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
  *  and send that home's terminal token to whatever address the connection names. Every command, a read as much as a write, is refused. */
 export function cliRefusal(config) {
+  if (config?.connectionsRefused) return config.connectionsRefused; // a refused connections list: nothing of OpenRig's runs
   return config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID && !config.openrigHome ? HOME_NEEDED : null;
 }
 /** A command that runs nothing of OpenRig's and fails (`false`: no shell, no output). The words for the person are `cliRefusal`'s, shown by the
