@@ -27,7 +27,7 @@ import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, h
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
 import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
 const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
@@ -268,11 +268,17 @@ export default class RigView extends View {
 
   loadConfig(cx) {
     cx.spawn(async (cx) => {
+      // Loads run concurrently (the watcher, the timers): a load that was overtaken by a newer one must not install its older config, or it would reopen the
+      // send gate after the newer load closed it.
+      const seq = this.loadSeq = (this.loadSeq ?? 0) + 1;
       const next = preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())), this.config);
+      let consentMachine = null;
       try{
         const saved=consentOf(await readTextFile(`${appHome()}/openrig/spec-consent.json`),this.config?.connectionId??LEGACY_CONNECTION_ID),key=JSON.parse(saved?.key??"null");
-        this.specConsentMachine=key?.sha256===SPEC_SHA256?key.machine:null;
-      }catch{this.specConsentMachine=null;}
+        consentMachine=key?.sha256===SPEC_SHA256?key.machine:null;
+      }catch{consentMachine=null;}
+      if (seq !== this.loadSeq) return; // a newer load has started: it installs its own
+      this.specConsentMachine=consentMachine;
       if (sameConfig(next, this.config)) return;
       if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine || next.connectionId !== this.config.connectionId)) {
         this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx); // reads still in flight belong to the old daemon (or the old connection at the same address)
@@ -392,8 +398,11 @@ export default class RigView extends View {
       this.config = nextCfg;
       return fromShared;
     }
-    const status = await discoverDaemonFromCli(this.config, exec);
-    // The config can turn refused while the CLI answers (loadConfig installs it): the answer is for the config that asked, so it is dropped.
+    let status;
+    // The config can turn refused (or change) while the CLI answers (loadConfig installs it): the answer is for the config that asked, so it is dropped
+    // and the reason is the gate's own sentence.
+    try { status = await discoverDaemonFromCli(this.config, exec); }
+    catch (error) { if (error?.code === "GATE_REFUSED") { this.lastDaemonMessage = error.message; return null; } throw error; }
     if (this.config?.connectionsRefused) { this.lastDaemonMessage = this.config.connectionsRefused; return null; }
     if (status.reachable && status.daemonUrl) {
       const nextCfg = { ...this.config, daemonUrl: status.daemonUrl, daemonUrlSource: "cli", daemonState: status.state };
@@ -2194,27 +2203,31 @@ export default class RigView extends View {
     const conflict = (onDisk) => { box.conflict = "The file changed on disk since you opened it."; if (onDisk != null) box.diskText = onDisk; };
     cx.spawn(async (cx) => {
       try {
+        // One operation: the address and the validation belong to the config this save began under. If the settings change in between (a list installed,
+        // an address edited), the save was NOT validated: nothing is written, and the person is told why.
+        const op = gatedOperation();
         // Written only inside the local spec folders, at the resolved path: a symlink out of them is refused.
         const file = await resolveInSpecRoots(s.sourcePath, this.specRoots, exec);
         if (!file) { box.note = refused; return; }
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) { box.note = "The daemon address isn't known yet."; return; }
         const route = s.kind === "agent" ? "/api/agents/validate" : "/api/rigs/import/validate";
-        const r = await fetch(`${daemonUrl}${route}`, { method: "POST", headers: { "content-type": "text/yaml" }, body: edited });
-        let data = null; try { data = JSON.parse(await r.text()); } catch (_) { data = null; }
+        const r = await op.fetch(`${daemonUrl}${route}`, { method: "POST", headers: { "content-type": "text/yaml" }, body: edited });
+        let data = null; try { data = JSON.parse(await r.text()); } catch (e) { data = rethrowGate(null)(e); }
         if (!r.ok || data?.valid === false) {
           box.errors = Array.isArray(data?.errors) && data.errors.length ? data.errors : [data?.error ?? data?.message ?? `Validation failed (${r.status})`];
           return;
         }
         const onDisk = await readTextFile(file).catch(() => null);
         if (onDisk != null && onDisk !== box.loaded) { conflict(onDisk); return; }
+        op.check(); // the validation above is only good for the config it was asked under
         try { await writeTextFile(file, edited, box.loaded); } catch (e) {
           // A changed file is a conflict; any other failure (permissions, I/O) says what it was.
           const now = await readTextFile(file).catch(() => null);
           if (now != null && now !== box.loaded) conflict(now); else box.errors = [String(e?.message ?? e)];
           return;
         }
-        const synced = await fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(() => null);
+        const synced = await op.fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(rethrowGate(null));
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
         box.savedText = synced?.ok ? "Saved." : "Saved; library re-index failed.";
         delete this.specCopyNotes?.[s.id];
@@ -2288,6 +2301,7 @@ export default class RigView extends View {
     box.copying = true; box.note = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
+        const op = gatedOperation(); // the library re-read below belongs to the config this copy began under
         const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s) : await this.specText(s);
         // Agent refs relative to the original's folder are made absolute (text only); a copy that couldn't find its agents is never written.
         const prepared = copyableSpecText(source, s.sourcePath);
@@ -2303,17 +2317,17 @@ export default class RigView extends View {
         const r = writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
         if (!r.ok) { box.note = r.text; return; }
         const daemonUrl = await this.resolveDaemonUrl();
-        if (daemonUrl) await fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(() => null);
+        if (daemonUrl) await op.fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(rethrowGate(null));
         let made = s.id, copy = null;
         try {
-          const res = daemonUrl ? await fetch(`${daemonUrl}/api/specs/library`) : null;
+          const res = daemonUrl ? await op.fetch(`${daemonUrl}/api/specs/library`) : null;
           const list = res ? JSON.parse(await res.text()) : null;
           if (res?.ok && Array.isArray(list)) {
             this.cache["/api/specs/library"] = { data: list, at: Date.now() };
             copy = list.find((x) => x.name === s.name && x.kind === s.kind && x.sourceType !== "builtin" && x.sourcePath) ?? null;
             made = copy?.id ?? s.id;
           }
-        } catch (_) { /* the list stays as it was */ }
+        } catch (e) { rethrowGate(null)(e); /* a gate refusal stops the copy flow; otherwise the list stays as it was */ }
         if (made !== s.id) {
           delete this.specBoxes?.[made];
           (this.specAutoEdit ??= new Set()).add(made);
@@ -2441,21 +2455,22 @@ export default class RigView extends View {
 
   /** What the folder-copy steps need from this page (see rig-spec-folder.js). The folder is copied on the box when a machine is
    *  configured, else on this computer; the daemon only ever supplies text. */
-  folderHost(cx, config, daemonUrl) {
-    const post = (path, init) => fetch(`${daemonUrl}${path}`, { method: "POST", ...init });
+  folderHost(cx, config, daemonUrl, op = gatedOperation()) {
+    // `op` was created by the caller at the moment it captured `config` (before any await): every send of this copy flow belongs to that config.
+    const post = (path, init) => op.fetch(`${daemonUrl}${path}`, { method: "POST", ...init });
     return {
       specText: (spec) => this.specText(spec),
       validate: async (text) => {
         const checked = await post("/api/rigs/import/validate", { headers: { "content-type": "text/yaml" }, body: text });
-        let v; try { v = JSON.parse(await checked.text()); } catch (_) { v = null; }
+        let v; try { v = JSON.parse(await checked.text()); } catch (e) { v = rethrowGate(null)(e); }
         return { ok: checked.ok && v?.valid !== false, errors: v?.errors ?? (v?.error ? [v.error] : undefined) };
       },
       addFolder: (request, grant) => config.daemonMachine
         ? this.remoteSpecController(cx).perform(config, { verb: "copy-folder", ...request }, grant)
         : this.localAddFolder(request, daemonUrl, cx),
       library: async (fresh) => {
-        if (fresh) await post("/api/specs/library/sync").catch(() => null);
-        const res = await fetch(`${daemonUrl}/api/specs/library`);
+        if (fresh) await post("/api/specs/library/sync").catch(rethrowGate(null));
+        const res = await op.fetch(`${daemonUrl}/api/specs/library`);
         if (!res.ok) throw new Error("The copy was made, but the library couldn't be read. Refresh before copying again.");
         const list = JSON.parse(await res.text());
         this.cache["/api/specs/library"] = { data: list, at: Date.now() };
@@ -2463,7 +2478,7 @@ export default class RigView extends View {
       },
       rename: async (id, name) => {
         const res = await post(`/api/specs/library/${encodeURIComponent(id)}/rename`, { headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
-        let data; try { data = JSON.parse(await res.text()); } catch (_) { data = null; }
+        let data; try { data = JSON.parse(await res.text()); } catch (e) { data = rethrowGate(null)(e); }
         if (!res.ok) throw new Error(`The copy was made but couldn't be renamed: ${data?.error ?? data?.message ?? `HTTP ${res.status}`}`);
         return data?.entry ?? null;
       },
@@ -2500,12 +2515,16 @@ export default class RigView extends View {
     const box = this.specBoxes?.[s.id];
     if (!box || box.copying || box.awaitingPermission) return;
     const config = { ...this.config };
+    // The operation begins where the config is captured, synchronously: a settings change while the address is resolved (a CLI discovery on a default
+    // install) must not pair this config's machine and home with the new address.
+    let op; try { op = gatedOperation(); } catch (error) { box.note = String(error?.message ?? error); cx.notify(); return; }
     box.copying = true; box.note = null; box.errors = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) throw new Error("The daemon address isn't known yet.");
-        const host = this.folderHost(cx, config, daemonUrl);
+        op.check(); // the address resolved above is for the config that asked
+        const host = this.folderHost(cx, config, daemonUrl, op);
         const out = await copyBuiltinFolder(host, s, consent);
         if (out.needsConsent) {
           if (this.specPermission) throw new Error("Finish the open spec permission dialog first.");
@@ -2575,6 +2594,7 @@ export default class RigView extends View {
     const config={...this.config};box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
     cx.spawn(async cx=>{
       try{
+        const op=gatedOperation(); // the validation below is only good for the config this write began under
         const daemonUrl=await this.resolveDaemonUrl();if(!daemonUrl)throw Error("The daemon address isn't known yet.");
         let content=request.content??await this.specText(s);
         if(request.verb==="copy"){
@@ -2584,9 +2604,10 @@ export default class RigView extends View {
         }
         const operation={...request,content};
         const route=s.kind==="agent"?"/api/agents/validate":"/api/rigs/import/validate";
-        const checked=await fetch(`${daemonUrl}${route}`,{method:"POST",headers:{"content-type":"text/yaml"},body:content});
-        let validation;try{validation=JSON.parse(await checked.text());}catch{}
+        const checked=await op.fetch(`${daemonUrl}${route}`,{method:"POST",headers:{"content-type":"text/yaml"},body:content});
+        let validation;try{validation=JSON.parse(await checked.text());}catch(e){validation=rethrowGate(undefined)(e);}
         if(!checked.ok||validation?.valid===false){box.errors=validation?.errors??[validation?.error??"Validation failed."];return;}
+        op.check();
         const result=await this.remoteSpecController(cx).perform(config,operation,consent);
         if(result.needsConsent){
           if(this.specPermission)throw Error("Finish the open spec permission dialog first.");
@@ -2597,7 +2618,7 @@ export default class RigView extends View {
         }
         if(!result.ok)throw Error(result.reason??"The box did not confirm the write.");
         this.specConsentMachine=config.daemonMachine;
-        const synced=await fetch(`${daemonUrl}/api/specs/library/sync`,{method:"POST"}).catch(()=>null);
+        const synced=await op.fetch(`${daemonUrl}/api/specs/library/sync`,{method:"POST"}).catch(rethrowGate(null));
         if(request.verb==="save"){
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
           box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
@@ -2606,7 +2627,7 @@ export default class RigView extends View {
           if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true);}
         }else{
           if(!synced?.ok)throw Error(`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
-          const response=await fetch(`${daemonUrl}/api/specs/library`);if(!response.ok)throw Error("The copy was saved, but the library couldn't be read. Refresh before copying again.");
+          const response=await op.fetch(`${daemonUrl}/api/specs/library`);if(!response.ok)throw Error("The copy was saved, but the library couldn't be read. Refresh before copying again.");
           const list=JSON.parse(await response.text()),copy=list.find(x=>x.sourceType==="user_file"&&x.sourcePath===result.path);
           if(!copy)throw Error("The copy was saved, but isn't indexed yet. Refresh before copying again.");
           this.cache["/api/specs/library"]={data:list,at:Date.now()};
@@ -3677,6 +3698,9 @@ export default class RigView extends View {
     const config = this.config;
     cx.spawn(async (cx) => {
       try {
+        // One operation: the address, the revision read and the POST belong to the config this decision began under. If the address changed while the
+        // revision was read, nothing is POSTed to the old daemon.
+        const op = gatedOperation();
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) {
           box.busy = false;
@@ -3689,7 +3713,7 @@ export default class RigView extends View {
         let latestRevision = queueRow?.decisionRevision ?? detailItem?.decisionRevision ?? n.decisionRevision ?? null;
         if ((latestRevision === null || latestRevision === undefined) && qid) {
           try {
-            const qr = await fetch(`${daemonUrl}/api/queue/${encodeURIComponent(qid)}`);
+            const qr = await op.fetch(`${daemonUrl}/api/queue/${encodeURIComponent(qid)}`);
             if (qr.ok) {
               const qd = await qr.json();
               if (qd && (typeof qd.decisionRevision === "number" || typeof qd.decisionRevision === "string")) {
@@ -3697,7 +3721,7 @@ export default class RigView extends View {
                 this.cache[`/api/queue/${encodeURIComponent(qid)}`] = { data: qd, status: qr.status, at: Date.now() };
               }
             }
-          } catch (_) { /* expectedRevision is omitted in missionAction when decisionRevision is unavailable */ }
+          } catch (e) { rethrowGate(null)(e); /* a gate refusal stops the decision; other failures: expectedRevision is omitted in missionAction when decisionRevision is unavailable */ }
         }
         const itemForAction = {
           ...n,
@@ -3721,7 +3745,7 @@ export default class RigView extends View {
           },
         };
         const outcome = await submitMissionActions(config, itemForAction, actWithProgress, async (req) => {
-          const r = await fetch(`${daemonUrl}${req.path}`, {
+          const r = await op.fetch(`${daemonUrl}${req.path}`, {
             method: req.method ?? "POST",
             headers: req.headers ?? { "content-type": "application/json" },
             body: JSON.stringify(req.body),
@@ -3938,7 +3962,7 @@ export default class RigView extends View {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ providers: ["codex", "claude"] }),
         });
-        let data = null; try { data = JSON.parse(await r.text()); } catch (_) { data = null; }
+        let data = null; try { data = JSON.parse(await r.text()); } catch (e) { data = rethrowGate(null)(e); }
         if (r.status === 409 || isUsageWindowsDisabled({ status: r.status, data, error: data?.error })) {
           this.usageRefreshNote = { ok: false, text: "Usage windows are off (provider.usage_windows = false)." };
         } else if (!r.ok) {

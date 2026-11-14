@@ -27,7 +27,7 @@ import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
 import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, gateSameConfig, CONFIG_CHANGED_OPEN, GateRefusal, gatedOperation } from "./rig-gate.js";
 // A gate refusal is the answer, not a failure to swallow: the person is told it before the menu closes.
 const sayRefusal = (error) => { if (error?.code === "GATE_REFUSED") notify({ title: "OpenRig", body: error.message, level: "warning" }); };
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
@@ -64,15 +64,27 @@ const RESULT_HEIGHT = 240;
 const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-model", "new-rig"]);
 /** Reopens this mod as a dialog for a step (input, confirm, result). A click beside it closes it. */
 const dialog = (target, step, height = 260) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
-const configNow = async () => {
+/** A fresh read of config.json, seen by the send gate. The menu has no config watcher (it is a dialog that opens and closes), so a list installed while
+ *  one is open is only seen when something reads the file: every action that sends reads it first. It keeps no address the CLI found
+ *  (the file has none), and the gate does not forget the one it knows. */
+const freshFileConfig = async () => {
   const cfg = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
-  observeConfig(cfg); // a fresh read of config.json is the current config, whoever holds it
+  observeConfig(cfg);
+  return cfg;
+};
+/** Whether config.json still says what it said when this dialog opened, for everything a send acts on: the gate's identity (connection, the file\'s address,
+ *  machine, home) and who the action is attributed to and which CLI it runs. (The person and the command stay out of the gate's identity on purpose.) */
+const sameDialogConfig = (a, b) => gateSameConfig(a, b) && (a.person ?? null) === (b.person ?? null) && JSON.stringify(a.rig ?? null) === JSON.stringify(b.rig ?? null);
+const configNow = async () => {
+  const cfg = await freshFileConfig(); // a fresh read of config.json is the current config, whoever holds it
   if (cfg.connectionsRefused) return { ...cfg, daemonMessage: cfg.connectionsRefused }; // a refused list has no address, from anywhere
   if (cfg.daemonUrl) return cfg;
   // Another mod's shared state may name the daemon only when it's on this machine (loopback).
   const fromShared = sharedLoopbackDaemonUrl(cfg, shared("rig.data"));
   if (fromShared) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
-  const status = await discoverDaemonFromCli(cfg, exec);
+  let status;
+  try { status = await discoverDaemonFromCli(cfg, exec); }
+  catch (error) { if (error?.code === "GATE_REFUSED") return { ...cfg, daemonMessage: error.message }; throw error; } // the settings changed: say so, not "unreachable"
   if (status.reachable && status.daemonUrl) return { ...cfg, daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
   return { ...cfg, daemonMessage: status.message || cfg.daemonMessage };
 };
@@ -89,8 +101,8 @@ const designDraftKey = (target) => `designer:${target?.rig ?? "rig"}:${target?.r
 const oneClick = (target, action) => startOneClick({ shared, setShared, run, layout, openOverlay }, target, action);
 
 /** The slice folders the daemon knows (`/api/slices`: each with its `slicePath`), by folder name. */
-async function slicePaths(config) {
-  const r = await fetch(`${config.daemonUrl}/api/slices`);
+async function slicePaths(config, op = gatedOperation()) {
+  const r = await op.fetch(`${config.daemonUrl}/api/slices`);
   if (!r.ok) throw new Error(`GET /api/slices → ${r.status}`);
   const body = await r.json();
   return new Map((body?.slices ?? []).filter((s) => typeof s.slicePath === "string").map((s) => [s.slicePath.split(/[\\/]/).pop(), s.slicePath]));
@@ -150,13 +162,14 @@ function complete(target, config) {
 async function openSlice(target, file = null) {
   const config = await configNow();
   if (!config.daemonUrl) return info(target, config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
+  const op = gatedOperation(); // the address above is this operation's: every request below refuses to go once the settings change
   try {
-    const get = async (path) => { const r = await fetch(`${config.daemonUrl}${path}`); if (!r.ok) throw new Error(`GET ${path} → ${r.status}`); return r.json(); };
+    const get = async (path) => { const r = await op.fetch(`${config.daemonUrl}${path}`); if (!r.ok) throw new Error(`GET ${path} → ${r.status}`); return r.json(); };
     const [rows, scopes] = await Promise.all([get(`/api/queue/list?destinationSession=${encodeURIComponent(target.session)}`), get("/api/scopes?counts=1")]);
     const hit = sliceForSeat(Array.isArray(rows) ? rows : rows?.items ?? [], scopes?.missions ?? []);
     if (!hit) return notify({ title: `${target.logicalId ?? target.session} has no open work naming a slice.`, level: "info" });
     if (!file) return page({ section: "scopes", mission: hit.mission, slice: hit.slice, name: hit.name });
-    const folder = (await slicePaths(config)).get(hit.slice);
+    const folder = (await slicePaths(config, op)).get(hit.slice);
     if (!folder) return info(target, `OpenRig doesn't say where ${hit.name} is on disk.`);
     return page(fileEntry(`${folder}/${file}`, `${file} · ${hit.name}`));
   } catch (e) { info(target, String(e?.message ?? e)); }
@@ -199,6 +212,7 @@ export default class RigMenu extends View {
     cx.spawn(async (cx) => {
       // The daemon's address as the other mods find it (config.json, a loopback address in shared state, then the CLI),
       // so Attach and Retry work without the sidebar too.
+      this.openedOn = await freshFileConfig(); // what config.json said when this dialog opened: a later send compares against it
       this.config = await configNow();
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         this.setupPanel=new MachineSetupPanel(this.machineSetupHost(cx),this.config,step.machine??step.confirmation?.machine,{
@@ -319,7 +333,7 @@ export default class RigMenu extends View {
     this.newSpecPreviews.set(spec, { loading: true });
     cx.spawn(async (cx) => {
       try {
-        const config = this.config ?? await configNow();
+        const config = await this.currentConfig();
         this.newSpecPreviews.set(spec, { data: await readRigSpecPreview(fetch,config.daemonUrl,spec) });
       } catch (e) { this.newSpecPreviews.set(spec, { error: singleLineText(e?.message ?? e).slice(0, 240) }); }
       cx.notify();
@@ -574,9 +588,21 @@ export default class RigMenu extends View {
     if (changed) setShared("rig.drafts", all);
   }
 
+  /** The config an action may send under: this dialog's own, but only while config.json still says the same (a list or another address typed since the
+   *  dialog opened refuses; the dialog's connection is not used for a send after that). */
+  async currentConfig() {
+    const fresh = await freshFileConfig();
+    if (fresh.connectionsRefused) throw new GateRefusal(fresh.connectionsRefused);
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) throw new GateRefusal(CONFIG_CHANGED_OPEN);
+    return this.config ?? configNow();
+  }
+
   /** Runs one CLI write as the person; returns { ok, json, text }. */
   async write(args, options, cx) {
     if (!args) return { ok: false, text: ACTION_REFUSED };
+    const fresh = await freshFileConfig();
+    if (fresh.connectionsRefused) return { ok: false, text: fresh.connectionsRefused }; // a list installed while this dialog was open
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return { ok: false, text: CONFIG_CHANGED_OPEN }; // the connection below is the one this dialog opened on
     // The connection is the target's own, from the row it came from: never a default. Without one nothing is sent.
     const conn = targetConnection(this.config, props()?.target);
     if (!conn.ok) return { ok: false, text: conn.reason };
@@ -592,6 +618,9 @@ export default class RigMenu extends View {
 
   async read(args) {
     // Pin this machine on Retry's `ps` re-read so a saved remote `host.selected` never queries another host.
+    const fresh = await freshFileConfig();
+    if (fresh.connectionsRefused) return null; // a list installed while this dialog was open
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return null; // the settings changed since this dialog opened: its connection is stale
     const conn = targetConnection(this.config, props()?.target);
     if (!conn.ok) return null;
     const cmd = readCommand(conn.config, [...args, "--json"], { env: ["OPENRIG_HOST_SELECTED=local"] });
@@ -619,7 +648,8 @@ export default class RigMenu extends View {
     cx.spawn(async (cx) => {
       const t = complete(props().target, this.config);
       // The confirmation shows the target's own daemon's seats (the write goes there too), never the default one's.
-      const conn = targetConnection(this.config ?? await configNow(), t);
+      let conn;
+      try { conn = targetConnection(await this.currentConfig(), t); } catch (e) { this.pause = { error: String(e?.message ?? e) }; cx.notify(); return; }
       if (!conn.ok) { this.pause = { error: conn.reason }; cx.notify(); return; }
       const config = conn.config;
       if (!config.daemonUrl) { this.pause = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." }; cx.notify(); return; }
@@ -1308,7 +1338,7 @@ export default class RigMenu extends View {
     if (step.action === "reply") {
       this.run(cx, "Sending", async () => {
         // To the target's own daemon, resolved the way `write` resolves it; nothing is sent when it can't be.
-        const conn = targetConnection(this.config ?? await configNow(), target);
+        const conn = targetConnection(await this.currentConfig(), target);
         if (!conn.ok) return { ok: false, text: conn.reason };
         const cfg = conn.config;
         if (!cfg.daemonUrl) return { ok: false, text: cfg.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." };

@@ -1514,7 +1514,8 @@ export default class RigSidebar extends View {
         for (const path of Object.keys(this.lists)) this.lists[path] = { ...this.lists[path], stale: true };
       }
     } catch (e) {
-      const errMsg = "Couldn't refresh OpenRig. Check the connection and retry.";
+      // A gate refusal (the settings changed while this ran, or a list is installed) is not a connection problem: the person gets its sentence.
+      const errMsg = e?.code === "GATE_REFUSED" ? e.message : "Couldn't refresh OpenRig. Check the connection and retry.";
       this.error = errMsg;
       if (!this.data) {
         const fallbackProbe = probed ?? await probeOpenRigState(
