@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.4
+Version: v0.4.5
 
 **OpenRig Mod for Herdr**
 
@@ -43,6 +43,7 @@ act from there (answer a request, message a seat, attach to it) without leaving 
 - **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
   questions, or reply in your own words), with quiet hours and modes in **System → People**.
 - **Command palette** on `ctrl-alt-r`.
+- **Connected assistants:** queue-checking team members have a folded group under their rig, All seats rows and a read-only detail page. Their own check-in words stay separate from activity counts; Queue work, Copy address and Open rig page are their only actions. Older OpenRig versions without the roster route show nothing.
 - **Right-click menus** on seats (send, queue, pause or resume, change model), Needs requests, specs and slices.
 - **Attach** opens a live seat in its own tab, and Herdr's **Agents** section shows its status.
 - **Follows your space:** the sidebar folds outside OpenRig's spaces, keeping Needs you and search visible. Click its

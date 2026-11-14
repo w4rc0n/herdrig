@@ -53,7 +53,8 @@ function inspect(run,machine,home){
  }
  return{path:current,sha256};
 }
-function shipped(){const f=path.join(__dirname,FILE),s=fs.lstatSync(f);if(!s.isFile()||s.isSymbolicLink())throw Error("Invalid shipped spec helper.");const bytes=fs.readFileSync(f);if(hash(bytes)!==SPEC_SHA256)throw Error("The spec helper does not match this release. Reinstall the mod.");return bytes;}
+// One open that refuses a symlink, the fd's own type, and the read through that fd; the bytes are then checked against the pin.
+function shipped(){const f=path.join(__dirname,FILE),fd=fs.openSync(f,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);let bytes;try{if(!fs.fstatSync(fd).isFile())throw Error("Invalid shipped spec helper.");bytes=fs.readFileSync(fd);}finally{fs.closeSync(fd);}if(hash(bytes)!==SPEC_SHA256)throw Error("The spec helper does not match this release. Reinstall the mod.");return bytes;}
 // Read-only root preview before permission to install a helper. Reuse its root
 // policy with an adapter that issues fixed public argv operations on the box.
 function preview(machine,home,searchPath,record,run=spawnSync){

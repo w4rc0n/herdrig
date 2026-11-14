@@ -124,7 +124,7 @@ export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
   return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
 }
 
-export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, now = Date.now() }) {
+export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, askOwner, now = Date.now() }) {
   const { div, svg, h_flex } = ui;
   const out = [];
   const many = rows.filter((r) => r.kind === "seat").length > 12;
@@ -141,8 +141,8 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
     if (!expanded) continue;
     for (const row of members) {
       const helperKey = `priority-helpers:${row.key}`, helpersOpen = folds[helperKey] ?? true;
-      const context = row.ask?.criticalHealth ? "health" : row.kind === "ask" && row.seat
-        ? [row.seat.logicalId, row.rig?.name].filter(Boolean).join(" · ") : row.rig?.name ?? "no seat";
+      const context = row.ask?.criticalHealth ? "health" : askOwner?.(row.ask) ?? (row.kind === "ask" && row.seat
+        ? [row.seat.logicalId, row.rig?.name].filter(Boolean).join(" · ") : row.rig?.name ?? "no seat");
       register({ key: row.key, foldKey: helperKey, expandable: row.helpers.length > 0, isOpen: helpersOpen, parentKey: key, priorityRow: row });
       out.push(h_flex().id(`priority-${row.key}`).px(12).h(30).gap(7).rounded(8).items_center().cursor_pointer()
         .when(row.focused || selected === row.key, (el) => el.bg(t.selected ?? t.selection ?? t.raised))

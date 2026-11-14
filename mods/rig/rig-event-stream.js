@@ -29,3 +29,39 @@ export async function openRigEventStream(connect,url,onSocket=()=>{}){
   }
   throw new Error("OpenRig has no supported event stream.");
 }
+
+/** Herdr's mod runtime fails a socket read after 30 s without bytes ("Resource temporarily unavailable", os error 11), and OpenRig's event
+ *  stream sends nothing while quiet. That is an idle stream, not a closed one (a closed one reads as `null`). A TCP timeout is a dead peer. */
+export const isIdleTimeout = (error) => /Resource temporarily unavailable|os error 11\b/i.test(String(error?.message ?? error));
+
+/** After this many idle timeouts in a row (30 s each: about two minutes of silence) the stream is replaced even though the daemon still answers
+ *  on a new connection. A tunnel or middlebox can drop an idle flow without a reset: the daemon is fine, this socket is not, and it would
+ *  otherwise stay open and silent forever. The sidebar's 5 s polling keeps its data fresh meanwhile; the replacement costs one reconnect and
+ *  one refresh per two quiet minutes (the unfixed code did four reconnects in that time). */
+export const MAX_IDLE_TIMEOUTS = 4;
+
+/** Reads a stream until it ends. An idle timeout is not a disconnect: `alive()` (one small health request) decides, and while the daemon
+ *  answers the same socket is read again, so a quiet system makes no reconnect and no refresh. Returns "closed" (the daemon closed it),
+ *  "unhealthy" (the check failed or threw: reconnect with backoff), "stale" (MAX_IDLE_TIMEOUTS timeouts in a row with no data: replace it)
+ *  or "stopped"; any other read error is thrown to the caller. Any chunk resets the idle count. */
+export async function pumpEvents(socket, { onChunk, alive, stop }) {
+  let idle = 0;
+  for (;;) {
+    let chunk;
+    try { chunk = await socket.read(65536); }
+    catch (error) {
+      if (!isIdleTimeout(error)) throw error;
+      if (stop()) return "stopped";
+      let ok = false;
+      try { ok = await alive(); } catch { ok = false; }
+      if (stop()) return "stopped";
+      if (!ok) return "unhealthy";
+      if (++idle >= MAX_IDLE_TIMEOUTS) return "stale";
+      continue;
+    }
+    if (chunk === null) return "closed";
+    if (stop()) return "stopped";
+    idle = 0;
+    onChunk(chunk);
+  }
+}

@@ -11,10 +11,12 @@
 // Dialogs: a click beside one closes it (herdr's dialog), and a typed draft is kept per action and
 // target until it is sent or cancelled, so an accidental close loses nothing. Ctrl+Enter (Cmd+Enter on macOS) sends.
 //
-// props: { target: { kind: "seat"|"rig"|"pod"|"need"|"cell"|"views"|"open-view"|"spec"|"slice", ... }, step?: dialog state }
+// props: { target: { kind: "seat"|"assistant"|"rig"|"pod"|"need"|"cell"|"views"|"open-view"|"spec"|"slice", ... }, step?: dialog state }
+import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
 import { registerRigRouting } from "./rig-lib.js";
+import { targetConnection } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
@@ -23,7 +25,10 @@ import { rigOrigin } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc, settings, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc, settings, machines } from "herdr";
+import { guardFlatStore } from "./rig-connections.js";
+let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
+const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
 import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
@@ -160,6 +165,7 @@ export default class RigMenu extends View {
   init(_p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
     this.config = null;
+    flatOwner = this;
     this.busy = null;
     this.result = null;
     this.handle = cx.focus_handle?.() ?? null;
@@ -250,6 +256,7 @@ export default class RigMenu extends View {
   initNewRig(cx) {
     const drafts = shared("rig.drafts") ?? {};
     this.newMode = "spec";
+    // Set by field changes, Tab navigation, field focus, mode clicks and pointer-down in the dialog.
     this.newFocusTouched=false;
     this.newRuntime = NEW_RIG_RUNTIMES[0];
     this.newSpec = null;
@@ -553,16 +560,26 @@ export default class RigMenu extends View {
   }
 
   /** Runs one CLI write as the person; returns { ok, json, text }. */
-  async write(args, options) {
+  async write(args, options, cx) {
     if (!args) return { ok: false, text: ACTION_REFUSED };
-    const cmd = writeCommand(this.config, args, options);
+    // The connection is the target's own, from the row it came from: never a default. Without one nothing is sent.
+    const conn = targetConnection(this.config, props()?.target);
+    if (!conn.ok) return { ok: false, text: conn.reason };
+    const target=props()?.target;
+    if(target?.kind==='assistant'){
+      if(args[0]!=='queue'||args[1]!=='create'||args[args.indexOf('--destination')+1]!==target.session)return{ok:false,text:'Connected assistants only accept queued work.'};
+      const verified=await verifyAssistantTarget(fetch,conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done):null);if(!verified.ok)return{ok:false,text:verified.reason};
+    }
+    const cmd = writeCommand(conn.config, args, options);
     if (!cmd) return { ok: false, text: NO_PERSON };
     return writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
   }
 
   async read(args) {
     // Pin this machine on Retry's `ps` re-read so a saved remote `host.selected` never queries another host.
-    const cmd = readCommand(this.config, [...args, "--json"], { env: ["OPENRIG_HOST_SELECTED=local"] });
+    const conn = targetConnection(this.config, props()?.target);
+    if (!conn.ok) return null;
+    const cmd = readCommand(conn.config, [...args, "--json"], { env: ["OPENRIG_HOST_SELECTED=local"] });
     const r = await exec(cmd.command, cmd.args, { timeout: 60000 });
     try { return JSON.parse(r.stdout); } catch (_) { return null; }
   }
@@ -608,6 +625,13 @@ export default class RigMenu extends View {
       const reason = capReason ?? pReason;
       out.push({ icon: iconName, label, act, disabled: !!reason, reason, dynamicLabel });
     };
+    if(target.kind==='assistant'){
+      if(!assistantAddress(target.session)||!targetConnection(this.config,target).ok)return out;
+      item('rig-queue','Queue work…',()=>dialog(target,{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true},300),'queue');
+      item('rig-copy','Copy address',cx=>{if(assistantAddress(target.session)&&targetConnection(this.config,target).ok)cx.write_to_clipboard(target.session);});
+      item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',conn:target.conn,rigId:target.rigId,name:target.rig}));
+      return out;
+    }
     if(target.kind==="sidebar-header"){
       const enabled=(shared("rig.settings")?.notifications??true)!==false;
       item("rig-bell",enabled?"Turn notifications off":"Turn notifications on",()=>{
@@ -627,7 +651,7 @@ export default class RigMenu extends View {
     if (target.kind === "seat" || target.kind === "cell") {
       const stoppedSeat = isStopped(target);
       if(target.allSeats){
-        item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',rigId:target.rigId,name:target.rig}));
+        item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',rigId:target.rigId,conn:target.conn,name:target.rig}));
         if(target.session)item('rig-copy','Copy session name',cx=>cx.write_to_clipboard(target.session));
       }
       // The row's own actions first: ⋯, the right-click and the Menu key open this same list.
@@ -637,7 +661,7 @@ export default class RigMenu extends View {
         item("rig-queue", "Queue work…", () => dialog(target, { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), "queue");
         item("rig-swap", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), "change-model");
       }
-      item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, name: target.logicalId, session: target.session }));
+      item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.logicalId, session: target.session }));
       if (target.session&&!target.allSeats) item("rig-copy", "Copy session address", (cx) => cx.write_to_clipboard(target.session));
       out.push({
         icon: "terminal",
@@ -692,7 +716,7 @@ export default class RigMenu extends View {
       for (const child of children) item("rig-helper", `Peek ${child.label}`, () => run("terminal.peek", { terminal: child.address }), null, true);
     }
     if (target.kind === "pod") {
-      item("rig-card", "Show pod card", () => page({ section: "topology", kind: "pod", rig: target.rig, rigId: target.rigId, pod: target.pod, name: target.pod }));
+      item("rig-card", "Show pod card", () => page({ section: "topology", kind: "pod", rig: target.rig, rigId: target.rigId, conn: target.conn, pod: target.pod, name: target.pod }));
     }
     if (target.kind === "rigspace") {
       // herdrig's Spaces list: herdr's own two actions for any space first (herdr's own commands, with herdr's own confirmation for
@@ -700,9 +724,9 @@ export default class RigMenu extends View {
       item("square-pen", "Rename", () => run("space.rename", { id: target.space }));
       item("x", "Close", () => run("space.close", { id: target.space }));
       out.push({ divider: "" }); // the popup header already names the rig
-      const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, name: target.rig,
+      const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig,
         lifecycle: (shared("rig.data")?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig)?.lifecycle ?? null };
-      item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology" } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, name: target.rig }));
+      item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology" } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig }));
       item("rig-operator", "Attach operator", () => run("rig.operator"));
       if (!target.home && target.rig) {
         item("rig-snapshot", "Snapshot now", () => oneClick(rigTarget, "snapshot"));
@@ -762,14 +786,14 @@ export default class RigMenu extends View {
         if (target.slicePath) item("file-text", `Open ${file}`, () => page(fileEntry(`${target.slicePath}/${file}`, `${file} · ${target.name}`)));
       }
       item("rig-card", "Show slice card", () => page({ section: "scopes", mission: target.mission, slice: target.slice, name: target.name }));
-      item("rig-follow", "Follow this slice", () => oneClick({ kind: "follow-target", view: `slice:${target.id ?? target.slice}`, name: target.name }, "follow"), "follow");
+      item("rig-follow", "Follow this slice", () => oneClick({ kind: "follow-target", conn: target.conn, view: `slice:${target.id ?? target.slice}`, name: target.name }, "follow"), "follow");
     }
     if (target.kind === "strip-view") {
       // A worker view's strip pill: close it, follow its rig's active workers, or reach the rig.
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
       item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
       if (target.rig) item("rig-follow", "Follow active workers", () => oneClick({ ...target, view: `rig:${target.rig}` }, "follow"), "follow");
-      this.viewExtras(target.rig, item);
+      this.viewExtras(target.rig, item, target.conn);
     }
     if (target.kind === "following") {
       // A following view's strip menu: stop or resume, the TTL, close. Closing ends only its viewers.
@@ -786,7 +810,7 @@ export default class RigMenu extends View {
       }
       out.push({ divider: "" });
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
-      this.viewExtras(String(target.target ?? "").startsWith("rig:") ? target.target.slice(4) : null, item);
+      this.viewExtras(String(target.target ?? "").startsWith("rig:") ? target.target.slice(4) : null, item, target.conn);
       item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
     }
     if (target.kind === "views") {
@@ -809,7 +833,7 @@ export default class RigMenu extends View {
           notify({ title: "This view is full (4×4)", level: "warning" });
           return;
         }
-        oneClick({ kind: "open-view", view: `rig:${target.rig}`, rig: target.rig, grid: nextGrid, replace: target.viewId }, "open-designed-view");
+        oneClick({ kind: "open-view", conn: target.conn, view: `rig:${target.rig}`, rig: target.rig, grid: nextGrid, replace: target.viewId }, "open-designed-view");
       }, "cell-split", true);
       out.push({ divider: "" });
       const stripView = viewInStrip(target.viewId);
@@ -846,7 +870,7 @@ export default class RigMenu extends View {
     if (target.kind === "system" && target.entry) item("rig-popout", `Open ${target.name}`, () => page(target.entry), null, true);
     if (target.kind === "saved-view" || target.kind === "terminal") {
       item("rig-card", "Show view", () => page({ section: "terminals", view: target.view, name: target.name }));
-      item("rig-view", "Open in herdr", () => oneClick({ kind: "open-view", view: target.view, rig: target.rig }, "open-view"), "open-view");
+      item("rig-view", "Open in herdr", () => oneClick({ kind: "open-view", conn: target.conn, view: target.view, rig: target.rig }, "open-view"), "open-view");
     }
     // A group's order can live under several keys (Specs: one per namespace): Reset clears every one that has an order.
     if (target.reorder) {
@@ -899,9 +923,9 @@ export default class RigMenu extends View {
   }
 
   /** What a strip view's menu adds for its rig: the rig card (with rigId when known), the TUI, a snapshot. */
-  viewExtras(rig, item) {
+  viewExtras(rig, item, conn) {
     item("terminal", "Open or switch to the Rig TUI", () => run("rig.tui"));
-    if (rig) item("rig-snapshot", "Snapshot now", () => oneClick({ kind: "rig", rig }, "snapshot"));
+    if (rig) item("rig-snapshot", "Snapshot now", () => oneClick({ kind: "rig", rig, conn }, "snapshot"));
   }
 
   /** The CLI behind each action (rig-lib actionArgs, shared with the sidebar's one-click runs). */
@@ -1014,6 +1038,7 @@ export default class RigMenu extends View {
         : target.kind === "cell-split" ? `Split ${target.logicalId ?? target.seat}` : target.kind === "pod" ? `Pod ${target.pod} · ${target.rig}`
         : target.kind === "host" ? `Host ${target.name}` : target.kind === "mission" ? `Mission ${target.name}` : target.kind === "branch" ? target.name
         : target.kind === "specs-group" ? `${target.name} specs` : target.kind === "system-config" || target.kind === "system" ? target.name
+        : target.kind === 'assistant' ? `Connected assistant ${target.logicalId ?? target.name}`
         : target.kind === "saved-view" || target.kind === "terminal" ? `View ${target.name ?? target.view}` : `Rig ${target.rig ?? ""}`))
       .child(v_flex().id('rig-action-list').min_h(0).h(Math.min(260,items.length*26+reasons.length*40)).overflow_y_scrollbar().track_scroll(this.menuScroll)
         .on_size_change((_size,cx)=>{if(this.menuIndex>=0)this.menuScroll?.scroll_to_item(this.menuIndex);cx.notify();})
@@ -1113,6 +1138,8 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
+    const assistantReason=assistantActionRefusal(target,step.action);
+    if(assistantReason){this.result={ok:false,text:assistantReason};cx.notify();return;}
     if(step.action==="confirm-spec-write"){
       if(!step.token)return;
       setShared("rig.specWriteDecisions",{...(shared("rig.specWriteDecisions")??{}),[step.token]:"allow"});
@@ -1275,7 +1302,7 @@ export default class RigMenu extends View {
       return;
     }
     const label = { pause: "Pausing", resume: "Resuming", fresh: "Starting fresh" }[step.action] ?? "Working";
-    this.run(cx, label, () => this.write(this.argsFor(target, step.action, text)));
+    this.run(cx, label, () => this.write(this.argsFor(target, step.action, text),undefined,cx));
   }
 
   /** Modal body: change seat harness, model, and effort ("Always via lead" + advisor for orch.lead). */

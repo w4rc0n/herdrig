@@ -5,10 +5,14 @@
 // `reply <words>` fills the request's inline reply); an error stays inline.
 // Local commands (`LOCAL_COMMANDS`): `open-page` opens/focuses the Rig Page tab, and `open-tui` / `tui` shows the active
 // space's TUI (or opens one, with the recorded CLI).
+import { stampConnection } from "./rig-connections.js";
 import { View, div } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
-import { appHome, readTextFile, theme, run, exec, shared, setShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout, notify } from "herdr";
+import { appHome, readTextFile, theme, run, exec, shared, setShared as rawSetShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout, notify } from "herdr";
+import { guardFlatStore } from "./rig-connections.js";
+let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
+const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
 import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
 
 /** The palette's own commands, offered first when they match what is typed. */
@@ -20,6 +24,7 @@ const STACK = "rig-work", PAGE = "rig-page";
 
 export default class RigPalette extends View {
   init(_p, cx) {
+    flatOwner = this;
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
     this.input = InputState.new({ placeholder: "agent dev.design · :scopes · tab graph · /codex" });
     // An opener can start it with text (the Rig page's Filter… starts it at "/").
@@ -197,7 +202,7 @@ export default class RigPalette extends View {
     const top = (shared("rig.nav") ?? {}).stack?.at(-1);
     const rig = name ? rigs.find((r) => r.name === name) : rigs.find((r) => top?.kind === "rig" && r.id === top.rigId) ?? rigs[0];
     if (!rig) { this.error = name ? `No rig ${name} on this daemon.` : "No rig to design a view for."; cx.notify(); return true; }
-    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target: { kind: "rig", rig: rig.name, rigId: rig.id, lifecycle: rig.lifecycle }, step: { action: "design-view" } } });
+    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target: { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle }, step: { action: "design-view" } } });
     this.dismiss();
     return true;
   }
@@ -226,7 +231,7 @@ export default class RigPalette extends View {
         target: {
           kind: "seat",
           rig: rig.name,
-          rigId: rig.id,
+          rigId: rig.id, conn: rig.conn,
           session: seat.session,
           logicalId: seat.logicalId,
           runtime: seat.runtime,
@@ -321,6 +326,7 @@ export default class RigPalette extends View {
       kind: "seat",
       rig: "kernel",
       rigId: kernelRig?.id ?? "kernel",
+      conn: kernelRig?.conn ?? this.config?.connectionId, // topology not loaded yet: the palette's own connection (one in PR 1)
       session: operatorSeat?.session ?? "operator-agent@kernel",
       logicalId: operatorSeat?.logicalId ?? "operator.agent",
       tmuxAttachCommand: operatorSeat?.tmuxAttachCommand ?? "tmux attach -t operator-agent@kernel",
@@ -358,7 +364,7 @@ export default class RigPalette extends View {
     const daemonUrl = await this.resolveDaemonUrl();
     const r = await fetch(`${daemonUrl}${path}`);
     if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
-    return r.json();
+    return stampConnection(await r.json(), this.config?.connectionId);
   }
 
   /** The work a line asks for that isn't just a page (paletteRoute's acts). Errors stay inline. */
@@ -379,7 +385,7 @@ export default class RigPalette extends View {
         const reason = capabilityDisableReason("open-view", this.caps());
         if (reason) return note(reason);
         // Opens at once (no one-item popup, no Working… dialog): the sidebar runs it and reports.
-        startOneClick({ shared, setShared, run, layout, openOverlay }, { kind: "open-view", view: route.view }, "open-view");
+        startOneClick({ shared, setShared, run, layout, openOverlay }, { kind: "open-view", view: route.view, conn: this.config?.connectionId }, "open-view");
         return this.dismiss();
       }
       if (route.act === "read") {
@@ -444,7 +450,7 @@ export default class RigPalette extends View {
         if (!spec) return fail(`${top.name ?? top.id} isn't in the spec library any more.`);
         // Rig specs only, the rule the card and the menu use.
         if (spec.kind && spec.kind !== "rig") return note(`${spec.name} is an agent spec; launch takes a rig spec.`);
-        openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: { kind: "spec", id: spec.id, name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } });
+        openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: { kind: "spec", id: spec.id, conn: this.config?.connectionId, name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } });
         return this.dismiss();
       }
     } catch (e) { fail(String(e?.message ?? e)); }

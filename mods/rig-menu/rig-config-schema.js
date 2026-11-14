@@ -46,8 +46,9 @@ add("enum", "provider.selected", { choices: ["", "claude", "codex", "claude,code
 add("enum", "transport.draft_delivery", { choices: ["refuse", "deliver"] });
 add("enum", "queue.wake_human_rung", { choices: ["always", "explicit-only"] });
 add("stream", "stream.intake", { choices: ["", "off", "queue.worker"] });
-add("text", `policies.claude_compaction.pre_compact_instruction policies.claude_compaction.compact_instruction
-  policies.claude_compaction.message_inline policies.claude_compaction.post_restore_audit_instruction`,
+export const CONFIG_TERMINAL_KEYS=Object.freeze(['policies.claude_compaction.pre_compact_instruction','policies.claude_compaction.compact_instruction',
+  'policies.claude_compaction.message_inline','policies.claude_compaction.post_restore_audit_instruction']);
+add("text", CONFIG_TERMINAL_KEYS.join(' '),
   { readOnly: "Value withheld by OpenRig · edit with rig config set in a terminal" });
 const high = `daemon.port daemon.host daemon.db_conflict db.path transcripts.path terminal.tmux_server
   workspace.root workspace.slices_root workspace.steering_path workspace.specs_root workspace.projects_root workspace.catalog_path
@@ -67,12 +68,59 @@ add("int", "output.rebuild_recaps", { min: 0, optional: true }); // public help:
 export const CONFIG_KEYS = Object.freeze(Object.keys(definitions).sort());
 export const CONFIG_SCHEMA = Object.freeze(definitions);
 
+// A metadata key can select only a per-key configuration route, never a command.
+export function canonicalConfigKey(key) {
+  return typeof key === "string" && key.length <= 128 && /^[a-z0-9_]+(?:\.[a-z0-9_]+)+$/.test(key)
+    && key!=="feed.subscriptions" && (!key.startsWith("feed.subscriptions.")||Object.hasOwn(definitions,key)) && !["init", "init_workspace", "browser"].includes(key.split(".")[0]);
+}
+const metadataFields = ["type", "choices", "range", "format", "writeRoute", "appliesAt"];
+function metadataDefinition(entry, fallback) {
+  const key=entry.key, def={...fallback,key,metadata:true};
+  if(!canonicalConfigKey(key)||entry.writeRoute!==true||!["boolean","integer","enum","string"].includes(entry.type))
+    return {...def,readOnly:"OpenRig hasn't offered a supported write control for this setting."};
+  delete def.readOnly;
+  // Metadata replaces table limits: an omitted range means no advertised bounds, not the table's bounds.
+  delete def.min;delete def.max;delete def.choices;delete def.allowEmpty;
+  def.type={boolean:"bool",integer:"int",enum:"enum",string:"text"}[entry.type];
+  if(entry.type==="integer"){
+    if(Object.hasOwn(entry,"range")&&(!entry.range||typeof entry.range!=="object"||Array.isArray(entry.range)))
+      return {...def,readOnly:"OpenRig reported invalid number limits."};
+    for(const side of ["min","max"])if(entry.range?.[side]!==undefined){
+      if(!Number.isSafeInteger(entry.range[side]))return {...def,readOnly:"OpenRig reported invalid number limits."};
+      def[side]=entry.range[side];
+    }
+    if(def.min!==undefined&&def.max!==undefined&&def.min>def.max)return {...def,readOnly:"OpenRig reported invalid number limits."};
+  }
+  if(entry.type==="enum"){
+    if(!Array.isArray(entry.choices)||!entry.choices.length||entry.choices.length>256||entry.choices.some(v=>typeof v!=="string"||v.length>4096))
+      return {...def,readOnly:"OpenRig reported invalid choices."};
+    def.choices=[...entry.choices];
+  }
+  if(entry.type==="string"){
+    def.allowEmpty=true;
+    if(entry.format==="iana-timezone")def.type="tz";
+    else if(entry.format==="absolute-path-or-empty")def.type="path";
+    else if(entry.format==="member@rig-or-empty")def.type="seat";
+    else if(entry.format==="queue.worker, off, or member@rig"){def.type="stream";def.choices=["off","queue.worker"];def.allowEmpty=false;}
+    else if(entry.format)return {...def,readOnly:"OpenRig reported an unsupported setting format."};
+  }
+  // Unknown timing is not stronger evidence than the older reviewed guidance.
+  if(entry.appliesAt==="daemon_restart")def.restart=true;
+  if(!fallback){def.risk="high";def.unfamiliar=true;}
+  return def;
+}
+
 export function configDefinition(entry) {
   const key = entry?.key ?? "";
+  if(CONFIG_TERMINAL_KEYS.includes(key))return definitions[key];
+  if(entry?.visibility==='withheld')return {key,type:'text',risk:'high',readOnly:'Value withheld by OpenRig · edit in a terminal'};
   if(entry?.source==="unavailable"||entry?.visibility==="unavailable")return {key,type:"text",risk:"high",readOnly:"OpenRig hasn't reported this setting's value."};
   if (entry?.source === "env") return { ...(definitions[key] ?? {}), key,
     readOnly: entry.envVar || entry.envKey ? `Set by ${entry.envVar ?? entry.envKey} in OpenRig's environment. Change it there.`
       : "Set in OpenRig's environment. Change it there." };
+  if(metadataFields.some(field=>Object.hasOwn(entry??{},field))){
+    return metadataDefinition(entry,definitions[key]);
+  }
   if (Object.hasOwn(definitions,key)) return definitions[key];
   const readOnly = key.startsWith("slack.") ? "Set in OpenRig's Slack connector, not here"
     : key.startsWith("people.") ? "Set in OpenRig's person registry (rig people)"
@@ -85,14 +133,19 @@ export function configDefinition(entry) {
 export function validateConfigValue(def, value) {
   if (!def || def.readOnly) return def?.readOnly ?? "Unknown setting";
   if (typeof value !== "string") return "Use a text value";
+  if(value.length>65536)return "Use at most 65536 characters";
   if (/[\x00-\x1f\x7f]/.test(value)) return "Control characters are not allowed";
   if (def.allowEmpty && value === "") return null;
   if (def.type === "bool") return ["true", "false"].includes(value) ? null : "Choose On or Off";
   if (def.type === "enum") return def.choices.includes(value) ? null : "Choose one of the listed values";
-  if (def.type === "int") return /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) >= def.min
-    && (def.max === undefined || Number(value) <= def.max) ? null : `Use a whole number ${def.min}–${def.max ?? Number.MAX_SAFE_INTEGER}`;
+  if (def.type === "int") return (def.metadata?/^-?\d+$/:/^\d+$/).test(value) && Number.isSafeInteger(Number(value)) && (def.min === undefined || Number(value) >= def.min)
+    && (def.max === undefined || Number(value) <= def.max) ? null : def.min!==undefined&&def.max!==undefined?`Use a whole number ${def.min}–${def.max}`
+      :def.min!==undefined?`Use a whole number, ${def.min} or more.`:def.max!==undefined?`Use a whole number, ${def.max} or less.`:"Use a whole number.";
   if (def.type === "path") return value.startsWith("/") ? null : "Use an absolute path, starting with /";
-  if (def.type === "seat" || def.type === "stream") return (def.type === "stream" && def.choices.includes(value)) || /^[A-Za-z0-9][A-Za-z0-9_.-]*@[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value) ? null : "Use a seat address: member@rig";
+  if (def.type === "seat" || def.type === "stream") {
+    const address=def.metadata?(def.type==="seat"?/^[^@\s]+@[^@\s]+$/:/^[a-zA-Z0-9\-_.]+@[a-zA-Z0-9\-_.]+$/):/^[A-Za-z0-9][A-Za-z0-9_.-]*@[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+    return (def.type === "stream" && def.choices.includes(value)) || address.test(value) ? null : "Use a seat address: member@rig";
+  }
   if (def.type === "tz") {
     if(typeof Intl==="undefined")return CONFIG_TIMEZONES.has(value)?null:"Use a supported IANA timezone, such as Europe/London";
     try { new Intl.DateTimeFormat("en", { timeZone: value }).format(); return null; } catch (_) { return "Use an IANA timezone, such as Europe/London"; }
@@ -115,8 +168,10 @@ export function configDeletesHistory(def, value, current) {
 
 export function configConsequence(def, value, oldValue = null) {
   const key = def.key;
+  if(def.unfamiliar)return `A setting this OpenRig offers that herdrig doesn't know: ${key}. OpenRig validates the saved value; check its documentation before changing it.`;
   if (["daemon.port", "daemon.host"].includes(key)) return `After the daemon restarts, herdrig and every other OpenRig client must use the new ${key.endsWith("port") ? "port" : "host"}: ${value}. herdrig's connection must be updated separately.`;
   if (key === "retention.erasure_ledger") return "Queue erasure records will be appended at this path before erasure commits. Nothing is moved from the old path; an empty value disables the ledger.";
+  if(key==='retention.transitions_days'&&configDeletesHistory(def,value,oldValue))return `${oldValue==null?"Today OpenRig's transition retention is unreported.":Number(oldValue)===0?'Today OpenRig keeps all queue transitions.':`Today OpenRig keeps ${oldValue} days of queue transitions.`} The next retention sweep deletes transitions older than ${value} days. They can't be recovered.`;
   const keeps={"retention.closed_content_days":"content of closed queue work","retention.closed_metadata_days":"closed queue rows","retention.events_days":"history-only events"};
   if(keeps[key])return value==="0"?`OpenRig will keep ${keeps[key]} at future retention sweeps. Previously deleted history is not recovered.`
     : !configDeletesHistory(def,value,oldValue)?`OpenRig will keep ${keeps[key]} for ${value} days. Raising this limit keeps more history; previously deleted history is not restored.`

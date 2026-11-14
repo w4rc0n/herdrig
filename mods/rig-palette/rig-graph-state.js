@@ -1,5 +1,6 @@
 // Public graph projection and bounded native-motion state. No frame loop or periodic timer.
 import {seatStatus} from "./rig-lib.js";
+import {LEGACY_CONNECTION_ID,perConnection,withConnection} from "./rig-connections.js";
 export const GRAPH_HOLD_MS=1600,GRAPH_FADE_MS=500,GRAPH_MAX_PATHS=8;
 export function normalizeRunningGraph(data,fallback=[]){
   const nodes=Array.isArray(data?.nodes)?data.nodes:[],pods=[],byId=new Map(),refs=new Map();
@@ -23,12 +24,15 @@ export function graphQueueEvent(event,now=Date.now()){
   if(pair.length!==2||pair.some(s=>typeof s!=="string"||!s||!s.includes("@"))||pair[0]===pair[1])return null;
   return{type,from:pair[0],to:pair[1],at:event.at??event.timestamp??now};
 }
-export function publishGraphActivity(shared,setShared,origin,event){
+/** The queue activity of one connection's stream, kept per connection (`{byConnection:{id:{origin,serial,events}}}`): a second stream
+ *  must not reset the first. An older flat value reads as the legacy connection's. */
+export function publishGraphActivity(shared,setShared,origin,event,conn=LEGACY_CONNECTION_ID){
   let data;try{data=typeof event.data==="string"?JSON.parse(event.data):event.data;}catch{return false;}
   const item=graphQueueEvent({...data,type:data?.type??event.event});if(!item)return false;
-  const old=shared("rig.graphActivity"),same=old?.origin===origin,serial=(same?old.serial??0:0)+1;
-  setShared("rig.graphActivity",{origin,serial,events:[...(same?old.events??[]:[]),{...item,serial}].slice(-64)});return true;
+  const stored=shared("rig.graphActivity"),old=perConnection(stored,conn),same=old?.origin===origin,serial=(same?old.serial??0:0)+1;
+  setShared("rig.graphActivity",withConnection(stored,conn,{origin,serial,events:[...(same?old.events??[]:[]),{...item,serial}].slice(-64)}));return true;
 }
+export const graphActivityOf=(shared,conn=LEGACY_CONNECTION_ID)=>perConnection(shared("rig.graphActivity"),conn);
 export class GraphMotion{
   constructor(){this.epoch=0;this.sequence=0;this.paths=new Map();this.flashes=new Map();this.seen=new Set();this.generations=new Map();}
   enter(schedule,notify,count,{reducedMotion=false}={}){

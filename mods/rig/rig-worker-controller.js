@@ -4,10 +4,15 @@ import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
 import {rigOrigin,resolveRigSpace,openRigSpaceContext,sameDaemonOrigin,hostLabelValue} from "./rig-space-context.js";
 import {rigSpaceRelocation} from "./rig-spaces.js";
+import {LEGACY_CONNECTION_ID} from "./rig-connections.js";
 
 const list=(host,key)=>(typeof host[key]==="function"?host[key]():host[key])??[];
-const identity=config=>JSON.stringify([rigOrigin(config?.daemonUrl),config?.daemonMachine,config?.rig??null]);
-const keyFor=(config,view)=>JSON.stringify([rigOrigin(config?.daemonUrl),config?.daemonMachine,view]);
+// Another connection's worker views are its own even when it shares an address spelling; the legacy connection's keys are the old ones
+// (stored views stay found).
+const own=config=>config?.connectionId&&config.connectionId!==LEGACY_CONNECTION_ID?[config.connectionId]:[];
+const identity=config=>JSON.stringify([rigOrigin(config?.daemonUrl),config?.daemonMachine,config?.rig??null,...own(config)]);
+const keyFor=(config,view)=>JSON.stringify([rigOrigin(config?.daemonUrl),config?.daemonMachine,view,...own(config)]);
+export {identity as workerIdentity,keyFor as workerViewKey};
 const nonce=()=>`${Date.now().toString(36)}-${Math.random().toString(36).slice(2,9)}`;
 const addr=terminal=>terminal?.address??terminal?.terminal;
 // Herdr's display/seen labels change during ordinary adoption. Bind only ownership labels.
