@@ -37,7 +37,7 @@ export default class RigPalette extends View {
   set config(value) { this._config = value; observeConfig(value); }
   init(_p, cx) {
     flatOwner = this;
-    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
+    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
     this.input = InputState.new({ placeholder: "agent dev.design · :scopes · tab graph · /codex" });
     // An opener can start it with text (the Rig page's Filter… starts it at "/").
     if (typeof props()?.initial === "string") this.input.set_value(props().initial);

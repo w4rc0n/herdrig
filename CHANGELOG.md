@@ -2,6 +2,8 @@
 
 ## v0.4.5
 
+- Pause, Resume and Snapshot work again from a rig in the Spaces list. Terminal menus and All seats links keep that connection too.
+- Spec editing no longer gets stuck when settings reload quickly.
 - Settings check current values before saving. If a confirmation changed underneath you, review it again; Undo returns to the value checked before your save.
 - Queue work to connected assistants keeps working after verification. Their requests no longer mark unrelated seats as needing you, and parked requests name their owner.
 - Actions with several steps keep the OpenRig settings they started with and refuse to continue if those settings change.

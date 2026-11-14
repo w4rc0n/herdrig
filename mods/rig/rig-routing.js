@@ -3,6 +3,7 @@ import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSe
 import { openRigSpaceContext, resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
 import { LEGACY_CONNECTION_ID } from "./rig-connections.js";
+import { gateSameConfig, gateIdentity } from "./rig-gate.js";
 /** The singular `homeSpace` is the legacy connection's record (older versions read only it). Another connection keeps its home in
  *  `homeSpaces[key]` alone, whose key is [origin, machine] and so is already its own. */
 const legacyHome=(config,id)=>(config?.connectionId??LEGACY_CONNECTION_ID)===LEGACY_CONNECTION_ID?{homeSpace:id}:{};
@@ -15,8 +16,17 @@ const contexts = host => openRigSpaceContext(list(host,"spaces"),list(host,"term
 const origin = config => String(config?.daemonUrl ?? "").replace(/\/$/,"");
 const spaceMachine = space => space?.machine??(String(space?.id??"").includes("/")?space.id.split("/")[0]:null);
 const homeKey = config => JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine||null]);
-const configIdentity = config => JSON.stringify([homeKey(config),config?.rig??["rig"],config?.openrigHome??null]);
-const configUnchanged = (host,config) => !host.currentConfig||configIdentity(host.currentConfig())===configIdentity(config);
+// What a fingerprint kept between a review and a confirm says about the config: the gate's identity, so a CLI-found address (an enrichment) is not a change.
+const configIdentity = config => gateIdentity(config);
+// A route judges "did the settings change" by the SEND GATE's identity (the file's address, machine, home, rig command, refusal), never by a raw compare: on a default install the
+// captured config has no address and the live one gains the address the CLI found, which is the same config enriched. A DIFFERENT address found or typed since is a change.
+const configUnchanged = (host,config) => {
+  if(!host.currentConfig) return true;
+  const live=host.currentConfig();
+  if(!live||!config) return live===config||(!live&&!config);
+  if(!gateSameConfig(live,config)) return false;
+  return !(live.daemonUrl&&config.daemonUrl&&rigOrigin(live.daemonUrl)!==rigOrigin(config.daemonUrl));
+};
 export const needsTabMigration = (context,config) => !!context && (context.legacy || context.home && spaceMachine(context.space)!==(config?.daemonMachine||null));
 export const migrationChoice = (saved,config,spaceId) => saved?.tabMigration?.[JSON.stringify([spaceId,homeKey(config)])]
   ?? (!config?.daemonMachine?saved?.tabMigration?.[spaceId]:null);
@@ -395,6 +405,9 @@ async function perform(host,config,request,rig,key){
   if(!destination) return fail("OpenRig's destination space is no longer open. Try again.");
   const entry=request.entry ?? {section:"topology"};
   const show=async()=>{
+  // This page job may have waited behind another one for the same destination: a connections list installed meanwhile refuses it before its first side effect.
+  const live=host.currentConfig?.();
+  if(live?.connectionsRefused) return fail(live.connectionsRefused);
   const current=list(host,"spaces").find(s=>s.id===destination.id);
   if(!current) return fail("OpenRig's destination space closed before its page could open. Try again.");
   let tab=request.newPage ? null : list(host,"panes").find(p=>p.mod===MOD_IDS.view && current.tabs?.some(t=>t.id===p.tab))?.tab;

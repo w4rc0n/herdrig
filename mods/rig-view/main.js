@@ -149,7 +149,7 @@ export default class RigView extends View {
   set config(value) { this._config = value; observeConfig(value); }
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
-    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
+    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
     this.statusMotion = new StatusMotion();
     this.pageViewMemory = {}; // Session only; never persisted with folds or navigation.
     this.pulseFilter = null; // Page-session only: never restore the legacy persisted shared filter.
@@ -279,13 +279,15 @@ export default class RigView extends View {
       }catch{consentMachine=null;}
       if (seq !== this.loadSeq) return; // a newer load has started: it installs its own
       this.specConsentMachine=consentMachine;
-      if (sameConfig(next, this.config)) return;
+      // The same config returns early only once ITS folders are published: an overtaken load that was still resolving them leaves it to the next one.
+      if (sameConfig(next, this.config) && this.specFoldersReady !== false) return;
       if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine || next.connectionId !== this.config.connectionId)) {
         this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx); // reads still in flight belong to the old daemon (or the old connection at the same address)
         for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
         this.specBoxes={};
       }
       this.config = next;
+      this.specFoldersReady = false;
       // The spec editor's folders, from local facts only (never the daemon's list).
       if(!next.daemonMachine){
         const roots = await localSpecRoots(next, exec, home());
@@ -295,6 +297,7 @@ export default class RigView extends View {
       const realpathAvailable = await specRealpathAvailable(exec);
       if (seq !== this.loadSeq) return; // overtaken while checking realpath
       this.specRealpathAvailable = realpathAvailable;
+      this.specFoldersReady = true;
       cx.notify();
     });
   }
@@ -2471,7 +2474,7 @@ export default class RigView extends View {
     // `op` was created by the caller at the moment it captured `config` (before any await): every send of this copy flow belongs to that config.
     const post = (path, init) => op.fetch(`${daemonUrl}${path}`, { method: "POST", ...init });
     return {
-      specText: (spec) => this.specText(spec),
+      specText: (spec) => this.specText(spec, op),
       validate: async (text) => {
         const checked = await post("/api/rigs/import/validate", { headers: { "content-type": "text/yaml" }, body: text });
         let v; try { v = JSON.parse(await checked.text()); } catch (e) { v = rethrowGate(null)(e); }
@@ -2479,7 +2482,7 @@ export default class RigView extends View {
       },
       addFolder: (request, grant) => config.daemonMachine
         ? this.remoteSpecController(cx).perform(config, { verb: "copy-folder", ...request }, grant)
-        : this.localAddFolder(request, daemonUrl, cx),
+        : this.localAddFolder(request, daemonUrl, cx, config, op),
       library: async (fresh) => {
         if (fresh) await post("/api/specs/library/sync").catch(rethrowGate(null));
         const res = await op.fetch(`${daemonUrl}/api/specs/library`);
@@ -2499,15 +2502,19 @@ export default class RigView extends View {
 
   /** No machine configured: this computer's own OpenRig copies the folder through the shipped helper, after checking the
    *  daemon this page talks to is this computer's (a copy made here is invisible to another machine's daemon). */
-  async localAddFolder(request, daemonUrl, cx) {
+  async localAddFolder(request, daemonUrl, cx, config = this.config, op = gatedOperationOrRefusal()) {
+    op.check(); // the CLI and the helper run under the settings this copy began with (the gate judges each result; the operation judges the start)
     const status = parseDaemonStatusJson((await exec("rig", ["status", "--json"], { timeout: 15000 })).stdout);
+    op.check();
     if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
-    const health = async (url) => { const r = await fetch(`${url}/healthz`); if (!r.ok) throw new Error("OpenRig isn't answering."); return JSON.parse(await r.text()); };
+    const health = async (url) => { const r = await op.fetch(`${url}/healthz`); if (!r.ok) throw new Error("OpenRig isn't answering."); return JSON.parse(await r.text()); };
     const [here, there] = await Promise.all([health(status.daemonUrl), health(daemonUrl)]);
     if (!here?.selfHostId || here.selfHostId !== there?.selfHostId)
       throw new Error("The OpenRig this page reads isn't this computer's own, so a copy made here would never be seen by it. Set up the machine first.");
     const helper = attachRelayPath(appHome(), MOD_IDS.view).replace(/rig-attach-relay\.cjs$/, "rig-spec-files.cjs");
+    op.check();
     const r = await exec("node", [helper, "copy-folder", "--local", "--", request.sourcePath], { timeout: 150000 });
+    op.check();
     let out; try { out = JSON.parse(r.stdout); } catch (_) { throw new Error(r.stderr || "The copy helper gave no answer."); }
     if (out.error) throw Object.assign(new Error(out.error), { code: out.code, folder: out.folder });
     const file = await resolveInSpecRoots(out.path, this.specRoots, exec);
@@ -2515,8 +2522,9 @@ export default class RigView extends View {
     const current = await readTextFile(file);
     if (current == null) throw new Error("The copied spec couldn't be read back.");
     const conflict = `The copied spec at ${file} changed before it could be rewritten. Your copy was kept; reopen it to review the changes.`;
-    if (!/^[a-f0-9]{64}$/.test(out.sha256 ?? "") || await this.remoteSpecController(cx).hashText(this.config, current) !== out.sha256)
+    if (!/^[a-f0-9]{64}$/.test(out.sha256 ?? "") || await this.remoteSpecController(cx).hashText(config, current) !== out.sha256)
       throw new Error(conflict);
+    op.check(); // the helper, the realpath and the readback awaited: the rewrite belongs to the settings this copy began under
     try { await writeTextFile(file, request.content, current); }
     catch { throw new Error(conflict); }
     return { ok: true, path: out.path, folder: out.folder };
@@ -2989,7 +2997,7 @@ export default class RigView extends View {
         return v_flex().id(`views-${i}`)
           .child(h_flex().id(`term-row-${r.view}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(toggleRow)
-            .on_mouse_down("right", () => menu({ kind: "terminal", view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
+            .on_mouse_down("right", () => menu({ kind: "terminal", conn: this.config?.connectionId, view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(r.name??"")).child(r.name))
             .child(this.copyButton(t, r.view, `view-id-${r.view}`, "view id"))

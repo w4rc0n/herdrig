@@ -154,7 +154,8 @@ export default class RigSidebar extends View {
     this.focusHandle = typeof cx?.focus_handle === "function" ? cx.focus_handle() : null;
     cx.spawn(async (cx) => {
       await this.loadSidebarState();
-      this.config = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
+      const first = await this.readConfigText();
+      if (!first.superseded()) { first.claim(); this.config = parseConfig(first.text); }
       await this.refresh(cx);
       this.stream(cx);
     });
@@ -164,7 +165,7 @@ export default class RigSidebar extends View {
         const dir = this.config && !this.config.missing ? `${appHome()}/openrig` : appHome();
         try { await watchFolder(dir); } catch (_) { await new Promise((r) => cx.timer.after(5000, () => r())); }
         if (this.closed) return;
-        await this.reloadConfig(cx);
+        try { await this.reloadConfig(cx); } catch (_) { /* one failed read must not end the watcher: the next event or the 5 s poll reads again */ }
       }
     });
     cx.timer.every(1000, (cx) => {
@@ -354,8 +355,19 @@ export default class RigSidebar extends View {
   }
 
   /** Reads the config again; a change takes effect at once: a new daemon reconnects the stream. */
+  /** One read of config.json, numbered by when it STARTED; INSTALLS are numbered too. A read may install only if it started after the newest read that already installed: an
+   *  older read that finishes after a newer INSTALL is dropped (a refused connections list is never replaced by an allowed config), but a newer read that FAILED never
+   *  installed, so it cannot drop an older read's result (herdr's readTextFile throws on any error but NotFound). */
+  async readConfigText() {
+    const seq = this.configSeq = (this.configSeq ?? 0) + 1;
+    const text = await readTextFile(`${appHome()}/openrig/config.json`);
+    return { text, superseded: () => seq <= (this.installedSeq ?? 0), claim: () => { this.installedSeq = seq; } };
+  }
   async reloadConfig(cx) {
-    const next = preserveCliDiscoveredConfig(parseConfig(await readTextFile(`${appHome()}/openrig/config.json`)), this.config);
+    const read = await this.readConfigText();
+    if (read.superseded()) return; // a newer read has already installed: it wins
+    read.claim();
+    const next = preserveCliDiscoveredConfig(parseConfig(read.text), this.config);
     if (sameConfig(next, this.config)) return;
     const reconnect = !!this.config && next.daemonUrl !== this.config.daemonUrl;
     const rigChanged = !!this.config && JSON.stringify(next.rig) !== JSON.stringify(this.config.rig);
@@ -1314,10 +1326,13 @@ export default class RigSidebar extends View {
 
   async refresh(cx) {
     if (!this.config) {
-      this.config = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
+      const read = await this.readConfigText();
+      if (!read.superseded()) { read.claim(); this.config = parseConfig(read.text); }
     } else if (this.config.missing) {
-      const reread = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
-      if (!reread.missing) {
+      const read = await this.readConfigText();
+      const reread = parseConfig(read.text);
+      if (!reread.missing && !read.superseded()) {
+        read.claim();
         this.config = reread;
       }
     }
