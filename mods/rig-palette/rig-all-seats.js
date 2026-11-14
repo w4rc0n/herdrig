@@ -30,6 +30,6 @@ export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,fil
   return {rig,rows:[...rows,...assistants],state,counts:computePulseCounts([model],attention),total:model.seats.length,assistantCount:assistants.length,error:model.nodesState?.error};
  });
  let rows=groups.flatMap(g=>g.rows);
- if(order==='status')rows=[...rows].sort((a,b)=>(ranks[a.status]??6)-(ranks[b.status]??6)||a.rigIndex-b.rigIndex||String(a.seat.logicalId).localeCompare(String(b.seat.logicalId)));
+ if(order==='status')rows=[...rows].sort((a,b)=>(ranks[a.status]??6)-(ranks[b.status]??6)||a.rigIndex-b.rigIndex||String(a.seat?.logicalId??a.assistant?.name??a.key).localeCompare(String(b.seat?.logicalId??b.assistant?.name??b.key)));
  return {groups,rows,rigWidth:Math.min(160,Math.max(120,...models.map(m=>String(m.rig.name??'').length*7+12)))};
 }

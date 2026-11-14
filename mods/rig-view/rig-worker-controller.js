@@ -2,7 +2,7 @@
 import {isValidSessionName} from "./rig-lib.js";
 import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
-import {rigOrigin,resolveRigSpace,openRigSpaceContext,sameDaemonOrigin,hostLabelValue} from "./rig-space-context.js";
+import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue} from "./rig-space-context.js";
 import {rigSpaceRelocation} from "./rig-spaces.js";
 import {LEGACY_CONNECTION_ID} from "./rig-connections.js";
 
@@ -146,7 +146,13 @@ export class HostWorkerViews{
       if(!space&&rig){
         const move=rigSpaceRelocation(host,rig,config);
         if(move)return {ok:false,needsRelocation:true,relocation:move,reason:"Move the Local rig space before opening its worker view on the box."};
-        space=resolveRigSpace(host,config,[rig.id,rig.name]);
+        // The same vouching inputs the pages and the grid use; a space that still can't be confirmed is asked about, never answered with a new one.
+        const vouch={sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),hostId:remote.selfHostId};
+        space=resolveRigSpace(host,config,[rig.id,rig.name],vouch);
+        if(!space){
+          const other=unconfirmedRigSpace(host,config,[rig.id,rig.name],vouch);
+          if(other)return {ok:false,unconfirmedSpace:true,reason:unconfirmedSpaceReason(rig.name,config.daemonMachine,other.origin,config.daemonUrl)};
+        }
       }
       if(!space&&!rig)space=openRigSpaceContext(list(host,"spaces"),list(host,"terminals"),list(host,"panes"),host.routeState?.()??{})
         .find(c=>c.home&&c.id.startsWith(config.daemonMachine+"/")&&list(host,"terminals").some(t=>

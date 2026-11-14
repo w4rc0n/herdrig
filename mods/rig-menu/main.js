@@ -603,7 +603,10 @@ export default class RigMenu extends View {
   async loadPause(cx) {
     cx.spawn(async (cx) => {
       const t = complete(props().target);
-      const config = await configNow();
+      // The confirmation shows the target's own daemon's seats (the write goes there too), never the default one's.
+      const conn = targetConnection(this.config ?? await configNow(), t);
+      if (!conn.ok) { this.pause = { error: conn.reason }; cx.notify(); return; }
+      const config = conn.config;
       if (!config.daemonUrl) { this.pause = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." }; cx.notify(); return; }
       try {
         const r = await fetch(`${config.daemonUrl}/api/rigs/${encodeURIComponent(t.rigId)}/nodes`);
@@ -846,7 +849,7 @@ export default class RigMenu extends View {
       // A native seat closed outside OpenRig. Offered, never done on its own.
       if (target.native) {
         item("rig-refresh", "Relaunch fresh…", () => dialog({ ...target, reason: "native seat closed outside OpenRig" }, { action: "fresh", confirm: true }, 220));
-        item("rig-play", "Resume…", () => dialog({ kind: "rig", rig: target.rig }, { action: "resume", confirm: true }, 380));
+        item("rig-play", "Resume…", () => dialog({ kind: "rig", rig: target.rig, conn: target.conn }, { action: "resume", confirm: true }, 380));
       }
       if (target.reply !== "none") item("rig-reply", "Reply…", () => dialog(target, { input: true, placeholder: "Your answer, in your own words", action: "reply", multiLine: true }, 290), target.reply === "answer" ? "reply-answer" : "reply");
       item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: target.summary }));
@@ -1289,7 +1292,10 @@ export default class RigMenu extends View {
     if (step.input && !text) return;
     if (step.action === "reply") {
       this.run(cx, "Sending", async () => {
-        const cfg = await configNow();
+        // To the target's own daemon, resolved the way `write` resolves it; nothing is sent when it can't be.
+        const conn = targetConnection(this.config ?? await configNow(), target);
+        if (!conn.ok) return { ok: false, text: conn.reason };
+        const cfg = conn.config;
         if (!cfg.daemonUrl) return { ok: false, text: cfg.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." };
         const r = await submitMissionActions(cfg, target, {
           kind: target.reply === "resolve" ? "resolve" : "answer-text",

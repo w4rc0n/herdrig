@@ -94,11 +94,12 @@ export async function verifyAssistantTarget(fetch,config,target,after){
 }
 /** Only unsupported detection is cached. A successful event-stream reconnect invalidates it for that connection. */
 export class HostedMembersReader {
- constructor(){this.off=new Map();}
+ constructor(){this.off=new Map();this.generations=new Map();}
  key(config){return JSON.stringify([config.connectionId,config.daemonUrl]);}
- reconnect(config){this.off.delete(this.key(config));}
+ reconnect(config){const key=this.key(config);this.off.delete(key);this.generations.set(key,(this.generations.get(key)??0)+1);}
  async read(fetch,config,after){
   const key=this.key(config);if(this.off.has(key))return this.off.get(key);
-  const result=await loadHostedMembers(fetch,config,after);if(result.state==='off')this.off.set(key,result);return result;
+  const generation=this.generations.get(key)??0;
+  const result=await loadHostedMembers(fetch,config,after);if(result.state==='off'&&generation===(this.generations.get(key)??0))this.off.set(key,result);return result;
  }
 }

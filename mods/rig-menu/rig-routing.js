@@ -1,6 +1,6 @@
 // All explicit opens and background grid reconciliation pass through this coordinator.
 import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers } from "./rig-lib.js";
-import { openRigSpaceContext, resolveRigSpace, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue } from "./rig-space-context.js";
+import { openRigSpaceContext, resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
 import { LEGACY_CONNECTION_ID } from "./rig-connections.js";
 /** The singular `homeSpace` is the legacy connection's record (older versions read only it). Another connection keeps its home in
@@ -256,8 +256,24 @@ function requestRig(host, request) {
   const rig=topology.find(r=>r.id===key || r.name===key);
   return {rig,key};
 }
+const vouchOf=(host,rig)=>({sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:typeof host?.selfHostId==="function"?host.selfHostId():host?.selfHostId});
 function rigSpace(host,config,rig,key){
-  return resolveRigSpace(host,config,[key,rig?.id,rig?.name],{sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:typeof host?.selfHostId==="function"?host.selfHostId():host?.selfHostId});
+  return resolveRigSpace(host,config,[key,rig?.id,rig?.name],vouchOf(host,rig));
+}
+/** A refusal for an unconfirmed space stays on the sidebar (the card there, with a Dismiss), not only in a toast that fades with its way
+ *  forward cut off: it is published as that rig's space status, the same place the grid's own failures go. */
+function publishUnconfirmed(host,rigId,result){
+  if(!rigId||!result?.unconfirmedSpace||typeof host?.setShared!=="function")return result;
+  host.setShared("rig.spaceStatus",{...(host.shared?.("rig.spaceStatus")??{}),[rigId]:result});
+  return result;
+}
+/** ONE RIG == ONE SPACE: when the rig has a space on the machine that can't be confirmed, the open says so and asks; it never goes to the home
+ *  or to a new space instead. Returns the refusal, or null when there is no such space. */
+function unconfirmedRefusal(host,config,rig,key,request){
+  // The entry carries the rig's name too, so this holds even before the sidebar has published its topology.
+  const entry=request.entry??{},named=rig?.name??request.rig??entry.rig??(entry.kind==="rig"?entry.name:null)??key;
+  const other=unconfirmedRigSpace(host,config,[key,rig?.id,rig?.name,request.rig,entry.rig,entry.kind==="rig"?entry.name:null],vouchOf(host,rig));
+  return other?fail(unconfirmedSpaceReason(named,config?.daemonMachine,other.origin,config?.daemonUrl)):null;
 }
 
 async function save(host,patch){
@@ -354,7 +370,7 @@ async function perform(host,config,request,rig,key){
   }
   if(request.kind==="attach"){
     const result=await attachToSeat({...host,routeOwner:true},request.seat,config,request.options??{});
-    return result;
+    return publishUnconfirmed(host,rig?.id??request.seat?.rigId??request.rigId,result);
   }
   if(request.kind==="grid"){
     if(!rig || !host.syncGrid) return fail("OpenRig hasn't loaded this rig yet. Try again in a moment.");
@@ -368,6 +384,10 @@ async function perform(host,config,request,rig,key){
   if(request.kind!=="page") return fail("Unknown OpenRig open request.");
   const source=contexts(host).find(c=>c.id===request.sourceSpace);
   let destination=request.home ? null : key ? rigSpace(host,config,rig,key) : source?.owned&&spaceMachine(source.space)===(config?.daemonMachine||null) ? source.space : null;
+  if(!destination&&key&&!request.home){
+    const refusal=unconfirmedRefusal(host,config,rig,key,request);
+    if(refusal)return publishUnconfirmed(host,rig?.id??request.rigId??request.entry?.rigId,{...refusal,unconfirmedSpace:true});
+  }
   if(!destination){
     const result=await home(host,config,false); if(!result.ok) return result;
     destination=list(host,"spaces").find(s=>s.id===result.space);

@@ -2,6 +2,10 @@
 
 ## v0.4.5
 
+- Opening a rig's page, Attach or worker views checks its existing space first. If OpenRig cannot confirm the match, the sidebar explains why and nothing opens, instead of creating a second space.
+- A slow settings save pauses further changes until OpenRig answers and its current values are checked. Undo preserves changes made elsewhere, and switching connections keeps their settings separate.
+- Find the Spaces list in **System → Layout**, in the sidebar and on the System page. The sidebar also includes Overview and Notifications; palette commands select their matching row.
+- All seats keeps connected assistants in order and shows each once when a rig cannot load. Reconnecting checks for assistants again, and the sidebar keeps the selected assistant in view.
 - Confirm setting changes beside the value you edited, with Cancel focused first. Saves show when they are still being checked, then offer Undo for a full ten seconds.
 - Click a setting to edit it, then press Enter or Tab or click away to save. Esc restores the old value; invalid text stays open. Undo restores your previous setting for ten seconds, and refuses if it changed elsewhere. Consequential changes still ask first.
 - See connected assistants under each rig and in All seats, with their check-in status. Queue work to them, copy their address, or read their queued work without mistaking them for terminal seats.

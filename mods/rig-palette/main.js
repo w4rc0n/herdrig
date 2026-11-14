@@ -285,6 +285,13 @@ export default class RigPalette extends View {
   }
 
   applyRoute(route) {
+    if(route.entry?.section==='system'){
+      const entry=route.entry;
+      const view=entry.openUsageHosts?'usage-hosts':entry.category||entry.settingKey?'config':entry.openRecent?'overview':entry.subview??'overview';
+      route={...route,entry:{...entry,subview:view}};
+      setShared('rig.open.sidebar',{...(shared('rig.open.sidebar')??{}),'branch:system':true});
+      setShared('rig.sel',{key:`sys:${view}`,entry:route.entry,at:Date.now()});
+    }
     if (route.open) setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), ...route.open });
     if (route.focus) setShared("rig.focus", route.focus);
     if (route.entry?.focusRig) setShared("rig.focusRig", route.entry.focusRig);

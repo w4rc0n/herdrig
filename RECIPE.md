@@ -385,7 +385,7 @@ and the 24 `rig-*.svg` icons it draws), and one more folder, `rig-spaces`, Herdr
 **The Spaces list (optional).** `rig-spaces` is a copy of Herdr's own Spaces list with a few marked lines and a separate `rig.js`:
 a small rig mark on a rig space's avatar, the rig's own status at the row's right (the needs-you diamond or the working dot), the
 OpenRig icon on the OpenRig home space, and the rig menu on right-click, under Herdr's Rename and Close. It does nothing until the
-person chooses it: **System → Layout → Spaces list** offers Herdr's (the default), herdrig's, or Both (Herdr's list stays and a
+person chooses it: open **System → Layout** in the sidebar or on the System page. **Spaces list** offers Herdr's (the default), herdrig's, or Both (Herdr's list stays and a
 second block, **Rig spaces**, lists only rig spaces and the OpenRig home). Every change goes through one screen that names the
 layout and the block it changes, works only on the person's **personal** layout (on a layout Herdr ships, such as `main`, it first
 makes a copy with Herdr's own `layout.clone`, and says so), records the way back, and is undone from the same row. Installing never

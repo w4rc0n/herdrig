@@ -34,6 +34,7 @@ act from there (answer a request, message a seat, attach to it) without leaving 
 - **Plain seat activity:** readable status and context, with copyable raw details in **How OpenRig knows**.
 - **Sidebar tree** with six branches: **Topology** (host, rig, pod, seat, helper), **Specs**, **Scopes**,
   **Terminals**, **Needs** and **System**, each seat with its status and context usage.
+- **Spaces list and layout:** open **System → Layout** in the sidebar or on the System page to choose Herdr's Spaces list, herdrig's list, or both.
 - **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
   OpenRig reports.
 - **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs show pod and seat
