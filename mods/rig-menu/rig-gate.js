@@ -40,6 +40,8 @@ const identity = (config) => JSON.stringify([config.connectionsRefused ?? null, 
 /** Whether two configs are the same one for what is in flight (the file's identity; an address the CLI found is not a change). A dialog that captured
  *  its config when it opened compares it with a fresh read before it sends. */
 export const gateSameConfig = (a, b) => identity(a) === identity(b);
+/** The same identity as a string, for a fingerprint a flow keeps between a review and a later confirm. */
+export const gateIdentity = (config) => identity(config ?? {});
 
 /** Called by every assignment of a mod's `config`. Null and undefined are ignored (a constructor's placeholder is not a config). */
 export function observeConfig(config) {
@@ -76,12 +78,21 @@ export async function gatedFetch(url, init, since) {
   // after the config changed is refused BEFORE it reaches the old daemon, not merely checked when its answer comes back.
   if (since !== undefined && since !== generation) throw new GateRefusal(CONFIG_CHANGED);
   const started = since ?? generation;
-  const response = await globalThis.fetch(url, init);
+  let response;
+  // A request that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error.
+  try { response = await globalThis.fetch(url, init); }
+  catch (error) { stillCurrent(started); throw error; }
   stillCurrent(started);
   return new Proxy(response, {
     get(target, prop) {
       if (prop === "json" || prop === "text" || prop === "arrayBuffer" || prop === "blob") {
-        return async (...args) => { const value = await target[prop](...args); stillCurrent(started); return value; };
+        return async (...args) => {
+          let value;
+          try { value = await target[prop](...args); }
+          catch (error) { stillCurrent(started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
+          stillCurrent(started);
+          return value;
+        };
       }
       const value = Reflect.get(target, prop, target);
       return typeof value === "function" ? value.bind(target) : value;
@@ -159,7 +170,9 @@ export function gatedOperationOrRefusal() {
 export async function gatedConnect(rawConnect, host, port) {
   refuse();
   const started = generation;
-  const socket = await rawConnect(host, port);
+  let socket;
+  try { socket = await rawConnect(host, port); }
+  catch (error) { stillCurrent(started); throw error; } // a connect that fails after the settings changed failed for the old settings
   try { stillCurrent(started); } catch (error) { try { socket?.close?.(); } catch (_) {} throw error; }
   return socket;
 }

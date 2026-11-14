@@ -55,7 +55,7 @@ export const rig = {
     const e = entryOf(w);
     if (!e) return false;
     openOverlay({ mod: "rig-menu", kind: "popup", width: 230, height: 320,
-      props: { target: { kind: "rigspace", space: w.id, name: w.name, rig: e.rig ?? null, rigId: e.rigId ?? null, home: !!e.home } } });
+      props: { target: { kind: "rigspace", conn: e.conn, space: w.id, name: w.name, rig: e.rig ?? null, rigId: e.rigId ?? null, home: !!e.home } } });
     return true;
   },
 

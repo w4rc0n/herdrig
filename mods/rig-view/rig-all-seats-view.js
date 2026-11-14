@@ -14,7 +14,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
  const layout=allSeatsLayout(width,model.rigWidth);
  const cell=(id,text,size=120,color=t.foreground)=>div().when(!!id,el=>el.id(id)).min_w(120).when(!!size,el=>el.w(size).flex_none()).when(!size,el=>el.flex_1())
   .truncate().text_size(12).text_color(color).tooltip(String(text??'')).child(text??'');
- const link=(id,rig)=>cell(id,rig.name,model.rigWidth,t.muted).cursor_pointer().hover(el=>el.underline()).on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,name:rig.name});});
+ const link=(id,rig)=>cell(id,rig.name,model.rigWidth,t.muted).cursor_pointer().hover(el=>el.underline()).on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,conn:rig.conn,name:rig.name});});
  const row=r=>{
   if(r.assistant){
    const m=r.assistant,target=assistantTarget(m,r.rig),entry=assistantEntry(m,r.rig),selected=page.pageSel===r.key,id=`${m.conn}-${m.seat}`,open=()=>navigate(entry);
@@ -31,7 +31,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
     .when(layout.compact,el=>el.child(div().pl(26).text_size(11.5).text_color(t.muted).child(`${r.rig.name} · ${words}`)));
   }
   const {seat,rig}=r,id=`${rig.id}-${seat.session??seat.logicalId}`,selected=page.pageSel===r.key;
-  const entry={section:'topology',kind:'seat',rig:rig.name,rigId:rig.id,name:seat.logicalId,session:seat.session,pod:seat.pod};
+  const entry={section:'topology',kind:'seat',rig:rig.name,rigId:rig.id,conn:rig.conn,name:seat.logicalId,session:seat.session,pod:seat.pod};
   const target={kind:'seat',rig:rig.name,rigId:rig.id,conn:rig.conn,session:seat.session,logicalId:seat.logicalId,runtime:seat.runtime,model:seat.model,
    lifecycle:models.find(m=>m.rig.id===rig.id)?.lifecycle,terminal:seat.terminal,attachable:r.attachable,status:seat.status,
    tmuxAttachCommand:seat.tmuxAttachCommand,host:seat.host,sessionAlive:r.attachable,allSeats:true,compactActions:!layout.attach};
@@ -54,7 +54,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
   if(layout.compact)return el.child(h_flex().gap(6).px(6).items_center().child(mark()).child(name).when(selected,el=>el.child(actions())))
    .child(h_flex().id(`all-seat-line2-${id}`).pl(26).pr(6).min_w(120).gap(6).items_center()
     .child(div().id(`all-seat-rig-${id}`).min_w(0).max_w(Math.max(40,width-50-words.length*6.5)).truncate().text_size(11.5).text_color(t.muted).tooltip(rig.name).cursor_pointer().hover(el=>el.underline())
-      .on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,name:rig.name});}).child(rig.name))
+      .on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,conn:rig.conn,name:rig.name});}).child(rig.name))
     .child(div().flex_none().text_size(11.5).text_color(t.dim).child(`· ${words}`)));
   return el.child(h_flex().px(6).h(34).gap(8).items_center().child(div().w(14).flex_none().child(mark())).child(name)
    .child(link(`all-seat-rig-${id}`,rig))

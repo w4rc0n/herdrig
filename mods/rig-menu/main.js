@@ -191,7 +191,7 @@ export default class RigMenu extends View {
   get config() { return this._config; }
   set config(value) { this._config = value; observeConfig(value); }
   init(_p, cx) {
-    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
+    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
     this.config = null;
     flatOwner = this;
     this.busy = null;

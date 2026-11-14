@@ -2332,7 +2332,7 @@ export function rigSpaceMarks({ spaces = [], terminals = [], panes = [], state =
     const link = links.find((l) => rigs.has(l.rig)) ?? links[0];
     if (!link) continue;
     const found = rigs.get(link.rig), counts = found ? statusCounts(found.seats ?? (found.pods ?? []).flatMap((p) => p.seats ?? [])) : { needs: 0, working: 0 };
-    out[context.id] = { rig: link.rig, rigId: found?.id ?? null, ...(found?.conn && found.conn !== LEGACY_CONNECTION_ID ? { conn: found.conn } : {}), status: counts.needs ? "needs" : counts.working ? "working" : "idle", needs: counts.needs };
+    out[context.id] = { rig: link.rig, rigId: found?.id ?? null, ...(found?.conn ? { conn: found.conn } : {}), status: counts.needs ? "needs" : counts.working ? "working" : "idle", needs: counts.needs };
   }
   return out;
 }
