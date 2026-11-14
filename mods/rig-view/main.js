@@ -26,7 +26,14 @@ import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, h
 
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run, exec, shared, setShared as rawSetShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc, layout, layouts, window, notify, machines } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig } from "./rig-gate.js";
+// THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
+const fetch = gatedFetch;
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
+const run = (name, args) => gatedRun(rawRun, name, args);
+
 import { guardFlatStore } from "./rig-connections.js";
 let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
 const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
@@ -137,6 +144,9 @@ const usd = (v) => typeof v === "number" ? `$${v.toFixed(2)}` : "—";
 import {rigSpecLibraryPath} from "./rig-lib.js";
 import {StatusMotion} from "./rig-status-motion.js";
 export default class RigView extends View {
+  // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
+  get config() { return this._config; }
+  set config(value) { this._config = value; observeConfig(value); }
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));

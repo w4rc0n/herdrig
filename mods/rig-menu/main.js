@@ -26,7 +26,16 @@ import { rigOrigin } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc, settings, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig } from "./rig-gate.js";
+// A gate refusal is the answer, not a failure to swallow: the person is told it before the menu closes.
+const sayRefusal = (error) => { if (error?.code === "GATE_REFUSED") notify({ title: "OpenRig", body: error.message, level: "warning" }); };
+// THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
+const fetch = gatedFetch;
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
+const run = (name, args) => gatedRun(rawRun, name, args);
+
 import { guardFlatStore } from "./rig-connections.js";
 let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
 const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
@@ -57,6 +66,7 @@ const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-
 const dialog = (target, step, height = 260) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
 const configNow = async () => {
   const cfg = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
+  observeConfig(cfg); // a fresh read of config.json is the current config, whoever holds it
   if (cfg.connectionsRefused) return { ...cfg, daemonMessage: cfg.connectionsRefused }; // a refused list has no address, from anywhere
   if (cfg.daemonUrl) return cfg;
   // Another mod's shared state may name the daemon only when it's on this machine (loopback).
@@ -164,6 +174,9 @@ async function openMission(target) {
 }
 
 export default class RigMenu extends View {
+  // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
+  get config() { return this._config; }
+  set config(value) { this._config = value; observeConfig(value); }
   init(_p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
     this.config = null;
@@ -520,7 +533,7 @@ export default class RigMenu extends View {
     if (!r || typeof r.then !== "function") { this.dismiss(); return; }
     this.pending = it.label;
     cx?.notify?.();
-    Promise.resolve(r).catch(() => {}).then(() => { this.pending = null; this.dismiss(); });
+    Promise.resolve(r).catch(sayRefusal).then(() => { this.pending = null; this.dismiss(); });
   }
 
   dismiss(discard = false) {
@@ -680,7 +693,7 @@ export default class RigMenu extends View {
           const attach = (wait) => attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, notify, wait, relayPath: attachRelayPath(appHome(), MOD_IDS.menu) }, target, config)
             .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); return res; });
           if (typeof cx?.spawn !== "function") return attach(undefined);
-          return new Promise((resolve) => { cx.spawn(async (cx) => { resolve(await attach(waitWith(cx)).catch(() => null)); }); });
+          return new Promise((resolve) => { cx.spawn(async (cx) => { resolve(await attach(waitWith(cx)).catch((error) => { sayRefusal(error); return null; })); }); });
         },
         disabled: stoppedSeat,
         reason: stoppedSeat ? "Stopped: seat has no running session to attach" : null,

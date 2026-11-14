@@ -5,6 +5,7 @@
 import { attachRemoteSeat } from "./rig-remote-attach.js";
 import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
+import { gatedFetch, rethrowGate, CONFIG_LOADING } from "./rig-gate.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
 import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, CONNECTIONS_LIST_REFUSED, CONNECTIONS_LIST_SUPPORTED } from "./rig-connections.js";
@@ -893,7 +894,7 @@ export async function probeOpenRigState(config, { exec, fetch: fetchFn, sidebarM
     try {
       const hr = await fetchFn(`${daemonUrl}/healthz`);
       if (hr.ok) {
-        const data = await hr.json().catch(() => ({ ok: true }));
+        const data = await hr.json().catch(rethrowGate({ ok: true })); // a gate refusal while the body is read is not a healthy probe
         healthzProbe = { ok: data?.ok !== false, status: hr.status, data };
       } else if (hr.status !== 404) {
         healthzProbe = { ok: false, status: hr.status, message: `HTTP ${hr.status}` };
@@ -2643,12 +2644,10 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   const publish = host.setShared ?? environment.setShared;
   const read = host.shared ?? environment.shared;
   publish?.("rig.nav", navPush(read?.("rig.nav"), current));
-  // A mod that registered its routing environment (every Rig mod does, at init) but has not read config.json yet has no config to open anything for:
-  // say so, never reach the router with none (a bare host with no registered environment is a caller that supplies everything itself).
-  if (routingEnvironment && !(environment.config ?? host.config)) {
-    const reason = "OpenRig's settings are still loading. Try again in a moment.";
-    (host.notify ?? environment.notify)?.({ title: "OpenRig", body: reason, level: "warning" });
-    return Promise.resolve({ ok: false, reason });
+  const loading = routingNotReady(host, null);
+  if (loading) {
+    (host.notify ?? environment.notify)?.({ title: "OpenRig", body: loading, level: "warning" });
+    return Promise.resolve({ ok: false, reason: loading });
   }
   return routeRigOpen(host, null, { kind: "page", entry: current }).then(result => {
     if (!result.ok) (host.notify ?? environment.notify)?.({ title: "OpenRig", body: result.reason, level: "warning" });
@@ -3509,7 +3508,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
   let runReq;
   if (typeof postOrOpts?.post === "function") {
     runReq = (req) => postOrOpts.post(req.path, req.body, req.headers);
-  } else if (typeof postOrOpts === "function" && postOrOpts !== globalThis.fetch && postOrOpts.name !== "fetch") {
+  } else if (typeof postOrOpts === "function" && postOrOpts !== gatedFetch && postOrOpts.name !== "fetch" && postOrOpts.name !== "gatedFetch") {
     runReq = async (req) => {
       const r = await postOrOpts(req);
       if (r && typeof r === "object" && "status" in r && typeof r.text === "function" && !("data" in r)) {
@@ -3521,7 +3520,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
       return r;
     };
   } else {
-    const fetchFn = (typeof postOrOpts === "function" ? postOrOpts : postOrOpts?.fetch) ?? globalThis.fetch;
+    const fetchFn = (typeof postOrOpts === "function" ? postOrOpts : postOrOpts?.fetch) ?? gatedFetch;
     if (typeof fetchFn !== "function") {
       throw new Error("submitMissionActions requires a post function or fetch");
     }
@@ -4243,7 +4242,16 @@ export function layoutHasMod(node, mod) {
 }
 
 /** Open or select the labelled local TUI in the recorded OpenRig home, independently of focused machine or space. */
+/** A mod that registered its routing (every Rig mod does, at init) but has not read config.json yet has no config to open anything for. A bare host with no
+ *  registered routing supplies everything itself and is not asked. Null when there is nothing to say. */
+function routingNotReady(host, config) {
+  if (!routingEnvironment) return null;
+  const environment = routingEnvironment() ?? {};
+  return (config ?? host?.config ?? environment.config) ? null : CONFIG_LOADING;
+}
 export async function openOrFocusTui(host, config) {
+  const loading = routingNotReady(host, config);
+  if (loading) { (host?.notify)?.({ title: "OpenRig", body: loading, level: "warning" }); return { ok: false, reason: loading }; }
   return routeRigOpen(host, config, { kind: "tui" });
 }
 
@@ -6034,6 +6042,8 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   const seat = { ...(isFirstHost ? second : first) };
   const refused = assistantActionRefusal(seat, 'attach');
   if (refused) return { ok: false, reason: refused };
+  const notReady = routingNotReady(host, config);
+  if (notReady) return { ok: false, reason: notReady };
   if (!host.routeOwner && !host.prepareRemote && typeof host.layout === "function" && layoutHasMod(host.layout(), MOD_IDS.sidebar)) {
     const session = seat.session ?? seat.canonicalSessionName;
     if (!isValidSessionName(session)) return { ok: false, reason: sessionNameRefusal(session) };
@@ -6142,7 +6152,9 @@ async function attachSeatOnce(host, seat, config, options) {
       "--",
       ...argv,
     ];
-    const started = await Promise.resolve(host.hc(hcArgs)).catch(() => null);
+    let started = null;
+    try { started = await Promise.resolve(host.hc(hcArgs)); }
+    catch (error) { if (error?.code === "GATE_REFUSED") return { ok: false, reason: error.message }; started = null; } // the gate's sentence, not a generic failure
     let address = null;
     try { address = JSON.parse(started?.stdout ?? "null")?.address ?? null; } catch (_) { address = null; }
     if (address && !String(address).includes("/") && (started?.code === undefined || started.code === 0)) {

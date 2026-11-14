@@ -5,6 +5,8 @@ import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-
 import { configDefinition, validateConfigValue,configPairPlan,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
 import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configRejectedSaveResidual,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
 import { timezoneNote } from './rig-time.js';
+import { gatedFetch } from "./rig-gate.js";
+const fetch = gatedFetch; // every request goes through the send gate
 const icon = iconsAt("mods/rig-view");
 const hidden = e => e?.visibility === "withheld" || CONFIG_TERMINAL_KEYS.includes(e?.key) || /token|credential/i.test(e?.key ?? "");
 const textValue = e => hidden(e) ? "Value withheld by OpenRig" : String(e?.value ?? "unset");
