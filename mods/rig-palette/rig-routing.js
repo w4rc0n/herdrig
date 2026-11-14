@@ -414,6 +414,8 @@ async function perform(host,config,request,rig,key){
 }
 
 export async function routeOpen(host,config,request={}){
+  // A refused connections list opens nothing, not even the local home space or a TUI that could not run: it has no address to open anything for.
+  if(config?.connectionsRefused)return fail(config.connectionsRefused);
   if(config?.daemonMachine!==undefined&&config.daemonMachine!==""&&
     (typeof config.daemonMachine!=="string"||!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(config.daemonMachine)))
     return fail("daemonMachine must name a Herdr machine. No local terminal was started.");

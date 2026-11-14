@@ -985,6 +985,20 @@ export function preserveCliDiscoveredConfig(next, prev) {
  * What every command's environment drops (a seat's identity, database, and `OPENRIG_URL` herdr-app may have inherited)
  * and sets (`OPENRIG_URL` is exported ONLY when `daemonUrl` was explicitly configured in `config.json`).
  */
+/** The loopback daemon address another mod published in the shared `rig.data` config, for a mod whose own config names none. A refused connections
+ *  list has NO address and gets none from here: a sidebar that ran before the list was added left one behind, and clears it only when its own refresh
+ *  runs. Every reader of that shared address goes through this. */
+export function sharedLoopbackDaemonUrl(config, published) {
+  if (config?.connectionsRefused) return null;
+  const url = published?.config?.daemonUrl;
+  return url && isLoopbackDaemonUrl(url) ? url : null;
+}
+/** What other mods published in the shared `rig.data` (rows, nodes, needs, versions), as a reader may RENDER or SUGGEST it. A refused connections list
+ *  has none: whatever a sidebar published before the list was added is stale, and the sidebar replaces it only when its own refresh runs. Every
+ *  reader of the shared rows goes through this (`undefined` reads like a sidebar that has published nothing). */
+export function sharedRigData(config, shared) {
+  return config?.connectionsRefused ? undefined : shared("rig.data");
+}
 /** Why the CLI must not run for this config, or null. A connection other than the legacy one authenticates from its OpenRig home alone (the
  *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
  *  and send that home's terminal token to whatever address the connection names. Every command, a read as much as a write, is refused. */

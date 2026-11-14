@@ -16,6 +16,7 @@ const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connecti
 import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
 
 /** The palette's own commands, offered first when they match what is typed. */
+import { sharedLoopbackDaemonUrl, sharedRigData } from "./rig-lib.js";
 import { registerRigRouting } from "./rig-lib.js";
 export { LOCAL_COMMANDS };
 const OWN = LOCAL_COMMANDS;
@@ -67,7 +68,7 @@ export default class RigPalette extends View {
   rows() {
     const q = this.input.value().trim().toLowerCase();
     const [verb] = q.split(/\s+/);
-    const data = shared("rig.data") ?? {};
+    const data = sharedRigData(this.config, shared) ?? {};
     const names = [];
     for (const rig of data.topology ?? []) {
       names.push({ line: `rig ${rig.name}`, hint: "Rig card", navigation: true });
@@ -152,12 +153,14 @@ export default class RigPalette extends View {
       return true;
     }
     if ((verb === "expand-all" || verb === ":expand-all") && !arg) {
-      setShared("rig.open.page", expandAllTopology(shared("rig.open.page"), shared("rig.data")?.topology ?? []));
+      if (this.config?.connectionsRefused) { this.error = this.config.connectionsRefused; cx.notify(); return true; } // a refused list opens no Rig page tab
+      setShared("rig.open.page", expandAllTopology(shared("rig.open.page"), sharedRigData(this.config, shared)?.topology ?? []));
       this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" }));
       return true;
     }
     if ((verb === "collapse-all" || verb === ":collapse-all") && !arg) {
-      setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), shared("rig.data")?.topology ?? []));
+      if (this.config?.connectionsRefused) { this.error = this.config.connectionsRefused; cx.notify(); return true; } // a refused list opens no Rig page tab
+      setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), sharedRigData(this.config, shared)?.topology ?? []));
       this.finishPage(openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" }));
       return true;
     }
@@ -186,7 +189,7 @@ export default class RigPalette extends View {
     ) {
       const nav = shared("rig.nav") ?? { stack: [] };
       const top = nav.stack?.at(-1) ?? { section: "topology" };
-      const route = paletteRoute({ line }, top, shared("rig.data")?.topology ?? []);
+      const route = paletteRoute({ line }, top, sharedRigData(this.config, shared)?.topology ?? []);
       if (route.error) { this.error = route.error; cx.notify(); return true; }
       this.applyRoute(route);
       return true;
@@ -198,7 +201,7 @@ export default class RigPalette extends View {
   design(cx, name) {
     const reason = capabilityDisableReason("design-view", this.caps());
     if (reason) { this.note = reason; cx.notify(); return true; }
-    const rigs = shared("rig.data")?.topology ?? [];
+    const rigs = sharedRigData(this.config, shared)?.topology ?? [];
     const top = (shared("rig.nav") ?? {}).stack?.at(-1);
     const rig = name ? rigs.find((r) => r.name === name) : rigs.find((r) => top?.kind === "rig" && r.id === top.rigId) ?? rigs[0];
     if (!rig) { this.error = name ? `No rig ${name} on this daemon.` : "No rig to design a view for."; cx.notify(); return true; }
@@ -209,7 +212,7 @@ export default class RigPalette extends View {
 
   /** `change-model [seat]`: opens the harness/model/effort swap modal for the named seat (or the seat on the Rig page). */
   changeModel(cx, seatArg) {
-    const rigs = shared("rig.data")?.topology ?? [];
+    const rigs = sharedRigData(this.config, shared)?.topology ?? [];
     const allSeats = rigs.flatMap((rig) => (rig.pods ?? []).flatMap((p) => (p.seats ?? []).map((seat) => ({ rig, seat }))));
     const top = (shared("rig.nav") ?? {}).stack?.at(-1);
     const hit = seatArg
@@ -275,7 +278,7 @@ export default class RigPalette extends View {
       if (!res.action || typeof res.action.type !== "string") { this.error = `rig tui resolve answered "${res.kind}" without saying what to do; is this the OpenRig that installed the Rig mods?`; cx.notify(); return; }
       const nav = shared("rig.nav") ?? { stack: [] };
       const top = nav.stack?.at(-1) ?? { section: "topology" };
-      const route = paletteRoute({ ...res, line }, top, shared("rig.data")?.topology ?? []);
+      const route = paletteRoute({ ...res, line }, top, sharedRigData(this.config, shared)?.topology ?? []);
       if (route.error) { this.error = route.error; cx.notify(); return; }
       if (route.note) { this.note = route.note; cx.notify(); return; }
       if (route.back) { setShared("rig.nav", navBack(nav)); this.finishPage(openOrFocusRigTab({run,spaces,panes,layout})); return; }
@@ -318,15 +321,15 @@ export default class RigPalette extends View {
 
   openOperator(cx) {
     const config = this.config ?? parseConfig(null);
-    const sharedUrl = shared("rig.data")?.config?.daemonUrl;
-    const daemonUrl = config.daemonUrl ?? (sharedUrl && isLoopbackDaemonUrl(sharedUrl) ? sharedUrl : null);
+    if (config.connectionsRefused) { this.error = config.connectionsRefused; this.note = null; cx.notify(); return true; }
+    const daemonUrl = config.daemonUrl ?? sharedLoopbackDaemonUrl(config, shared("rig.data"));
     if (!isLoopbackDaemonUrl(daemonUrl)) {
       this.error = REMOTE_OPERATOR_REASON;
       this.note = null;
       cx.notify();
       return true;
     }
-    const topo = shared("rig.data")?.topology ?? [];
+    const topo = sharedRigData(this.config, shared)?.topology ?? [];
     const kernelRig = topo.find((r) => r.name === "kernel");
     const operatorSeat = kernelRig?.pods?.flatMap((p) => p.seats ?? [])?.find((s) => s.logicalId === "operator.agent" || String(s.session ?? "").startsWith("operator-agent@"));
     const target = {
@@ -352,10 +355,11 @@ export default class RigPalette extends View {
   }
 
   async resolveDaemonUrl() {
+    if (this.config?.connectionsRefused) throw new Error(this.config.connectionsRefused); // a refused list has no address, from anywhere
     if (this.config?.daemonUrl) return this.config.daemonUrl;
     // Another mod's shared state may name the daemon only when it's on this machine (loopback).
-    const fromShared = shared("rig.data")?.config?.daemonUrl;
-    if (fromShared && isLoopbackDaemonUrl(fromShared)) {
+    const fromShared = sharedLoopbackDaemonUrl(this.config, shared("rig.data"));
+    if (fromShared) {
       this.config = { ...(this.config ?? parseConfig(null)), daemonUrl: fromShared, daemonUrlSource: "cli" };
       return fromShared;
     }

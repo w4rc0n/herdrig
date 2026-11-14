@@ -4,7 +4,7 @@
 
 - A connections list is not supported yet; herdrig says so and leaves it unchanged.
 - Opening a rig's page, Attach or worker views checks its existing space first. If OpenRig cannot confirm the match, the sidebar explains why and nothing opens, instead of creating a second space.
-- Paired settings keep changes made elsewhere and reset in a safe order. A lost save reply pauses further changes until settings are checked. Undo checks again before each restored value; a simultaneous change can still win or be overwritten because OpenRig offers no atomic settings update.
+- Paired settings keep changes made elsewhere and reset in a safe order. A lost save reply pauses further changes until settings are checked. Undo checks again before each restored value; a simultaneous change can still win or be overwritten because OpenRig offers no atomic settings update. If a proxy or tunnel retains an interrupted save, it can still arrive after that check and replace a newer value; recovery now warns you to check the setting again if it matters.
 - A slow settings save pauses further changes until OpenRig answers and its current values are checked. Undo preserves changes made elsewhere, and switching connections keeps their settings separate.
 - Find the Spaces list in **System → Layout**, in the sidebar and on the System page. The sidebar also includes Overview and Notifications; palette commands select their matching row.
 - All seats keeps connected assistants in order and shows each once when a rig cannot load. Reconnecting checks for assistants again, and the sidebar keeps the selected assistant in view.
