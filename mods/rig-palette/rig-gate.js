@@ -31,11 +31,11 @@ let current; // undefined: never observed (unloaded). Otherwise the last non-nul
 let generation = 0, identityKey = null, discovered = null;
 
 // What makes a config a different one for the requests already in flight: the list refusal, the connection, the address THE FILE names, the machine
-// and the OpenRig home. An address the CLI found is NOT part of that identity: a default install has no daemonUrl, so its first discovery turns the same
+// the OpenRig home and the configured rig command (another wrapper can select another OpenRig home). An address the CLI found is NOT part of that identity: a default install has no daemonUrl, so its first discovery turns the same
 // file config into one with an address, and calls that began before it finished (the menu and New rig both ask at once) must not be dropped for it.
 // A DIFFERENT address found later (the daemon moved) is a change, tracked on its own below.
 const fileAddress = (config) => (config.daemonUrlSource === "cli" || config.daemonUrlSource === "default" ? null : (config.daemonUrl ?? null));
-const identity = (config) => JSON.stringify([config.connectionsRefused ?? null, config.connectionId ?? null, fileAddress(config), config.daemonMachine ?? null, config.openrigHome ?? null]);
+const identity = (config) => JSON.stringify([config.connectionsRefused ?? null, config.connectionId ?? null, fileAddress(config), config.daemonMachine ?? null, config.openrigHome ?? null, config.rig ?? null]);
 
 /** Whether two configs are the same one for what is in flight (the file's identity; an address the CLI found is not a change). A dialog that captured
  *  its config when it opened compares it with a fresh read before it sends. */
@@ -90,11 +90,15 @@ export async function gatedFetch(url, init, since) {
 }
 
 /** A process run for the mod (the OpenRig CLI is `env ... rig ...`). Under a refused or unloaded config only the listed local utilities run. */
-export async function gatedExec(rawExec, command, args, options) {
+export async function gatedExec(rawExec, command, args, options, since) {
   const local = NON_DAEMON_COMMANDS.includes(basename(command));
-  if (!local) refuse();
-  const started = generation;
-  const result = await rawExec(command, args, options);
+  if (!local) { refuse(); if (since !== undefined && since !== generation) throw new GateRefusal(CONFIG_CHANGED); }
+  const started = since ?? generation;
+  let result;
+  // A process that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error it could
+  // read as "that command does not work, use the default".
+  try { result = await rawExec(command, args, options); }
+  catch (error) { if (!local) stillCurrent(started); throw error; }
   if (!local) stillCurrent(started);
   return result;
 }
@@ -102,12 +106,15 @@ export async function gatedExec(rawExec, command, args, options) {
 /** A Herdr command. Verbs that only drive Herdr itself (ls, get, label, space, tab, pane, machine...) send nothing to a daemon and start no process:
  *  they pass. `run` and `exec` start a process (a TUI, an attach relay, a spec helper), so under a refused or unloaded config they are refused. */
 export const PROCESS_VERBS = Object.freeze(["run", "exec", "file"]); // `file` writes on another machine
-export async function gatedHc(rawHc, args, bytes) {
+export async function gatedHc(rawHc, args, bytes, since) {
   const verb = Array.isArray(args) ? args[0] : null;
   if (!PROCESS_VERBS.includes(verb)) return rawHc(args, bytes);
   refuse();
-  const started = generation;
-  const result = await rawHc(args, bytes);
+  if (since !== undefined && since !== generation) throw new GateRefusal(CONFIG_CHANGED);
+  const started = since ?? generation;
+  let result;
+  try { result = await rawHc(args, bytes); }
+  catch (error) { stillCurrent(started); throw error; }
   // The process was started under the config that is gone. It cannot be un-started, but nothing may ACT on it (select its tab, label it, report
   // success): the caller gets the refusal, as for every other gated sink.
   stillCurrent(started);
@@ -131,8 +138,21 @@ export function gatedOperation() {
   return {
     since,
     fetch: (url, init) => gatedFetch(url, init, since),
+    // The rig CLI and Herdr's process verbs under the same generation: they refuse to START after a change, and their results are judged by it.
+    exec: (rawExec, command, args, options) => gatedExec(rawExec, command, args, options, since),
+    hc: (rawHc, args, bytes) => gatedHc(rawHc, args, bytes, since),
     check: () => { refuse(); if (since !== generation) throw new GateRefusal(CONFIG_CHANGED); },
   };
+}
+
+/** `gatedOperation()` for a caller that has no place to catch the refusal where it starts (a view method): under a refused or unloaded config the
+ *  operation exists and every request, process and check of it fails with that refusal, exactly as a plain gated call would. */
+export function gatedOperationOrRefusal() {
+  try { return gatedOperation(); }
+  catch (error) {
+    const fail = () => Promise.reject(error);
+    return { since: -1, fetch: fail, exec: fail, hc: fail, check: () => { throw error; } };
+  }
 }
 
 /** An event-stream connection. The socket it returns is closed if the config changed while it was being made. */

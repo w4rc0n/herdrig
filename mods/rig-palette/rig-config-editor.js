@@ -7,10 +7,21 @@ const shown = entry => entry?.visibility !== "withheld" && !CONFIG_TERMINAL_KEYS
 const valueOf = entry => shown(entry) ? String(entry?.value ?? "") : "";
 const normalized = (def,value) => def.type === 'int' && /^-?\d+$/.test(String(value)) && Number.isSafeInteger(Number(value)) ? String(Number(value)) : String(value??'');
 const restorable = entry => entry && shown(entry) && ['file','default'].includes(entry.source) && !configDefinition(entry).readOnly;
+const planState = entry => !entry || !Object.hasOwn(entry,'value') || ['withheld','unavailable'].includes(entry.visibility) || entry.source==='unavailable' ? null
+  : JSON.stringify([JSON.stringify(entry.value),entry.source,entry.visibility,configDefinition(entry),JSON.stringify(entry.defaultValue)]);
+const CHANGED_PLAN = 'This setting changed elsewhere; review it again.';
+const brief=value=>{const text=String(value??'').replace(/\s+/g,' ');return text.length>80?`${text.slice(0,79)}…`:text;};
+const changedPlan=(model,pending)=>{
+  const key=pending.groupKeys.length===1?pending.groupKeys[0]:null,e=model.entry(key),state=model.planStates.get(pending)?.find(([k])=>k===key)?.[1];
+  const changedValue=state&&JSON.parse(state)[0]!==JSON.stringify(e?.value);
+  const target=pending.changes.find(([k])=>k===key)?.[1];
+  const message=key&&shown(e)&&e&&changedValue?`This setting changed elsewhere to ${brief(e.value)}, so your ${brief(target)} wasn't saved. Review it, then save again.`:CHANGED_PLAN;
+  return Object.assign(new Error(message),{tone:'working'});
+};
 
 /** One editor, one pending confirmation, no implicit writes. Callers inject the reviewed transport. */
 export class ConfigEditor {
-  constructor(connection = '') { this.connection=connection;this.entries = []; this.row = null; this.results = new Map(); this.busy = false; this.approved = new WeakSet(); }
+  constructor(connection = '') { this.connection=connection;this.entries = []; this.row = null; this.results = new Map(); this.busy = false; this.approved = new WeakSet();this.planStates=new WeakMap();this.reviewed=new WeakSet(); }
   observe(browser) { this.entries = Array.isArray(browser?.entries) ? browser.entries : []; }
   entry(key) { return this.entries.find(e => e.key === key); }
   open(key) {
@@ -32,6 +43,7 @@ export class ConfigEditor {
   cancelConfirmation() { this.confirmation=null; }
   commit() {
     if(this.busy||!this.row||this.confirmation)return null;
+    this.row.error=null;this.row.errorTone=null;
     if(this.row.keys.every(key=>normalized(configDefinition(this.entry(key)),this.row.values[key])===normalized(configDefinition(this.entry(key)),valueOf(this.entry(key))))){this.cancel();return null;}
     const plan=this.plan();
     if(plan.error){this.row.error=plan.error;return null;}
@@ -41,7 +53,7 @@ export class ConfigEditor {
   }
   plan() {
     if (!this.row) return { error: "Open a setting first" };
-    const value=key=>normalized(configDefinition(this.entry(key)),this.row.keys.length===2&&!this.row.touched[key]?valueOf(this.entry(key)):this.row.values[key]);
+    const value=key=>normalized(configDefinition(this.entry(key)),!this.row.touched[key]?valueOf(this.entry(key)):this.row.values[key]);
     for (const key of this.row.keys) {
       const error = validateConfigValue(configDefinition(this.entry(key)), value(key));
       if (error) return { error };
@@ -65,17 +77,20 @@ export class ConfigEditor {
     const operations=changes.map(([key,value])=>({key,value,reset:undoReceipt?undoReceipt.old.find(v=>v.key===key)?.source==='default':reset}));
     const high = changes.find(([key,value]) => undoReceipt?configDeletesHistory(configDefinition(this.entry(key)),value,this.entry(key)?.value):configDefinition(this.entry(key)).risk === "high");
     const pending = { changes: changes.map(v => [...v]), operations,groupKeys,connection:this.connection,undoOf:undoReceipt, reset, old,baseline };
+    const states=groupKeys.map(key=>[key,planState(this.entry(key))]);
     if (high) {
       const def = configDefinition(this.entry(high[0]));
       const current=shown(this.entry(high[0]))?this.entry(high[0]).value:null;
       this.confirmation = { ...pending, consequence: configConsequence(def, high[1],current), destructive: configDeletesHistory(def,high[1],current) };
+      this.planStates.set(this.confirmation,states);this.reviewed.add(this.confirmation);
       return null;
     }
     this.approved.add(pending);
+    this.planStates.set(pending,states);
     return pending;
   }
   confirm() { const pending = this.confirmation; if (!pending) return null; this.confirmation = null; this.approved.add(pending); return pending; }
-  async save(pending, write, refresh, now = Date.now, readCurrent) {
+  async save(pending, write, refresh, now = Date.now, readCurrent, checkCurrent) {
     if (this.busy || !pending || !this.approved.has(pending)) return false;
     this.approved.delete(pending);
     if(!pending.undoOf){this.results.clear();this.latestReceipt=null;this.lastSavedText=null;}
@@ -83,6 +98,7 @@ export class ConfigEditor {
     const checkUndo=async key=>{
       if(typeof readCurrent!=='function')throw new Error('Undo requires a fresh settings read');
       const current=await readCurrent(key),expected=pending.undoOf.expected.find(v=>v.key===key);
+      checkCurrent?.();
       if(pending.connection!==this.connection)throw new Error('OpenRig connection changed; Undo is no longer available');
       if(!restorable(this.entry(key))||!current||current.source!==expected?.source||JSON.stringify(current.value)!==JSON.stringify(expected?.value)){
         pending.undoOf.changed=true;throw Object.assign(new Error("It changed since you saved, so it wasn't undone."),{changedKey:key,changedValue:current?.value,changedSource:current?.source});
@@ -90,31 +106,62 @@ export class ConfigEditor {
     };
     try {
       if(pending.connection!==this.connection)throw new Error('OpenRig connection changed; Undo is no longer available');
+      checkCurrent?.();
+      // This is a new read, never the browser cached when the editor or confirmation opened.
+      await refresh();checkCurrent?.();
+      if(pending.connection!==this.connection)throw new Error('OpenRig connection changed; reopen the setting');
+      const states=this.planStates.get(pending)??[];
+      const strict=this.reviewed.has(pending)||(!pending.undoOf&&pending.groupKeys.length>1);
+      if(strict&&(states.length!==pending.groupKeys.length||states.some(([key,state])=>!state||planState(this.entry(key))!==state)))throw changedPlan(this,pending);
+      if(!pending.undoOf){
+        if(states.length!==pending.groupKeys.length)throw changedPlan(this,pending);
+        for(const [key,state]of states){
+          const fresh=planState(this.entry(key));
+          if(!fresh||!state)throw changedPlan(this,pending);
+        }
+        for(const key of pending.groupKeys)if(!this.entry(key)||configDefinition(this.entry(key)).readOnly)throw changedPlan(this,pending);
+        // A newly high-risk control cannot inherit a low-risk approval.
+        if(!strict&&pending.operations.some(({key})=>configDefinition(this.entry(key)).risk==='high'))throw changedPlan(this,pending);
+        const planned=!pending.reset&&this.row&&pending.changes.every(([key])=>this.row.keys.includes(key))?this.plan():{changes:pending.changes};
+        if(planned.error)throw new Error(planned.error);
+        const operations=pending.reset?pending.operations:planned.changes.map(([key,value])=>({key,value,reset:false}));
+        if(operations.some(({key})=>!pending.groupKeys.includes(key)))throw changedPlan(this,pending);
+        pending.operations=operations.filter(({key,value,reset})=>reset?this.entry(key).source!=='default'
+          :normalized(configDefinition(this.entry(key)),value)!==normalized(configDefinition(this.entry(key)),valueOf(this.entry(key))));
+        if(!pending.operations.length){this.row=null;this.confirmation=null;finished=true;return true;}
+        pending.old=pending.groupKeys.map(key=>{const e=this.entry(key);return{key,value:restorable(e)?valueOf(e):null,source:restorable(e)?e.source:null};});
+        pending.baseline=pending.groupKeys.map(key=>{const e=this.entry(key);return{key,value:restorable(e)?e.value:null,source:restorable(e)?e.source:null};});
+      }
       if(pending.undoOf){
-        await refresh();
         if(pending.undoOf!==this.latestReceipt||!this.receipt(pending.undoOf.keys[0],typeof now==='function'?now():now))throw new Error('Undo is no longer available');
+        if(pending.operations.some(({key,value,reset})=>reset&&normalized(configDefinition(this.entry(key)),value)!==normalized(configDefinition(this.entry(key)),String(this.entry(key)?.defaultValue??''))))throw changedPlan(this,pending);
         for(const key of pending.undoOf.keys){
           if(!restorable(this.entry(key))){pending.undoOf.changed=true;throw new Error("It changed since you saved, so it wasn't undone.");}
           await checkUndo(key);
         }
       }
+      const guarded=new Map(pending.groupKeys.map(key=>[key,planState(this.entry(key))]));
       const expected=[];
       for (const {key,value,reset} of pending.operations) {
+        checkCurrent?.();
+        if(!pending.undoOf&&completed&&pending.groupKeys.length>1&&pending.groupKeys.some(k=>!guarded.get(k)||planState(this.entry(k))!==guarded.get(k)))throw changedPlan(this,pending);
         // Re-check at the write boundary. A UI control or stale confirmation cannot add an unknown key.
         const def = configDefinition(this.entry(key));
         if (def.readOnly || !this.entry(key) || (!reset && validateConfigValue(def, value))) throw new Error("Setting changed; reopen it before saving");
         // Best effort: the public config API has no atomic precondition. Re-read immediately before EACH Undo write.
         if(pending.undoOf)await checkUndo(key);
+        const before=this.entry(key);
         const result = await write(key, value, reset);
         if (!result.ok) throw new Error(result.error ?? "OpenRig refused the save");
         completed++;
+        guarded.set(key,planState({...before,...result.resolved}));
         if(completed===1){this.results.clear();this.latestReceipt=null;}
         await refresh();
         const current = this.entry(key);
         const resolved = current ? {value:current.value,source:current.source} : result.resolved;
         const produced=result.resolved??resolved;
         expected.push({key,value:restorable(current)&&['file','default'].includes(produced?.source)?produced.value:null,source:produced?.source});
-        this.lastSavedText=configSavedText(def,{...result,resolved,withheld:!shown(current)},reset);
+        this.lastSavedText=configSavedText(def,{...result,resolved,withheld:!shown(current)},reset,!!pending.undoOf);
       }
       // Unwritten pair fields belong to the pre-save snapshot, never another writer's refresh.
       for(const key of pending.groupKeys)if(!expected.some(v=>v.key===key))expected.push({...pending.baseline.find(v=>v.key===key)});
@@ -127,6 +174,7 @@ export class ConfigEditor {
       finished=true;
       return true;
     } catch (error) {
+      this.errorTone=error.tone??null;
       let message=`${completed ? `${completed} setting${completed===1?'':'s'} ${pending.undoOf?'restored':'saved'}; the next was refused.\n` : ""}${error.message}`;
       if(pending.undoOf&&completed&&[PRESSURE_WARNING,PRESSURE_CRITICAL].includes(error.changedKey)){
         const label=key=>key===PRESSURE_WARNING?'Warning':'Critical';
@@ -139,7 +187,7 @@ export class ConfigEditor {
       else this.error = message;
       return false;
     } finally {
-      if(!finished)try { await refresh(); } catch (error) { this.error = `Could not refresh configuration: ${error.message}`; }
+      if(!finished)try { await refresh(); } catch (error) { if(!this.row?.error&&!this.error)this.error = `Could not refresh configuration: ${error.message}`; }
       this.busy = false;
     }
   }
@@ -164,9 +212,13 @@ export class ConfigEditor {
   }
 }
 
-export function configSavedText(def, result, reset = false) {
+export function configSavedText(def, result, reset = false, undo = false) {
   const where = result.daemon ? ` on ${result.daemon}` : "";
   if (result.resolved?.source === "env") return `Saved${where}, but OpenRig is using ${result.withheld ? "a withheld value" : result.resolved.value} from its environment instead.`;
+  if(undo){
+    const timing=def.restart?' Takes effect when the daemon restarts.':def.key.startsWith('retention.')?' Applies at the next retention sweep.':def.key.startsWith('snapshots.periodic.')?' Selected when the snapshot scheduler starts.':'';
+    return result.withheld?`✓ Undo completed${where}.${timing}`:`✓ Undone: ${def.key} is ${brief(result.resolved?.value)} again.${timing}`;
+  }
   if (reset) return `✓ Reset to the default${where}.`;
   if (result.resolved?.source === "default") return `✓ Saved${where} (same as the default).`;
   if (def.restart) return `✓ Saved${where}. Takes effect when the daemon restarts.`;

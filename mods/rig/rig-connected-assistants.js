@@ -76,10 +76,12 @@ export function assistantTarget(member,rig){
 }
 export function assistantForNeed(need,roster){
  if(roster?.state!=='ready'||typeof need?.conn!=='string')return null;
- const seat=need.asker??need.sourceSession;
+ const seat=need.reply==='resolve'||need.answer?.verb==='resolve'?need.waiting?.owner??need.destinationSession:need.asker??need.sourceSession;
  return roster.members.find(m=>!m.invalid&&m.conn===need.conn&&m.seat===seat)??null;
 }
 export const assistantOwner=member=>`${member.name} · ${member.rig} (connected assistant)`;
+/** Assistant-owned requests stay in Needs, but never promote unrelated terminal seats via a rig fallback. */
+export const terminalAttention=(items,roster)=>(items??[]).filter(need=>!assistantForNeed(need,roster));
 export const ASSISTANT_ACTION_REFUSED='Connected assistants check their own queue; terminal and model actions do not apply.';
 export function assistantActionRefusal(target,action){
  if(target?.kind!=='assistant')return null;

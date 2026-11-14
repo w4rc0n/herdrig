@@ -10,7 +10,7 @@ import { View, div } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc as rawHc, layout, notify } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
 const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
@@ -390,8 +390,9 @@ export default class RigPalette extends View {
   }
 
   async get(path) {
+    const op = gatedOperationOrRefusal(); // the address below belongs to the config it was resolved under: the request refuses to go if the settings changed meanwhile
     const daemonUrl = await this.resolveDaemonUrl();
-    const r = await fetch(`${daemonUrl}${path}`);
+    const r = await op.fetch(`${daemonUrl}${path}`);
     if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
     return stampConnection(await r.json(), this.config?.connectionId);
   }
@@ -425,9 +426,10 @@ export default class RigPalette extends View {
         if (unsafeReadPath(route.target.path)) return fail("Path must stay inside the readable root.");
         // The daemon's guarded read decides: `..`, absolute paths and symlinks out of the root are refused
         // there, and the file shown is the one it resolved.
+        const op = gatedOperationOrRefusal();
         const daemonUrl = await this.resolveDaemonUrl();
         const url = `${daemonUrl}/api/files/read?root=${encodeURIComponent(route.target.root)}&path=${encodeURIComponent(route.target.path)}`;
-        const r = await fetch(url);
+        const r = await op.fetch(url);
         let body = null; try { body = await r.json(); } catch (e) { body = rethrowGate(null)(e); }
         if (!r.ok) return fail(`read: ${body?.message ?? body?.error ?? `the daemon refused it (${r.status})`}`);
         const at = typeof body?.absolutePath === "string" ? body.absolutePath : `${root.path.replace(/\/+$/, "")}/${route.target.path}`;

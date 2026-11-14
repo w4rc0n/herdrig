@@ -15,7 +15,7 @@
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
 import { stampConnection, targetConnection, consentOf, consentText, LEGACY_CONNECTION_ID } from "./rig-connections.js";
-import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
+import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
 import {SYSTEM_PAGE_VIEWS} from './rig-page-nav.js';
 import { View, div, svg } from "gpui-kit";
@@ -985,6 +985,15 @@ export default class RigSidebar extends View {
   async oneClick(cx, id, target, action, actionKey = null) {
     const assistantReason=assistantActionRefusal(target,action);
     if(assistantReason){setShared('rig.busyAction',null);setShared('rig.status',{id,busy:false,ok:false,text:assistantReason,at:Date.now()});cx.notify();return;}
+    if(target?.kind==='assistant'&&action==='queue'){
+      // All assistant sends use the composer, including a stale one-click/palette target.
+      // It obtains text and re-observes settings after roster verification before dispatch.
+      setShared('rig.busyAction',null);
+      const conn=targetConnection(this.config,target);
+      if(!conn.ok){setShared('rig.status',{id,busy:false,ok:false,text:conn.reason,at:Date.now()});cx.notify();return;}
+      openOverlay({mod:MOD_IDS.menu,kind:'dialog',modal:true,width:460,height:300,props:{target,step:{action:'queue',input:true,multiLine:true,placeholder:'One-line summary; the body follows on the next lines'}}});
+      cx.notify();return;
+    }
     const workerCaps=currentCapabilities(shared,terminals());
     if(workerCaps.hostWorkerViews&&workerCaps.herdrAppAvailable===false&&["open-view","follow","unfollow","prune"].includes(action)){
       setShared("rig.busyAction",null);return this.hostWorkerAction(cx,id,target,action);
@@ -1013,10 +1022,6 @@ export default class RigSidebar extends View {
       const config = this.config ?? parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
       // The connection is the target's own (stamped where its row came from), never a default: without one nothing is sent.
       const conn = targetConnection(config, target);
-      if(conn.ok&&target?.kind==='assistant'){
-        const verified=await verifyAssistantTarget(fetch,conn.config,target,(ms,done)=>cx.timer.after(ms,done));
-        if(!verified.ok){clearBusy();setShared('rig.status',{id,busy:false,ok:false,text:verified.reason,at:Date.now()});cx.notify();return;}
-      }
       const args = conn.ok ? actionArgs(target, action, "", appHome()) : null;
       const cmd = args ? writeCommand(conn.config, args) : null;
       r = !conn.ok ? { ok: false, text: conn.reason }
@@ -1705,7 +1710,7 @@ export default class RigSidebar extends View {
     const registered=[];
     const elements=priorityElements({ div, svg, h_flex }, t, rows, {
       requestCount: needsRequestCount(this.data?.topology, this.data?.attentionItems),
-      askOwner:ask=>{const member=assistantForNeed(ask,this.data?.hostedMembers);return member?assistantOwner(member):null;},
+      askOwner:ask=>{if(ask?.reply==='resolve'||ask?.answer?.verb==='resolve')return ask.waiting?.owner??ask.destinationSession??null;const member=assistantForNeed(ask,this.data?.hostedMembers);return member?assistantOwner(member):null;},
       folds: shared("rig.open.sidebar") ?? {}, selected: shared("rig.sel")?.key, iconOf: icon,
       register: (row) => {this.visibleTreeRows.push(row);registered.push(row);},
       fold: (key, value, cx) => { this.fold(key, value); cx.notify(); },
