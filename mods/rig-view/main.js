@@ -383,6 +383,8 @@ export default class RigView extends View {
       return fromShared;
     }
     const status = await discoverDaemonFromCli(this.config, exec);
+    // The config can turn refused while the CLI answers (loadConfig installs it): the answer is for the config that asked, so it is dropped.
+    if (this.config?.connectionsRefused) { this.lastDaemonMessage = this.config.connectionsRefused; return null; }
     if (status.reachable && status.daemonUrl) {
       const nextCfg = { ...this.config, daemonUrl: status.daemonUrl, daemonUrlSource: "cli", daemonState: status.state };
       delete nextCfg.daemonMessage;

@@ -23,6 +23,7 @@ const OWN = LOCAL_COMMANDS;
 
 const STACK = "rig-work", PAGE = "rig-page";
 
+const CONFIG_LOADING = "OpenRig's settings are still loading. Try again in a moment.";
 export default class RigPalette extends View {
   init(_p, cx) {
     flatOwner = this;
@@ -59,7 +60,8 @@ export default class RigPalette extends View {
     });
   }
 
-  cli(args) { const c = readCommand(this.config ?? parseConfig(null), args); return [c.command, c.args, { timeout: 30000 }]; }
+  cli(args) { const c = this.config ? readCommand(this.config, args) : { command: "false", args: [] }; // never a default config before config.json is read
+    return [c.command, c.args, { timeout: 30000 }]; }
   caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
   /** Closes the palette (named apart from close(), which herdr calls at teardown). */
   dismiss() { const id = props()?.overlay; if (id) closeOverlay(id); else run("mod.open", { name: MOD_IDS.palette }); }
@@ -141,7 +143,7 @@ export default class RigPalette extends View {
     if ((verb === "tui" || verb === "open-tui" || verb === ":open-tui") && !arg) {
       // Wait for the sidebar's receipt, or complete the labelled local open here, before closing this palette.
       const inRigLayout = !!(function find(n) { return n && typeof n === "object" && (n.id === STACK || (n.children ?? []).some(find)); })(layout());
-      const config = this.config ?? parseConfig(null);
+      const config = this.config; // loaded: submit() waits for it
       this.busy = true; cx.notify();
       cx.spawn(async (cx) => {
         try {
@@ -251,6 +253,8 @@ export default class RigPalette extends View {
 
   submit(cx, line) {
     if (!line.trim()) return;
+    // Before config.json has been read a refused list cannot be seen: wait, never fall back to a default config.
+    if (!this.config) { this.error = CONFIG_LOADING; this.note = null; cx.notify(); return; }
     if (this.own(cx, line)) return;
     this.busy = true; this.error = null; this.note = null; cx.notify();
     cx.spawn(async (cx) => {
@@ -320,7 +324,8 @@ export default class RigPalette extends View {
   }
 
   openOperator(cx) {
-    const config = this.config ?? parseConfig(null);
+    if (!this.config) { this.error = CONFIG_LOADING; this.note = null; cx.notify(); return true; }
+    const config = this.config;
     if (config.connectionsRefused) { this.error = config.connectionsRefused; this.note = null; cx.notify(); return true; }
     const daemonUrl = config.daemonUrl ?? sharedLoopbackDaemonUrl(config, shared("rig.data"));
     if (!isLoopbackDaemonUrl(daemonUrl)) {
@@ -355,17 +360,20 @@ export default class RigPalette extends View {
   }
 
   async resolveDaemonUrl() {
-    if (this.config?.connectionsRefused) throw new Error(this.config.connectionsRefused); // a refused list has no address, from anywhere
+    if (!this.config) throw new Error(CONFIG_LOADING);
+    if (this.config.connectionsRefused) throw new Error(this.config.connectionsRefused); // a refused list has no address, from anywhere
     if (this.config?.daemonUrl) return this.config.daemonUrl;
     // Another mod's shared state may name the daemon only when it's on this machine (loopback).
     const fromShared = sharedLoopbackDaemonUrl(this.config, shared("rig.data"));
     if (fromShared) {
-      this.config = { ...(this.config ?? parseConfig(null)), daemonUrl: fromShared, daemonUrlSource: "cli" };
+      this.config = { ...this.config, daemonUrl: fromShared, daemonUrlSource: "cli" };
       return fromShared;
     }
-    const status = await discoverDaemonFromCli(this.config ?? parseConfig(null), exec);
+    const status = await discoverDaemonFromCli(this.config, exec);
+    // The config can turn refused while the CLI answers (a list added meanwhile): the answer is for the config that asked, so it is dropped.
+    if (this.config?.connectionsRefused) throw new Error(this.config.connectionsRefused);
     if (status.reachable && status.daemonUrl) {
-      this.config = { ...(this.config ?? parseConfig(null)), daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
+      this.config = { ...this.config, daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
       return status.daemonUrl;
     }
     throw new Error(status.message || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");

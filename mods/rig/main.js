@@ -392,7 +392,9 @@ export default class RigSidebar extends View {
 
   /** The active space's Rig TUI, shown, or opened once (works without config.json). */
   tui(cx) {
-    const config = this.config ?? parseConfig(null), inRigLayout = inRigLayoutNow();
+    // Before config.json has been read a refused list cannot be seen: wait, never fall back to a default config (it could open a home space and a TUI).
+    if (!this.config) { notify({ title: "Open TUI", body: "OpenRig is still loading; try again in a moment", level: "warning" }); return; }
+    const config = this.config, inRigLayout = inRigLayoutNow();
     cx.spawn(async (cx) => {
       const result = await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
       if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
@@ -405,7 +407,7 @@ export default class RigSidebar extends View {
       notify({ title: "Open operator", body: "OpenRig is still loading; try again in a moment", level: "warning" });
       return;
     }
-    const config = this.config ?? parseConfig(null);
+    const config = this.config; // loaded: the guard above returned otherwise
     if (config?.daemonUrl && !isLoopbackDaemonUrl(config.daemonUrl)) {
       notify({ title: "Open operator", body: REMOTE_OPERATOR_REASON, level: "warning" });
       cx?.notify?.();
@@ -776,6 +778,8 @@ export default class RigSidebar extends View {
   }
 
   routeRequest(cx, request, consent = null) {
+    // A forwarded route: command in the init window: there is no config to open anything for yet.
+    if (!this.config) { this.notifyResult("OpenRig", { ok: false, reason: "OpenRig's settings are still loading. Try again in a moment." }); return; }
     cx.spawn(async (cx) => {
       try {
         // A caller supplies an identity, never authority to invent a seat or its command.
@@ -1520,6 +1524,8 @@ export default class RigSidebar extends View {
     } finally {
       this.refreshing = false;
     }
+    // A list added while this refresh was in flight: whatever it read belongs to the config that is gone, so nothing of it is stored or published.
+    if (this.config?.connectionsRefused) { this.refuseConnectionsList(cx); return; }
     setShared("rig.data", {
       ...(this.data ?? {}),
       live: this.live,

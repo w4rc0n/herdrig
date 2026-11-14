@@ -997,7 +997,8 @@ export function sharedLoopbackDaemonUrl(config, published) {
  *  has none: whatever a sidebar published before the list was added is stale, and the sidebar replaces it only when its own refresh runs. Every
  *  reader of the shared rows goes through this (`undefined` reads like a sidebar that has published nothing). */
 export function sharedRigData(config, shared) {
-  return config?.connectionsRefused ? undefined : shared("rig.data");
+  // No config yet (a mod's first moments, before it has read config.json) cannot rule a refused list out, so it reads nothing either.
+  return !config || config.connectionsRefused ? undefined : shared("rig.data");
 }
 /** Why the CLI must not run for this config, or null. A connection other than the legacy one authenticates from its OpenRig home alone (the
  *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
@@ -2642,6 +2643,13 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   const publish = host.setShared ?? environment.setShared;
   const read = host.shared ?? environment.shared;
   publish?.("rig.nav", navPush(read?.("rig.nav"), current));
+  // A mod that registered its routing environment (every Rig mod does, at init) but has not read config.json yet has no config to open anything for:
+  // say so, never reach the router with none (a bare host with no registered environment is a caller that supplies everything itself).
+  if (routingEnvironment && !(environment.config ?? host.config)) {
+    const reason = "OpenRig's settings are still loading. Try again in a moment.";
+    (host.notify ?? environment.notify)?.({ title: "OpenRig", body: reason, level: "warning" });
+    return Promise.resolve({ ok: false, reason });
+  }
   return routeRigOpen(host, null, { kind: "page", entry: current }).then(result => {
     if (!result.ok) (host.notify ?? environment.notify)?.({ title: "OpenRig", body: result.reason, level: "warning" });
     return result;
