@@ -2,6 +2,10 @@
 import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers } from "./rig-lib.js";
 import { openRigSpaceContext, resolveRigSpace, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
+import { LEGACY_CONNECTION_ID } from "./rig-connections.js";
+/** The singular `homeSpace` is the legacy connection's record (older versions read only it). Another connection keeps its home in
+ *  `homeSpaces[key]` alone, whose key is [origin, machine] and so is already its own. */
+const legacyHome=(config,id)=>(config?.connectionId??LEGACY_CONNECTION_ID)===LEGACY_CONNECTION_ID?{homeSpace:id}:{};
 
 const jobs = new Map(), homeJobs = new Map(), pageJobs = new Map();
 const list = (host, key) => (typeof host[key] === "function" ? host[key]() : host[key]) ?? [];
@@ -291,7 +295,7 @@ async function home(host,config,needTui=true){
       if(found.context){
         try{await markHomeSpace(host,config,found.terminals,{hostId:remote?.selfHostId});}catch(error){return fail(String(error?.message??error));}
         known=found.context;space=known.space;for(const t of found.terminals)adopt.add(t.address);
-        await save(host,{homeSpace:space.id,homeSpaces:{...(state(host).homeSpaces??{}),[key]:space.id}});
+        await save(host,{...legacyHome(config,space.id),homeSpaces:{...(state(host).homeSpaces??{}),[key]:space.id}});
       }
     }
     if(space && !needTui) return {ok:true,space:space.id};
@@ -328,7 +332,7 @@ async function home(host,config,needTui=true){
     if(!adoptedSpace) return fail("Herdr has not adopted OpenRig's home terminal yet; check the local core before retrying.");
     if(!space) host.run("space.rename",{id,name:"OpenRig"});
     host.run("tab.rename",{id:tab,name:"Rig TUI"});
-    await save(host,{homeSpace:id,homeSpaces:{...(state(host).homeSpaces??{}),[key]:id}});
+    await save(host,{...legacyHome(config,id),homeSpaces:{...(state(host).homeSpaces??{}),[key]:id}});
     return {ok:true,reused:false,space:id,tab,terminal:address};
   })();
   homeJobs.set(key,task);

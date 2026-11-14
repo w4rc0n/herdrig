@@ -7,6 +7,8 @@ import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
+import { connectionsOf, LEGACY_CONNECTION_ID } from "./rig-connections.js";
+import { assistantActionRefusal } from './rig-connected-assistants.js';
 
 /** The single space-routing entry point for pages, the TUI, Attach and rig grids. */
 let routingEnvironment = null;
@@ -358,7 +360,7 @@ export const STATE_COPY = Object.freeze({
 export function parseConfig(text) {
   let raw = null;
   try { raw = JSON.parse(text ?? "null"); } catch { raw = null; }
-  if (!raw || typeof raw !== "object") return { person: null, daemonUrl: null, rig: ["rig"], openrigHome: null, missing: true };
+  if (!raw || typeof raw !== "object") { const { connections } = connectionsOf(null); return { person: null, daemonUrl: null, rig: ["rig"], openrigHome: null, missing: true, connectionId: connections[0].id, connections }; }
   const person = typeof raw.person === "string" && /^[^@\s]+@external$/.test(raw.person) ? raw.person : null;
   const daemonUrl = typeof raw.daemonUrl === "string" && /^https?:\/\/[^\s]+$/.test(raw.daemonUrl) ? raw.daemonUrl.replace(/\/+$/, "") : null;
   const daemonUrlSource = typeof raw.daemonUrlSource === "string" && raw.daemonUrlSource ? raw.daemonUrlSource : undefined;
@@ -369,9 +371,14 @@ export function parseConfig(text) {
   // The configured OpenRig home, pinned on every command (herdr-app's own environment may name another).
   const openrigHome = typeof raw.openrigHome === "string" && raw.openrigHome.startsWith("/") ? raw.openrigHome : null;
   const capabilities = raw.capabilities && typeof raw.capabilities === "object" && !Array.isArray(raw.capabilities) ? raw.capabilities : undefined;
+  // The connections this config describes (v0.5.0): the legacy daemonUrl / daemonMachine keys are connection one of a list of one, and
+  // nothing is rewritten. PR 1 runs the first connection only; the config below is that connection's, so a single-daemon setup is as it was.
+  const { connections, legacy } = connectionsOf(raw);
+  const first = connections[0];
   return {
-    person, daemonUrl, rig, openrigHome, missing: false,
-    ...(raw.daemonMachine !== undefined && raw.daemonMachine !== "" ? { daemonMachine: raw.daemonMachine } : {}),
+    person, daemonUrl: legacy ? daemonUrl : first.daemonUrl, rig, openrigHome: legacy ? openrigHome : first.openrigHome, missing: false,
+    connectionId: first.id, connections,
+    ...(legacy ? (raw.daemonMachine !== undefined && raw.daemonMachine !== "" ? { daemonMachine: raw.daemonMachine } : {}) : (first.machine ? { daemonMachine: first.machine } : {})),
     ...(daemonUrlSource ? { daemonUrlSource } : {}),
     ...(daemonState ? { daemonState } : {}),
     ...(daemonMessage ? { daemonMessage } : {}),
@@ -970,6 +977,9 @@ export function cliEnv(config) {
   return ["-u", "OPENRIG_SESSION_NAME", "-u", "RIGGED_SESSION_NAME", "-u", "OPENRIG_NODE_ID", "-u", "RIGGED_NODE_ID",
     "-u", "OPENRIG_ACTIVITY_HOOK_TOKEN", "-u", "RIGGED_ACTIVITY_HOOK_TOKEN", "-u", "OPENRIG_OCCUPANT_GENERATION",
     "-u", "OPENRIG_DB", "-u", "RIGGED_DB", "-u", "OPENRIG_URL",
+    // Another connection never inherits a credential: the CLI sends the home's terminal token (and these bearer variables) to whatever
+    // OPENRIG_URL names. The legacy connection is unchanged.
+    ...(config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID ? ["-u", "OPENRIG_HOME", "-u", "OPENRIG_TERMINAL_BEARER_TOKEN", "-u", "OPENRIG_AUTH_BEARER_TOKEN"] : []),
     ...(hasExplicitUrl ? [`OPENRIG_URL=${config.daemonUrl}`] : []),
     ...(config?.openrigHome ? [`OPENRIG_HOME=${config.openrigHome}`] : [])];
 }
@@ -1755,6 +1765,7 @@ export const ACTION_REFUSED = "Refused: OpenRig named a seat, cell or plan this 
 /** The CLI behind each menu action (`home` is the app home the herdr-app provider writes to); null when a value the
  *  daemon named can't be passed on safely. */
 export function actionArgs(target, action, text, home) {
+  if (assistantActionRefusal(target, action)) return null;
   const appHomeArgs = ["--app-home", home];
   // Options first, then `--`, then what the daemon named (a rig, a view, a terminal): a value such as `--host` stays an
   // argument and can't become an option. A session must also be a name OpenRig makes, and a value the daemon named that
@@ -2100,7 +2111,7 @@ export function rigTone(seats) {
 export const hostOf = (n) => n?.host ?? n?.hostSelfId ?? n?.hostId ?? null;
 
 /** Rigs → pods → seats, from `/api/rigs/summary` and each rig's `/api/rigs/:id/nodes`. */
-export function buildTopology(summary, nodesByRig, nativeSeats = []) {
+export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null) {
   // Native seats (placement: herdr) by session, with their live `hc run` children.
   const native = new Map((Array.isArray(nativeSeats) ? nativeSeats : []).map((s) => [s.sessionName, s]));
   return (summary ?? []).filter((r) => !r.archivedAt).map((rig) => {
@@ -2113,6 +2124,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = []) {
       const glyphInfo = rowStatusGlyph(status);
       if (!pods.has(pod)) pods.set(pod, []);
       pods.get(pod).push({
+        ...(conn ? { conn } : {}),
         logicalId: n.logicalId,
         member: n.logicalId.includes(".") ? n.logicalId.slice(n.logicalId.indexOf(".") + 1) : n.logicalId,
         session: n.canonicalSessionName,
@@ -2157,12 +2169,13 @@ export function buildTopology(summary, nodesByRig, nativeSeats = []) {
     const rigHost = rig.host ?? rig.hostId ?? seats.find((s) => s.host)?.host ?? "local";
     return {
       id: rig.id,
+      ...(conn ? { conn } : {}),
       name: rig.name,
       host: rigHost,
       lifecycle: rig.lifecycleState,
       seatCount: seats.length,
       tone: rigTone(seats),
-      pods: [...pods].map(([name, podSeats]) => ({ name, seats: podSeats })),
+      pods: [...pods].map(([name, podSeats]) => ({ name, seats: podSeats, ...(conn ? { conn } : {}) })),
     };
   });
 }
@@ -2179,13 +2192,14 @@ export function isSeatContextWarning(seat) {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 85;
 }
 
-export function rigModel(rig, nodes, nativeSeats = []) {
+export function rigModel(rig, nodes, nativeSeats = [], conn = null) {
   const native = new Map((Array.isArray(nativeSeats) ? nativeSeats : []).map((s) => [s.sessionName, s]));
   const seats = (nodes ?? []).filter((n) => n.nodeKind !== "service").map((n) => {
     const status = seatStatus(n);
     const look = statusLook(status);
     const glyphInfo = rowStatusGlyph(status);
     return {
+      ...(conn ? { conn } : {}),
       logicalId: n.logicalId,
       member: n.logicalId?.includes(".") ? n.logicalId.slice(n.logicalId.indexOf(".") + 1) : n.logicalId,
       session: n.canonicalSessionName,
@@ -2226,7 +2240,7 @@ export function rigModel(rig, nodes, nativeSeats = []) {
   const pods = new Map();
   for (const s of seats) { if (!pods.has(s.pod)) pods.set(s.pod, []); pods.get(s.pod).push(s); }
   const rigHost = rig.host ?? rig.hostId ?? seats.find((s) => s.host)?.host ?? "local";
-  return { id: rig.id, name: rig.name, host: rigHost, lifecycle: rig.lifecycleState ?? rig.lifecycle ?? null, seats, pods: [...pods].map(([name, list]) => ({ name, seats: list })) };
+  return { id: rig.id, ...(conn ? { conn } : {}), name: rig.name, host: rigHost, lifecycle: rig.lifecycleState ?? rig.lifecycle ?? null, seats, pods: [...pods].map(([name, list]) => ({ name, seats: list, ...(conn ? { conn } : {}) })) };
 }
 
 /** Seat counts by status for a header or pod line: working, needs you (blocked), idle. */
@@ -2265,7 +2279,7 @@ export function rigSpaceMarks({ spaces = [], terminals = [], panes = [], state =
     const link = links.find((l) => rigs.has(l.rig)) ?? links[0];
     if (!link) continue;
     const found = rigs.get(link.rig), counts = found ? statusCounts(found.seats ?? (found.pods ?? []).flatMap((p) => p.seats ?? [])) : { needs: 0, working: 0 };
-    out[context.id] = { rig: link.rig, rigId: found?.id ?? null, status: counts.needs ? "needs" : counts.working ? "working" : "idle", needs: counts.needs };
+    out[context.id] = { rig: link.rig, rigId: found?.id ?? null, ...(found?.conn && found.conn !== LEGACY_CONNECTION_ID ? { conn: found.conn } : {}), status: counts.needs ? "needs" : counts.working ? "working" : "idle", needs: counts.needs };
   }
   return out;
 }
@@ -2801,8 +2815,8 @@ export function commandLine(args) {
 }
 
 /** The New rig dialog, for `openOverlay`: from the sidebar's `+` and from the Topology page. */
-export function newRigOverlay() {
-  return { mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 480, height: 700, props: { target: { kind: "new-rig" }, step: { action: "new-rig" } } };
+export function newRigOverlay(conn = null) {
+  return { mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 480, height: 700, props: { target: { kind: "new-rig", ...(conn ? { conn } : {}) }, step: { action: "new-rig" } } };
 }
 
 /** The runtimes the New rig dialog offers for one seat; `rig create --runtime` takes any OpenRig knows. */
@@ -2989,6 +3003,7 @@ export function needTarget(item) {
   const tier = tierOf(item);
   return {
     kind: "need",
+    ...(item?.conn ? { conn: item.conn } : {}),
     ...(item?.criticalHealth ? { criticalHealth: true, healthFinding: item.healthFinding, source: item.source } : {}),
     id,
     qitemId,
@@ -3840,7 +3855,7 @@ export function resolveAskerSeat(asker, topology = []) {
       ) {
         return {
           found: true,
-          seat: { ...s, rig: rig.name, rigId: rig.id },
+          seat: { ...s, rig: rig.name, rigId: rig.id, conn: rig.conn },
         };
       }
     }
@@ -3954,7 +3969,10 @@ export function paletteKey(keys, platform) {
 
 /** A text box's draft key: the action and what it is for (a draft outlives an accidental close). */
 export function draftKey(target, action) {
-  return `${action ?? ""}::${target?.qitemId ?? target?.session ?? target?.rig ?? target?.id ?? ""}`;
+  // The legacy connection's drafts keep their old key (stored drafts stay found); another connection's are its own, so the same
+  // seat name on two OpenRigs (every kernel has operator-agent@kernel) never shares a draft.
+  const own = target?.conn && target.conn !== LEGACY_CONNECTION_ID ? `${target.conn}:` : "";
+  return `${own}${action ?? ""}::${target?.qitemId ?? target?.session ?? target?.rig ?? target?.id ?? ""}`;
 }
 
 /** The editor language for a file, as herdr's Files viewer picks it (defaults/mods/files LANG). */
@@ -4039,8 +4057,8 @@ export function crumbsFor(entry) {
   if (e.section === "topology") {
     if (e.kind === "host") return [section("topology"), { text: e.name ?? e.hostId ?? e.host, entry: e }];
     if (e.kind === "rig") return [section("topology"), { text: e.name ?? e.rigId, entry: e }];
-    if (e.kind === "pod") return [section("topology"), { text: e.rig ?? e.rigId, entry: { section: "topology", kind: "rig", rigId: e.rigId, name: e.rig ?? e.rigId } }, { text: e.name ?? e.pod, entry: e }];
-    if (e.kind === "seat") return [section("topology"), { text: e.rig, entry: { section: "topology", kind: "rig", rigId: e.rigId, name: e.rig } }, { text: e.name, entry: e, icon: "rig-seat" }];
+    if (e.kind === "pod") return [section("topology"), { text: e.rig ?? e.rigId, entry: { section: "topology", kind: "rig", rigId: e.rigId, ...(e.conn ? { conn: e.conn } : {}), name: e.rig ?? e.rigId } }, { text: e.name ?? e.pod, entry: e }];
+    if (e.kind === "seat" || e.kind === 'assistant') return [section("topology"), { text: e.rig, entry: { section: "topology", kind: "rig", rigId: e.rigId, ...(e.conn ? { conn: e.conn } : {}), name: e.rig } }, { text: e.name, entry: e, icon: e.kind==='assistant'?'rig-queue':"rig-seat" }];
     if (e.focus === "pulse" || e.subview === "pulse") return [section("topology"), { text: "Pulse", entry: e }];
     return [section("topology")];
   }
@@ -4429,13 +4447,13 @@ export function recentTransitionTarget(tr, topologyOrOpts = [], extraOpts = {}) 
       s.session === raw || s.logicalId === raw || `${rig.name}/${s.logicalId}` === raw || `${s.logicalId}@${rig.name}` === raw
     );
     if (hit) {
-      return { section: "topology", kind: "seat", rig: hit.rig.name, rigId: hit.rig.id, name: hit.s.logicalId, session: hit.s.session };
+      return { section: "topology", kind: "seat", rig: hit.rig.name, rigId: hit.rig.id, conn: hit.rig.conn, name: hit.s.logicalId, session: hit.s.session };
     }
     if (raw.includes("@")) {
       const at = raw.lastIndexOf("@");
       const name = raw.slice(0, at).replace("-", ".");
       const rig = raw.slice(at + 1);
-      return { section: "topology", kind: "seat", rig, ...(tr.rigId ? { rigId: tr.rigId } : {}), name, session: raw };
+      return { section: "topology", kind: "seat", rig, ...(tr.rigId ? { rigId: tr.rigId, conn: tr.conn } : {}), name, session: raw };
     }
     if (raw.includes("/")) {
       const [rig, name] = raw.split("/", 2);
@@ -4770,11 +4788,11 @@ export function paletteRoute(res, top, topology = []) {
     case "drill":
       if (a.resource === "agent") {
         const hit = topology.flatMap((rig) => rig.pods.flatMap((p) => p.seats.map((s) => ({ rig, s })))).find((x) => x.s.logicalId === a.name || x.s.member === a.name);
-        return { entry: hit ? { section: "topology", kind: "seat", rig: hit.rig.name, rigId: hit.rig.id, name: hit.s.logicalId, session: hit.s.session } : { section: "topology", filter: a.name } };
+        return { entry: hit ? { section: "topology", kind: "seat", rig: hit.rig.name, rigId: hit.rig.id, conn: hit.rig.conn, name: hit.s.logicalId, session: hit.s.session } : { section: "topology", filter: a.name } };
       }
       if (a.resource === "rig") {
         const rig = topology.find((r) => r.name === a.name);
-        return { entry: rig ? { section: "topology", kind: "rig", rigId: rig.id, name: rig.name } : { section: "topology", filter: a.name } };
+        return { entry: rig ? { section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name } : { section: "topology", filter: a.name } };
       }
       if (a.resource === "spec") return { entry: { section: "specs", name: a.name } };
       // A pod or host: opens the dedicated Pod/Host page when matched in topology, else narrows the rig card or topology filter.
@@ -4784,7 +4802,7 @@ export function paletteRoute(res, top, topology = []) {
         const wantPod = slash > 0 ? a.name.slice(slash + 1) : a.name;
         const hitRig = (topology ?? []).find((r) => (wantRig ? (r.name === wantRig || r.id === wantRig) : true) && (r.pods ?? []).some((p) => p.name === wantPod));
         if (hitRig) {
-          return { entry: { section: "topology", kind: "pod", rig: hitRig.name, rigId: hitRig.id, pod: wantPod, name: wantPod } };
+          return { entry: { section: "topology", kind: "pod", rig: hitRig.name, rigId: hitRig.id, conn: hitRig.conn, pod: wantPod, name: wantPod } };
         }
         return { entry: rigCard ? { ...top, tab: "table", filter: a.name } : { section: "topology", filter: a.name } };
       }
@@ -4989,8 +5007,13 @@ export function stripSecondaryEnterNewline(prev, now) {
   let i = 0;
   while (i < a.length && a[i] === b[i]) i++;
   const extra = b.length - a.length;
-  const inserted = b.slice(i, i + extra);
-  return /^\n[ \t]*$/.test(inserted) && b.slice(0, i) + b.slice(i + extra) === a ? a : b;
+  const matches = at => /^\r?\n[ \t]*$/.test(b.slice(at, at + extra)) && b.slice(0, at) + b.slice(at + extra) === a;
+  if (matches(i)) return a;
+  // A shared existing newline/indent can be swallowed by the common prefix.
+  // Try its start too, so inserting before an existing line stays unambiguous.
+  while(i>0 && (a[i-1]===' ' || a[i-1]==='\t'))i--;
+  if(i>0 && a[i-1]==='\n'){i--;if(i>0&&a[i-1]==='\r')i--;}
+  return matches(i) ? a : b;
 }
 
 /** The TUI's configuration categories (tui/src/config/config-model.ts CONFIG_CATEGORIES). */
@@ -5954,6 +5977,8 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   const isFirstHost = Boolean(typeof first?.run === "function" || typeof first?.hc === "function" || typeof first?.spaces === "function" || Array.isArray(first?.spaces));
   const host = isFirstHost ? first : second;
   const seat = { ...(isFirstHost ? second : first) };
+  const refused = assistantActionRefusal(seat, 'attach');
+  if (refused) return { ok: false, reason: refused };
   if (!host.routeOwner && !host.prepareRemote && typeof host.layout === "function" && layoutHasMod(host.layout(), MOD_IDS.sidebar)) {
     const session = seat.session ?? seat.canonicalSessionName;
     if (!isValidSessionName(session)) return { ok: false, reason: sessionNameRefusal(session) };
@@ -6090,7 +6115,7 @@ async function attachSeatOnce(host, seat, config, options) {
  * Returns `{ items, openCount, savedCount }` where `items` contains:
  * 1. Open/following worker views for `rig` (`kind: "open-view"`, `id`, `name`, `following`, `cellCount`, `rig`),
  * 2. Saved views for `rig` from `/api/terminal/views` not currently open (`kind: "saved-view"`, `id`, `name`, `rig`, `grid`),
- * 3. Always ends with `{ kind: "new-view", id: "+new-view:<rigName>", name: "+ New worker view…", rig: rig.name, rigId: rig.id }`.
+ * 3. Always ends with `{ kind: "new-view", id: "+new-view:<rigName>", name: "+ New worker view…", rig: rig.name, rigId: rig.id, conn: rig.conn }`.
  */
 export function rigViewsBranch(rig, stripProps = null, terminalViewsData = null) {
   const rigName = String(rig?.name ?? rig?.id ?? "");
@@ -6105,6 +6130,7 @@ export function rigViewsBranch(rig, stripProps = null, terminalViewsData = null)
     name: v.name ?? v.title ?? v.id,
     rig: rigName,
     rigId,
+    ...(rig?.conn ? { conn: rig.conn } : {}),
     open: true,
     following: Boolean(v.following),
     cellCount: Array.isArray(v.cells) ? v.cells.filter((c) => c?.seat || c?.kind === "shell").length : 0,

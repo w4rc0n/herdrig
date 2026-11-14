@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.4
+Version: v0.4.5
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
@@ -253,6 +253,7 @@ Top to bottom:
 2. **The tree**, scrolling, filling the rest. Six top-level branches, each with a 12 px chevron in `t.dim`:
    **Topology**, **Specs**, **Scopes**, **Terminals**, **Needs**, **System**. A branch row is 24 px; children indent
    12 px per level; every row is 22 px with a `t.hover` background on hover.
+   - **Connected assistants** — when OpenRig serves its hosted-members roster, a folded group appears after each rig's pods. Queue icons and check-in words distinguish these members from terminal seats. They also appear under All in All seats, without changing activity chips. Needs identifies their asks. Their read-only detail shows check-in evidence and open queued work. Queue work uses the existing `rig queue create --destination <address>` composer on the row's connection; Copy address and Open rig page are the other actions. No terminal, model, roster or cadence action is offered. A failed roster read or host mismatch is shown as unavailable, and older daemons returning 404 show nothing.
    - **Topology** — `host` → `rig` → `Views` → `pod` → `seat` → helper. A rig row carries its name in 12.5 px
      semibold and, when it is not running, a `(stopped)` or `(recoverable)` suffix in 10.5 px `t.dim` plus a small
      **Resume…** pill. A seat row carries its status dot, the seat name in 12 px, the **status word** in 11 px

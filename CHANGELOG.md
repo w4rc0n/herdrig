@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.5
+
+- Confirm setting changes beside the value you edited, with Cancel focused first. Saves show when they are still being checked, then offer Undo for a full ten seconds.
+- Click a setting to edit it, then press Enter or Tab or click away to save. Esc restores the old value; invalid text stays open. Undo restores your previous setting for ten seconds, and refuses if it changed elsewhere. Consequential changes still ask first.
+- See connected assistants under each rig and in All seats, with their check-in status. Queue work to them, copy their address, or read their queued work without mistaking them for terminal seats.
+
+- Settings use the controls and limits OpenRig reports, while older versions keep their existing controls. New settings ask for confirmation before saving. Empty fields show an error only after you edit them.
+- Ctrl+Enter saves a spec without adding a blank line or indentation to its file; intentional blank lines stay intact.
+- A quiet OpenRig keeps its live connection instead of repeatedly reloading the sidebar. A stream that stops answering still reconnects.
+- Helper verification reads the installed files safely before checking their hashes. Existing helper permissions stay valid.
+
 ## v0.4.4
 
 - Copy & edit keeps newer file changes and unsaved drafts, and recovers agent paths from your copy. All seats' Show all works from the keyboard; parked work stays with its owner.
