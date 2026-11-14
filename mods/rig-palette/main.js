@@ -10,7 +10,7 @@ import { View, div } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc as rawHc, layout, notify } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
 const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
@@ -428,7 +428,7 @@ export default class RigPalette extends View {
         const daemonUrl = await this.resolveDaemonUrl();
         const url = `${daemonUrl}/api/files/read?root=${encodeURIComponent(route.target.root)}&path=${encodeURIComponent(route.target.path)}`;
         const r = await fetch(url);
-        let body = null; try { body = await r.json(); } catch (_) { body = null; }
+        let body = null; try { body = await r.json(); } catch (e) { body = rethrowGate(null)(e); }
         if (!r.ok) return fail(`read: ${body?.message ?? body?.error ?? `the daemon refused it (${r.status})`}`);
         const at = typeof body?.absolutePath === "string" ? body.absolutePath : `${root.path.replace(/\/+$/, "")}/${route.target.path}`;
         return this.show({ ...fileEntry(at), ...(route.target.anchor ? { anchor: route.target.anchor } : {}) });

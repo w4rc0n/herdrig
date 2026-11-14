@@ -540,7 +540,8 @@ export async function discoverDaemonFromCli(config, execFn) {
             if (hostRes && hostRes.code === 0 && typeof hostRes.stdout === "string" && hostRes.stdout.trim()) {
               host = parseDaemonHostJson(hostRes.stdout);
             }
-          } catch {
+          } catch (hostError) {
+            if (hostError?.code === "GATE_REFUSED") throw hostError; // the settings changed: not a reason to assume 127.0.0.1
             host = "127.0.0.1";
           }
         }
@@ -573,6 +574,7 @@ export async function discoverDaemonFromCli(config, execFn) {
       message: firstLine || config?.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').",
     };
   } catch (err) {
+    if (err?.code === "GATE_REFUSED") throw err; // "settings changed" or a refused list is not "the daemon is unreachable": the caller says what it is
     if (isEnoentExecResult(null, err)) {
       return {
         reachable: false,
@@ -867,6 +869,7 @@ export async function probeOpenRigState(config, { exec, fetch: fetchFn, sidebarM
         versionProbe = { installed: true, code: 0, cliVersion };
       }
     } catch (err) {
+      if (err?.code === "GATE_REFUSED") throw err; // not "the rig command failed"
       if (isEnoentExecResult(null, err)) {
         versionProbe = { enoent: true, installed: false, code: 127, error: String(err?.message ?? err) };
       } else {
@@ -5268,7 +5271,7 @@ export async function probeCapabilities(config, { exec, terminals = [], hasNativ
     });
   }
   if (typeof exec !== "function") return availableNow({ ...DEFAULT_CAPABILITIES });
-  const probeExec = (cmd) => Promise.resolve(exec(cmd.command, cmd.args, { timeout: 15000 })).catch(() => null);
+  const probeExec = (cmd) => Promise.resolve(exec(cmd.command, cmd.args, { timeout: 15000 })).catch(rethrowGate(null)); // a refusal is not "nothing available": it must not be cached
   const openCmd = readCommand(config, ["terminal", "open", "--help"]);
   const closeCmd = readCommand(config, ["terminal", "close", "--help"]);
   const tuiCmd = readCommand(config, ["tui", "--help"]);
