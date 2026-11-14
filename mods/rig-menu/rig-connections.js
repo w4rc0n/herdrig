@@ -11,7 +11,7 @@ const HOST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export const NO_CONNECTION = "This needs to know which OpenRig it is for, and it didn't say. Nothing was sent.";
 export const UNKNOWN_CONNECTION = "That OpenRig connection isn't set up any more. Nothing was sent.";
-export const HOME_NEEDED = "With more than one OpenRig, each needs its own OpenRig home. Nothing was sent.";
+export const HOME_NEEDED = "This OpenRig needs its own OpenRig home in its connection settings, and none is set. Nothing was sent.";
 export const EXPLICIT_ADDRESS_NEEDED = "With more than one OpenRig, each needs its own address. Nothing was sent.";
 
 const text = (value) => (typeof value === "string" && value !== "" ? value : null);

@@ -17,6 +17,7 @@
 import { stampConnection, targetConnection, consentOf, consentText, LEGACY_CONNECTION_ID } from "./rig-connections.js";
 import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
+import {SYSTEM_PAGE_VIEWS} from './rig-page-nav.js';
 import { View, div, svg } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { workflowPath,workflowView,workflowEntry,workflowWord } from './rig-workflow.js';
@@ -1074,6 +1075,8 @@ export default class RigSidebar extends View {
     if(result.needsConsent)this.reviewMachine(result,(cx,approval)=>cx.spawn(cx=>this.hostWorkerAction(cx,id,target,action,approval)));
     else if(result.needsRelocation)this.reviewGridMove(rig,result.relocation,null,{id,target,action});
     else{
+      // The same card as the grid's failures, so the way forward stays on screen (see listRows).
+      if(result.unconfirmedSpace&&rig)setShared("rig.spaceStatus",{...(shared("rig.spaceStatus")??{}),[rig.id]:result});
       const words=result.ok?(result.reason??`Worker view open here: ${result.pages?.length??0} pages.`):result.reason;
       setShared("rig.status",{id,ok:result.ok,busy:false,text:words,at:Date.now()});
       this.notifyResult("Worker view",result);
@@ -2191,6 +2194,7 @@ export default class RigSidebar extends View {
       }
 
       const assistants=assistantGroup(t,cx,this.data.hostedMembers,rig,{prefix:'sidebar',icon,rows:this.visibleTreeRows,parentKey:rKey,indent:baseIndent+12,folds,
+        append:(row,key)=>out.push(this.scrollRow(row,key)),
         fold:(key,open)=>this.fold(key,open),select:(key,entry,cx)=>{selectRow(entry,key);cx?.notify?.();},open:entry=>openPage(entry),menu:target=>this.menu(target,180),decorate:(row,options)=>this.decorateRow(t,row,options)});
       if(assistants)out.push(assistants);
 
@@ -2266,7 +2270,7 @@ export default class RigSidebar extends View {
             this.visibleTreeRows.push({ key: itemKey, expandable: false, parentKey: vKey, entry: itemEntry });
             const savedRow = h_flex().id(`sidebar-saved-view-${rig.id}-${item.rawId}`).pl(baseIndent + 2 * TREE_STEP).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
               .on_click(() => selectRow(itemEntry, itemKey))
-              .on_mouse_down("right", () => this.menu({ kind: "saved-view", rig: rig.name, view: item.id, name: item.name, orderGroupKey: viewItemsGroupKey }, 140, itemKey))
+              .on_mouse_down("right", () => this.menu({ kind: "saved-view", rig: rig.name, conn: rig.conn, view: item.id, name: item.name, orderGroupKey: viewItemsGroupKey }, 140, itemKey))
               .child(leafCell())
               .child(div().text_size(11.5).text_color(t.foreground).tooltip(`⬚ ${item.name}`).child(`⬚ ${item.name}`).flex_1().truncate())
               .child(div().text_size(10.5).text_color(t.dim).child("saved"));
@@ -2470,15 +2474,13 @@ export default class RigSidebar extends View {
     if (section === "system") {
       const health = this.list(cx, "/api/health");
       const counts = healthCounts(health.data?.records);
-      const sysItems = [
-        { id: "health", label: `Health${counts.notes ? ` · ${counts.notes} notes` : ""}`, entry: { section: "system", subview: "health", name: "Health" } },
-        { id: "config", label: "Configuration", expandable: true, foldKey: "system:config", entry: { section: "system", subview: "config", name: "Configuration" } },
-        { id: "connections", label: "Connections", entry: { section: "system", subview: "connections", name: "Connections" } },
-        { id: "people", label: "People", entry: { section: "system", subview: "people", name: "People" } },
-        { id: "usage", label: "Usage", entry: { section: "system", subview: "usage", name: "Usage" } },
-        { id: "usage-hosts", label: "Usage · all hosts", entry: { section: "system", subview: "usage-hosts", openUsageHosts: true, name: "Usage · all hosts" } },
-        { id: "cost", label: "Cost", entry: { section: "system", subview: "cost", name: "Cost" } },
-      ];
+      const sysItems = SYSTEM_PAGE_VIEWS.flatMap(([id,name])=>[
+        {id,label:id==='health'&&counts.notes?`${name} · ${counts.notes} notes`:name,
+          entry:{section:'system',subview:id,name},
+          ...(id==='config'?{expandable:true,foldKey:'system:config'}:{}),
+          ...(id==='layout'?{tooltip:'Spaces list and layout'}:{})},
+        ...(id==='usage'?[{id:'usage-hosts',label:'Usage · all hosts',entry:{section:'system',subview:'usage-hosts',openUsageHosts:true,name:'Usage · all hosts'}}]:[]),
+      ]);
       const orderedSys = orderSiblings(sysItems, "system:items", orderMap, (x) => x.id);
       const sysSiblingIds = orderedSys.map((x) => x.id);
       const out = [];
@@ -2525,6 +2527,7 @@ export default class RigSidebar extends View {
             id: `sys-node-${item.id}`,
             rowKey: `sys:${item.id}`,
             label: item.label,
+            tooltip: item.tooltip,
             entry: item.entry,
             indent: treeIndent(1),
             parentKey: parentBranchKey,
@@ -2732,7 +2735,7 @@ export default class RigSidebar extends View {
           entry,
           indent: treeIndent(1),
           parentKey: parentBranchKey,
-          onRight: () => this.menu({ kind: "terminal", view: entry.view, name: entry.name, orderGroupKey: "terminals:saved" }, 140),
+          onRight: () => this.menu({ kind: "terminal", conn: this.config?.connectionId, view: entry.view, name: entry.name, orderGroupKey: "terminals:saved" }, 140),
           groupKey: "terminals:saved",
           itemId: s.id,
           siblingIds: savedIds,
@@ -2750,7 +2753,7 @@ export default class RigSidebar extends View {
           entry,
           indent: treeIndent(1),
           parentKey: parentBranchKey,
-          onRight: () => this.menu({ kind: "terminal", rig: r, view: entry.view, name: entry.name, orderGroupKey: "terminals:derived" }, 140),
+          onRight: () => this.menu({ kind: "terminal", conn: this.config?.connectionId, rig: r, view: entry.view, name: entry.name, orderGroupKey: "terminals:derived" }, 140),
           groupKey: "terminals:derived",
           itemId: r,
           siblingIds: derivedList,
@@ -3113,6 +3116,10 @@ export default class RigSidebar extends View {
           const status = shared("rig.spaceStatus")?.[rig.id];
           if (this.opening?.has(rig.id)) return [div().id(`opening-grid-${rig.id}`).mx(8).my(4).px(8).py(6).rounded(6).bg(t.raised).text_size(11.5).text_color(t.muted)
             .child(this.openingLine(rig))];
+          if (status?.unconfirmedSpace) return [v_flex().id(`unconfirmed-space-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
+            .child(div().text_size(11.5).text_color(t.muted).child(status.reason))
+            .child(div().id(`dismiss-unconfirmed-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer().child("Dismiss")
+              .on_click((_e, cx) => { const next = { ...(shared("rig.spaceStatus") ?? {}) }; delete next[rig.id]; setShared("rig.spaceStatus", next); cx.notify(); }))];
           if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}: ${status.reason}`))
             .when(!!status.needsConsent,el=>el.child(div().id(`review-grid-machine-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer().child("Review")

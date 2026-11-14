@@ -30,7 +30,7 @@ import { guardFlatStore } from "./rig-connections.js";
 let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
 const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
-  configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
+  configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, cliRefusal, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
@@ -204,7 +204,7 @@ export default class RigView extends View {
   }
 
   /** herdr's teardown: the watch loop ends with this copy; a reply typed and not sent stays as a draft. */
-  async close() { this.closed = true; for(const box of Object.values(this.specBoxes??{}))box.secondaryEnterTask?.cancel?.();this.statusMotion.close(); this.nowTails?.close(); for(const graph of this.graphs?.values()??[])graph.reset(); this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); }
+  async close() { this.configPanel?.close();this.closed = true; for(const box of Object.values(this.specBoxes??{}))box.secondaryEnterTask?.cancel?.();this.statusMotion.close(); this.nowTails?.close(); for(const graph of this.graphs?.values()??[])graph.reset(); this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); }
 
   updateAction(action, value) { requestDismissal({ shared, setShared, run, scope: dismissalScope(this.config) }, action, value); }
   updateModel() {
@@ -264,7 +264,7 @@ export default class RigView extends View {
       }catch{this.specConsentMachine=null;}
       if (sameConfig(next, this.config)) return;
       if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine)) {
-        this.cache = {}; this.resetNowTails(cx);
+        this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx); // reads still in flight belong to the old daemon
         for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
         this.specBoxes={};
       }
@@ -398,6 +398,8 @@ export default class RigView extends View {
     const hit = this.cache[path];
     if ((!hit || force || hit.stale) && this.config && !hit?.loading) {
       const sharedAt = shared("rig.data")?.at;
+      // The read belongs to the daemon and connection it started against: a late answer, after the configuration moved, is dropped.
+      const epoch = this.cacheEpoch ?? 0, connId = this.config?.connectionId;
       this.cache[path] = { ...(hit ?? {}), stale: false, loading: true };
       const finish = (outcome) => {
         const pending = this.cache[path];
@@ -425,13 +427,14 @@ export default class RigView extends View {
           }
           const r = await fetch(`${daemonUrl}${path}`);
           const body = await r.text();
-          let data = null; try { data = stampConnection(JSON.parse(body), this.config?.connectionId); } catch (_) { data = body; }
+          if (epoch !== (this.cacheEpoch ?? 0)) return;
+          let data = null; try { data = stampConnection(JSON.parse(body), connId); } catch (_) { data = body; }
           // onData runs here, after the await: outside render, so it may create view state (an EditorState).
           if (r.ok && onData) onData(data);
           finish(r.ok
             ? { ok: true, data, status: r.status }
             : { ok: false, error: `GET ${path} → ${r.status}${data?.error ? `: ${data.error}` : ""}`, status: r.status, errorData: data });
-        } catch (e) { finish({ ok: false, error: String(e?.message ?? e) }); }
+        } catch (e) { if (epoch === (this.cacheEpoch ?? 0)) finish({ ok: false, error: String(e?.message ?? e) }); }
         cx.notify();
       });
     }
@@ -2280,6 +2283,7 @@ export default class RigView extends View {
         // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
         const file = await resolveInSpecRoots(written, this.specRoots, exec);
         if (!file) { box.note = this.specRefusal(); return; }
+        if (cliRefusal(this.config)) { box.note = cliRefusal(this.config); return; } // no home of its own: no CLI run, and the person is told
         const cmd = writeCommand(this.config, ["specs", "add", "--", file]);
         if (!cmd) { box.note = NO_PERSON; return; }
         const r = writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
@@ -2380,13 +2384,19 @@ export default class RigView extends View {
     const why = info.at && info.installed === false ? "herdrig's Spaces list isn't installed. Reinstall herdrig."
       : mode === "none" ? "This layout has no Spaces block, so there's nothing to change."
       : mode === "custom" ? "This layout mixes Herdr's Spaces list and herdrig's in a way herdrig didn't make, so it leaves it alone." : null;
-    const current = MODES.includes(mode) ? MODE_LABEL[mode] : "Not set up";
     const kept = info.state?.keep === true;
     const card = [
       v_flex().id("system-spaces-list").gap(6)
         .child(h_flex().gap(8).items_center().flex_wrap()
-          .child(div().text_size(12).child(`Spaces list: ${current}`))
-          .children(MODES.map((m) => this.button(t, `spaces-list-${m}`, MODE_LABEL[m], () => this.chooseSpacesMode(cx, m), { small: true, disabled: !!why || !!info.busy || !!this.spacesPending || m === mode }))))
+          .child(div().text_size(12).child('Spaces list'))
+          .child(h_flex().gap(2).p(2).rounded(8).bg(t.raised).children(MODES.map(m=>{
+            const blocked=!!why||!!info.busy||!!this.spacesPending,selected=m===mode;
+            return div().id(`spaces-list-${m}`).px(10).h(24).flex().items_center().rounded(6).text_size(12)
+              .bg(selected?t.accent:t.raised).text_color(selected?t.solid_foreground:t.foreground)
+              .when(blocked,el=>el.opacity(.45)).when(!blocked,el=>el.cursor_pointer())
+              .hover(el=>el.bg(selected?t.accent:blocked?t.raised:t.hover))
+              .on_click(()=>{if(!blocked&&!selected)this.chooseSpacesMode(cx,m);}).child(MODE_LABEL[m]);
+          }))))
         .when(!!why, (el) => el.child(div().id("spaces-list-why").text_size(11.5).text_color(t.muted).child(why)))
         .when(mode === "herdrig" || mode === "both", (el) => el.child(div().id("spaces-list-where").text_size(11.5).text_color(t.muted)
           .child(`herdrig's copy of Herdr's list, in layout ${name} · based on Herdr ${BASE_HERDR}`)))

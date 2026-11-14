@@ -61,9 +61,10 @@ export class ConfigEditor {
     }
     const groupKeys=undoReceipt?undoReceipt.keys:this.row&&changes.every(([key])=>this.row.keys.includes(key))?[...this.row.keys]:changes.map(([key])=>key);
     const old=groupKeys.map(key=>{const e=this.entry(key);return {key,value:restorable(e)?valueOf(e):null,source:restorable(e)?e.source:null};});
+    const baseline=groupKeys.map(key=>{const e=this.entry(key);return {key,value:restorable(e)?e.value:null,source:restorable(e)?e.source:null};});
     const operations=changes.map(([key,value])=>({key,value,reset:undoReceipt?undoReceipt.old.find(v=>v.key===key)?.source==='default':reset}));
     const high = changes.find(([key,value]) => undoReceipt?configDeletesHistory(configDefinition(this.entry(key)),value,this.entry(key)?.value):configDefinition(this.entry(key)).risk === "high");
-    const pending = { changes: changes.map(v => [...v]), operations,groupKeys,connection:this.connection,undoOf:undoReceipt, reset, old };
+    const pending = { changes: changes.map(v => [...v]), operations,groupKeys,connection:this.connection,undoOf:undoReceipt, reset, old,baseline };
     if (high) {
       const def = configDefinition(this.entry(high[0]));
       const current=shown(this.entry(high[0]))?this.entry(high[0]).value:null;
@@ -108,7 +109,8 @@ export class ConfigEditor {
         expected.push({key,value:restorable(current)&&['file','default'].includes(produced?.source)?produced.value:null,source:produced?.source});
         this.lastSavedText=configSavedText(def,{...result,resolved,withheld:!shown(current)},reset);
       }
-      for(const key of pending.groupKeys)if(!expected.some(v=>v.key===key)){const e=this.entry(key);expected.push({key,value:e?.value,source:e?.source});}
+      // Unwritten pair fields belong to the pre-save snapshot, never another writer's refresh.
+      for(const key of pending.groupKeys)if(!expected.some(v=>v.key===key))expected.push({...pending.baseline.find(v=>v.key===key)});
       // Finish checking before publishing Saved/Undo, so slow tunnels do not spend the usable window.
       await refresh();
       const receipt={at:typeof now==='function'?now():now,text:this.lastSavedText,keys:pending.groupKeys,old:pending.old,expected,connection:this.connection,

@@ -7,8 +7,10 @@ import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
-import { connectionsOf, LEGACY_CONNECTION_ID } from "./rig-connections.js";
+import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
+import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
+const SYSTEM_VIEW_LABELS = new Map(SYSTEM_PAGE_VIEWS);
 
 /** The single space-routing entry point for pages, the TUI, Attach and rig grids. */
 let routingEnvironment = null;
@@ -489,6 +491,9 @@ function isEnoentExecResult(res, err = null) {
  * Never reads `daemon.json` or `<openrigHome>/config.json`, and never defaults to `:7433`.
  */
 export async function discoverDaemonFromCli(config, execFn) {
+  // No OpenRig home of its own: nothing runs, and the real cause is named (not "the daemon isn't running").
+  const refused = cliRefusal(config);
+  if (refused) return { reachable: false, state: "unreachable", homeNeeded: true, port: null, daemonUrl: null, kernel: null, rigs: null, message: refused };
   if (typeof execFn !== "function") {
     return {
       reachable: false,
@@ -833,6 +838,9 @@ export function formatOpenRigVersionLine({ healthz = null, cliVersion = null } =
  * `GET /healthz`) and return `{ cliVersion, versionProbe, statusProbe, healthzProbe, daemonUrl, state }`.
  */
 export async function probeOpenRigState(config, { exec, fetch: fetchFn, sidebarModId = MOD_IDS.sidebar } = {}) {
+  // A connection that has no OpenRig home of its own runs no CLI: say so, never "OpenRig isn't installed".
+  const refused = cliRefusal(config);
+  if (refused) return { cliVersion: null, versionProbe: null, statusProbe: null, healthzProbe: null, daemonUrl: null, state: { id: "S3", substate: null, headline: STATE_COPY.S3.headline, detail: refused } };
   const baseConfig = { ...(config ?? {}), daemonUrl: null, daemonUrlSource: "default" };
   let versionProbe = null;
   let cliVersion = null;
@@ -970,6 +978,16 @@ export function preserveCliDiscoveredConfig(next, prev) {
  * What every command's environment drops (a seat's identity, database, and `OPENRIG_URL` herdr-app may have inherited)
  * and sets (`OPENRIG_URL` is exported ONLY when `daemonUrl` was explicitly configured in `config.json`).
  */
+/** Why the CLI must not run for this config, or null. A connection other than the legacy one authenticates from its OpenRig home alone (the
+ *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
+ *  and send that home's terminal token to whatever address the connection names. Every command, a read as much as a write, is refused. */
+export function cliRefusal(config) {
+  return config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID && !config.openrigHome ? HOME_NEEDED : null;
+}
+/** A command that runs nothing of OpenRig's and fails (`false`: no shell, no output). The words for the person are `cliRefusal`'s, shown by the
+ *  callers that report to the person (the state probe, spec Add); every other caller treats it as a command that failed. */
+const refusedCommand = () => ({ command: "false", args: [] });
+
 export function cliEnv(config) {
   const hasExplicitUrl = Boolean(config?.daemonUrl && config?.daemonUrlSource !== "cli" && config?.daemonUrlSource !== "default");
   // RIGGED_* are the legacy names the CLI still reads for the same things. A seat's node id goes too: with it, `rig tui`
@@ -981,7 +999,10 @@ export function cliEnv(config) {
     // OPENRIG_URL names. The legacy connection is unchanged.
     ...(config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID ? ["-u", "OPENRIG_HOME", "-u", "OPENRIG_TERMINAL_BEARER_TOKEN", "-u", "OPENRIG_AUTH_BEARER_TOKEN"] : []),
     ...(hasExplicitUrl ? [`OPENRIG_URL=${config.daemonUrl}`] : []),
-    ...(config?.openrigHome ? [`OPENRIG_HOME=${config.openrigHome}`] : [])];
+    ...(config?.openrigHome ? [`OPENRIG_HOME=${config.openrigHome}`] : []),
+    // Defence in depth for anything that builds an environment from such a config without going through the builders below: a path beneath
+    // a file, where no home can be read or created, so the CLI cannot fall back to ~/.openrig.
+    ...(cliRefusal(config) ? ["OPENRIG_HOME=/dev/null/openrig-home-needed"] : [])];
 }
 
 /**
@@ -1032,6 +1053,8 @@ const VALUE_OPTIONS = new Set(["--actor", "--app-home", "--availability", "--bod
  * instead they pass `--actor <person>@external` with both `OPENRIG_SESSION_NAME` and `RIGGED_SESSION_NAME` unset by `cliEnv`.
  */
 export function writeCommand(config, args, { env = [] } = {}) {
+  const refused = cliRefusal(config);
+  if (refused) return refusedCommand();
   if (!Array.isArray(args)) return null;
   const hasPerson = Boolean(config?.person);
   if (!hasPerson && requiresPersonForWrite(args)) return null;
@@ -1885,6 +1908,8 @@ export function plainOutcome(stdout) {
 
 /** A read command (no identity needed): the CLI against the mods' daemon and OpenRig home. */
 export function readCommand(config, args, { env = [] } = {}) {
+  const refused = cliRefusal(config);
+  if (refused) return refusedCommand();
   return { command: "env", args: [...cliEnv(config), ...env, ...(config.rig ?? ["rig"]), ...args] };
 }
 
@@ -4092,7 +4117,7 @@ export function crumbsFor(entry) {
   if (e.section === "system") {
     if (e.settingKey) return [section("system"), { text: "Configuration", entry: { section: "system", subview: "config", name: "Configuration" } }, { text: e.settingKey, entry: e }];
     if (e.category) return [section("system"), { text: "Configuration", entry: { section: "system", subview: "config", name: "Configuration" } }, { text: e.category, entry: e }];
-    if (e.subview) return [section("system"), { text: e.name ?? ({ overview: "Overview", people: "People", config: "Configuration", health: "Health", connections: "Connections", layout: "Layout", usage: "Usage", cost: "Cost", notifications: "Notifications" }[e.subview] ?? e.subview), entry: e }];
+    if (e.subview) return [section("system"), { text: e.name ?? (SYSTEM_VIEW_LABELS.get(e.subview) ?? e.subview), entry: e }];
     if (e.openUsageHosts) return [section("system"), { text: "Usage · all hosts", entry: e }];
     return [section("system")];
   }
@@ -4750,13 +4775,13 @@ export function paletteRoute(res, top, topology = []) {
     return { error: "notifications takes on or off (or no argument to toggle)." };
   }
   if (typed === "usage-hosts" || typed === ":usage-hosts" || a.type === "usage-hosts" || resolved?.area === "usage-hosts") {
-    return { entry: { section: "system", openUsageHosts: true }, open: { "usage:hosts": true, "sys:usage-hosts": true }, focus: "usage:hosts" };
+    return { entry: { section: "system", openUsageHosts: true }, open: { "usage:hosts": true, "sys:usage-hosts": true }, focus: "sys:usage-hosts" };
   }
   if (typed === "people" || typed === ":people" || a.type === "people" || resolved?.area === "people") {
-    return { entry: { section: "system", subview: "people", name: "People" }, open: { "branch:system": true }, focus: "system:people" };
+    return { entry: { section: "system", subview: "people", name: "People" }, open: { "branch:system": true }, focus: "sys:people" };
   }
   if (typed === "spaces-list" || typed === ":spaces-list" || a.type === "spaces-list" || resolved?.area === "spaces-list") {
-    return { entry: { section: "system", subview: "layout", name: "Layout" }, open: { "branch:system": true }, focus: "system:layout" };
+    return { entry: { section: "system", subview: "layout", name: "Layout" }, open: { "branch:system": true }, focus: "sys:layout" };
   }
   if (typed === "pulse" || typed === ":pulse" || a.type === "pulse" || resolved?.area === "pulse") {
     return { entry: { section: "topology", focus: "pulse" }, focus: "pulse" };

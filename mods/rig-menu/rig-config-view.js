@@ -3,7 +3,7 @@ import { h_flex, v_flex, InputState, Input, Select, Popup } from "gpui-base";
 import { configRows, iconsAt } from "./rig-lib.js";
 import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-editor.js";
 import { configDefinition, validateConfigValue,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
-import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT } from "./rig-config-write.js";
+import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
 import { timezoneNote } from './rig-time.js';
 const icon = iconsAt("mods/rig-view");
 const hidden = e => e?.visibility === "withheld" || CONFIG_TERMINAL_KEYS.includes(e?.key) || /token|credential/i.test(e?.key ?? "");
@@ -12,7 +12,9 @@ const sourceName = e => ({file:"saved",env:"environment",default:"default"}[e.so
 
 /** The page owns this presentation object; the model contains no native input state. */
 export class ConfigPanel {
-  constructor(page) { this.page = page; this.model = new ConfigEditor(); this.inputs = {}; this.selected = null; this.releasedReviews=new WeakSet(); }
+  constructor(page) { this.page = page; this.model = new ConfigEditor(); this.inputs = {}; this.selected = null; this.releasedReviews=new WeakSet();this.saves=new Map();this.writeWatches=new Map();this.reconcileStopped=new Set();this.writeOwner={}; }
+  close(){this.disposed=true;closeConfigWrites(this.writeOwner);}
+  get saving(){return this.saves.has(this.identity());}
   origin() { return this.page.config?.daemonUrl ?? ""; }
   identity() { return JSON.stringify([this.origin(),this.page.config?.daemonMachine??null,this.page.config?.connectionId??null]); }
   daemonName() { return this.page.config?.daemonMachine || `the OpenRig at ${this.origin().replace(/^https?:\/\//,"")}`; }
@@ -24,11 +26,12 @@ export class ConfigPanel {
     }
     return def;
   }
-  releaseInputs() { this.blurGeneration=(this.blurGeneration??0)+1;this.focusedField=null;for (const input of Object.values(this.inputs)) input.release?.(); this.inputs = {}; this.dropdown=null; this.selectHandles={}; }
+  releaseInputs() { this.blurGeneration=(this.blurGeneration??0)+1;if(this.focusedField)this.page.typing=false;this.focusedField=null;for (const input of Object.values(this.inputs)) input.release?.(); this.inputs = {}; this.dropdown=null; this.selectHandles={}; }
   sync(origin, browser, probe) {
     const identity=this.identity();
     if (this.boundIdentity !== identity) { this.releaseInputs(); this.model = new ConfigEditor(identity); this.boundOrigin = origin;this.boundIdentity=identity;this.nextKey=null; }
     this.model.observe(browser);
+    if(configWriteState(identity)?.uncertain){this.model.results.clear();this.model.latestReceipt=null;this.model.lastSavedText=null;}
     const editingKeys=this.model.row?.keys??this.model.confirmation?.changes.map(([key])=>key)??[];
     if(!this.saving&&!this.model.busy&&editingKeys.some(key=>this.definition(this.model.entry(key)).readOnly)){
       this.model.cancel();this.releaseInputs();this.model.error='This setting is now read-only. The open edit was not saved.';
@@ -36,6 +39,7 @@ export class ConfigPanel {
     this.detected = !probe?.error && Object.hasOwn(probe?.data ?? {}, "value") && ["file","env","default"].includes(probe?.data?.source);
   }
   open(key, cx) {
+    if(this.pauseWrites(cx))return;
     if (!this.detected || this.definition(this.model.entry(key)).readOnly) return;
     if(this.saving||this.model.busy){if(this.model.row?.key!==key)this.nextKey=key;return;}
     if(this.model.confirmation)return;
@@ -62,7 +66,7 @@ export class ConfigPanel {
         // Native Tab traversal may finish after the focus event. Do not replace text typed meanwhile.
         cx.timer?.after(16,next=>{if(current()&&this.focusedField===field&&input.value()===value)select();next.notify();});
       });
-      input.on('blur',(_e,cx)=>{if(!current())return;if(this.focusedField===field)this.focusedField=null;this.deferBlur(cx);});
+      input.on('blur',(_e,cx)=>{if(!current())return;if(this.focusedField===field){this.focusedField=null;this.page.typing=false;}this.deferBlur(cx);});
       this.inputs[field] = input;
     }
     this.editorHandle??=cx.focus_handle();this.focusField(key,cx,true);cx.notify();
@@ -93,14 +97,59 @@ export class ConfigPanel {
     }
     return false;
   }
-  async refresh(origin,request=fetch) {
+  async refresh(origin,request=fetch,model=this.model,identity=this.identity()) {
     const response = await request(`${origin.replace(/\/$/, "")}/api/config?view=browser`);
     if (!response.ok) throw new Error(`GET configuration → ${response.status}`);
     const data = await response.json();
-    if (this.origin() !== origin) throw new Error("OpenRig connection changed during the save");
-    this.page.cache["/api/config?view=browser"] = { data, at: Date.now() }; this.model.observe(data);
+    return this.applyRefresh(data,origin,model,identity);
+  }
+  applyRefresh(data,origin,model,identity){
+    if (this.disposed||this.origin() !== origin||this.identity()!==identity||this.model!==model) throw new Error("OpenRig connection changed during the save");
+    this.page.cache["/api/config?view=browser"] = { data, at: Date.now() }; model.observe(data);
     const zone=data?.entries?.find(e=>e.key==='ui.timezone'&&!hidden(e));
     this.page.cache['/api/config/ui.timezone']={data:zone?{value:zone.value}:null,at:Date.now()};
+    return data;
+  }
+  pauseWrites(cx){
+    const state=this.writePauseState();if(!state?.blocked)return false;
+    this.model.error=state.reason;if(this.model.row)this.model.row.error=state.reason;
+    if(state.uncertain)this.watchWrites(cx);cx.notify();return true;
+  }
+  writePauseState(){
+    const identity=this.identity(),state=configWriteState(identity);
+    if(state?.pending)return state;
+    return this.reconcileStopped.has(identity)?{blocked:true,uncertain:true,failed:true,reason:'The last save could not be checked on this page. Reopen this page before saving again.'}:state;
+  }
+  watchWrites(cx,binding={origin:this.origin(),model:this.model,identity:this.identity()}){
+    const {origin,model,identity}=binding;
+    if(configWriteState(identity)?.ownerClosed||this.reconcileStopped.has(identity)||this.writeWatches.get(identity)?.model===model)return;
+    const watch={model};this.writeWatches.set(identity,watch);
+    cx.spawn(async next=>{
+      let request,record,token;
+      const current=()=>!this.disposed&&this.identity()===identity&&this.model===model;
+      try{
+        record=await waitForConfigWrites(identity);
+        if(!configWriteState(identity)?.uncertain||configWriteState(identity)?.ownerClosed)return;
+        if(!current()){failConfigReconcile(identity,record);this.reconcileStopped.add(identity);return;}
+        token=beginConfigReconcile(identity,record,this.writeOwner);
+        let result;
+        if(token){
+          request=configOperationRequest(fetch,(ms,fn)=>next.timer.after(ms,fn));
+          const data=await this.refresh(origin,request,model,identity);
+          finishConfigReconcile(identity,record,token,data);result={ok:true,data};
+        }else result=await configReconcileResult(record);
+        if(!result.ok)throw new Error('The last save could not be reconciled');
+        if(current()){
+          this.applyRefresh(result.data,origin,model,identity);this.reconciledModel=model;
+          model.error=null;
+          if(model.row)model.row.error=null;
+        }
+      }catch(error){
+        if(token)finishConfigReconcile(identity,record,token,null,error);
+        this.reconcileStopped.add(identity);
+        if(current()){model.error=configWriteState(identity)?.reason??error.message;if(model.row)model.row.error=model.error;}
+      }finally{request?.finish();if(this.writeWatches.get(identity)===watch)this.writeWatches.delete(identity);next.notify();}
+    });
   }
   execute(cx, pending) {
     if (!pending) {
@@ -112,15 +161,16 @@ export class ConfigPanel {
       cx.notify(); return;
     }
     if(this.saving||this.model.busy)return;
+    if(this.pauseWrites(cx))return;
     const origin = this.boundOrigin, model = this.model,identity=this.boundIdentity,draft=model.row;
-    const request=configOperationRequest(fetch,(ms,fn)=>cx.timer.after(ms,fn));
-    this.saving=true;
+    const request=configOperationRequest(fetch,(ms,fn)=>cx.timer.after(ms,fn),identity,this.writeOwner,this.daemonName());
+    this.saves.set(identity,request);this.reconciledModel=null;
     cx.spawn(async cx => {
       try{await model.save(pending, (key, value, reset) => {
         if (this.identity() !== identity || this.model !== model) return { ok:false, error:"OpenRig connection changed; reopen the setting" };
         return writeDaemonConfig({origin,key,value,reset,entry:model.entry(key),detected:this.detected},request)
           .then(result=>({...result,daemon:this.daemonName()}));
-      }, () => this.refresh(origin,request),Date.now,async key=>{
+      }, () => this.refresh(origin,request,model,identity),Date.now,async key=>{
         if(this.identity()!==identity||this.model!==model)throw new Error('OpenRig connection changed; Undo is no longer available');
         const result=await readDaemonConfig({origin,key,entry:model.entry(key),detected:this.detected},request);
         if(!result.ok)throw new Error(result.error);return result.resolved;
@@ -130,7 +180,11 @@ export class ConfigPanel {
           if(!model.row&&draft)model.row=draft;
           if(model.row)model.row.error=CONFIG_SAVE_TIMEOUT;
         }
-        request.finish();this.saving=false;
+        request.finish();if(this.saves.get(identity)===request)this.saves.delete(identity);
+        if(request.expired()&&configWriteState(identity)?.uncertain){
+          const reason=configWriteState(identity).reason;model.error=reason;if(model.row)model.row.error=reason;
+          this.watchWrites(cx,{origin,model,identity});
+        }
       }
       if(request.expired()&&this.model===model&&!model.row){this.open(pending.changes[0][0],cx);if(model.row)model.row.error=CONFIG_SAVE_TIMEOUT;}
       if(this.model===model){
@@ -143,6 +197,7 @@ export class ConfigPanel {
   }
   save(cx) {
     if(!this.model.row||this.saving||this.model.busy||this.model.confirmation)return;
+    if(this.pauseWrites(cx))return false;
     const pending=this.model.commit();
     if(!this.model.row){this.releaseInputs();cx.notify();return;}
     if(this.model.row.error){this.focusField(this.model.row.key,cx);cx.notify();return false;}
@@ -153,6 +208,7 @@ export class ConfigPanel {
   toggle(entry, cx) { this.open(entry.key,cx);if(this.model.row?.keys.includes(entry.key)&&!this.saving){this.model.change(entry.key,entry.value === true || entry.value === "true" ? "false" : "true");this.save(cx);} }
   reset(entry, cx) {
     this.more=null;if(this.saving||this.model.busy)return;
+    if(this.pauseWrites(cx))return;
     this.open(entry.key,cx);if(!this.model.row?.keys.includes(entry.key))return;
     const changes=this.model.row.keys.map(key=>[key,String(this.model.entry(key)?.defaultValue??'')]);
     if(this.model.row.keys.every(key=>this.model.entry(key)?.source==='default')){this.cancel(cx);return;}
@@ -244,10 +300,13 @@ export class ConfigPanel {
     const rows=ownRows.map(row=>({entry:m.entry(row.key),group:row.group})).filter(row=>row.entry && (pinned.has(row.entry.key)||!filter || `${row.entry.key} ${row.group}`.toLowerCase().includes(filter)));
     const editable=rows.filter(({entry})=>!this.definition(entry).readOnly).length;
     const out=[div().id("config-edit-summary").text_size(11.5).text_color(t.muted).child(`${editable} settable · ${rows.length-editable} read-only`)];
+    const writePause=this.writePauseState();
+    if(writePause?.uncertain)out.push(div().id('config-write-paused').text_size(12).text_color(writePause.ownerClosed||writePause.failed?t.blocked:t.working).child(writePause.reason));
     if (!this.detected) out.push(div().id("config-edit-unavailable").text_size(11.5).text_color(t.dim)
       .child(probe?.status ? configWriteError(probe.status,probe.errorData)
         : "This OpenRig hasn't confirmed support for editing settings from Herdr. Use rig config set on that machine."));
-    if(m.error)out.push(div().id("config-edit-error").text_size(12).text_color(t.blocked).child(m.error));
+    if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(t.blocked).child(m.error));
+    if(this.reconciledModel===m)out.push(div().id('config-write-recovered').text_size(11.5).text_color(t.muted).child('OpenRig’s current settings were checked. Review your draft before saving again.'));
     let group=null,pair=false;
     for(const {entry,group:entryGroup} of [...rows.filter(r=>!this.definition(r.entry).readOnly),...rows.filter(r=>this.definition(r.entry).readOnly)]) {
       const def=this.definition(entry), readOnly=!!def.readOnly;
@@ -287,6 +346,8 @@ export class ConfigPanel {
       }else line.child(this.control(t,cx));
       if(!readOnly)line.child(this.action(t,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();}));
       row.child(line);
+      if(writePause?.uncertain&&(editing||selected))row.child(div().id('config-row-write-paused').text_size(11.5).text_color(t.dim).child('Saving paused'));
+      if(this.reconciledModel===m&&editing)row.child(div().id('config-reconciled-value').text_size(11.5).text_color(t.muted).child(`OpenRig currently reports: ${textValue(entry)} (${sourceName(entry)}).`));
       if(reviewing)row.child(div().id('config-confirm-below').text_size(11.5).text_color(t.foreground)
         .child(`Confirm below: ${m.confirmation.destructive?'Delete older history?':'Save this change?'}`));
       const zoneNote=key==='ui.timezone'&&!hidden(entry)?timezoneNote(entry.value):null;
@@ -305,7 +366,7 @@ export class ConfigPanel {
           if(fieldDef.type==="int"&&m.row.keys.length===1)row.child(div().text_size(11).text_color(t.dim).child(this.integerHint(fieldDef,field)));
           const error=m.row.touched?.[field]?validateConfigValue(fieldDef,value):null;if(error)row.child(div().text_size(11.5).text_color(t.blocked).child(error));
         }
-        if(m.row.error&&!m.row.keys.some(field=>m.row.touched?.[field]&&validateConfigValue(configDefinition(m.entry(field)),m.row.values[field])===m.row.error))
+        if(m.row.error&&!writePause?.uncertain&&!m.row.keys.some(field=>m.row.touched?.[field]&&validateConfigValue(configDefinition(m.entry(field)),m.row.values[field])===m.row.error))
           row.child(div().id("config-save-refusal").text_size(12).text_color(t.blocked).child(m.row.error));
       }
       const receipt=m.receipt(key);if(receipt){this.page.ticking=true;row.child(h_flex().gap(6).items_center()

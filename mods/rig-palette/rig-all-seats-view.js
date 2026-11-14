@@ -100,7 +100,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
   .when(layout.runtime,el=>el.child(div().w(36).text_size(11).child('Needs'))).child(div().w(layout.attach?110:20).flex_none()));
  const failures=model.groups.filter(g=>g.state!=='ready');
  if(page.allSeatsOrder==='status'){
-  result.children(failures.map(group)).children(model.rows.filter(r=>!r.assistant).map(row));
+  result.children(failures.map(g=>group({...g,rows:[]}))).children(model.rows.filter(r=>!r.assistant).map(row));
   const assistants=model.rows.filter(r=>r.assistant);
   if(assistants.length)result.child(div().id('all-assistants-heading').py(6).text_size(12).text_color(t.muted).font_semibold().child('Connected assistants')).children(assistants.map(row));
  }
