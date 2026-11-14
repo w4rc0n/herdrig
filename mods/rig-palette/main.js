@@ -9,7 +9,14 @@ import { stampConnection } from "./rig-connections.js";
 import { View, div } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
-import { appHome, readTextFile, theme, run, exec, shared, setShared as rawSetShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc, layout, notify } from "herdr";
+import { appHome, readTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc as rawHc, layout, notify } from "herdr";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig } from "./rig-gate.js";
+// THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
+const fetch = gatedFetch;
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
+const run = (name, args) => gatedRun(rawRun, name, args);
+
 import { guardFlatStore } from "./rig-connections.js";
 let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
 const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
@@ -25,6 +32,9 @@ const STACK = "rig-work", PAGE = "rig-page";
 
 const CONFIG_LOADING = "OpenRig's settings are still loading. Try again in a moment.";
 export default class RigPalette extends View {
+  // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
+  get config() { return this._config; }
+  set config(value) { this._config = value; observeConfig(value); }
   init(_p, cx) {
     flatOwner = this;
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));

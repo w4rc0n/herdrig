@@ -1,5 +1,7 @@
 import { CONFIG_SCHEMA, configDefinition, validateConfigValue } from "./rig-config-schema.js";
 import { isLoopbackDaemonUrl } from "./rig-lib.js";
+import { gatedFetch } from "./rig-gate.js";
+const fetch = gatedFetch; // every request goes through the send gate
 
 export const CONFIG_SAVE_TIMEOUT = 'The save did not answer; nothing was confirmed. Refresh before trying again.';
 export function configRejectedSaveResidual(value=null){

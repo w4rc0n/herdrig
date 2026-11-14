@@ -28,7 +28,14 @@ import { healthCounts } from "./rig-health.js";
 import { filterAttentionHealth } from "./rig-lib.js";
 import { h_flex, v_flex, ScrollHandle } from "gpui-base";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
-import { appHome, readTextFile, writeTextFile, props, theme, run, exec, layout, focused, openOverlay, closeOverlay, setShared as rawSetShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc, commands, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, props, theme, run as rawRun, exec as rawExec, layout, focused, openOverlay, closeOverlay, setShared as rawSetShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc as rawHc, commands, machines } from "herdr";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate } from "./rig-gate.js";
+// THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
+const fetch = gatedFetch;
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
+const run = (name, args) => gatedRun(rawRun, name, args);
+
 import { guardFlatStore } from "./rig-connections.js";
 let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
 const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
@@ -42,7 +49,8 @@ import { openRigSpaceContext, SidebarSpaceFold, rigOrigin } from "./rig-space-co
 import { publishGraphActivity } from "./rig-graph-state.js";
 import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest, requestDismissal, dismissible } from "./rig-dismiss.js";
 import { NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
-import net from "net";
+import rawNet from "net";
+const net = { connect: (host, port) => gatedConnect((h, p) => rawNet.connect(h, p), host, port) };
 import {
   MOD_IDS, STATE_COPY, NO_PERSON, ACTION_REFUSED, TERMINAL_TOKEN_PROTECTED, REMOTE_OPERATOR_REASON, s1CopyLine, routeRigOpen, registerRigRouting,
   utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine,
@@ -115,6 +123,9 @@ function selectRow(entry, key) {
 import {openRigEventStream,pumpEvents} from "./rig-event-stream.js";
 import {StatusMotion} from "./rig-status-motion.js";
 export default class RigSidebar extends View {
+  // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
+  get config() { return this._config; }
+  set config(value) { this._config = value; observeConfig(value); }
   init(_p, cx) {
     this.listScroll = ScrollHandle.new();
     registerRigRouting(cx, context => ({ ...this.routeHost(context), config: this.config, notify }));
@@ -166,7 +177,7 @@ export default class RigSidebar extends View {
         try { await model.flush((item) => commitDismissal(config, item, boundedDismissalRequest(async (req) => {
           const res = await fetch(`${config.daemonUrl}${req.path}`, { method: req.method,
             ...(req.body ? { headers: req.headers, body: JSON.stringify(req.body) } : {}) });
-          const data = await res.json().catch(() => null);
+          const data = await res.json().catch(rethrowGate(null));
           return { ok: res.ok, status: res.status, data };
         }, (ms, done) => cx.timer.after(ms, done)), {
           attentionItems: this.dismissals?.scope === model.scope ? this.data?.attentionItems ?? [] : [],
@@ -1390,14 +1401,14 @@ export default class RigSidebar extends View {
         if (hasExplicitConfigUrl && typeof fetch === "function") {
           const hzRes = await fetch(`${this.config.daemonUrl}/healthz`).catch(() => null);
           if (hzRes?.ok) {
-            this.healthz = await hzRes.json().catch(() => this.healthz);
+            this.healthz = await hzRes.json().catch(rethrowGate(() => this.healthz));
           }
         }
         let kernelStatus = probed?.statusProbe?.kernel ?? null;
         if (!kernelStatus && typeof fetch === "function" && this.config.daemonUrl) {
           const krRes = await fetch(`${this.config.daemonUrl}/api/kernel/status`).catch(() => null);
           if (krRes?.ok) {
-            kernelStatus = await krRes.json().catch(() => null);
+            kernelStatus = await krRes.json().catch(rethrowGate(null));
           }
         }
         let capabilities;
