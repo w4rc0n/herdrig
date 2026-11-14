@@ -1,10 +1,10 @@
 /** Public summary projection only. Archived rigs never contribute active seats or counts. */
-export function withArchivedHosts(records, nodesFor) {
+export function withArchivedHosts(records, nodesFor, conn = null) {
   return archivedOnHost(records).map(r => {
     const explicit = r.host ?? r.hostSelfId ?? r.hostId;
     const nodes = nodesFor(r.id);
     const hosts = [...new Set((Array.isArray(nodes) ? nodes : []).map(n => n.host ?? n.hostSelfId ?? n.hostId).filter(h => typeof h === "string" && h))];
-    return { ...r, hosts: hosts.length ? hosts : [explicit || "unknown"] };
+    return { ...r, hosts: hosts.length ? hosts : [explicit || "unknown"], ...(conn ? { conn } : {}) };
   });
 }
 export function archivedOnHost(records, host = null) {

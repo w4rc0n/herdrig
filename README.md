@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.4
+Version: v0.4.5
 
 **OpenRig Mod for Herdr**
 
@@ -34,6 +34,7 @@ act from there (answer a request, message a seat, attach to it) without leaving 
 - **Plain seat activity:** readable status and context, with copyable raw details in **How OpenRig knows**.
 - **Sidebar tree** with six branches: **Topology** (host, rig, pod, seat, helper), **Specs**, **Scopes**,
   **Terminals**, **Needs** and **System**, each seat with its status and context usage.
+- **Spaces list and layout:** open **System → Layout** in the sidebar or on the System page to choose Herdr's Spaces list, herdrig's list, or both.
 - **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
   OpenRig reports.
 - **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs show pod and seat
@@ -43,6 +44,7 @@ act from there (answer a request, message a seat, attach to it) without leaving 
 - **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
   questions, or reply in your own words), with quiet hours and modes in **System → People**.
 - **Command palette** on `ctrl-alt-r`.
+- **Connected assistants:** queue-checking team members have a folded group under their rig, All seats rows and a read-only detail page. Their own check-in words stay separate from activity counts; Queue work, Copy address and Open rig page are their only actions. Older OpenRig versions without the roster route show nothing.
 - **Right-click menus** on seats (send, queue, pause or resume, change model), Needs requests, specs and slices.
 - **Attach** opens a live seat in its own tab, and Herdr's **Agents** section shows its status.
 - **Follows your space:** the sidebar folds outside OpenRig's spaces, keeping Needs you and search visible. Click its

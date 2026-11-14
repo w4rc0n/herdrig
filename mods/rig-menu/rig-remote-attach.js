@@ -1,6 +1,6 @@
-import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, layoutHasMod, MOD_IDS } from "./rig-lib.js";
+import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, rigSeatServers, layoutHasMod, MOD_IDS } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
-import { resolveRigSpace, markRigSpace, rigOrigin, hostLabelValue } from "./rig-space-context.js";
+import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, topologyRig, rigSessions, markRigSpace, rigOrigin, hostLabelValue } from "./rig-space-context.js";
 
 const list = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
 
@@ -68,8 +68,17 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     refuseChangedViewer();
     const rig = seat.rig ?? session.slice(session.lastIndexOf("@") + 1);
     const isOperator = options.operator || session === "operator-agent@kernel";
-    const space = resolveRigSpace(host,config,[rig,seat.rigId]);
-    if(space)await markRigSpace(host,config,[rig,seat.rigId],space);
+    // The same vouching inputs the pages and the grid use, so a space made with another spelling of this daemon's address is adopted when its
+    // own stamps or the rig's seats vouch for it; when it still can't be confirmed, Attach asks instead of making a second space.
+    // The tmux server each seat is on goes with the sessions, as it does for the pages and the grid: seats that match by name alone must not
+    // confirm a space whose viewers run on another tmux server (two daemons on one machine). The topology is built once for both.
+    const names = [rig, seat.rigId], listed = topologyRig(host, names), vouch = { sessions: rigSessions(listed), servers: rigSeatServers(listed), hostId: remote.selfHostId };
+    const space = resolveRigSpace(host,config,names,vouch);
+    if (!space) {
+      const other = unconfirmedRigSpace(host,config,names,vouch);
+      if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig, machine, other.origin, config.daemonUrl) };
+    }
+    if(space)await markRigSpace(host,config,[rig,seat.rigId],space,vouch);
     const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const spaceId = space?.id ?? qualified(`sp-openrig-${nonce}`), tab = qualified(`tb-attach-${nonce}`);
     // Preparation revalidates the profile, identity and relay bytes immediately before launching.

@@ -1,8 +1,9 @@
 // Projection only: no fetch, terminal tail, or alternative status vocabulary.
 import {computePulseCounts,matchesPulseFilter,needTarget,isUpdateNeed,orderSiblings} from './rig-lib.js';
+import {assistantsForRig,assistantWord} from './rig-connected-assistants.js';
 export const allSeatsLayout=(width,rigWidth=120)=>({runtime:width>=Math.max(680,490+rigWidth),compact:width<Math.max(460,318+rigWidth),attach:width>=Math.max(760,580+rigWidth),minText:120});
-const ranks={needs_input:0,attention_required:1,blocked:1,failed:1,active:2,done:3,completed:3,idle:4,terminal:4,stopped:5,exited:5,detached:5,unknown:6};
-export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,filter='',orderMap={}}={}){
+const ranks={needs_input:0,attention_required:1,blocked:1,failed:1,active:2,done:3,completed:3,idle:4,terminal:4,stopped:5,exited:5,detached:5,unknown:6,assistant:7};
+export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,filter='',orderMap={},hostedMembers=null}={}){
  const asks=attention.filter(n=>n&&!isUpdateNeed(n)&&!['done','closed','canceled'].includes(n.state)).map(n=>{
   const target=needTarget(n);
   target.ownerAttributed=n.answer?.verb==='resolve'||n.reply==='resolve';
@@ -23,9 +24,12 @@ export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,fil
     since:raw.activityState?.since??raw.agentActivity?.eventAt??raw.lastActivityAt??null,
     attachable:!!seat.session&&raw.attachable!==false&&raw.sessionAlive!==false&&!['stopped','exited','detached'].includes(seat.status)&&!['stopped','recoverable'].includes(raw.lifecycleState)};
   });
-  return {rig,rows,state,counts:computePulseCounts([model],attention),total:model.seats.length,error:model.nodesState?.error};
+  const assistants=(!pulse||pulse==='all'?assistantsForRig(hostedMembers,rig.name,rig.conn):[])
+   .filter(m=>!filter||[m.name,m.rig,'connected assistant',assistantWord(m.status)].some(v=>String(v).toLowerCase().includes(filter.toLowerCase())))
+   .map(assistant=>({rig,assistant,status:'assistant',rigIndex,key:`all-assistant:${assistant.conn}:${assistant.seat}`}));
+  return {rig,rows:[...rows,...assistants],state,counts:computePulseCounts([model],attention),total:model.seats.length,assistantCount:assistants.length,error:model.nodesState?.error};
  });
  let rows=groups.flatMap(g=>g.rows);
- if(order==='status')rows=[...rows].sort((a,b)=>(ranks[a.status]??6)-(ranks[b.status]??6)||a.rigIndex-b.rigIndex||String(a.seat.logicalId).localeCompare(String(b.seat.logicalId)));
+ if(order==='status')rows=[...rows].sort((a,b)=>(ranks[a.status]??6)-(ranks[b.status]??6)||a.rigIndex-b.rigIndex||String(a.seat?.logicalId??a.assistant?.name??a.key).localeCompare(String(b.seat?.logicalId??b.assistant?.name??b.key)));
  return {groups,rows,rigWidth:Math.min(160,Math.max(120,...models.map(m=>String(m.rig.name??'').length*7+12)))};
 }

@@ -11,10 +11,13 @@
 // Dialogs: a click beside one closes it (herdr's dialog), and a typed draft is kept per action and
 // target until it is sent or cancelled, so an accidental close loses nothing. Ctrl+Enter (Cmd+Enter on macOS) sends.
 //
-// props: { target: { kind: "seat"|"rig"|"pod"|"need"|"cell"|"views"|"open-view"|"spec"|"slice", ... }, step?: dialog state }
+// props: { target: { kind: "seat"|"assistant"|"rig"|"pod"|"need"|"cell"|"views"|"open-view"|"spec"|"slice", ... }, step?: dialog state }
+import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
+import { sharedLoopbackDaemonUrl, sharedRigData } from "./rig-lib.js";
 import { registerRigRouting } from "./rig-lib.js";
+import { targetConnection } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
@@ -23,7 +26,19 @@ import { rigOrigin } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run, exec, props, openOverlay, closeOverlay, notify, setShared, shared, layout, window, spaces, panes, terminals, hc, settings, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, gateSameConfig, CONFIG_CHANGED_OPEN, GateRefusal, gatedOperation } from "./rig-gate.js";
+// A gate refusal is the answer, not a failure to swallow: the person is told it before the menu closes.
+const sayRefusal = (error) => { if (error?.code === "GATE_REFUSED") notify({ title: "OpenRig", body: error.message, level: "warning" }); };
+// THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
+const fetch = gatedFetch;
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
+const run = (name, args) => gatedRun(rawRun, name, args);
+
+import { guardFlatStore } from "./rig-connections.js";
+let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
+const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
 import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
@@ -49,13 +64,27 @@ const RESULT_HEIGHT = 240;
 const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-model", "new-rig"]);
 /** Reopens this mod as a dialog for a step (input, confirm, result). A click beside it closes it. */
 const dialog = (target, step, height = 260) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
-const configNow = async () => {
+/** A fresh read of config.json, seen by the send gate. The menu has no config watcher (it is a dialog that opens and closes), so a list installed while
+ *  one is open is only seen when something reads the file: every action that sends reads it first. It keeps no address the CLI found
+ *  (the file has none), and the gate does not forget the one it knows. */
+const freshFileConfig = async () => {
   const cfg = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
+  observeConfig(cfg);
+  return cfg;
+};
+/** Whether config.json still says what it said when this dialog opened, for everything a send acts on: the gate's identity (connection, the file\'s address,
+ *  machine, home) and who the action is attributed to and which CLI it runs. (The person and the command stay out of the gate's identity on purpose.) */
+const sameDialogConfig = (a, b) => gateSameConfig(a, b) && (a.person ?? null) === (b.person ?? null) && JSON.stringify(a.rig ?? null) === JSON.stringify(b.rig ?? null);
+const configNow = async () => {
+  const cfg = await freshFileConfig(); // a fresh read of config.json is the current config, whoever holds it
+  if (cfg.connectionsRefused) return { ...cfg, daemonMessage: cfg.connectionsRefused }; // a refused list has no address, from anywhere
   if (cfg.daemonUrl) return cfg;
   // Another mod's shared state may name the daemon only when it's on this machine (loopback).
-  const fromShared = shared("rig.data")?.config?.daemonUrl;
-  if (fromShared && isLoopbackDaemonUrl(fromShared)) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
-  const status = await discoverDaemonFromCli(cfg, exec);
+  const fromShared = sharedLoopbackDaemonUrl(cfg, shared("rig.data"));
+  if (fromShared) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
+  let status;
+  try { status = await discoverDaemonFromCli(cfg, exec); }
+  catch (error) { if (error?.code === "GATE_REFUSED") return { ...cfg, daemonMessage: error.message }; throw error; } // the settings changed: say so, not "unreachable"
   if (status.reachable && status.daemonUrl) return { ...cfg, daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
   return { ...cfg, daemonMessage: status.message || cfg.daemonMessage };
 };
@@ -72,8 +101,8 @@ const designDraftKey = (target) => `designer:${target?.rig ?? "rig"}:${target?.r
 const oneClick = (target, action) => startOneClick({ shared, setShared, run, layout, openOverlay }, target, action);
 
 /** The slice folders the daemon knows (`/api/slices`: each with its `slicePath`), by folder name. */
-async function slicePaths(config) {
-  const r = await fetch(`${config.daemonUrl}/api/slices`);
+async function slicePaths(config, op = gatedOperation()) {
+  const r = await op.fetch(`${config.daemonUrl}/api/slices`);
   if (!r.ok) throw new Error(`GET /api/slices → ${r.status}`);
   const body = await r.json();
   return new Map((body?.slices ?? []).filter((s) => typeof s.slicePath === "string").map((s) => [s.slicePath.split(/[\\/]/).pop(), s.slicePath]));
@@ -102,9 +131,9 @@ const ttlWords = (ms) => ms == null ? "never" : ms < 60000 ? `${Math.round(ms / 
   : `${Math.floor(ms / 3600000)}h${Math.round(ms / 60000) % 60 ? ` ${Math.round(ms / 60000) % 60}m` : ""}`;
 
 /** Fills what a target's opener didn't know (a cell header knows the rig's name, not its id) from the sidebar's data. */
-function complete(target) {
+function complete(target, config) {
   if (!target || !target.rig) return target;
-  const rig = (shared("rig.data")?.topology ?? []).find((r) => r.id === target.rigId || r.name === target.rig);
+  const rig = (sharedRigData(config, shared)?.topology ?? []).find((r) => r.id === target.rigId || r.name === target.rig);
   if (!rig) return target;
   const seat = target.session
     ? rig.pods.flatMap((p) => p.seats).find((s) => s.session === target.session)
@@ -133,13 +162,14 @@ function complete(target) {
 async function openSlice(target, file = null) {
   const config = await configNow();
   if (!config.daemonUrl) return info(target, config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
+  const op = gatedOperation(); // the address above is this operation's: every request below refuses to go once the settings change
   try {
-    const get = async (path) => { const r = await fetch(`${config.daemonUrl}${path}`); if (!r.ok) throw new Error(`GET ${path} → ${r.status}`); return r.json(); };
+    const get = async (path) => { const r = await op.fetch(`${config.daemonUrl}${path}`); if (!r.ok) throw new Error(`GET ${path} → ${r.status}`); return r.json(); };
     const [rows, scopes] = await Promise.all([get(`/api/queue/list?destinationSession=${encodeURIComponent(target.session)}`), get("/api/scopes?counts=1")]);
     const hit = sliceForSeat(Array.isArray(rows) ? rows : rows?.items ?? [], scopes?.missions ?? []);
     if (!hit) return notify({ title: `${target.logicalId ?? target.session} has no open work naming a slice.`, level: "info" });
     if (!file) return page({ section: "scopes", mission: hit.mission, slice: hit.slice, name: hit.name });
-    const folder = (await slicePaths(config)).get(hit.slice);
+    const folder = (await slicePaths(config, op)).get(hit.slice);
     if (!folder) return info(target, `OpenRig doesn't say where ${hit.name} is on disk.`);
     return page(fileEntry(`${folder}/${file}`, `${file} · ${hit.name}`));
   } catch (e) { info(target, String(e?.message ?? e)); }
@@ -157,9 +187,13 @@ async function openMission(target) {
 }
 
 export default class RigMenu extends View {
+  // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
+  get config() { return this._config; }
+  set config(value) { this._config = value; observeConfig(value); }
   init(_p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, wait: waitWith(context) }));
     this.config = null;
+    flatOwner = this;
     this.busy = null;
     this.result = null;
     this.handle = cx.focus_handle?.() ?? null;
@@ -178,6 +212,7 @@ export default class RigMenu extends View {
     cx.spawn(async (cx) => {
       // The daemon's address as the other mods find it (config.json, a loopback address in shared state, then the CLI),
       // so Attach and Retry work without the sidebar too.
+      this.openedOn = await freshFileConfig(); // what config.json said when this dialog opened: a later send compares against it
       this.config = await configNow();
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         this.setupPanel=new MachineSetupPanel(this.machineSetupHost(cx),this.config,step.machine??step.confirmation?.machine,{
@@ -195,7 +230,7 @@ export default class RigMenu extends View {
       cx.notify();
       // A one-click action that failed in the sidebar arrives with its failure, for Retry; without the sidebar one starts
       // once, here: never from render, where notify isn't allowed.
-      if (step?.failed) { this.result = step.failed; cx.notify(); } else if (step?.run) this.go(cx, complete(props().target), step);
+      if (step?.failed) { this.result = step.failed; cx.notify(); } else if (step?.run) this.go(cx, complete(props().target, this.config), step);
     });
     if (step?.action === "launch-spec") {
       // Where and on which host the rig starts: the palette's launch-folder / launch-host fill them.
@@ -206,18 +241,18 @@ export default class RigMenu extends View {
       for (const field of [this.folder, this.host]) {
         field.on("focus", () => { this.typing = true; });
         field.on("blur", () => { this.typing = false; });
-        field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, complete(props().target), props().step); });
+        field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, complete(props().target, this.config), props().step); });
       }
       this.dialogFocusedField=this.folder;this.folder.focus();
       this.typing = true;
     }
     if (step?.action === "new-rig") this.initNewRig(cx);
     if (step?.action === "design-view") {
-      this.initDesigner(complete(props().target));
+      this.initDesigner(complete(props().target, this.config));
       cx.timer.after(0,nextCx=>{this.dialogConfirmHandle?.focus?.();nextCx.notify();});
     }
     if (step?.action === "change-model") {
-      this.initChangeModel(complete(props().target));
+      this.initChangeModel(complete(props().target, this.config));
       cx.timer.after(0,nextCx=>{this.dialogConfirmHandle?.focus?.();nextCx.notify();});
     }
     if (step?.input) {
@@ -232,7 +267,7 @@ export default class RigMenu extends View {
         cx.timer.after(300, () => { this.saving = false; this.keepDraft(); });
       });
       // Enter adds a line; Ctrl+Enter (Cmd+Enter on macOS: GPUI's secondary-enter) sends.
-      this.input.on("submit", (e, cx) => { if (e?.secondary && !this.result) this.go(cx, complete(props().target), props().step); });
+      this.input.on("submit", (e, cx) => { if (e?.secondary && !this.result) this.go(cx, complete(props().target, this.config), props().step); });
       this.dialogFocusedField=this.input;this.input.focus();
       this.typing = true;
       cx.timer.after(400, () => this.input.focus());
@@ -250,6 +285,7 @@ export default class RigMenu extends View {
   initNewRig(cx) {
     const drafts = shared("rig.drafts") ?? {};
     this.newMode = "spec";
+    // Set by field changes, Tab navigation, field focus, mode clicks and pointer-down in the dialog.
     this.newFocusTouched=false;
     this.newRuntime = NEW_RIG_RUNTIMES[0];
     this.newSpec = null;
@@ -297,7 +333,7 @@ export default class RigMenu extends View {
     this.newSpecPreviews.set(spec, { loading: true });
     cx.spawn(async (cx) => {
       try {
-        const config = this.config ?? await configNow();
+        const config = await this.currentConfig();
         this.newSpecPreviews.set(spec, { data: await readRigSpecPreview(fetch,config.daemonUrl,spec) });
       } catch (e) { this.newSpecPreviews.set(spec, { error: singleLineText(e?.message ?? e).slice(0, 240) }); }
       cx.notify();
@@ -511,7 +547,7 @@ export default class RigMenu extends View {
     if (!r || typeof r.then !== "function") { this.dismiss(); return; }
     this.pending = it.label;
     cx?.notify?.();
-    Promise.resolve(r).catch(() => {}).then(() => { this.pending = null; this.dismiss(); });
+    Promise.resolve(r).catch(sayRefusal).then(() => { this.pending = null; this.dismiss(); });
   }
 
   dismiss(discard = false) {
@@ -552,17 +588,42 @@ export default class RigMenu extends View {
     if (changed) setShared("rig.drafts", all);
   }
 
+  /** The config an action may send under: this dialog's own, but only while config.json still says the same (a list or another address typed since the
+   *  dialog opened refuses; the dialog's connection is not used for a send after that). */
+  async currentConfig() {
+    const fresh = await freshFileConfig();
+    if (fresh.connectionsRefused) throw new GateRefusal(fresh.connectionsRefused);
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) throw new GateRefusal(CONFIG_CHANGED_OPEN);
+    return this.config ?? configNow();
+  }
+
   /** Runs one CLI write as the person; returns { ok, json, text }. */
-  async write(args, options) {
+  async write(args, options, cx) {
     if (!args) return { ok: false, text: ACTION_REFUSED };
-    const cmd = writeCommand(this.config, args, options);
+    const fresh = await freshFileConfig();
+    if (fresh.connectionsRefused) return { ok: false, text: fresh.connectionsRefused }; // a list installed while this dialog was open
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return { ok: false, text: CONFIG_CHANGED_OPEN }; // the connection below is the one this dialog opened on
+    // The connection is the target's own, from the row it came from: never a default. Without one nothing is sent.
+    const conn = targetConnection(this.config, props()?.target);
+    if (!conn.ok) return { ok: false, text: conn.reason };
+    const target=props()?.target;
+    if(target?.kind==='assistant'){
+      if(args[0]!=='queue'||args[1]!=='create'||args[args.indexOf('--destination')+1]!==target.session)return{ok:false,text:'Connected assistants only accept queued work.'};
+      const verified=await verifyAssistantTarget(fetch,conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done):null);if(!verified.ok)return{ok:false,text:verified.reason};
+    }
+    const cmd = writeCommand(conn.config, args, options);
     if (!cmd) return { ok: false, text: NO_PERSON };
     return writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
   }
 
   async read(args) {
     // Pin this machine on Retry's `ps` re-read so a saved remote `host.selected` never queries another host.
-    const cmd = readCommand(this.config, [...args, "--json"], { env: ["OPENRIG_HOST_SELECTED=local"] });
+    const fresh = await freshFileConfig();
+    if (fresh.connectionsRefused) return null; // a list installed while this dialog was open
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return null; // the settings changed since this dialog opened: its connection is stale
+    const conn = targetConnection(this.config, props()?.target);
+    if (!conn.ok) return null;
+    const cmd = readCommand(conn.config, [...args, "--json"], { env: ["OPENRIG_HOST_SELECTED=local"] });
     const r = await exec(cmd.command, cmd.args, { timeout: 60000 });
     try { return JSON.parse(r.stdout); } catch (_) { return null; }
   }
@@ -585,8 +646,12 @@ export default class RigMenu extends View {
 
   async loadPause(cx) {
     cx.spawn(async (cx) => {
-      const t = complete(props().target);
-      const config = await configNow();
+      const t = complete(props().target, this.config);
+      // The confirmation shows the target's own daemon's seats (the write goes there too), never the default one's.
+      let conn;
+      try { conn = targetConnection(await this.currentConfig(), t); } catch (e) { this.pause = { error: String(e?.message ?? e) }; cx.notify(); return; }
+      if (!conn.ok) { this.pause = { error: conn.reason }; cx.notify(); return; }
+      const config = conn.config;
       if (!config.daemonUrl) { this.pause = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." }; cx.notify(); return; }
       try {
         const r = await fetch(`${config.daemonUrl}/api/rigs/${encodeURIComponent(t.rigId)}/nodes`);
@@ -608,6 +673,13 @@ export default class RigMenu extends View {
       const reason = capReason ?? pReason;
       out.push({ icon: iconName, label, act, disabled: !!reason, reason, dynamicLabel });
     };
+    if(target.kind==='assistant'){
+      if(!assistantAddress(target.session)||!targetConnection(this.config,target).ok)return out;
+      item('rig-queue','Queue work…',()=>dialog(target,{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true},300),'queue');
+      item('rig-copy','Copy address',cx=>{if(assistantAddress(target.session)&&targetConnection(this.config,target).ok)cx.write_to_clipboard(target.session);});
+      item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',conn:target.conn,rigId:target.rigId,name:target.rig}));
+      return out;
+    }
     if(target.kind==="sidebar-header"){
       const enabled=(shared("rig.settings")?.notifications??true)!==false;
       item("rig-bell",enabled?"Turn notifications off":"Turn notifications on",()=>{
@@ -627,7 +699,7 @@ export default class RigMenu extends View {
     if (target.kind === "seat" || target.kind === "cell") {
       const stoppedSeat = isStopped(target);
       if(target.allSeats){
-        item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',rigId:target.rigId,name:target.rig}));
+        item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',rigId:target.rigId,conn:target.conn,name:target.rig}));
         if(target.session)item('rig-copy','Copy session name',cx=>cx.write_to_clipboard(target.session));
       }
       // The row's own actions first: ⋯, the right-click and the Menu key open this same list.
@@ -637,7 +709,7 @@ export default class RigMenu extends View {
         item("rig-queue", "Queue work…", () => dialog(target, { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), "queue");
         item("rig-swap", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), "change-model");
       }
-      item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, name: target.logicalId, session: target.session }));
+      item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.logicalId, session: target.session }));
       if (target.session&&!target.allSeats) item("rig-copy", "Copy session address", (cx) => cx.write_to_clipboard(target.session));
       out.push({
         icon: "terminal",
@@ -651,7 +723,7 @@ export default class RigMenu extends View {
           const attach = (wait) => attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, notify, wait, relayPath: attachRelayPath(appHome(), MOD_IDS.menu) }, target, config)
             .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); return res; });
           if (typeof cx?.spawn !== "function") return attach(undefined);
-          return new Promise((resolve) => { cx.spawn(async (cx) => { resolve(await attach(waitWith(cx)).catch(() => null)); }); });
+          return new Promise((resolve) => { cx.spawn(async (cx) => { resolve(await attach(waitWith(cx)).catch((error) => { sayRefusal(error); return null; })); }); });
         },
         disabled: stoppedSeat,
         reason: stoppedSeat ? "Stopped: seat has no running session to attach" : null,
@@ -692,7 +764,7 @@ export default class RigMenu extends View {
       for (const child of children) item("rig-helper", `Peek ${child.label}`, () => run("terminal.peek", { terminal: child.address }), null, true);
     }
     if (target.kind === "pod") {
-      item("rig-card", "Show pod card", () => page({ section: "topology", kind: "pod", rig: target.rig, rigId: target.rigId, pod: target.pod, name: target.pod }));
+      item("rig-card", "Show pod card", () => page({ section: "topology", kind: "pod", rig: target.rig, rigId: target.rigId, conn: target.conn, pod: target.pod, name: target.pod }));
     }
     if (target.kind === "rigspace") {
       // herdrig's Spaces list: herdr's own two actions for any space first (herdr's own commands, with herdr's own confirmation for
@@ -700,9 +772,9 @@ export default class RigMenu extends View {
       item("square-pen", "Rename", () => run("space.rename", { id: target.space }));
       item("x", "Close", () => run("space.close", { id: target.space }));
       out.push({ divider: "" }); // the popup header already names the rig
-      const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, name: target.rig,
-        lifecycle: (shared("rig.data")?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig)?.lifecycle ?? null };
-      item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology" } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, name: target.rig }));
+      const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig,
+        lifecycle: (sharedRigData(this.config, shared)?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig)?.lifecycle ?? null };
+      item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology" } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig }));
       item("rig-operator", "Attach operator", () => run("rig.operator"));
       if (!target.home && target.rig) {
         item("rig-snapshot", "Snapshot now", () => oneClick(rigTarget, "snapshot"));
@@ -762,14 +834,14 @@ export default class RigMenu extends View {
         if (target.slicePath) item("file-text", `Open ${file}`, () => page(fileEntry(`${target.slicePath}/${file}`, `${file} · ${target.name}`)));
       }
       item("rig-card", "Show slice card", () => page({ section: "scopes", mission: target.mission, slice: target.slice, name: target.name }));
-      item("rig-follow", "Follow this slice", () => oneClick({ kind: "follow-target", view: `slice:${target.id ?? target.slice}`, name: target.name }, "follow"), "follow");
+      item("rig-follow", "Follow this slice", () => oneClick({ kind: "follow-target", conn: target.conn, view: `slice:${target.id ?? target.slice}`, name: target.name }, "follow"), "follow");
     }
     if (target.kind === "strip-view") {
       // A worker view's strip pill: close it, follow its rig's active workers, or reach the rig.
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
       item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
       if (target.rig) item("rig-follow", "Follow active workers", () => oneClick({ ...target, view: `rig:${target.rig}` }, "follow"), "follow");
-      this.viewExtras(target.rig, item);
+      this.viewExtras(target.rig, item, target.conn);
     }
     if (target.kind === "following") {
       // A following view's strip menu: stop or resume, the TTL, close. Closing ends only its viewers.
@@ -786,7 +858,7 @@ export default class RigMenu extends View {
       }
       out.push({ divider: "" });
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
-      this.viewExtras(String(target.target ?? "").startsWith("rig:") ? target.target.slice(4) : null, item);
+      this.viewExtras(String(target.target ?? "").startsWith("rig:") ? target.target.slice(4) : null, item, target.conn);
       item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
     }
     if (target.kind === "views") {
@@ -809,7 +881,7 @@ export default class RigMenu extends View {
           notify({ title: "This view is full (4×4)", level: "warning" });
           return;
         }
-        oneClick({ kind: "open-view", view: `rig:${target.rig}`, rig: target.rig, grid: nextGrid, replace: target.viewId }, "open-designed-view");
+        oneClick({ kind: "open-view", conn: target.conn, view: `rig:${target.rig}`, rig: target.rig, grid: nextGrid, replace: target.viewId }, "open-designed-view");
       }, "cell-split", true);
       out.push({ divider: "" });
       const stripView = viewInStrip(target.viewId);
@@ -822,7 +894,7 @@ export default class RigMenu extends View {
       // A native seat closed outside OpenRig. Offered, never done on its own.
       if (target.native) {
         item("rig-refresh", "Relaunch fresh…", () => dialog({ ...target, reason: "native seat closed outside OpenRig" }, { action: "fresh", confirm: true }, 220));
-        item("rig-play", "Resume…", () => dialog({ kind: "rig", rig: target.rig }, { action: "resume", confirm: true }, 380));
+        item("rig-play", "Resume…", () => dialog({ kind: "rig", rig: target.rig, conn: target.conn }, { action: "resume", confirm: true }, 380));
       }
       if (target.reply !== "none") item("rig-reply", "Reply…", () => dialog(target, { input: true, placeholder: "Your answer, in your own words", action: "reply", multiLine: true }, 290), target.reply === "answer" ? "reply-answer" : "reply");
       item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: target.summary }));
@@ -846,7 +918,7 @@ export default class RigMenu extends View {
     if (target.kind === "system" && target.entry) item("rig-popout", `Open ${target.name}`, () => page(target.entry), null, true);
     if (target.kind === "saved-view" || target.kind === "terminal") {
       item("rig-card", "Show view", () => page({ section: "terminals", view: target.view, name: target.name }));
-      item("rig-view", "Open in herdr", () => oneClick({ kind: "open-view", view: target.view, rig: target.rig }, "open-view"), "open-view");
+      item("rig-view", "Open in herdr", () => oneClick({ kind: "open-view", conn: target.conn, view: target.view, rig: target.rig }, "open-view"), "open-view");
     }
     // A group's order can live under several keys (Specs: one per namespace): Reset clears every one that has an order.
     if (target.reorder) {
@@ -884,7 +956,7 @@ export default class RigMenu extends View {
 
   /** The seats of a target's rig (the sidebar's topology), plus any a view being edited holds that it doesn't know. */
   rigSeats(target) {
-    const rig = (shared("rig.data")?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig);
+    const rig = (sharedRigData(this.config, shared)?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig);
     const seats = rig ? rig.pods.flatMap((p) => p.seats) : [];
     for (const c of target.cells ?? []) {
       if (c.seat && !seats.some((s) => s.session === c.seat)) seats.push({ session: c.seat, logicalId: String(c.seat).split("@")[0], status: "running", word: "in view" });
@@ -899,9 +971,9 @@ export default class RigMenu extends View {
   }
 
   /** What a strip view's menu adds for its rig: the rig card (with rigId when known), the TUI, a snapshot. */
-  viewExtras(rig, item) {
+  viewExtras(rig, item, conn) {
     item("terminal", "Open or switch to the Rig TUI", () => run("rig.tui"));
-    if (rig) item("rig-snapshot", "Snapshot now", () => oneClick({ kind: "rig", rig }, "snapshot"));
+    if (rig) item("rig-snapshot", "Snapshot now", () => oneClick({ kind: "rig", rig, conn }, "snapshot"));
   }
 
   /** The CLI behind each action (rig-lib actionArgs, shared with the sidebar's one-click runs). */
@@ -1014,6 +1086,7 @@ export default class RigMenu extends View {
         : target.kind === "cell-split" ? `Split ${target.logicalId ?? target.seat}` : target.kind === "pod" ? `Pod ${target.pod} · ${target.rig}`
         : target.kind === "host" ? `Host ${target.name}` : target.kind === "mission" ? `Mission ${target.name}` : target.kind === "branch" ? target.name
         : target.kind === "specs-group" ? `${target.name} specs` : target.kind === "system-config" || target.kind === "system" ? target.name
+        : target.kind === 'assistant' ? `Connected assistant ${target.logicalId ?? target.name}`
         : target.kind === "saved-view" || target.kind === "terminal" ? `View ${target.name ?? target.view}` : `Rig ${target.rig ?? ""}`))
       .child(v_flex().id('rig-action-list').min_h(0).h(Math.min(260,items.length*26+reasons.length*40)).overflow_y_scrollbar().track_scroll(this.menuScroll)
         .on_size_change((_size,cx)=>{if(this.menuIndex>=0)this.menuScroll?.scroll_to_item(this.menuIndex);cx.notify();})
@@ -1113,6 +1186,8 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
+    const assistantReason=assistantActionRefusal(target,step.action);
+    if(assistantReason){this.result={ok:false,text:assistantReason};cx.notify();return;}
     if(step.action==="confirm-spec-write"){
       if(!step.token)return;
       setShared("rig.specWriteDecisions",{...(shared("rig.specWriteDecisions")??{}),[step.token]:"allow"});
@@ -1262,7 +1337,10 @@ export default class RigMenu extends View {
     if (step.input && !text) return;
     if (step.action === "reply") {
       this.run(cx, "Sending", async () => {
-        const cfg = await configNow();
+        // To the target's own daemon, resolved the way `write` resolves it; nothing is sent when it can't be.
+        const conn = targetConnection(await this.currentConfig(), target);
+        if (!conn.ok) return { ok: false, text: conn.reason };
+        const cfg = conn.config;
         if (!cfg.daemonUrl) return { ok: false, text: cfg.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." };
         const r = await submitMissionActions(cfg, target, {
           kind: target.reply === "resolve" ? "resolve" : "answer-text",
@@ -1275,7 +1353,7 @@ export default class RigMenu extends View {
       return;
     }
     const label = { pause: "Pausing", resume: "Resuming", fresh: "Starting fresh" }[step.action] ?? "Working";
-    this.run(cx, label, () => this.write(this.argsFor(target, step.action, text)));
+    this.run(cx, label, () => this.write(this.argsFor(target, step.action, text),undefined,cx));
   }
 
   /** Modal body: change seat harness, model, and effort ("Always via lead" + advisor for orch.lead). */
@@ -1961,7 +2039,7 @@ export default class RigMenu extends View {
     if(this.setupPanel)return this.setupPanel.render(t,cx);
     if(p.step&&["confirm-machine","setup-machine","stop-machine"].includes(p.step.action))return div().p(14).child("Checking OpenRig configuration…");
     if (!p.target) return div();
-    const target = complete(p.target);
+    const target = complete(p.target, this.config);
     const tree=p.step ? this.dialogView(t, cx, target, p.step) : this.popup(t, target);
     this.dialogRenderCx=null;
     return tree;

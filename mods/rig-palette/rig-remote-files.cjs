@@ -39,8 +39,14 @@ function inspectRemote(run, expectedHome = null) {
 }
 function shippedBytes() {
   const p = path.join(__dirname, "rig-attach-relay.cjs");
-  if (!fs.lstatSync(p).isFile() || fs.lstatSync(p).isSymbolicLink()) throw new Error("The shipped relay must be a regular file.");
-  const bytes = fs.readFileSync(p);
+  // One open that refuses a symlink, then the fd's own type, then the read through that fd: no check of a path that could change
+  // before the read. The bytes are then hashed against the pin before any use.
+  const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  let bytes;
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error("The shipped relay must be a regular file.");
+    bytes = fs.readFileSync(fd);
+  } finally { fs.closeSync(fd); }
   if (crypto.createHash("sha256").update(bytes).digest("hex") !== RELAY_SHA256) throw new Error("The shipped relay differs from this release. Reinstall the mod.");
   return bytes;
 }

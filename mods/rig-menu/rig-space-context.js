@@ -119,6 +119,16 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   return {space:null,unconfirmed:unknown?{space:unknown.space,origin}:null};
 }
 
+/** What every open path says, and nothing new opens, when the rig's space on a machine can't be confirmed (ONE RIG == ONE SPACE: the grid,
+ *  Attach and worker views all ask instead of making a second space). */
+export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl)=>`${rigName} already has a space on ${machine}, made with the address ${origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${daemonUrl}, so nothing new was opened. Close that space and open ${rigName} again, or set daemonUrl to ${origin??"that address"}.`;
+/** The rig the sidebar published (by id or name), for the sessions that vouch for a space of it; null when it isn't known. */
+export function topologyRig(host,refs){
+  const topology=host.topology?.()??host.shared?.("rig.data")?.topology??[];
+  const wanted=(refs??[]).filter(Boolean);
+  return topology.find(rig=>wanted.some(ref=>rig.id===ref||rig.name===ref))??null;
+}
+
 /** One label-based destination lookup for pages, grids and Attach; never infer ownership from a display name. */
 export function resolveRigSpace(host,config,names,options={}) {
   return lookup(host,config,names,options).space;

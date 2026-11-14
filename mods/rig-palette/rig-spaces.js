@@ -1,7 +1,7 @@
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
 import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8, rigSeatServers } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure, goodHome } from "./rig-remote.js";
-import { resolveRigSpace, unconfirmedRigSpace, markRigSpace, rigSessions, rigOrigin, hostLabelValue } from "./rig-space-context.js";
+import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigSessions, rigOrigin, hostLabelValue } from "./rig-space-context.js";
 
 const ROLE = "rig-grid";
 const get = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
@@ -227,7 +227,7 @@ export class RigSpaces {
     }
     if (!space && explicit && machine) {
       const other = unconfirmedRigSpace(host, config, [rig.id, rig.name], { markedOnly: true, sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) });
-      if (other) return { ok: false, unconfirmedSpace: true, reason: `${rig.name} already has a space on ${machine}, made with the address ${other.origin ?? "an earlier one"}. Herdr could not confirm it is the same OpenRig as ${config.daemonUrl}, so nothing new was opened. Close that space and open ${rig.name} again, or set daemonUrl to ${other.origin ?? "that address"}.` };
+      if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig.name, machine, other.origin, config.daemonUrl) };
     }
     // A closed space is never recreated by polling, even when membership changes.
     if (!space && !explicit) { this.done.delete(key); return { ok: true, closed: true }; }
