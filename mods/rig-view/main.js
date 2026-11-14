@@ -263,8 +263,8 @@ export default class RigView extends View {
         this.specConsentMachine=key?.sha256===SPEC_SHA256?key.machine:null;
       }catch{this.specConsentMachine=null;}
       if (sameConfig(next, this.config)) return;
-      if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine)) {
-        this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx); // reads still in flight belong to the old daemon
+      if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine || next.connectionId !== this.config.connectionId)) {
+        this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx); // reads still in flight belong to the old daemon (or the old connection at the same address)
         for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
         this.specBoxes={};
       }
