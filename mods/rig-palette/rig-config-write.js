@@ -2,6 +2,10 @@ import { CONFIG_SCHEMA, configDefinition, validateConfigValue } from "./rig-conf
 import { isLoopbackDaemonUrl } from "./rig-lib.js";
 
 export const CONFIG_SAVE_TIMEOUT = 'The save did not answer; nothing was confirmed. Refresh before trying again.';
+export function configRejectedSaveResidual(value=null){
+  const text=value==null?null:String(value).replace(/\s+/g,' '),brief=text?.length>80?`${text.slice(0,79)}…`:text;
+  return `OpenRig didn't confirm your earlier save${text===null?'':` (${brief||'empty'})`}. It may still land later and replace a newer value, so check this setting again if it matters.`;
+}
 // Raw requests outlive an editor's 15 s UI deadline. A replacement panel must see the same lock.
 // Herdr reloads each view's modules under a new generation, inside the window's same JS runtime.
 // Keep the registry on that runtime too, so a newly loaded module cannot bypass the raw request.
@@ -49,7 +53,9 @@ export function configOperationRequest(request, after, identity=null, owner=null
       const response=await request(...args);return {ok:response.ok,status:response.status,data:await response.json()};
     });
     const settled=()=>{if(record){record.pending.delete(raw);if(!record.pending.size){for(const resolve of record.idle)resolve(record);record.idle.clear();if(!record.uncertain&&configWrites.get(identity)===record)configWrites.delete(identity);}}};
-    raw.then(({ok,status,data})=>{settled();if(!expired&&!closed){waiting.delete(reject);resolve({ok,status,json:async()=>data});}},cause=>{if(record)record.uncertain=true;settled();waiting.delete(reject);reject(cause);});
+    // If a proxy or tunnel retained the body, this interrupted save may still arrive and replace a newer value.
+    // A fresh read observes the current value, not a server-side barrier against that delayed POST.
+    raw.then(({ok,status,data})=>{settled();if(!expired&&!closed){waiting.delete(reject);resolve({ok,status,json:async()=>data});}},cause=>{if(record){record.uncertain=true;record.rejected=true;}settled();waiting.delete(reject);reject(cause);});
   });
   bounded.expired=()=>expired;
   bounded.finish=()=>{closed=true;waiting.clear();};

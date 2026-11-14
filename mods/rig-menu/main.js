@@ -15,6 +15,7 @@
 import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
+import { sharedLoopbackDaemonUrl, sharedRigData } from "./rig-lib.js";
 import { registerRigRouting } from "./rig-lib.js";
 import { targetConnection } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
@@ -56,10 +57,11 @@ const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-
 const dialog = (target, step, height = 260) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
 const configNow = async () => {
   const cfg = parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
+  if (cfg.connectionsRefused) return { ...cfg, daemonMessage: cfg.connectionsRefused }; // a refused list has no address, from anywhere
   if (cfg.daemonUrl) return cfg;
   // Another mod's shared state may name the daemon only when it's on this machine (loopback).
-  const fromShared = shared("rig.data")?.config?.daemonUrl;
-  if (fromShared && isLoopbackDaemonUrl(fromShared)) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
+  const fromShared = sharedLoopbackDaemonUrl(cfg, shared("rig.data"));
+  if (fromShared) return { ...cfg, daemonUrl: fromShared, daemonUrlSource: cfg.daemonUrlSource ?? "cli" };
   const status = await discoverDaemonFromCli(cfg, exec);
   if (status.reachable && status.daemonUrl) return { ...cfg, daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
   return { ...cfg, daemonMessage: status.message || cfg.daemonMessage };
@@ -107,9 +109,9 @@ const ttlWords = (ms) => ms == null ? "never" : ms < 60000 ? `${Math.round(ms / 
   : `${Math.floor(ms / 3600000)}h${Math.round(ms / 60000) % 60 ? ` ${Math.round(ms / 60000) % 60}m` : ""}`;
 
 /** Fills what a target's opener didn't know (a cell header knows the rig's name, not its id) from the sidebar's data. */
-function complete(target) {
+function complete(target, config) {
   if (!target || !target.rig) return target;
-  const rig = (shared("rig.data")?.topology ?? []).find((r) => r.id === target.rigId || r.name === target.rig);
+  const rig = (sharedRigData(config, shared)?.topology ?? []).find((r) => r.id === target.rigId || r.name === target.rig);
   if (!rig) return target;
   const seat = target.session
     ? rig.pods.flatMap((p) => p.seats).find((s) => s.session === target.session)
@@ -201,7 +203,7 @@ export default class RigMenu extends View {
       cx.notify();
       // A one-click action that failed in the sidebar arrives with its failure, for Retry; without the sidebar one starts
       // once, here: never from render, where notify isn't allowed.
-      if (step?.failed) { this.result = step.failed; cx.notify(); } else if (step?.run) this.go(cx, complete(props().target), step);
+      if (step?.failed) { this.result = step.failed; cx.notify(); } else if (step?.run) this.go(cx, complete(props().target, this.config), step);
     });
     if (step?.action === "launch-spec") {
       // Where and on which host the rig starts: the palette's launch-folder / launch-host fill them.
@@ -212,18 +214,18 @@ export default class RigMenu extends View {
       for (const field of [this.folder, this.host]) {
         field.on("focus", () => { this.typing = true; });
         field.on("blur", () => { this.typing = false; });
-        field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, complete(props().target), props().step); });
+        field.on("submit", (_e, cx) => { if (!this.result?.ok && !this.busy) this.go(cx, complete(props().target, this.config), props().step); });
       }
       this.dialogFocusedField=this.folder;this.folder.focus();
       this.typing = true;
     }
     if (step?.action === "new-rig") this.initNewRig(cx);
     if (step?.action === "design-view") {
-      this.initDesigner(complete(props().target));
+      this.initDesigner(complete(props().target, this.config));
       cx.timer.after(0,nextCx=>{this.dialogConfirmHandle?.focus?.();nextCx.notify();});
     }
     if (step?.action === "change-model") {
-      this.initChangeModel(complete(props().target));
+      this.initChangeModel(complete(props().target, this.config));
       cx.timer.after(0,nextCx=>{this.dialogConfirmHandle?.focus?.();nextCx.notify();});
     }
     if (step?.input) {
@@ -238,7 +240,7 @@ export default class RigMenu extends View {
         cx.timer.after(300, () => { this.saving = false; this.keepDraft(); });
       });
       // Enter adds a line; Ctrl+Enter (Cmd+Enter on macOS: GPUI's secondary-enter) sends.
-      this.input.on("submit", (e, cx) => { if (e?.secondary && !this.result) this.go(cx, complete(props().target), props().step); });
+      this.input.on("submit", (e, cx) => { if (e?.secondary && !this.result) this.go(cx, complete(props().target, this.config), props().step); });
       this.dialogFocusedField=this.input;this.input.focus();
       this.typing = true;
       cx.timer.after(400, () => this.input.focus());
@@ -602,7 +604,7 @@ export default class RigMenu extends View {
 
   async loadPause(cx) {
     cx.spawn(async (cx) => {
-      const t = complete(props().target);
+      const t = complete(props().target, this.config);
       // The confirmation shows the target's own daemon's seats (the write goes there too), never the default one's.
       const conn = targetConnection(this.config ?? await configNow(), t);
       if (!conn.ok) { this.pause = { error: conn.reason }; cx.notify(); return; }
@@ -728,7 +730,7 @@ export default class RigMenu extends View {
       item("x", "Close", () => run("space.close", { id: target.space }));
       out.push({ divider: "" }); // the popup header already names the rig
       const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig,
-        lifecycle: (shared("rig.data")?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig)?.lifecycle ?? null };
+        lifecycle: (sharedRigData(this.config, shared)?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig)?.lifecycle ?? null };
       item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology" } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig }));
       item("rig-operator", "Attach operator", () => run("rig.operator"));
       if (!target.home && target.rig) {
@@ -911,7 +913,7 @@ export default class RigMenu extends View {
 
   /** The seats of a target's rig (the sidebar's topology), plus any a view being edited holds that it doesn't know. */
   rigSeats(target) {
-    const rig = (shared("rig.data")?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig);
+    const rig = (sharedRigData(this.config, shared)?.topology ?? []).find((r) => (target.rigId && r.id === target.rigId) || r.name === target.rig);
     const seats = rig ? rig.pods.flatMap((p) => p.seats) : [];
     for (const c of target.cells ?? []) {
       if (c.seat && !seats.some((s) => s.session === c.seat)) seats.push({ session: c.seat, logicalId: String(c.seat).split("@")[0], status: "running", word: "in view" });
@@ -1994,7 +1996,7 @@ export default class RigMenu extends View {
     if(this.setupPanel)return this.setupPanel.render(t,cx);
     if(p.step&&["confirm-machine","setup-machine","stop-machine"].includes(p.step.action))return div().p(14).child("Checking OpenRig configuration…");
     if (!p.target) return div();
-    const target = complete(p.target);
+    const target = complete(p.target, this.config);
     const tree=p.step ? this.dialogView(t, cx, target, p.step) : this.popup(t, target);
     this.dialogRenderCx=null;
     return tree;

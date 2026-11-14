@@ -3,7 +3,7 @@ import { h_flex, v_flex, InputState, Input, Select, Popup } from "gpui-base";
 import { configRows, iconsAt } from "./rig-lib.js";
 import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-editor.js";
 import { configDefinition, validateConfigValue,configPairPlan,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
-import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
+import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configRejectedSaveResidual,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
 import { timezoneNote } from './rig-time.js';
 const icon = iconsAt("mods/rig-view");
 const hidden = e => e?.visibility === "withheld" || CONFIG_TERMINAL_KEYS.includes(e?.key) || /token|credential/i.test(e?.key ?? "");
@@ -121,7 +121,7 @@ export class ConfigPanel {
     return this.reconcileStopped.has(identity)?{blocked:true,uncertain:true,failed:true,reason:'The last save could not be checked on this page. Reopen this page before saving again.'}:state;
   }
   watchWrites(cx,binding={origin:this.origin(),model:this.model,identity:this.identity()}){
-    const {origin,model,identity}=binding;
+    const {origin,model,identity,rejected}=binding;
     if(configWriteState(identity)?.ownerClosed||this.reconcileStopped.has(identity)||this.writeWatches.get(identity)?.model===model)return;
     const watch={model};this.writeWatches.set(identity,watch);
     cx.spawn(async next=>{
@@ -140,7 +140,8 @@ export class ConfigPanel {
         }else result=await configReconcileResult(record);
         if(!result.ok)throw new Error('The last save could not be reconciled');
         if(current()){
-          this.applyRefresh(result.data,origin,model,identity);this.reconciledModel=model;
+          this.applyRefresh(result.data,origin,model,identity);this.reconciledModel=model;this.reconciledRejectedModel=record?.rejected?model:null;
+          const entry=model.entry(rejected?.key);this.reconciledRejectedText=configRejectedSaveResidual(entry&&!hidden(entry)?rejected?.value:null);
           model.error=null;
           if(model.row)model.row.error=null;
         }
@@ -164,12 +165,13 @@ export class ConfigPanel {
     if(this.pauseWrites(cx))return;
     const origin = this.boundOrigin, model = this.model,identity=this.boundIdentity,draft=model.row;
     const request=configOperationRequest(fetch,(ms,fn)=>cx.timer.after(ms,fn),identity,this.writeOwner,this.daemonName());
-    this.saves.set(identity,request);this.reconciledModel=null;
+    this.saves.set(identity,request);this.reconciledModel=null;this.reconciledRejectedModel=null;this.reconciledRejectedText=null;
     cx.spawn(async cx => {
+      let rejected;
       try{await model.save(pending, (key, value, reset) => {
         if (this.identity() !== identity || this.model !== model) return { ok:false, error:"OpenRig connection changed; reopen the setting" };
         return writeDaemonConfig({origin,key,value,reset,entry:model.entry(key),detected:this.detected},request)
-          .then(result=>({...result,daemon:this.daemonName()}));
+          .then(result=>{if(!result.ok)rejected={key,value:hidden(model.entry(key))?null:reset?'the default':value};return {...result,daemon:this.daemonName()};});
       }, () => this.refresh(origin,request,model,identity),Date.now,async key=>{
         if(this.identity()!==identity||this.model!==model)throw new Error('OpenRig connection changed; Undo is no longer available');
         const result=await readDaemonConfig({origin,key,entry:model.entry(key),detected:this.detected},request);
@@ -183,7 +185,7 @@ export class ConfigPanel {
         request.finish();if(this.saves.get(identity)===request)this.saves.delete(identity);
         if(configWriteState(identity)?.uncertain){
           const reason=configWriteState(identity).reason;model.error=reason;if(model.row)model.row.error=reason;
-          this.watchWrites(cx,{origin,model,identity});
+          this.watchWrites(cx,{origin,model,identity,rejected});
         }
       }
       if(request.expired()&&this.model===model&&!model.row){this.open(pending.changes[0][0],cx);if(model.row)model.row.error=CONFIG_SAVE_TIMEOUT;}
@@ -311,7 +313,10 @@ export class ConfigPanel {
       .child(probe?.status ? configWriteError(probe.status,probe.errorData)
         : "This OpenRig hasn't confirmed support for editing settings from Herdr. Use rig config set on that machine."));
     if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(m.errorTone==='working'?t.working:t.blocked).child(m.error));
-    if(this.reconciledModel===m)out.push(div().id('config-write-recovered').text_size(11.5).text_color(t.muted).child('OpenRig’s current settings were checked. Review your draft before saving again.'));
+    if(this.reconciledModel===m){
+      const rejected=this.reconciledRejectedModel===m,message=rejected?(this.reconciledRejectedText??configRejectedSaveResidual()):'OpenRig’s current settings were checked. Review your draft before saving again.';
+      out.push(div().id('config-write-recovered').text_size(11.5).text_color(rejected?t.working:t.muted).tooltip(message).child(message));
+    }
     let group=null,pair=false;
     for(const {entry,group:entryGroup} of [...rows.filter(r=>!this.definition(r.entry).readOnly),...rows.filter(r=>this.definition(r.entry).readOnly)]) {
       const def=this.definition(entry), readOnly=!!def.readOnly;
