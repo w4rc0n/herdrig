@@ -610,6 +610,10 @@ export default class RigMenu extends View {
     if(target?.kind==='assistant'){
       if(args[0]!=='queue'||args[1]!=='create'||args[args.indexOf('--destination')+1]!==target.session)return{ok:false,text:'Connected assistants only accept queued work.'};
       const verified=await verifyAssistantTarget(fetch,conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done):null);if(!verified.ok)return{ok:false,text:verified.reason};
+      // The roster await can outlive a config-file edit; observing it here also updates the send gate.
+      const afterVerify=await freshFileConfig();
+      if(afterVerify.connectionsRefused)return{ok:false,text:afterVerify.connectionsRefused};
+      if(!sameDialogConfig(this.openedOn??fresh,afterVerify))return{ok:false,text:CONFIG_CHANGED_OPEN};
     }
     const cmd = writeCommand(conn.config, args, options);
     if (!cmd) return { ok: false, text: NO_PERSON };
@@ -631,7 +635,7 @@ export default class RigMenu extends View {
   run(cx, label, work, { dismissOnSuccess = false } = {}) {
     this.busy = label; this.result = null; cx.notify();
     cx.spawn(async (cx) => {
-      try { this.result = await work(); } catch (e) { this.result = { ok: false, text: String(e?.message ?? e) }; }
+      try { this.result = await work(cx); } catch (e) { this.result = { ok: false, text: String(e?.message ?? e) }; }
       // Sent: the draft is done with. Not sent: it stays, for a retry from the menu.
       if (this.result?.ok) this.dropDraft();
       this.busy = null;
@@ -1353,7 +1357,7 @@ export default class RigMenu extends View {
       return;
     }
     const label = { pause: "Pausing", resume: "Resuming", fresh: "Starting fresh" }[step.action] ?? "Working";
-    this.run(cx, label, () => this.write(this.argsFor(target, step.action, text),undefined,cx));
+    this.run(cx, label, taskCx => this.write(this.argsFor(target, step.action, text),undefined,taskCx));
   }
 
   /** Modal body: change seat harness, model, and effort ("Always via lead" + advisor for orch.lead). */

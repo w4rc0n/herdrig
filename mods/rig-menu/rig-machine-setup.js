@@ -2,7 +2,7 @@
 // Host file operations are injected only for the two fixed app-home files, never from remote metadata.
 import {RemoteMachine} from "./rig-remote.js";
 import {formatAbsoluteTime} from './rig-time.js';
-import {LEGACY_CONNECTION_ID,connectionsOf,consentOf,consentText} from './rig-connections.js';
+import {LEGACY_CONNECTION_ID,consentOf,consentText} from './rig-connections.js';
 
 const parsed=text=>{
   const value=JSON.parse(text??"{}");
@@ -13,7 +13,7 @@ const connectionOf=config=>config?.connectionId??LEGACY_CONNECTION_ID;
 // With a connections list the machine lives in the connection's own record, which these flows don't edit yet (the setup screen for connections
 // does, in v0.5.0): they refuse instead of saving a root key that nothing reads and reporting success.
 export const MACHINE_SETUP_LIST="This OpenRig is set up with a connections list in its configuration. Choosing its machine here comes with the next version, so nothing was changed.";
-const hasList=raw=>connectionsOf(raw).legacy===false;
+const hasList=raw=>raw?.connections!==undefined&&raw?.connections!==null; // the loader's own rule: any value but absent or null is a list it refuses
 const errorText=error=>String(error?.message??error);
 function connectionMatches(raw,config,machine){
   if(hasList(raw))throw new Error(MACHINE_SETUP_LIST);

@@ -426,7 +426,12 @@ export async function routeOpen(host,config,request={}){
     return forwardRigOpen(host,selected);
   const {rig,key}=requestRig(host,selected);
   const queueKey=JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine??"",rig?.name??key??"home"]);
-  const job=(jobs.get(queueKey)??Promise.resolve()).catch(()=>{}).then(()=>perform(host,config,selected,rig,key));
+  const job=(jobs.get(queueKey)??Promise.resolve()).catch(()=>{}).then(()=>{
+    // The request waited behind earlier work: a connections list installed meanwhile refuses it now, whatever config it was queued under.
+    const current=host.currentConfig?.();
+    if(current?.connectionsRefused)return fail(current.connectionsRefused);
+    return perform(host,config,selected,rig,key);
+  });
   jobs.set(queueKey,job);
   try{return await job;}catch(error){return fail(String(error?.message??error));}
   finally{if(jobs.get(queueKey)===job) jobs.delete(queueKey);}

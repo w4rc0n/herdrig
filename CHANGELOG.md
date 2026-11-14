@@ -2,6 +2,10 @@
 
 ## v0.4.5
 
+- Settings check current values before saving. If a confirmation changed underneath you, review it again; Undo returns to the value checked before your save.
+- Queue work to connected assistants keeps working after verification. Their requests no longer mark unrelated seats as needing you, and parked requests name their owner.
+- Actions with several steps keep the OpenRig settings they started with and refuse to continue if those settings change.
+- Clicking away from a setting you haven't edited keeps changes made elsewhere.
 - A connections list is not supported yet; herdrig says so and leaves it unchanged.
 - Opening a rig's page, Attach or worker views checks its existing space first. If OpenRig cannot confirm the match, the sidebar explains why and nothing opens, instead of creating a second space.
 - Paired settings keep changes made elsewhere and reset in a safe order. A lost save reply pauses further changes until settings are checked. Undo checks again before each restored value; a simultaneous change can still win or be overwritten because OpenRig offers no atomic settings update. If a proxy or tunnel retains an interrupted save, it can still arrive after that check and replace a newer value; recovery now warns you to check the setting again if it matters.

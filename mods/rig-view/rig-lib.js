@@ -903,6 +903,7 @@ export async function probeOpenRigState(config, { exec, fetch: fetchFn, sidebarM
         healthzProbe = { ok: false, status: hr.status, message: `HTTP ${hr.status}` };
       }
     } catch (err) {
+      if (err?.code === "GATE_REFUSED") throw err; // a settings change is not an unhealthy daemon
       healthzProbe = { ok: false, message: String(err?.message ?? err ?? "OpenRig daemon did not answer /healthz.") };
     }
   }

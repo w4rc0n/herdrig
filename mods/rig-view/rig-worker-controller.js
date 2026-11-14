@@ -1,5 +1,5 @@
 // The sidebar owns reconciliation. Daemon previews are read-only; Herdr owns PTYs.
-import {isValidSessionName} from "./rig-lib.js";
+import {isValidSessionName,rigSeatServers} from "./rig-lib.js";
 import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
 import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue} from "./rig-space-context.js";
@@ -147,7 +147,7 @@ export class HostWorkerViews{
         const move=rigSpaceRelocation(host,rig,config);
         if(move)return {ok:false,needsRelocation:true,relocation:move,reason:"Move the Local rig space before opening its worker view on the box."};
         // The same vouching inputs the pages and the grid use; a space that still can't be confirmed is asked about, never answered with a new one.
-        const vouch={sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),hostId:remote.selfHostId};
+        const vouch={sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),servers:rigSeatServers({seats:nodes}),hostId:remote.selfHostId}; // the tmux server too: a session name is unique only within one server
         space=resolveRigSpace(host,config,[rig.id,rig.name],vouch);
         if(!space){
           const other=unconfirmedRigSpace(host,config,[rig.id,rig.name],vouch);

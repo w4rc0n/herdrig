@@ -5,16 +5,17 @@ import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-
 import { configDefinition, validateConfigValue,configPairPlan,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
 import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configRejectedSaveResidual,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
 import { timezoneNote } from './rig-time.js';
-import { gatedFetch } from "./rig-gate.js";
+import { gatedFetch, gatedOperationOrRefusal,gateSameConfig,GateRefusal,CONFIG_CHANGED_OPEN } from "./rig-gate.js";
 const fetch = gatedFetch; // every request goes through the send gate
 const icon = iconsAt("mods/rig-view");
 const hidden = e => e?.visibility === "withheld" || CONFIG_TERMINAL_KEYS.includes(e?.key) || /token|credential/i.test(e?.key ?? "");
 const textValue = e => hidden(e) ? "Value withheld by OpenRig" : String(e?.value ?? "unset");
 const sourceName = e => ({file:"saved",env:"environment",default:"default"}[e.source] ?? e.source ?? "unreported");
+const sameReviewConfig=(a,b)=>gateSameConfig(a,b)&&(a.person??null)===(b.person??null)&&JSON.stringify(a.rig??null)===JSON.stringify(b.rig??null);
 
 /** The page owns this presentation object; the model contains no native input state. */
 export class ConfigPanel {
-  constructor(page) { this.page = page; this.model = new ConfigEditor(); this.inputs = {}; this.selected = null; this.releasedReviews=new WeakSet();this.saves=new Map();this.writeWatches=new Map();this.reconcileStopped=new Set();this.writeOwner={}; }
+  constructor(page) { this.page = page; this.model = new ConfigEditor(); this.inputs = {}; this.selected = null; this.releasedReviews=new WeakSet();this.reviewConfigs=new WeakMap();this.saves=new Map();this.writeWatches=new Map();this.reconcileStopped=new Set();this.writeOwner={}; }
   close(){this.disposed=true;closeConfigWrites(this.writeOwner);}
   get saving(){return this.saves.has(this.identity());}
   origin() { return this.page.config?.daemonUrl ?? ""; }
@@ -124,6 +125,7 @@ export class ConfigPanel {
   }
   watchWrites(cx,binding={origin:this.origin(),model:this.model,identity:this.identity()}){
     const {origin,model,identity,rejected}=binding;
+    const op=binding.op??gatedOperationOrRefusal(); // the reconciling reads belong to the generation the origin was captured under
     if(configWriteState(identity)?.ownerClosed||this.reconcileStopped.has(identity)||this.writeWatches.get(identity)?.model===model)return;
     const watch={model};this.writeWatches.set(identity,watch);
     cx.spawn(async next=>{
@@ -136,7 +138,7 @@ export class ConfigPanel {
         token=beginConfigReconcile(identity,record,this.writeOwner);
         let result;
         if(token){
-          request=configOperationRequest(fetch,(ms,fn)=>next.timer.after(ms,fn));
+          request=configOperationRequest(op.fetch,(ms,fn)=>next.timer.after(ms,fn));
           const data=await this.refresh(origin,request,model,identity);
           finishConfigReconcile(identity,record,token,data);result={ok:true,data};
         }else result=await configReconcileResult(record);
@@ -158,6 +160,7 @@ export class ConfigPanel {
     if (!pending) {
       if(this.model.confirmation){
         const confirmation=this.model.confirmation;this.cancelHandle??=cx.focus_handle?.();this.confirmHandle??=cx.focus_handle?.();
+        if(!this.reviewConfigs.has(confirmation))this.reviewConfigs.set(confirmation,{...this.page.config,rig:Array.isArray(this.page.config?.rig)?[...this.page.config.rig]:this.page.config?.rig});
         const handle=this.cancelHandle;handle?.focus?.();
         cx.timer?.after(16,next=>{if(this.model.confirmation===confirmation)handle?.focus();next.notify();});
       }
@@ -166,7 +169,13 @@ export class ConfigPanel {
     if(this.saving||this.model.busy)return;
     if(this.pauseWrites(cx))return;
     const origin = this.boundOrigin, model = this.model,identity=this.boundIdentity,draft=model.row;
-    const request=configOperationRequest(fetch,(ms,fn)=>cx.timer.after(ms,fn),identity,this.writeOwner,this.daemonName());
+    const op=gatedOperationOrRefusal(); // the origin above belongs to this generation: a deferred send after the settings changed is refused
+    const reviewed=this.reviewConfigs.get(pending);
+    const checkCurrent=()=>{
+      if(this.identity()!==identity||this.model!==model||(reviewed&&!sameReviewConfig(reviewed,this.page.config)))throw new GateRefusal(CONFIG_CHANGED_OPEN);
+      op.check();
+    };
+    const request=configOperationRequest((...args)=>{checkCurrent();return op.fetch(...args);},(ms,fn)=>cx.timer.after(ms,fn),identity,this.writeOwner,this.daemonName());
     this.saves.set(identity,request);this.reconciledModel=null;this.reconciledRejectedModel=null;this.reconciledRejectedText=null;
     cx.spawn(async cx => {
       let rejected;
@@ -178,7 +187,7 @@ export class ConfigPanel {
         if(this.identity()!==identity||this.model!==model)throw new Error('OpenRig connection changed; Undo is no longer available');
         const result=await readDaemonConfig({origin,key,entry:model.entry(key),detected:this.detected},request);
         if(!result.ok)throw new Error(result.error);return result.resolved;
-      });}finally{
+      },checkCurrent);}finally{
         if(request.expired()){
           model.results.clear();model.latestReceipt=null;model.lastSavedText=null;model.error=CONFIG_SAVE_TIMEOUT;
           if(!model.row&&draft)model.row=draft;
@@ -187,7 +196,7 @@ export class ConfigPanel {
         request.finish();if(this.saves.get(identity)===request)this.saves.delete(identity);
         if(configWriteState(identity)?.uncertain){
           const reason=configWriteState(identity).reason;model.error=reason;if(model.row)model.row.error=reason;
-          this.watchWrites(cx,{origin,model,identity,rejected});
+          this.watchWrites(cx,{origin,model,identity,rejected,op});
         }
       }
       if(request.expired()&&this.model===model&&!model.row){this.open(pending.changes[0][0],cx);if(model.row)model.row.error=CONFIG_SAVE_TIMEOUT;}

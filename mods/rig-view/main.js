@@ -27,7 +27,7 @@ import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, h
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
 import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
 const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
@@ -56,7 +56,7 @@ import { NowTailCache, nowTailPresentation } from "./rig-now.js";
 import { RigGraph, GRAPH_EDGE_LOOK } from "./rig-graph.js";
 import { pageBodyLayout } from "./rig-page-layout.js";
 import {allSeatsView} from './rig-all-seats-view.js';
-import {HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantSentence,assistantForNeed,assistantOwner} from './rig-connected-assistants.js';
+import {HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantSentence,assistantForNeed,assistantOwner,terminalAttention} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
 import { normalizeRunningGraph, graphActivityOf } from "./rig-graph-state.js";
 import { pageViewKind, pageViewOptions, selectedPageView, entryWithPageView, compactLocationCrumbs, visiblePageTabs, pageSectionChoices } from "./rig-page-nav.js";
@@ -287,8 +287,14 @@ export default class RigView extends View {
       }
       this.config = next;
       // The spec editor's folders, from local facts only (never the daemon's list).
-      if(!next.daemonMachine)this.specRoots = await localSpecRoots(next, exec, home());
-      this.specRealpathAvailable = await specRealpathAvailable(exec);
+      if(!next.daemonMachine){
+        const roots = await localSpecRoots(next, exec, home());
+        if (seq !== this.loadSeq) return; // overtaken while resolving the folders: the newer load publishes its own
+        this.specRoots = roots;
+      }
+      const realpathAvailable = await specRealpathAvailable(exec);
+      if (seq !== this.loadSeq) return; // overtaken while checking realpath
+      this.specRealpathAvailable = realpathAvailable;
       cx.notify();
     });
   }
@@ -444,11 +450,12 @@ export default class RigView extends View {
       };
       cx.spawn(async (cx) => {
         try {
+          const op = gatedOperationOrRefusal();
           const daemonUrl = await this.resolveDaemonUrl();
           if (!daemonUrl) {
             throw new Error(this.lastDaemonMessage || this.config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
           }
-          const r = await fetch(`${daemonUrl}${path}`);
+          const r = await op.fetch(`${daemonUrl}${path}`);
           const body = await r.text();
           if (epoch !== (this.cacheEpoch ?? 0)) return;
           let data = null; try { data = stampConnection(JSON.parse(body), connId); } catch (_) { data = body; }
@@ -720,7 +727,7 @@ export default class RigView extends View {
     if (entry.kind === "pod") return this.podCard(t, cx, entry);
     const summary = this.read(cx, "/api/rigs/summary");
     const att = this.read(cx, "/api/attention");
-    const attentionItems = att.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [];
+    const attentionItems = terminalAttention(att.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [],this.hostedMembers(cx));
     // One rig (`Topology › factory`): the same block, alone. It reads its own seats at once.
     if (entry.kind === "rig" && entry.rigId) {
       const one = (summary.data ?? []).find((r) => r.id === entry.rigId) ?? { id: entry.rigId, name: entry.name };
@@ -874,7 +881,7 @@ export default class RigView extends View {
     const counts = statusCounts(podSeats);
     const nativeSeats = this.read(cx, `/api/native-seats?rig=${encodeURIComponent(entry.rig)}`).data?.seats ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
-    const attentionItems = (this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? []).map(needTarget);
+    const attentionItems = terminalAttention(this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [],this.hostedMembers(cx)).map(needTarget);
     return v_flex().id(`pod-page-${entry.rigId ?? entry.rig}-${podName}`).gap(12)
       .child(this.title(t, `Pod ${podName} · ${entry.rig}`))
       .child(this.card(t, "Pod", [this.kv(t, [
@@ -971,9 +978,10 @@ export default class RigView extends View {
   resetNowTails(cx) {
     this.nowTails?.close(); this.nowDue = true; this.nowWidths = Object.create(null); this.nowSignature = null;
     this.nowTails = new NowTailCache(async seat => {
+      const op = gatedOperationOrRefusal();
       const origin = await this.resolveDaemonUrl();
       if (!origin) return { ok: false, error: "OpenRig daemon is unavailable." };
-      const response = await fetch(`${origin}/api/transcripts/${encodeURIComponent(seat.session)}/tail?lines=40`);
+      const response = await op.fetch(`${origin}/api/transcripts/${encodeURIComponent(seat.session)}/tail?lines=40`);
       const data = await response.json(); return { ok: response.ok, status: response.status, data };
     }, () => { if (!this.closed) cx.notify(); });
   }
@@ -1293,7 +1301,7 @@ export default class RigView extends View {
       ?? this.cache["/api/native-seats"]?.data?.seats
       ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
-    const attentionItems = (this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? []).map(needTarget);
+    const attentionItems = terminalAttention(this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [],this.hostedMembers(cx)).map(needTarget);
     const hosts = [...new Set(model.seats.map((s) => s.host ?? "local"))];
     const sourceSeats = preserveHidden ? model.seats : seats;
     const groups = hosts.length > 1 ? hosts.map((h) => [h, sourceSeats.filter((s) => (s.host ?? "local") === h)]).filter(([, list]) => list.length) : [[null, sourceSeats]];
@@ -1895,10 +1903,11 @@ export default class RigView extends View {
     box.graphLoading=true;box.graphError=null;box.graph=null;
     cx.spawn(async cx=>{
       try{
+        const op=gatedOperationOrRefusal();
         const url=await this.resolveDaemonUrl();if(!url)throw new Error("Connect OpenRig before opening the saved spec graph.");
         // This is the same public structured review used by rig specs preview in OpenRig0.7.11.
         // It stays on the person's existing HTTP/tunnel origin and needs no local or remote CLI.
-        box.graph=await readRigSpecPreview(fetch,url,s);
+        box.graph=await readRigSpecPreview(op.fetch,url,s);
       }catch(error){box.graphError=singleLineText(error?.message??error).slice(0,240);}
       finally{box.graphLoading=false;cx.notify();}
     });
@@ -2248,14 +2257,15 @@ export default class RigView extends View {
 
   /** User specs may read their file inside the local spec folders with symlinks resolved. All other entries use only
    *  the daemon's own copy, even when their sourcePath happens to name a local spec. */
-  async specText(s) {
+  async specText(s, outer = null) {
+    const op = outer ?? gatedOperationOrRefusal(); // the address resolved below belongs to the config this read began under
     const path=rigSpecLibraryPath(s);if(!path)throw new Error("This library entry has no usable spec id.");
     const file = !this.config?.daemonMachine && s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
     let text = file ? await readTextFile(file).catch(() => null) : null;
     if (text == null && this.config) {
       const daemonUrl = await this.resolveDaemonUrl();
       if (daemonUrl) {
-        const r = await fetch(`${daemonUrl}${path}`);
+        const r = await op.fetch(`${daemonUrl}${path}`);
         const body = await r.text();
         if (!r.ok) throw new Error(`GET /api/specs/library/${s.id} → ${r.status}`);
         let data = null; try { data = JSON.parse(body); } catch (_) { data = body; }
@@ -2269,7 +2279,7 @@ export default class RigView extends View {
   /** Writes `text` as a new file in the first local spec folder, under a name made from the spec's (never a path the
    *  daemon sent), taking a name free in every local spec folder because the CLI also copies into its library.
    *  Returns the file written. */
-  async writeSpecCopy(s, text) {
+  async writeSpecCopy(s, text, op = null) {
     const root = this.specRoots?.[0];
     if (!root) throw new Error(this.specRefusal());
     const base = specCopyName(s.name);
@@ -2279,6 +2289,7 @@ export default class RigView extends View {
       const existing = await Promise.all(this.specRoots.map((r) => readTextFile(`${r}/${name}`)));
       if (existing.some((text) => text != null)) continue;
       // Create-only: herdr refuses if the file appeared meanwhile, and the next name is tried.
+      op?.check(); // the name checks above awaited: the copy is only created under the settings it began with
       try { await writeTextFile(file, text, null); } catch (_) { continue; }
       return file;
     }
@@ -2302,16 +2313,17 @@ export default class RigView extends View {
     cx.spawn(async (cx) => {
       try {
         const op = gatedOperation(); // the library re-read below belongs to the config this copy began under
-        const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s) : await this.specText(s);
+        const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s, op) : await this.specText(s, op);
         // Agent refs relative to the original's folder are made absolute (text only); a copy that couldn't find its agents is never written.
         const prepared = copyableSpecText(source, s.sourcePath);
         if (prepared.refused) { box.note = prepared.refused; return; }
         const text = prepared.text;
-        const written = await this.writeSpecCopy(s, text);
+        const written = await this.writeSpecCopy(s, text, op);
         // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
         const file = await resolveInSpecRoots(written, this.specRoots, exec);
         if (!file) { box.note = this.specRefusal(); return; }
         if (cliRefusal(this.config)) { box.note = cliRefusal(this.config); return; } // no home of its own: no CLI run, and the person is told
+        op.check(); // the path resolution above awaited
         const cmd = writeCommand(this.config, ["specs", "add", "--", file]);
         if (!cmd) { box.note = NO_PERSON; return; }
         const r = writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
@@ -2596,7 +2608,7 @@ export default class RigView extends View {
       try{
         const op=gatedOperation(); // the validation below is only good for the config this write began under
         const daemonUrl=await this.resolveDaemonUrl();if(!daemonUrl)throw Error("The daemon address isn't known yet.");
-        let content=request.content??await this.specText(s);
+        let content=request.content??await this.specText(s,op);
         if(request.verb==="copy"){
           const prepared=copyableSpecText(content,s.sourcePath);
           if(prepared.refused)throw Error(prepared.refused);
@@ -3952,12 +3964,13 @@ export default class RigView extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
+        const op = gatedOperationOrRefusal(); // the address is resolved under this config and used under it
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) {
           this.usageRefreshNote = { ok: false, text: "The daemon address isn't known yet." };
           return;
         }
-        const r = await fetch(`${daemonUrl}/api/provider/usage/hosts/refresh`, {
+        const r = await op.fetch(`${daemonUrl}/api/provider/usage/hosts/refresh`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ providers: ["codex", "claude"] }),
