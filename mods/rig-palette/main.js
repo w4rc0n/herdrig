@@ -9,7 +9,7 @@ import { stampConnection } from "./rig-connections.js";
 import { View, div } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
-import { appHome, readTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, openOverlay, props, closeOverlay, spaces, panes, terminals, hc as rawHc, layout, notify } from "herdr";
+import { appHome, readTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, openOverlay as rawOpenOverlay, props, closeOverlay, spaces, panes, terminals, hc as rawHc, layout, notify } from "herdr";
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
@@ -24,7 +24,7 @@ import { MOD_IDS, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, re
 
 /** The palette's own commands, offered first when they match what is typed. */
 import { sharedLoopbackDaemonUrl, sharedRigData } from "./rig-lib.js";
-import { registerRigRouting } from "./rig-lib.js";
+import { registerRigRouting, stampRows, rowsIdentityOf } from "./rig-lib.js";
 export { LOCAL_COMMANDS };
 const OWN = LOCAL_COMMANDS;
 
@@ -35,6 +35,8 @@ export default class RigPalette extends View {
   // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
   get config() { return this._config; }
   set config(value) { this._config = value; observeConfig(value); }
+  /** Every overlay this instance opens is stamped with ITS OWN config (its rows were read under it), never the latest instance's. */
+  open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config))); }
   init(_p, cx) {
     flatOwner = this;
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
@@ -217,7 +219,7 @@ export default class RigPalette extends View {
     const top = (shared("rig.nav") ?? {}).stack?.at(-1);
     const rig = name ? rigs.find((r) => r.name === name) : rigs.find((r) => top?.kind === "rig" && r.id === top.rigId) ?? rigs[0];
     if (!rig) { this.error = name ? `No rig ${name} on this daemon.` : "No rig to design a view for."; cx.notify(); return true; }
-    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target: { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle }, step: { action: "design-view" } } });
+    this.open({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target: { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle }, step: { action: "design-view" } } });
     this.dismiss();
     return true;
   }
@@ -236,7 +238,7 @@ export default class RigPalette extends View {
       return true;
     }
     const { rig, seat } = hit;
-    openOverlay({
+    this.open({
       mod: MOD_IDS.menu,
       kind: "dialog",
       modal: true,
@@ -415,7 +417,7 @@ export default class RigPalette extends View {
         const reason = capabilityDisableReason("open-view", this.caps());
         if (reason) return note(reason);
         // Opens at once (no one-item popup, no Working… dialog): the sidebar runs it and reports.
-        startOneClick({ shared, setShared, run, layout, openOverlay }, { kind: "open-view", view: route.view, conn: this.config?.connectionId }, "open-view");
+        startOneClick({ shared, setShared, run, layout, openOverlay: (spec) => this.open(spec) }, { kind: "open-view", view: route.view, conn: this.config?.connectionId }, "open-view");
         return this.dismiss();
       }
       if (route.act === "read") {
@@ -481,7 +483,7 @@ export default class RigPalette extends View {
         if (!spec) return fail(`${top.name ?? top.id} isn't in the spec library any more.`);
         // Rig specs only, the rule the card and the menu use.
         if (spec.kind && spec.kind !== "rig") return note(`${spec.name} is an agent spec; launch takes a rig spec.`);
-        openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: { kind: "spec", id: spec.id, conn: this.config?.connectionId, name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } });
+        this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: { kind: "spec", id: spec.id, conn: this.config?.connectionId, name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } });
         return this.dismiss();
       }
     } catch (e) { fail(String(e?.message ?? e)); }

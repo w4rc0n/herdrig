@@ -16,7 +16,7 @@ import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './r
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
 import { sharedLoopbackDaemonUrl, sharedRigData } from "./rig-lib.js";
-import { registerRigRouting } from "./rig-lib.js";
+import { registerRigRouting, stampRows, ROWS_STALE } from "./rig-lib.js";
 import { targetConnection } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
@@ -26,7 +26,7 @@ import { rigOrigin } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, gateSameConfig, CONFIG_CHANGED_OPEN, GateRefusal, gatedOperation } from "./rig-gate.js";
 // A gate refusal is the answer, not a failure to swallow: the person is told it before the menu closes.
 const sayRefusal = (error) => { if (error?.code === "GATE_REFUSED") notify({ title: "OpenRig", body: error.message, level: "warning" }); };
@@ -39,6 +39,7 @@ const run = (name, args) => gatedRun(rawRun, name, args);
 import { guardFlatStore } from "./rig-connections.js";
 let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
 const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
+const openOverlay = (spec) => rawOpenOverlay(stampRows(spec, props()?.target?.rowsConfig ?? null)); // a dialog opened from a menu keeps the stamp of the target it was opened for
 import { MOD_IDS, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, navPush, actionArgs, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
@@ -54,8 +55,12 @@ const ASSETS = `mods/${MOD_IDS.menu}`;
 const icon = iconsAt(ASSETS);
 
 const STACK = "rig-work", PAGE = "rig-page";
-const page = (entry) => {
-  setShared("rig.nav", navPush(shared("rig.nav"), entry));
+// An open menu has no config watcher and keeps the config it loaded: a connections list installed later is only seen when something reads the file. Opening a Rig page
+// (a Herdr UI command the send gate does not stop) reads it first.
+const page = async (entry) => {
+  setShared("rig.nav", navPush(shared("rig.nav"), entry)); // as before: the page the person asked for is where the Rig page goes when it opens
+  const fresh = await freshFileConfig();
+  if (fresh.connectionsRefused) { notify({ title: "OpenRig", body: fresh.connectionsRefused, level: "warning" }); return { ok: false, reason: fresh.connectionsRefused }; }
   return openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology" });
 };
 /** A one-click action's dialog: the title, a two-line error and its hint, Retry and the footer fit unclipped. */
@@ -74,6 +79,21 @@ const freshFileConfig = async () => {
 };
 /** Whether config.json still says what it said when this dialog opened, for everything a send acts on: the gate's identity (connection, the file\'s address,
  *  machine, home) and who the action is attributed to and which CLI it runs. (The person and the command stay out of the gate's identity on purpose.) */
+/** The rows a menu acts on (a rig, a seat, a pod) were published by the sidebar under the settings it held then (`rig.data.config`). The connection id is the same before and
+ *  after an address edit, so a row published under A would resolve to B through this menu's own fresh read of config.json: Pause would stop B's rig of the same name. Until
+ *  the sidebar has re-published (the folder watcher or a refresh), such a row is refused. Judged by the gate's identity, so a CLI-found address or a person edit is no change. */
+const PAUSE_REVIEW_FAILED = "OpenRig couldn't show this rig's agents (it may not be on this OpenRig). Nothing was stopped. Close this and open it again from the list.";
+const rowsPublishedUnder = (target, fresh) => {
+  if (!target) return null;
+  // The rows were read under the settings their PRODUCER stamped on the target (the sidebar, the Rig page, All seats, the palette and the Needs cards each read their own rows under their
+  // own config). Only that stamp is judged: with no sidebar there is no rig.data to compare, and a sidebar on A beside a page on B is no disagreement.
+  const stamp = target.rowsConfig;
+  return stamp && !gateSameConfig(stamp, fresh) ? ROWS_STALE : null;
+};
+/** The check for an action that does NOT go through this menu's `write()` (the one-click hand-off to the sidebar, the menu's own Attach) and must stay immediate: the rows are judged
+ *  against the settings THIS menu read when it opened (`openedOn`), which needs no new read. A menu opened after an edit holds the new settings while the rows are still the old
+ *  ones; a menu opened before it hands the action to the sidebar, which acts under its own settings and rows (consistent) until it re-publishes. Returns the sentence or null. */
+const rowRefusalNow = (target) => (flatOwner?.openedOn ? rowsPublishedUnder(target, flatOwner.openedOn) : null);
 const sameDialogConfig = (a, b) => gateSameConfig(a, b) && (a.person ?? null) === (b.person ?? null) && JSON.stringify(a.rig ?? null) === JSON.stringify(b.rig ?? null);
 const configNow = async () => {
   const cfg = await freshFileConfig(); // a fresh read of config.json is the current config, whoever holds it
@@ -98,7 +118,11 @@ const rowCursor = (el) => el.cursor_row_resize?.() ?? el;
 const isStopped = (s) => s.status === "stopped" || s.status === "exited" || s.lifecycle === "stopped" || s.lifecycle === "recoverable" || s.attachable === false;
 const designDraftKey = (target) => `designer:${target?.rig ?? "rig"}:${target?.replace ?? "new"}`;
 /** A one-click action, run by the Rig sidebar: no dialog unless it fails (rig-lib startOneClick). */
-const oneClick = (target, action) => startOneClick({ shared, setShared, run, layout, openOverlay }, target, action);
+const oneClick = (target, action) => {
+  const refusal = rowRefusalNow(target);
+  if (refusal) { notify({ title: "OpenRig", body: refusal, level: "warning" }); return { ok: false, reason: refusal }; }
+  return startOneClick({ shared, setShared, run, layout, openOverlay }, target, action);
+};
 
 /** The slice folders the daemon knows (`/api/slices`: each with its `slicePath`), by folder name. */
 async function slicePaths(config, op = gatedOperation()) {
@@ -594,6 +618,8 @@ export default class RigMenu extends View {
     const fresh = await freshFileConfig();
     if (fresh.connectionsRefused) throw new GateRefusal(fresh.connectionsRefused);
     if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) throw new GateRefusal(CONFIG_CHANGED_OPEN);
+    const stale = rowsPublishedUnder(props()?.target, fresh);
+    if (stale) throw new GateRefusal(stale);
     return this.config ?? configNow();
   }
 
@@ -603,6 +629,8 @@ export default class RigMenu extends View {
     const fresh = await freshFileConfig();
     if (fresh.connectionsRefused) return { ok: false, text: fresh.connectionsRefused }; // a list installed while this dialog was open
     if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return { ok: false, text: CONFIG_CHANGED_OPEN }; // the connection below is the one this dialog opened on
+    const staleRows = rowsPublishedUnder(props()?.target, fresh);
+    if (staleRows) return { ok: false, text: staleRows }; // the row is from the old address, the connection below would resolve it to the new one
     // The connection is the target's own, from the row it came from: never a default. Without one nothing is sent.
     const conn = targetConnection(this.config, props()?.target);
     if (!conn.ok) return { ok: false, text: conn.reason };
@@ -625,6 +653,7 @@ export default class RigMenu extends View {
     const fresh = await freshFileConfig();
     if (fresh.connectionsRefused) return null; // a list installed while this dialog was open
     if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return null; // the settings changed since this dialog opened: its connection is stale
+    if (rowsPublishedUnder(props()?.target, fresh)) return null;
     const conn = targetConnection(this.config, props()?.target);
     if (!conn.ok) return null;
     const cmd = readCommand(conn.config, [...args, "--json"], { env: ["OPENRIG_HOST_SELECTED=local"] });
@@ -659,8 +688,14 @@ export default class RigMenu extends View {
       if (!config.daemonUrl) { this.pause = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." }; cx.notify(); return; }
       try {
         const r = await fetch(`${config.daemonUrl}/api/rigs/${encodeURIComponent(t.rigId)}/nodes`);
-        this.pause = pauseSummary(await r.json());
-      } catch (e) { this.pause = { error: String(e?.message ?? e) }; }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const nodes = await r.json();
+        if (!Array.isArray(nodes)) throw new Error("not a list of seats");
+        this.pause = pauseSummary(nodes);
+      } catch (e) {
+        // A review that could not be read says so in a plain sentence and leaves its action disabled: the person cannot approve what they cannot see. A settings change already has its own sentence.
+        this.pause = { error: e?.code === "GATE_REFUSED" ? String(e.message) : PAUSE_REVIEW_FAILED };
+      }
       cx.notify();
     });
   }
@@ -723,6 +758,8 @@ export default class RigMenu extends View {
         // before the popup closes; a refusal says why. It runs as a task: the click's cx goes stale at the first await,
         // and the wait for herdr to adopt the tab needs a cx that doesn't.
         act: (cx) => {
+          const refusal = rowRefusalNow(target);
+          if (refusal) { notify({ title: `Attach ${target.logicalId ?? target.session}`, body: refusal, level: "warning" }); return { ok: false, reason: refusal }; }
           const config = this.config;
           const attach = (wait) => attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, notify, wait, relayPath: attachRelayPath(appHome(), MOD_IDS.menu) }, target, config)
             .then((res) => { if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" }); return res; });
@@ -1190,6 +1227,7 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
+    if (step?.load === "pause" && this.pause?.error) return; // the review that this action asks the person to approve could not be read
     const assistantReason=assistantActionRefusal(target,step.action);
     if(assistantReason){this.result={ok:false,text:assistantReason};cx.notify();return;}
     if(step.action==="confirm-spec-write"){
@@ -1877,6 +1915,7 @@ export default class RigMenu extends View {
       : { pause: "Pause rig", resume: "Resume rig", fresh: "Start fresh", "design-view": "Open", send: "Send", queue: "Queue", reply: "Reply", "launch-spec": "Launch" }[step.action];
     const done = !!this.result?.ok;
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
+    const reviewFailed = step.load === "pause" && !!this.pause?.error; // the card could not read what it asks the person to approve: its action stays visible but disabled
     const canConfirm = !!confirmLabel && (step.action === "launch-spec" || step.action === "new-rig" || step.action === "design-view" || step.action === "change-model" ? !this.result?.ok : !this.result) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps()) : null;
     const mac = window()?.platform === "macos";
@@ -1943,11 +1982,11 @@ export default class RigMenu extends View {
             () => { run(`rig.space:${result.createdRig}`); this.dismiss(); },false,"Open rig space")))
         .when(canConfirm && step.action === "delete-rig", (el) => el.child(this.dialogButton(t,div().id("rig-archive").px(12).h(26).rounded(6).bg(t.raised).border_1().border_color(t.border)
           .flex().items_center().hover((s) => s.bg(t.hover)).when(!!archiveReason, (b) => b.opacity(0.45).tooltip(archiveReason))
-          ,this.dialogArchiveHandle,(_e,cx)=>this.archive(cx,target),!!archiveReason,this.rigRunning(target) ? "Pause and archive" : "Archive")))
-        .when(canConfirm, (el) => el.child(this.dialogButton(t,div().id("rig-confirm").px(12).h(26).rounded(6)
+          ,this.dialogArchiveHandle,(_e,cx)=>this.archive(cx,target),!!archiveReason||reviewFailed,this.rigRunning(target) ? "Pause and archive" : "Archive")))
+        .when(canConfirm, (el) => el.child(this.dialogButton(t,div().id("rig-confirm").px(12).h(26).rounded(6).when(reviewFailed, (b) => b.opacity(0.45))
           .bg(step.action === "pause" || step.action === "fresh" || step.action === "delete-rig" ? t.blocked : t.accent)
           .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center(),this.dialogConfirmHandle,
-          (_e,cx)=>go(cx),false,confirmLabel))));
+          (_e,cx)=>go(cx),reviewFailed,confirmLabel))));
   }
 
   /** Delete's confirmation: what stops (every seat, with its state and owned work), the command, and Archive instead. */

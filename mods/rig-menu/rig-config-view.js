@@ -16,7 +16,7 @@ const sameReviewConfig=(a,b)=>gateSameConfig(a,b)&&(a.person??null)===(b.person?
 /** The page owns this presentation object; the model contains no native input state. */
 export class ConfigPanel {
   constructor(page) { this.page = page; this.model = new ConfigEditor(); this.inputs = {}; this.selected = null; this.releasedReviews=new WeakSet();this.reviewConfigs=new WeakMap();this.saves=new Map();this.writeWatches=new Map();this.reconcileStopped=new Set();this.writeOwner={}; }
-  close(){this.disposed=true;closeConfigWrites(this.writeOwner);}
+  close(){this.disposed=true;closeConfigWrites(this.writeOwner);for(const handle of this.controlHandles?.values()??[])handle.release();this.controlHandles?.clear();}
   get saving(){return this.saves.has(this.identity());}
   origin() { return this.page.config?.daemonUrl ?? ""; }
   identity() { return JSON.stringify([this.origin(),this.page.config?.daemonMachine??null,this.page.config?.connectionId??null]); }
@@ -76,7 +76,7 @@ export class ConfigPanel {
   }
   focusField(key,cx,select=false) {
     const input=this.inputs[key]??Object.values(this.inputs)[0],row=this.model.row,generation=this.blurGeneration;
-    const focus=()=>{if(this.model.row!==row||!row||this.blurGeneration!==generation)return;input?.focus();if(select&&input)input.set_selected_range({start:0,end:String(input.value()??'').length});if(!input)(this.selectHandles[key]?.trigger??this.editorHandle)?.focus();};
+    const focus=()=>{if(this.model.row!==row||!row||this.blurGeneration!==generation)return;input?.focus();if(select&&input)input.set_selected_range({start:0,end:String(input.value()??'').length});if(!input){const def=configDefinition(this.model.entry(key)),value=row.values[key],choice=def.choices?.[Math.max(0,def.choices.indexOf(value))]??value;(this.selectHandles[key]?.trigger??this.focusHandle(`config-choice-${key}-${choice||'unset'}`,cx))?.focus();}};
     focus();cx.timer?.after(0,next=>{focus();next.notify();});
   }
   deferBlur(cx) {
@@ -87,7 +87,8 @@ export class ConfigPanel {
     if(this.saving||this.model.busy||this.model.confirmation||!this.model.row)return;
     const keys=this.model.row.keys,index=keys.indexOf(field),next=index+(backward?-1:1);
     if(next>=0&&next<keys.length){this.focusField(keys[next],cx,true);return;}
-    if(this.save(cx)!==false){if(backward)window.focus_prev();else window.focus_next();}
+    const order=(this.controlOrder??[]).filter(Boolean),controlIndex=order.findIndex(handle=>handle.field===field),target=order[controlIndex+(backward?-1:1)];
+    if(this.save(cx)!==false){if(target)target.focus();else if(backward)window.focus_prev();else window.focus_next();}
   }
   cancel(cx) { if(this.saving||this.model.busy)return;this.model.cancel();this.nextKey=null; this.releaseInputs(); cx.notify(); }
   keyDown(event,cx) {
@@ -96,7 +97,7 @@ export class ConfigPanel {
       if(this.model.confirmation){this.model.cancelConfirmation();this.focusField(this.model.row?.key,cx);}else this.cancel(cx);cx.notify();return true;
     }
     if(["enter","space"," "].includes(event.key)&&this.selected&&!this.model.row&&!this.model.confirmation) {
-      cx.stop_propagation();this.activate(this.model.entry(this.selected),cx);return true;
+      cx.stop_propagation();this.keyboardAction(`config-toggle-${this.selected}`,event,cx,()=>this.activate(this.model.entry(this.selected),cx));return true;
     }
     return false;
   }
@@ -233,9 +234,60 @@ export class ConfigPanel {
     for(const [key,value]of changes){this.model.change(key,value);this.inputs[key]?.set_value(value);}
     this.execute(cx,this.model.request(changes,true));
   }
-  action(t,id,label,fn,options={}) {
-    return this.page.button(t,id,label,fn,{small:true,...options})
+  focusHandle(id,cx){
+    this.controlHandles??=new Map();this.pendingHandles??=new Set();
+    if(!this.controlHandles.has(id)&&!this.pendingHandles.has(id)){
+      this.pendingHandles.add(id);
+      // Herdr forbids creating handles during render. Retain them after the event frame instead.
+      cx.timer.after(0,next=>{this.pendingHandles.delete(id);if(this.disposed)return;
+        if(!this.controlsBound){next.bind_keys([{keystroke:'tab',action:'herdrig_settings_next',context:'HerdrigSettings'},{keystroke:'shift-tab',action:'herdrig_settings_previous',context:'HerdrigSettings'}]);this.controlsBound=true;}
+        this.controlHandles.set(id,next.focus_handle());next.notify();});
+    }
+    return this.controlHandles.get(id);
+  }
+  keyboardAction(id,event,cx,fn){
+    this.keyboardLatches??=new Map();
+    if(!['enter','space',' '].includes(event.key)){this.keyboardLatches.delete(id);return;}
+    cx.stop_propagation();
+    // X11 repeat may contain release/press pairs. A release alone never rearms a save.
+    // Keep the latch through temporary removal while saving; explicit navigation or a click rearms it.
+    if(event.is_held||this.keyboardLatches.get(id)===event.key)return;
+    this.keyboardLatches.set(id,event.key);fn({},cx);
+  }
+  focusControl(t,cx,id,child,fn,{disabled=false,handle,tabStop=true,onKey}={}){
+    handle??=this.focusHandle(id,cx);
+    if(!disabled&&tabStop)this.controlOrder?.push(handle);
+    return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role('button')
+      .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled&&tabStop).focus(el=>el.border_color(t.accent))
+      .on_key_down((event,ctx)=>{
+        if(onKey?.(event,ctx))return;
+        if(!disabled)this.keyboardAction(id,event,ctx,fn);
+      }).child(child);
+  }
+  tabControl(backward,cx){
+    this.keyboardLatches?.clear();
+    const handles=(this.controlOrder??[]).filter(Boolean),index=handles.findIndex(handle=>handle.is_focused());
+    const next=index<0?(backward?handles.length-1:0):index+(backward?-1:1);
+    if(next<0||next>=handles.length)return false;
+    handles[next].focus();cx.notify();return true;
+  }
+  action(t,cx,id,label,fn,options={}) {
+    const child=this.page.button(t,id,label,(event,ctx)=>{this.keyboardLatches?.delete(id);fn(event,ctx);},{small:true,...options})
       .when(options.primary&&!options.disabled,el=>el.bg(t.accent).text_color(t.solid_foreground).hover(s=>s.bg(t.accent)));
+    return options.keyboard===false?child:this.focusControl(t,cx,id,child,fn,options);
+  }
+  choices(t,cx,field,values,value,disabled=false){
+    const handles=values.map(choice=>this.focusHandle(`config-choice-${field}-${choice||'unset'}`,cx));
+    const focused=handles.findIndex(handle=>handle?.is_focused());
+    const active=focused<0?Math.max(0,values.indexOf(value)):focused;
+    return h_flex().id(`config-choices-${field}`).gap(4).flex_wrap().children(values.map((choice,index)=>
+      this.action(t,cx,`config-choice-${field}-${choice||'unset'}`,choice||'unset',(_e,ctx)=>this.choose(field,choice,ctx),{
+        primary:value===choice,disabled,handle:handles[index],tabStop:index===active,
+        onKey:(event,ctx)=>{
+          if(event.key!=='left'&&event.key!=='right')return false;
+          ctx.stop_propagation();handles[Math.max(0,Math.min(values.length-1,index+(event.key==='right'?1:-1)))]?.focus();ctx.notify();return true;
+        }
+      })));
   }
   integerHint(def,field) {
     const bounds=def.min===undefined&&def.max===undefined?'any whole number':def.max===undefined?`any whole number ≥ ${def.min}`:def.min===undefined?`any whole number ≤ ${def.max}`:`${def.min}–${def.max}`;
@@ -243,20 +295,22 @@ export class ConfigPanel {
   }
   cancelReview(cx){this.model.cancelConfirmation();this.focusField(this.model.row?.key,cx);cx.notify();}
   reviewAction(t,id,label,fn,handle,{disabled=false,primary=false,destructive=false}={}){
+    if(!disabled)this.controlOrder?.push(handle);
     const model=this.model,review=model.confirmation,activation=key=>['enter','space',' '].includes(key);
     return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role('button')
       .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled).focus(el=>el.border_color(t.accent))
       // Cancel-first is the repeat safety boundary. This release gate is secondary; explicit Tab navigation arms it too.
       .on_key_up((event,cx)=>{if((activation(event.key)||event.key==='tab')&&this.model===model&&model.confirmation===review){cx.stop_propagation();this.releasedReviews.add(review);}})
       .on_key_down((event,cx)=>{if(activation(event.key)){cx.stop_propagation();if(!disabled&&!event.is_held&&this.model===model&&model.confirmation===review&&this.releasedReviews.has(review))fn({},cx);}})
-      .child(this.action(t,id,label,fn,{disabled,primary}).when(destructive,el=>el.bg(t.blocked).text_color(t.solid_foreground).hover(s=>s.bg(t.blocked))));
+      .child(this.action(t,null,id,label,fn,{disabled,primary,keyboard:false}).when(destructive,el=>el.bg(t.blocked).text_color(t.solid_foreground).hover(s=>s.bg(t.blocked))));
   }
 
-  select(t,field,def,value) {
+  select(t,cx,field,def,value) {
     const handles=this.selectHandles[field],open=this.dropdown===field;
+    this.controlOrder?.push(open?handles.list:handles.trigger);
     const choose=(choice,cx)=>{this.choose(field,choice,cx);cx.notify();};
     const trigger=h_flex().id(`config-select-trigger-${field}`).gap(8).px(8).h(28).items_center().rounded(5).border_1().border_color(t.border)
-      .track_focus(handles.trigger).tab_stop(true).cursor_pointer().on_click((_e,cx)=>{
+      .cursor_pointer().on_click((_e,cx)=>{
         this.dropdown=open?null:field;this.highlight=Math.max(0,def.choices.indexOf(value));
         if(!open)cx.timer.after(0,next=>{if(this.dropdown===field)handles.list.focus();next.notify();});
         else handles.trigger.focus();cx.notify();
@@ -266,13 +320,14 @@ export class ConfigPanel {
         if(event.key==="up"||event.key==="down"){
           cx.stop_propagation();this.highlight=((this.highlight??0)+(event.key==="down"?1:-1)+def.choices.length)%def.choices.length;cx.notify();
         }else if(event.key==="enter"){cx.stop_propagation();choose(def.choices[this.highlight??0],cx);}
-      }).children(def.choices.map((choice,index)=>this.action(t,`config-option-${field}-${index}`,choice||"unset",(_e,cx)=>choose(choice,cx),{primary:this.highlight===index})
+      }).children(def.choices.map((choice,index)=>this.action(t,cx,`config-option-${field}-${index}`,choice||"unset",(_e,cx)=>choose(choice,cx),{primary:this.highlight===index,keyboard:false})
         .role("list_box_option").aria_selected(value===choice).when(this.highlight===index,el=>el.aria_active_descendant())));
     return Select.new(`config-select-${field}`).accessibility_label(field).open(open).track_focus(handles.trigger)
       .content_focus_handle(handles.list).on_open_change((next,cx)=>{
         this.dropdown=next?field:null;this.highlight=Math.max(0,def.choices.indexOf(value));cx.notify();
       }).on_confirm((_e,cx)=>choose(def.choices[this.highlight??0],cx))
-      .child(Popup.new(`config-select-popup-${field}`,trigger).when(open,el=>el.content(list)));
+      .child(Popup.new(`config-select-popup-${field}`,div().id(`config-select-trigger-${field}-focus`).p(2).border(2).border_color('#00000000').rounded(7)
+        .track_focus(handles.trigger).tab_stop(true).focus(el=>el.border_color(t.accent)).child(trigger)).when(open,el=>el.content(list)));
   }
 
   control(t,cx) {
@@ -283,17 +338,13 @@ export class ConfigPanel {
         if(this.save(ctx)===false)ctx.stop_propagation();
       });
     if(this.saving||m.busy)return control.child(div().text_color(t.dim).text_size(12).child('Saving and checking…'));
-    if(!Object.keys(this.inputs).length)control.track_focus(this.editorHandle).tab_stop(true);
     for(const field of row.keys){
       const def=configDefinition(m.entry(field)),value=row.values[field];
       if(row.keys.length>1)control.child(div().text_size(11).text_color(t.dim).child(field===PRESSURE_WARNING?'Warning':'Critical'));
-      if(def.choices?.length>4&&this.selectHandles[field])control.child(this.select(t,field,def,value));
-      else if(def.choices&&def.type!=='stream')control.child(h_flex().id(`config-choices-${field}`).gap(4).flex_wrap()
-        .children(def.choices.map(choice=>this.action(t,`config-choice-${field}-${choice||'unset'}`,choice||'unset',(_e,ctx)=>this.choose(field,choice,ctx),{primary:value===choice,disabled:m.busy}))));
-      else if(def.type==='bool')control.child(h_flex().gap(4)
-        .child(this.action(t,`config-on-${field}`,'On',(_e,ctx)=>this.choose(field,'true',ctx),{primary:value==='true'}))
-        .child(this.action(t,`config-off-${field}`,'Off',(_e,ctx)=>this.choose(field,'false',ctx),{primary:value==='false'})));
-      else if(this.inputs[field])control.child(div().id(`config-input-guard-${field}`)
+      if(def.choices?.length>4&&this.selectHandles[field])control.child(this.select(t,cx,field,def,value));
+      else if(def.choices&&def.type!=='stream')control.child(this.choices(t,cx,field,def.choices,value,m.busy));
+      else if(def.type==='bool')control.child(this.choices(t,cx,field,['true','false'],value,m.busy));
+      else if(this.inputs[field]){const input=this.inputs[field];this.controlOrder?.push({field,focus:()=>input.focus(),is_focused:()=>this.focusedField===field});control.child(div().id(`config-input-guard-${field}`)
         .key_context('HerdrigConfigInput')
         .on_action('herdrig_config_next',(_e,ctx)=>{ctx.stop_propagation();this.tabField(field,false,ctx);})
         .on_action('herdrig_config_previous',(_e,ctx)=>{ctx.stop_propagation();this.tabField(field,true,ctx);})
@@ -304,13 +355,14 @@ export class ConfigPanel {
           else if(event.key==='tab'){
             ctx.stop_propagation();this.tabField(field,!!event.modifiers?.shift,ctx);
           }else this.page.typing=true;
-        }).child(Input.new(this.inputs[field]).id(`config-input-${field}`).h(30).px(8).rounded(5).border_1().border_color(t.border).bg(t.background).text_color(t.foreground)));
+        }).child(Input.new(input).id(`config-input-${field}`).h(30).px(8).rounded(5).border_1().border_color(t.border).bg(t.background).text_color(t.foreground)));}
       if(row.keys.length>1&&def.type==='int')control.child(div().id(`config-hint-${field}`).text_size(11).text_color(t.dim).child(this.integerHint(def,field)));
     }
     return control;
   }
 
   render(t,cx,browser,probe,scope={}) {
+    this.controlOrder=[];
     this.sync(this.origin(),browser,probe);
     const m=this.model, ownRows=configRows(browser,scope), filter=String(this.page.filter ?? "").toLowerCase();
     const pinned=new Set([...(m.row?.keys??[]),...(m.confirmation?.changes.map(([key])=>key)??[])]);
@@ -341,7 +393,7 @@ export class ConfigPanel {
         .when(editing,el=>el.bg(t.raised)).when(selected,el=>el.border_l(2).border_color(t.accent))
         .on_click((_event,ctx)=>{this.selected=key;ctx.notify();})
         .on_key_down((event,ctx)=>{if(event.key==="escape"&&editing){ctx.stop_propagation();this.cancel(ctx);}
-          else if(['enter','space',' '].includes(event.key)&&selected&&!readOnly&&!editing){ctx.stop_propagation();this.activate(entry,ctx);}});
+          else if(['enter','space',' '].includes(event.key)&&selected&&!readOnly&&!editing){ctx.stop_propagation();this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>this.activate(entry,ctx));}});
       const line=h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).text_size(12).font_family("monospace").child(paired?"health.context_pressure · warning / critical":key))
         .child(this.page.copyButton(t,key,`config-key-${key}`,"setting key"))
@@ -350,22 +402,26 @@ export class ConfigPanel {
         const valueLabel = paired ? `${textValue(m.entry(PRESSURE_WARNING))}% / ${textValue(m.entry(PRESSURE_CRITICAL))}%` : textValue(entry);
         if(def.type==="bool"&&!readOnly) {
           const on=entry.value===true||entry.value==="true";
-          line.child(h_flex().id(`config-toggle-${key}`).gap(5).items_center().cursor_pointer()
-            .on_click((_e,ctx)=>{ctx.stop_propagation();if(this.detected&&!m.busy)this.toggle(entry,ctx);})
+          this.controlOrder.push(this.focusHandle(`config-toggle-${key}`,cx));
+          line.child(h_flex().id(`config-toggle-${key}`).p(2).border(2).border_color('#00000000').rounded(7)
+            .when(!!this.focusHandle(`config-toggle-${key}`,cx),el=>el.track_focus(this.controlHandles.get(`config-toggle-${key}`))).tab_stop(true).focus(el=>el.border_color(t.accent))
+            .on_key_down((event,ctx)=>this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>{if(this.detected&&!m.busy)this.toggle(entry,ctx);}))
+            .gap(5).items_center().cursor_pointer()
+            .on_click((_e,ctx)=>{ctx.stop_propagation();this.keyboardLatches?.delete(`config-toggle-${key}`);if(this.detected&&!m.busy)this.toggle(entry,ctx);})
             .child(div().size(13).rounded(3).border_1().border_color(on?t.accent:t.border).when(on,el=>el.bg(t.accent)
               .child(svg(icon("check")).size(10).text_color(t.solid_foreground))))
             .child(div().text_size(12).text_color(t.foreground).child(on?"On":"Off")));
         }else if(readOnly)line.child(div().id(`config-locked-${key}`).max_w(340).truncate().text_size(12).text_color(t.foreground).tooltip(def.readOnly).child(valueLabel));
         else {
           const value=div().id(`config-value-${key}`).max_w(340).min_w(80).px(5).py(2).rounded(4).border_1().border_color('#00000000')
-            .hover(s=>s.border_color(t.border)).cursor_text().tab_stop(true).truncate().text_size(12).text_color(t.foreground).tooltip(valueLabel)
+            .hover(s=>s.border_color(t.border)).cursor_text().truncate().text_size(12).text_color(t.foreground).tooltip(valueLabel)
             .on_click((_e,ctx)=>{ctx.stop_propagation();this.selected=key;this.open(key,ctx);})
             .on_key_down((event,ctx)=>{if(['enter','space',' '].includes(event.key)){ctx.stop_propagation();this.activate(entry,ctx);}}).child(valueLabel);
-          line.child(value);
+          line.child(this.focusControl(t,cx,`config-value-${key}`,value,(_e,ctx)=>this.activate(entry,ctx)));
         }
         if(readOnly)line.child(svg(icon("rig-lock")).size(12).text_color(t.dim));
       }else line.child(this.control(t,cx));
-      if(!readOnly)line.child(this.action(t,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();}));
+      if(!readOnly)line.child(this.action(t,cx,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();}));
       row.child(line);
       if(writePause?.uncertain&&(editing||selected))row.child(div().id('config-row-write-paused').text_size(11.5).text_color(t.dim).child('Saving paused'));
       if(this.reconciledModel===m&&editing)row.child(div().id('config-reconciled-value').text_size(11.5).text_color(t.muted).child(`OpenRig currently reports: ${textValue(entry)} (${sourceName(entry)}).`));
@@ -380,7 +436,8 @@ export class ConfigPanel {
         .child(div().font_family("monospace").child("rig config set"))
         .child(div().child("in a terminal on that machine."))
         :div().text_size(11).text_color(t.dim).child(help));
-      if(this.more===key)row.child(this.action(t,`config-reset-${key}`,`Reset to default (${hidden(entry)?"withheld":String(entry.defaultValue??"unset")})`,(_e,ctx)=>this.reset(entry,ctx),{disabled:!this.detected||m.busy}));
+      const defaultLabel=hidden(entry)?'withheld':def.type==='bool'&&[true,false,'true','false'].includes(entry.defaultValue)?(String(entry.defaultValue)==='true'?'On':'Off'):String(entry.defaultValue??'unset');
+      if(this.more===key)row.child(this.action(t,cx,`config-reset-${key}`,`Reset to default (${defaultLabel})`,(_e,ctx)=>this.reset(entry,ctx),{disabled:!this.detected||m.busy}));
       if(editing){
         for(const field of m.row.keys){const fieldDef=configDefinition(m.entry(field)),value=m.row.values[field];
           if(fieldDef.type==="path")row.child(div().text_size(11).text_color(t.dim).child(`Herdr doesn't check this folder. OpenRig uses the path as given on ${this.daemonName()}.`));
@@ -392,7 +449,7 @@ export class ConfigPanel {
       }
       const receipt=m.receipt(key);if(receipt){this.page.ticking=true;row.child(h_flex().gap(6).items_center()
         .child(div().id(`config-result-${key}`).text_size(11.5).text_color(t.muted).child(receipt.text))
-        .when(receipt.undo!==null&&!readOnly,el=>el.child(this.action(t,`config-undo-${key}`,"Undo",(_e,ctx)=>{
+        .when(receipt.undo!==null&&!readOnly,el=>el.child(this.action(t,cx,`config-undo-${key}`,"Undo",(_e,ctx)=>{
           this.execute(ctx,m.undo(key));},{disabled:this.saving||!!m.undoBlocked(key)}).tooltip(m.undoBlocked(key)??'Restore the previous setting after a fresh check. Another change during the write may still be overwritten.'))));
         if(receipt.undo!==null&&m.undoBlocked(key))row.child(div().id(`config-undo-reason-${key}`).text_size(11).text_color(t.dim).child(m.undoBlocked(key)));}
       if(reviewing){

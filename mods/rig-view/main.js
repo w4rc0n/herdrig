@@ -19,14 +19,14 @@ import { formatAbsoluteTime, timezoneValue } from './rig-time.js';
 // Needs-You: a request row expands in place to the request's words and a reply box (Answer or
 // Resolve, Ctrl+Enter); the item page shows the same. Drafts are rig-menu's (`shared("rig.drafts")`, draftKey).
 import { View, div, svg } from "gpui-kit";
-import { sharedLoopbackDaemonUrl, sharedRigData } from "./rig-lib.js";
+import { sharedLoopbackDaemonUrl, sharedRigData, stampRows, rowsIdentityOf } from "./rig-lib.js";
 import { relativeTimeText, specRealpathAvailable } from "./rig-lib.js";
 
 import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, healthScopeTarget, healthQueueId, healthAge, validHealthQitemId, healthContextPercentage, classifyHealth, mergeHealthHistory } from "./rig-health.js";
 
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay as rawOpenOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
@@ -88,11 +88,8 @@ function push(entry) {
 function closeInspection() {
   closeRigInspection({ shared, setShared, run, spaces, panes, layout, stackId: STACK, mainId: "main" });
 }
-const menu = (target) => openOverlay({ mod: MOD_IDS.menu, kind: "popup", width: 280, height: 320, props: { target } });
 /** A one-click write (snapshot, follow, open a view): the sidebar runs it; a dialog opens only when it fails. */
-const oneClick = (target, action, actionKey = null) => startOneClick({ shared, setShared, run, layout, openOverlay }, target, action, actionKey);
 /** The Rig palette, started with text (Filter… starts it at the page's filter). */
-const palette = (initial) => openOverlay({ mod: MOD_IDS.palette, kind: "dialog", width: 560, height: 360, props: { initial } });
 /** The shown page without its filter. */
 function clearFilter() {
   const stack = nav().stack ?? [];
@@ -147,6 +144,11 @@ export default class RigView extends View {
   // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
   get config() { return this._config; }
   set config(value) { this._config = value; observeConfig(value); }
+  /** Every overlay this instance opens is stamped with ITS OWN config (its rows were read under it), never the latest instance's. */
+  open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config))); }
+  menu(target) { return this.open({ mod: MOD_IDS.menu, kind: "popup", width: 280, height: 320, props: { target } }); }
+  oneClick(target, action, actionKey = null) { return startOneClick({ shared, setShared, run, layout, openOverlay: (spec) => this.open(spec) }, target, action, actionKey); }
+  palette(initial) { return this.open({ mod: MOD_IDS.palette, kind: "dialog", width: 560, height: 360, props: { initial } }); }
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
@@ -321,11 +323,11 @@ export default class RigView extends View {
     return v_flex().id(`host-worker-${rig.id}`).gap(4)
       .child(div().text_size(11.5).text_color(t.dim).child(message))
       .when(!!entry.paused,el=>el.child(div().text_size(11.5).text_color(t.working??t.muted).child("Couldn't refresh this view; tiles kept.")
-        .child(div().text_color(t.accent).cursor_pointer().child("Retry").on_click(()=>oneClick({kind:"open-view",view:entry.view,rig:rig.name,rigId:rig.id,conn:rig.conn},"open-view")))))
+        .child(div().text_color(t.accent).cursor_pointer().child("Retry").on_click(()=>this.oneClick({kind:"open-view",view:entry.view,rig:rig.name,rigId:rig.id,conn:rig.conn},"open-view")))))
       .child(h_flex().gap(8).flex_wrap().children(pages.map((page,index)=>div().id(`host-worker-page-${rig.id}-${index}`).text_size(11.5).text_color(t.accent).cursor_pointer()
         .child(`Show page ${index+1}`).on_click(()=>{if(spaces().some(s=>s.id===entry.space&&s.tabs?.some(tab=>tab.id===page.tab))){run("space.select",{id:entry.space});run("tab.select",{id:page.tab});}}))))
       .child(div().text_size(11.5).text_color(t.accent).cursor_pointer().child(`herdrig prune: ${entry.pruneMs?Math.round(entry.pruneMs/60000)+"m":"off"}…`)
-        .on_click(()=>menu({kind:"following",target:entry.view,name:entry.name,rig:rig.name,rigId:rig.id,conn:rig.conn,enabled:entry.following,pruneAfterMs:entry.pruneMs||null})));
+        .on_click(()=>this.menu({kind:"following",target:entry.view,name:entry.name,rig:rig.name,rigId:rig.id,conn:rig.conn,enabled:entry.following,pruneAfterMs:entry.pruneMs||null})));
   }
   caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
 
@@ -353,7 +355,7 @@ export default class RigView extends View {
   }
 
   navigationMenu(choices, title = "Sections") {
-    openOverlay({ mod: MOD_IDS.menu, kind: "popup", width: 260, height: Math.min(360, 42 + choices.length * 30),
+    this.open({ mod: MOD_IDS.menu, kind: "popup", width: 260, height: Math.min(360, 42 + choices.length * 30),
       props: { target: { kind: "page-navigation", name: title, choices } } });
   }
 
@@ -710,7 +712,7 @@ export default class RigView extends View {
     const target=assistantTarget(member,{id:entry.rigId}),last=member.lastCheckInAt?this.time(member.lastCheckInAt):null,word=assistantWord(member.status);
     this.pageHeading={title:member.name,icon:'rig-queue',status:`Connected assistant · ${member.rig}`};
     this.pageActions=h_flex().gap(8).items_center().flex_wrap()
-      .child(this.button(t,'assistant-queue','Queue work…',()=>openOverlay({mod:MOD_IDS.menu,kind:'dialog',width:460,height:300,props:{target,step:{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true}}}),{iconName:'rig-queue'}))
+      .child(this.button(t,'assistant-queue','Queue work…',()=>this.open({mod:MOD_IDS.menu,kind:'dialog',width:460,height:300,props:{target,step:{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true}}}),{iconName:'rig-queue'}))
       .child(this.button(t,'assistant-open-rig','Open rig page',()=>push({section:'topology',kind:'rig',conn:member.conn,rigId:entry.rigId,name:member.rig}),{small:true}));
     const path=seatQueuePaths(member.seat).open,got=this.read(cx,path),queue=seatQueueDetails(got.data,null);
     const records=[...queue.current,...queue.pending,...queue.blocked];
@@ -753,7 +755,7 @@ export default class RigView extends View {
     this.topologyStrip=strip;
     if((entry.topologyTab??this.activePageView)==='seats'){
       this.allSeatsOrder=entry.seatsOrder??this.allSeatsOrder??'rig';
-      return allSeatsView(this,t,cx,loadedModels,attentionItems,{navigate:push,menu,hostedMembers:this.hostedMembers(cx),orderMap:shared('rig.order')??{},openSpecs:()=>push({section:'specs'}),
+      return allSeatsView(this,t,cx,loadedModels,attentionItems,{navigate:push,menu:(t)=>this.menu(t),hostedMembers:this.hostedMembers(cx),orderMap:shared('rig.order')??{},openSpecs:()=>push({section:'specs'}),
         attach:(target,cx)=>cx.spawn(async cx=>{
           const result=await attachToSeat({exec,run,hc,spaces,panes,terminals,layout,shared,setShared,wait:waitWith(cx),relayPath:attachRelayPath(appHome(),MOD_IDS.view)},target,this.config);
           if(result?.ok===false)notify({title:`Attach ${target.logicalId}`,body:result.reason,level:'warning'});
@@ -769,7 +771,7 @@ export default class RigView extends View {
       .when(!!missingFocusRig, (el) => el.child(missingFocusRig))
       .children(blocks.length ? blocks : [this.dim(t, this.filter ? `No matches for /${this.filter}.` : "No rigs registered — run rig up <spec> to launch a team.")])
       // A new rig, from a spec in the library or with one seat.
-      .child(h_flex().child(this.button(t, "topology-new-rig", "New rig…", () => openOverlay(newRigOverlay(this.config?.connectionId)), { small: true, iconName: "plus" })));
+      .child(h_flex().child(this.button(t, "topology-new-rig", "New rig…", () => this.open(newRigOverlay(this.config?.connectionId)), { small: true, iconName: "plus" })));
   }
 
   /** TUI parity: bounded recorded queue chronology, never a synthetic log of activity-change notifications. */
@@ -863,8 +865,8 @@ export default class RigView extends View {
       )]))
       .children(archivedElements({ div, svg, h_flex }, t, withArchivedHosts(archived.data, id => this.read(cx, `/api/rigs/${encodeURIComponent(id)}/nodes`).data, this.config?.connectionId), { host: hostId, icon, open: Boolean(this.archivedOpen?.[hostId]),
         toggle: (_e, cx) => { (this.archivedOpen ??= {})[hostId] = !this.archivedOpen?.[hostId]; cx.notify(); },
-        restore: r => oneClick({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }, "unarchive-rig"),
-        menu: r => menu({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }),
+        restore: r => this.oneClick({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }, "unarchive-rig"),
+        menu: r => this.menu({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }),
       }));
   }
 
@@ -1092,8 +1094,8 @@ export default class RigView extends View {
     const tone = counts.needs ? "needs_input" : counts.blocked ? "blocked" : counts.working ? "working" : rigTone(model.seats);
     const target = { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle };
     const viewTarget = { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, view: `rig:${rig.name}` };
-    const dialog = (step, height) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
-    const more = () => this.moreButton(t, `rig-more-${rig.id}`, () => menu(target));
+    const dialog = (step, height) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
+    const more = () => this.moreButton(t, `rig-more-${rig.id}`, () => this.menu(target));
     const showBody = dedicated || expanded && (!noMatch || Boolean(pulseFilter));
     const rigRowKey = rigKey(rig.id);
     const rigEntry = { section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name };
@@ -1108,7 +1110,7 @@ export default class RigView extends View {
     const head = h_flex().id(`rig-head-${rig.id}`).px(4).when(!compact, el => el.h(30)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
       .when(rigSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
       .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) push(rigEntry); else this.selectPageRow(rigRowKey, cx); })
-      .on_mouse_down("right", () => menu(target))
+      .on_mouse_down("right", () => this.menu(target))
       .child(div().id(`rig-fold-${rig.id}`).w(14).flex_none().text_color(t.dim).on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(rigKey(rig.id), expanded, model.seats); })
         .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(12)))
       .child(this.dot(t, tone))
@@ -1131,10 +1133,10 @@ export default class RigView extends View {
       const followReason = capabilityDisableReason(on ? "unfollow" : "follow", caps);
       this.inPageActions=dedicated;
       const actionBar=h_flex().gap(6).items_center().flex_wrap()
-        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens here; tiles run on ${this.config.daemonMachine}.`:null), actionKey: "open-view" }))
-        .child(this.button(t, `rig-act-design-${rig.name}`, "Design view…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target, step: { action: "design-view" } } }), { small: true, iconName: "rig-view", disabled: !!designReason, tooltip: designReason }))
-        .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow" }))
-        .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => oneClick({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn }, "snapshot", `rig-snapshot-${rig.id}`), { small: true, iconName: "rig-snapshot", actionKey: "snapshot" }))
+        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => this.oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens here; tiles run on ${this.config.daemonMachine}.`:null), actionKey: "open-view" }))
+        .child(this.button(t, `rig-act-design-${rig.name}`, "Design view…", () => this.open({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target, step: { action: "design-view" } } }), { small: true, iconName: "rig-view", disabled: !!designReason, tooltip: designReason }))
+        .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => this.oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow" }))
+        .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => this.oneClick({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn }, "snapshot", `rig-snapshot-${rig.id}`), { small: true, iconName: "rig-snapshot", actionKey: "snapshot" }))
         .when(!stoppedRig && lifecycle !== "stopped", (el) => el.child(this.button(t, `rig-pause-${rig.id}`, "Pause…", () => dialog({ action: "pause", load: "pause" }, 360), { small: true, iconName: "rig-pause" })))
         .when(stoppedRig || lifecycle !== "running", (el) => el.child(resume()))
         .child(div().flex_1()).child(more());
@@ -1171,7 +1173,7 @@ export default class RigView extends View {
             id:`rig-graph-${rig.id}`,assets:ASSETS,running:true,reducedMotion:this.config?.reducedMotion===true,
             events:graphActivityOf(shared,this.config?.connectionId)?.origin===this.config?.daemonUrl?graphActivityOf(shared,this.config?.connectionId).events:[],
             open:s=>push({section:"topology",kind:"seat",rig:rig.name,rigId:rig.id,conn:rig.conn,name:s.lid}),
-            menu:s=>menu({...s.node,kind:"seat",session:s.session,rig:rig.name,rigId:rig.id,conn:rig.conn,logicalId:s.lid}),
+            menu:s=>this.menu({...s.node,kind:"seat",session:s.session,rig:rig.name,rigId:rig.id,conn:rig.conn,logicalId:s.lid}),
           }));
           else body.push(this.status(t,cx,graphPath,graphGot)??this.skeleton(t));
         }
@@ -1182,7 +1184,7 @@ export default class RigView extends View {
       if(!dedicated||entry.tab==='table'){
         const group=assistantGroup(t,cx,this.hostedMembers(cx),{...rig,conn:rig.conn??this.config?.connectionId},{prefix:'page',icon,rows:this.pageRows,folds:shared('rig.open.page')??{},
           fold:(key,open)=>{setShared('rig.open.page',{...(shared('rig.open.page')??{}),[key]:open});this.persistStatePatch(cx);},
-          select:(key,_entry,cx)=>this.selectPageRow(key,cx),open:push,menu});
+          select:(key,_entry,cx)=>this.selectPageRow(key,cx),open:push,menu:(t)=>this.menu(t)});
         if(group)body.push(group);
       }
     }
@@ -1415,8 +1417,8 @@ export default class RigView extends View {
       ? { key: rowKey, foldKey: hKey, expandable: true, isOpen: openHelpers, parentKey: podKey(rig.id, s.pod), entry: seatEntry, target: seatTarget, open: go }
       : { key: rowKey, expandable: false, parentKey: podKey(rig.id, s.pod), entry: seatEntry, target: seatTarget, open: go });
     const selected = this.pageSel === rowKey;
-    const send = () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 260, props: { target: seatTarget, step: { input: true, placeholder: `Message to ${s.session}`, action: "send", multiLine: true } } });
-    const queue = () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: seatTarget, step: { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true } } });
+    const send = () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 260, props: { target: seatTarget, step: { input: true, placeholder: `Message to ${s.session}`, action: "send", multiLine: true } } });
+    const queue = () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: seatTarget, step: { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true } } });
     const answer = () => quickBtn(`seat-answer-${s.session}`, "Answer", () => {
       openNeed(setShared, { section: "needs", id: seatNeed.id });
       openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" });
@@ -1428,7 +1430,7 @@ export default class RigView extends View {
       .child(h_flex().id(`topo-seat-row-${s.session}`).pl(compact ? 0 : 12).pr(compact ? 0 : 8).h(28).gap(compact ? 4 : 6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
         .when(selected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
         .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) go(); else this.selectPageRow(rowKey, cx); })
-        .on_mouse_down("right", () => menu(seatTarget))
+        .on_mouse_down("right", () => this.menu(seatTarget))
         .child(helpers.length
           ? div().id(`topo-seat-fold-${s.session}`).w(12).flex_none().text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); setOpen(hKey, !openHelpers); })
@@ -1457,7 +1459,7 @@ export default class RigView extends View {
           .when(selected && !s.terminal && !compact, (el) => el
             .child(quickBtn(`seat-send-${s.session}`, "Send…", send, { disabled: !!sendReason, tooltip: sendReason }))
             .child(quickBtn(`seat-queue-${s.session}`, "Queue…", queue, { disabled: !!queueReason, tooltip: queueReason })))
-          .child(this.moreButton(t, `seat-more-${s.session}`, () => menu(seatTarget)))))
+          .child(this.moreButton(t, `seat-more-${s.session}`, () => this.menu(seatTarget)))))
       .when(!!seatNeed && compact, el => el.child(h_flex().id(`seat-answer-line-${s.session}`).pl(18).pb(4).child(answer())))
       .children(openHelpers ? helpers.map((child, idx) =>
         h_flex().id(`topo-helper-${s.session}-${idx}`).pl(36).pr(8).h(24).gap(6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
@@ -1498,7 +1500,7 @@ export default class RigView extends View {
     }
     else if (act.type === "activate") { if (row?.open) row.open(cx); else if (row?.entry) push(row.entry); }
     else if (act.type === "action") { const fn = this.seatActions?.[act.key]?.[act.action]; if (fn) fn(); }
-    else if (act.type === "menu") { if (row?.target) menu(row.target); }
+    else if (act.type === "menu") { if (row?.target) this.menu(row.target); }
     cx?.notify?.();
     return true;
   }
@@ -1578,7 +1580,7 @@ export default class RigView extends View {
       tmuxAttachCommand: n.tmuxAttachCommand ?? null,
       attachable: !stoppedSeat,
     };
-    const dialog = (step, height) => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
+    const dialog = (step, height) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
     const live = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? []);
     const seatViewReason = capabilityDisableReason("open-seat", this.caps());
     const attachReason = stoppedSeat ? "Stopped: seat has no running session to attach" : null;
@@ -1612,7 +1614,7 @@ export default class RigView extends View {
         run("pane.focus", { terminal: hit.terminal });
         return;
       }
-      oneClick(target, "open-seat", "seat-focus-pane");
+      this.oneClick(target, "open-seat", "seat-focus-pane");
     };
 
     const tab=entry.seatTab??"activity";
@@ -1627,7 +1629,7 @@ export default class RigView extends View {
         .when(!isTerminalSeat(n), (el) => el
           .child(this.button(t, "seat-act-send", "Send…", () => dialog({ input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }, 260), { small: true, iconName: "rig-send", disabled: !!sendReason, tooltip: sendReason }))
           .child(this.button(t, "seat-act-queue", "Queue…", () => dialog({ input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), { small: true, iconName: "rig-queue", disabled: !!queueReason, tooltip: queueReason })))
-        .child(this.button(t, "seat-act-more", "⋯", () => menu(target), { small: true }));
+        .child(this.button(t, "seat-act-more", "⋯", () => this.menu(target), { small: true }));
     this.inPageActions=false;
     return v_flex().id(`seat-page-${entry.name}`).gap(12)
       .when(tab === "activity" && !isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && push(fileEntry(transcript, `${entry.name} transcript`)))))
@@ -1656,7 +1658,7 @@ export default class RigView extends View {
             .tooltip(seatViewReason ?? "")
             .child("This seat has no running terminal to attach.")
           : (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("seat-open-terminal-link").gap(6).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center()).cursor_pointer()
-              .on_click(() => oneClick(target, "open-seat", "seat-open-terminal"))
+              .on_click(() => this.oneClick(target, "open-seat", "seat-open-terminal"))
               .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.w(120)).text_size(12).text_color(t.dim).child("Terminal"))
               .child(div().text_size(12.5).text_color(t.accent).child("Open terminal ▸"))]),
       ]))))
@@ -1872,7 +1874,7 @@ export default class RigView extends View {
         return v_flex()
           .when(builtin && i === g.yours && i > 0, el => el.child(div().id(`spec-divider-${g.kind}`).mx(8).h(1).bg(t.border)))
           .child(h_flex().id(`specs-${lib.data.indexOf(s)}`).pl(24).pr(8).h(30).gap(10).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover((x) => x.bg(t.hover))
-            .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => menu({ kind: "spec", conn: this.config?.connectionId, id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
+            .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => this.menu({ kind: "spec", conn: this.config?.connectionId, id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(s.name??"")).child(s.name))
             .when(this.specDirty(box), (el) => el.child(div().text_size(11.5).text_color(t.working).flex_none().child("● Unsaved changes")))
@@ -1973,7 +1975,7 @@ export default class RigView extends View {
       .when(isBuiltin, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Built-in specs can't be edited; copy one to make your own.")))
       .when(!isBuiltin && !editing, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Read-only")))
       .when(dirty, (el) => el.child(div().text_size(11.5).text_color(t.working).child("● Unsaved changes")))
-      .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:460,height:300,
+      .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:460,height:300,
         props:{target:{kind:"spec",id:s.id,conn:this.config?.connectionId,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{primary:true,iconName:"rig-play"})))
       .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().flex_wrap().child(div().text_size(11.5).text_color(t.muted).child(this.config?.daemonMachine
         ? `Restored your unsaved edits from ${this.time(box.draftAt??Date.now())}.` : "Restored unsaved edits"))
@@ -2386,7 +2388,7 @@ export default class RigView extends View {
     const token = `spaces-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.spacesPending = { token, target, shown: { layout: name, tree: JSON.parse(JSON.stringify(tree)) }, expires: Date.now() + 300000 };
     info.note = null;
-    openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 540,
+    this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 540,
       props: { target: { kind: "spaces-list" }, step: { action: "spaces-list", token, copy: describeChange({ layout: name, shipped: isShippedLayout(name), copy: isShippedLayout(name) ? freeCopyName(name, layouts()) : null, from: plan.from, to: target, lines: plan.lines }) } } });
     cx.notify();
   }
@@ -2551,7 +2553,7 @@ export default class RigView extends View {
           const token = `spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           box.awaitingPermission = true;
           this.specPermission = { token, spec: s, request: { verb: "copy-folder" }, box, confirmation: out.confirmation, expires: Date.now() + 300000 };
-          openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 420, props: { target: { kind: "spec", id: s.id }, step: { action: "confirm-spec-write", token, confirmation: out.confirmation } } });
+          this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 420, props: { target: { kind: "spec", id: s.id }, step: { action: "confirm-spec-write", token, confirmation: out.confirmation } } });
           return;
         }
         if (out.exists) { await this.openExistingCopy(cx, s, host, out.folder, box); return; }
@@ -2634,7 +2636,7 @@ export default class RigView extends View {
           const token=`spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           box.awaitingPermission=true;
           this.specPermission={token,spec:s,request:operation,box,confirmation:result.confirmation,expires:Date.now()+300000};
-          openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:560,height:340,props:{target:{kind:"spec",id:s.id},step:{action:"confirm-spec-write",token,confirmation:result.confirmation}}});return;
+          this.open({mod:MOD_IDS.menu,kind:"dialog",width:560,height:340,props:{target:{kind:"spec",id:s.id},step:{action:"confirm-spec-write",token,confirmation:result.confirmation}}});return;
         }
         if(!result.ok)throw Error(result.reason??"The box did not confirm the write.");
         this.specConsentMachine=config.daemonMachine;
@@ -2670,7 +2672,7 @@ export default class RigView extends View {
 
   /** "Launch rig from spec…": rig specs only, with or without a file (the menu and palette use the same rule). */
   launchButton(t, spec, id = "spec-launch") {
-    return this.button(t, id, "Launch rig from spec…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300,
+    return this.button(t, id, "Launch rig from spec…", () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300,
       props: { target: { kind: "spec", id: spec.id, conn: this.config?.connectionId, name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } }), { iconName: "rig-play" });
   }
 
@@ -2836,12 +2838,12 @@ export default class RigView extends View {
         const followReason = capabilityDisableReason("follow", this.caps());
         const doFollow = (_e, cx) => {
           cx?.stop_propagation?.();
-          oneClick({ kind: "follow-target", conn: this.config?.connectionId, view: `slice:${s.id ?? sDir}`, name: sName }, "follow", `slice-follow-${sKey}`);
+          this.oneClick({ kind: "follow-target", conn: this.config?.connectionId, view: `slice:${s.id ?? sDir}`, name: sName }, "follow", `slice-follow-${sKey}`);
         };
         return v_flex().id(`slices-${mi}-${si}`).when(sliceFocused, (el) => el.rounded(6).border_1().border_color(t.accent))
           .child(h_flex().id(`slice-row-${mKey}-${sKey}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((x) => x.bg(t.hover))
             .on_click(toggleSlice)
-            .on_mouse_down("right", () => menu(sliceTarget(m, s)))
+            .on_mouse_down("right", () => this.menu(sliceTarget(m, s)))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(sName??"")).child(sName))
             .child(this.copyButton(t, sKey, `slice-id-${sKey}`, "slice id"))
@@ -2915,12 +2917,12 @@ export default class RigView extends View {
     const openReason = capReason ?? noAttachableReason;
     const doOpen = (_e, cx) => {
       cx?.stop_propagation?.();
-      oneClick({ kind: "open-view", view: viewKey, plan: preview.data?.planId, rig: rigName, rigId: rigEntry?.id ?? null, conn: rigEntry?.conn ?? this.config?.connectionId }, "open-view", `open-view-${viewKey}`);
+      this.oneClick({ kind: "open-view", view: viewKey, plan: preview.data?.planId, rig: rigName, rigId: rigEntry?.id ?? null, conn: rigEntry?.conn ?? this.config?.connectionId }, "open-view", `open-view-${viewKey}`);
     };
     const doResume = (_e, cx) => {
       cx?.stop_propagation?.();
       if (!rigName) return;
-      openOverlay({
+      this.open({
         mod: MOD_IDS.menu,
         kind: "dialog",
         width: 460,
@@ -2997,7 +2999,7 @@ export default class RigView extends View {
         return v_flex().id(`views-${i}`)
           .child(h_flex().id(`term-row-${r.view}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(toggleRow)
-            .on_mouse_down("right", () => menu({ kind: "terminal", conn: this.config?.connectionId, view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
+            .on_mouse_down("right", () => this.menu({ kind: "terminal", conn: this.config?.connectionId, view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(r.name??"")).child(r.name))
             .child(this.copyButton(t, r.view, `view-id-${r.view}`, "view id"))
@@ -3340,7 +3342,7 @@ export default class RigView extends View {
           .child(h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover))
             .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.bg(t.selection ?? t.raised))
             .when(isEscalation, (el) => el.border_l(2).border_color(t.blocked))
-            .on_click(() => toggle(n)).on_mouse_down("right", () => menu(n))
+            .on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(rowTheme.dim))
             .when(isEscalation, (el) => el.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.blocked + "26").text_color(t.blocked).text_size(10).font_semibold().child("ESCALATION")))
             .when(!isEscalation && tier !== "update", (el) => el.child(this.plainDot(t, isAlert ? "blocked" : "accent")))
@@ -3350,7 +3352,7 @@ export default class RigView extends View {
             .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.child(this.updateButton(t, `dismiss-${idPrefix}-${i}`, n.dismissed ? "Restore" : "Dismiss", (_e, cx) => {
               cx.stop_propagation(); this.updateAction(n.dismissed ? "restore" : "dismiss", n.dismissed ? updateKey(n) : n);
             })))
-            .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); }))
+            .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); }))
             .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).tooltip(this.time(n.at,{exact:true})).child(relativeTimeText(n.at))))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(n.dismissed ? this.dim(t, n.dismissalNote ?? "Hidden here only.") : this.needBody(t, cx, n, perspective))));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")]);
@@ -3379,12 +3381,12 @@ export default class RigView extends View {
       const shown = Boolean((shared("rig.open.page") ?? {})[`needs:${n.id}`]);
       return v_flex().min_w(0).child(h_flex().id(`needs-${i}`).px(8).h(34).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
         .when(this.selectedNeed === n.id, el => el.bg(t.selection ?? t.raised))
-        .on_click(() => toggle(n)).on_mouse_down("right", () => menu(n))
+        .on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
         .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(text.headline))
         .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip(String(String(owner ?? "")??"")).child(String(owner ?? "")))
         .child(div().text_size(11).text_color(t.dim).tooltip(this.time(n.at,{exact:true})).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
-        .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); menu(n); })))
+        .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); })))
         .when(shown, el => el.child(this.decisionCard(t, cx, n, { perspective })));
     }) : [this.dim(t, filter ? "No matching requests." : "No pending Needs-You requests.")]);
   }
@@ -3478,7 +3480,7 @@ export default class RigView extends View {
         .child(label).when(recommended, el => el.child(div().text_size(10.5).child("Recommended")));
     };
     const actions = [];
-    if (n.native) actions.push(action("resume", "Relaunch / Resume…", () => menu(n), { primary: true }));
+    if (n.native) actions.push(action("resume", "Relaunch / Resume…", () => this.menu(n), { primary: true }));
     else if (qState.totalCount && verb) {
       for (const q of qState.questions) {
         if (q.answered) continue;
@@ -3809,7 +3811,7 @@ export default class RigView extends View {
           this.read(cx, `/api/attention?item=${encodeURIComponent(n.id)}`, true);
           if (qid) this.read(cx, `/api/queue/${encodeURIComponent(qid)}`, true);
         } else {
-          if (outcome.conflict) {
+          if (outcome.conflict || outcome.settingsChanged) { // a settings change mid-answer also leaves recorded steps: the card drops them and re-reads the item
             if (Array.isArray(outcome.committedQuestionIds) && outcome.committedQuestionIds.length > 0) {
               const nextChoices = { ...(this.questionChoices[n.id] ?? {}) };
               for (const qId of outcome.committedQuestionIds) delete nextChoices[qId];
@@ -4527,7 +4529,7 @@ export default class RigView extends View {
           &&shared("rig.machineSetup")?.origin===this.config.daemonUrl&&!!shared("rig.machineSetup")?.verifiedAt,
           el=>el.child(div().text_size(11).text_color(t.muted).child(machineSetupReceiptLabel(shared("rig.machineSetup"),this.uiTimezone))))
         .child(div().id("system-choose-machine").text_color(t.accent).cursor_pointer().child(this.config?.daemonMachine?`Stop using ${this.config.daemonMachine}…`:"Choose machine…")
-          .on_click(()=>{if(this.config?.daemonMachine)openOverlay({mod:MOD_IDS.menu,kind:"dialog",width:560,height:400,
+          .on_click(()=>{if(this.config?.daemonMachine)this.open({mod:MOD_IDS.menu,kind:"dialog",width:560,height:400,
             props:{target:{kind:"machine"},step:{action:"stop-machine",machine:this.config.daemonMachine}}});else run("rig.choose-machine");})),
       this.kv(t, [
         ["Herdrig Version", `herdrig v${HERDRIG_VERSION}`],
@@ -4641,7 +4643,7 @@ export default class RigView extends View {
           t,
           `status-resume-${s.rig}`,
           "Resume…",
-          () => openOverlay({
+          () => this.open({
             mod: MOD_IDS.menu,
             kind: "dialog",
             width: 460,
@@ -4680,14 +4682,14 @@ export default class RigView extends View {
         })))
         .when(!!entry.filter,el=>el.child(div().id("rig-clear-filter").text_size(12).text_color(t.accent).cursor_pointer()
           .on_click(()=>clearFilter()).child(`/${entry.filter} ×`)))
-        .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"})))
+        .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"})))
         .when(!tiny&&!!this.config,el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel})))
         .when(!tiny,el=>el.child(div().id("rig-close").size(24).flex_none().flex().items_center().justify_center().cursor_pointer().tooltip("Close")
           .on_click(()=>closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)))))
       // Below 320 px, controls get their own row so the remaining location links still take clicks.
       .when(tiny,el=>el.child(h_flex().id("page-compact-controls").px(14).pb(6).gap(6).items_center()
         .child(this.button(t,"rig-back","",()=>this.back(),{iconName:"chevron-left",tooltip:"Back (Backspace)",disabled:!backTo}).px(6))
-        .child(this.button(t,"rig-filter-btn","",()=>palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"}).px(6))
+        .child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"}).px(6))
         .when(!!this.config,row=>row.child(this.button(t,"rig-open-tui","",(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel}).px(6)))
         .child(div().id("rig-close").size(20).flex_none().cursor_pointer().tooltip("Close").on_click(()=>closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)))))
       .child(h_flex().id("page-title-bar").px(14).pb(10).gap(12).items_center().flex_wrap()
@@ -4698,7 +4700,7 @@ export default class RigView extends View {
             .child(div().id("page-title").truncate().text_size(18).font_semibold().text_color(t.foreground).tooltip(String(this.pageHeading?.title??entryTitle(entry)??"")).child(this.pageHeading?.title??entryTitle(entry))))
           .when(!!this.pageHeading?.status,el=>el.child(this.pageHeading.statusView??div().id("page-status").truncate().text_size(12).text_color(t.muted).tooltip(this.pageHeading.status).child(this.pageHeading.status))))
         .when(!!this.pageActions,el=>el.child(this.pageActions))
-        .when(!!target&&!this.pageActions,el=>el.child(this.button(t,"rig-actions","⋯",()=>menu(target),{tooltip:"Page actions"}))))
+        .when(!!target&&!this.pageActions,el=>el.child(this.button(t,"rig-actions","⋯",()=>this.menu(target),{tooltip:"Page actions"}))))
       .when(!!status,el=>el.child(div().px(14).pb(6).child(status)));
   }
   render(cx) {
@@ -4767,6 +4769,9 @@ export default class RigView extends View {
     const note = file ? null : this.refreshNote(t);
     this.refreshNowTails(cx);
     return v_flex().id("rig-view-root").size_full().bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).track_focus(this.handle)
+      .when(entry?.section==='system'&&entry.subview==='config',el=>el.key_context('HerdrigSettings')
+        .on_action('herdrig_settings_next',(_e,ctx)=>{if(this.configPanel?.tabControl(false,ctx))ctx.stop_propagation();})
+        .on_action('herdrig_settings_previous',(_e,ctx)=>{if(this.configPanel?.tabControl(true,ctx))ctx.stop_propagation();}))
       .on_size_change((size,cx)=>{if(size.width>0&&this.pageWidth!==size.width){this.pageWidth=size.width;cx.notify();}})
       // A click outside text takes the page keyboard, so Esc and Backspace work after it.
       .on_mouse_down("left", () => this.handle.focus())
@@ -4784,7 +4789,7 @@ export default class RigView extends View {
           && this.visibleUpdates?.some((n) => updateKey(n) === updateKey(this.selectedUpdate)))
           this.updateAction("dismiss", this.selectedUpdate);
         // `/` filters a page's tables; a file page has none, so it does nothing there, as Filter… isn't offered.
-        else if (e.key === "/" && entry?.section !== "file" && !e.modifiers?.control && !e.modifiers?.platform && !e.modifiers?.alt) palette(entry?.filter ? `/${entry.filter}` : "/");
+        else if (e.key === "/" && entry?.section !== "file" && !e.modifiers?.control && !e.modifiers?.platform && !e.modifiers?.alt) this.palette(entry?.filter ? `/${entry.filter}` : "/");
         // Otherwise the rows' keys: ↑/↓, ←/→, Home/End, Enter, S, Q, the Menu key or Shift+F10.
         else this.pageTreeKey(e, cx);
       })

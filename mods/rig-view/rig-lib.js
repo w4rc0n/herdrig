@@ -5,7 +5,7 @@
 import { attachRemoteSeat } from "./rig-remote-attach.js";
 import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
-import { gatedFetch, rethrowGate, CONFIG_LOADING } from "./rig-gate.js";
+import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING } from "./rig-gate.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
 import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, CONNECTIONS_LIST_REFUSED, CONNECTIONS_LIST_SUPPORTED } from "./rig-connections.js";
@@ -15,6 +15,17 @@ const SYSTEM_VIEW_LABELS = new Map(SYSTEM_PAGE_VIEWS);
 
 /** The single space-routing entry point for pages, the TUI, Attach and rig grids. */
 let routingEnvironment = null;
+/** The settings a producer's rows were read under, reduced to the fields that make a config a different one for the send gate (see rig-gate.js identity). */
+export const ROWS_STALE = "OpenRig's settings changed since these rows were loaded. Wait for the list to refresh, then try again.";
+export const rowsIdentityOf = (config) => (config ? { connectionId: config.connectionId, daemonUrl: config.daemonUrl, daemonUrlSource: config.daemonUrlSource, daemonMachine: config.daemonMachine,
+  openrigHome: config.openrigHome, rig: config.rig, connectionsRefused: config.connectionsRefused } : null);
+/** Every producer of a menu target stamps the settings ITS rows were read under (`rowsConfig`) before it opens the menu: the sidebar, the Rig page, All seats, the palette and the Needs
+ *  cards each read their own rows under their own config, and the menu judges the target by its own stamp against a fresh read of config.json (a stamp-less target is not judged:
+ *  no sidebar, no rig.data, nothing to compare). A stamp already on the target (a dialog opened from a menu) is kept. */
+export function stampRows(spec, identity) {
+  if (!identity || spec?.mod !== MOD_IDS.menu || !spec.props?.target || typeof spec.props.target !== "object" || spec.props.target.rowsConfig) return spec;
+  return { ...spec, props: { ...spec.props, target: { ...spec.props.target, rowsConfig: identity } } };
+}
 export function registerRigRouting(cx, environment) {
   // init/render contexts expire when their call returns. Keep waits on a view-owned asynchronous task instead.
   cx.spawn(async context => {
@@ -3509,6 +3520,9 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
  * chaining `expectedRevision` from each step's response `decisionRevision`.
  */
 export async function submitMissionActions(config, item, act = {}, postOrOpts = {}) {
+  // ONE operation for the whole answer, taken before the address is read: every POST of a multi-question answer is sent under the generation the first one began
+  // with, so a settings change between two POSTs refuses the rest (a bare `gatedFetch` would start a new generation per request and send the second to the old daemon).
+  const op = gatedOperationOrRefusal();
   let runReq;
   if (typeof postOrOpts?.post === "function") {
     runReq = (req) => postOrOpts.post(req.path, req.body, req.headers);
@@ -3524,7 +3538,8 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
       return r;
     };
   } else {
-    const fetchFn = (typeof postOrOpts === "function" ? postOrOpts : postOrOpts?.fetch) ?? gatedFetch;
+    const given = (typeof postOrOpts === "function" ? postOrOpts : postOrOpts?.fetch) ?? gatedFetch;
+    const fetchFn = given === gatedFetch ? op.fetch : given; // a caller's own operation fetch is used as it is
     if (typeof fetchFn !== "function") {
       throw new Error("submitMissionActions requires a post function or fetch");
     }
@@ -3588,7 +3603,14 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
     let res;
     try {
       res = await runReq(req);
-    } catch (_) {
+    } catch (error) {
+      if (error?.code === "GATE_REFUSED") {
+        // The settings changed (or a connections list arrived) between steps: nothing more is sent. Say which steps went and which did not; this is NOT an unconfirmed network error.
+        const went = idx > 0 ? ` Your earlier part (${idx} of ${steps.length}) was recorded; the rest was not sent.` : " Nothing was sent.";
+        const message = `${String(error.message).trimEnd()}${went}`;
+        return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, conflict: false, tokenProtected: false, partial: idx > 0,
+          operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
+      }
       return {
         ok: false,
         status: 0,
