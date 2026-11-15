@@ -67,6 +67,8 @@ const page = async (entry) => {
 const RESULT_HEIGHT = 240;
 /** What a shell or launcher prints when it could not find or run the command (exit 127 or 126): nothing ran. */
 const LAUNCHER_COULD_NOT_RUN = /not found|no such file|permission denied|cannot execute|not executable/i;
+/** The seats of a rig by their logical ids, sorted: what a delete confirmation was shown, compared again before a Retry of that delete. */
+const seatIdsOf = (nodes) => nodes.map((n) => String(n.logicalId ?? n.canonicalSessionName ?? "")).sort();
 /** The host's own wording when its exec timeout ended the child (herdr-app src/mods.rs): the child started and was stopped, so what it was doing may have finished. */
 const HOST_STOPPED_CHILD = /took longer than [\d.]+ s( on .+)? and was stopped/;
 /** Writes that may have arrived even when they failed (a timeout), or whose form stays on screen: never resent via Retry. */
@@ -456,7 +458,7 @@ export default class RigMenu extends View {
       // The pause already ran: whatever stopped the archive, "Nothing was sent." would be false, so the result says the pause ran and the archive did not.
       if (running && !a.ok) { const { notSent, ...rest } = a; return { ...rest, kind: "archive", paused, text: `${target.rig} was paused, but it wasn't archived: ${a.text || "the CLI gave no reason."}` }; }
       return { ...a, kind: "archive", paused };
-    });
+    }, { kind: "archive" });
   }
 
   /** Undo an archive: `rig unarchive`. */
@@ -467,7 +469,7 @@ export default class RigMenu extends View {
       const r = await this.write(this.argsFor(target, "unarchive-rig"));
       if (r.ok) { run("rig.refresh"); notify({ title: `${target.rig} restored. It's stopped; Resume it from its row.`, level: "info" }); }
       return { ...r, kind: "unarchive", text: r.ok ? `${target.rig} restored. It's stopped; Resume it from its row.` : r.text };
-    }, { dismissOnSuccess: true });
+    }, { dismissOnSuccess: true, kind: "unarchive" });
   }
 
   /** The designer's state: the grid, the seat picked or dragged, the shape of what is saved. */
@@ -687,14 +689,15 @@ export default class RigMenu extends View {
     try { return JSON.parse(r.stdout); } catch (_) { return null; }
   }
 
-  run(cx, label, work, { dismissOnSuccess = false } = {}) {
+  /** Runs one step of a dialog on its own task. `kind` names the step: it is on EVERY result, including one built from a throw, so the dialog always knows which step a failed result came from (a Retry re-runs that step and no other). */
+  run(cx, label, work, { dismissOnSuccess = false, kind = null } = {}) {
     this.busy = label; this.result = null; cx.notify();
     cx.spawn(async (cx) => {
       try { this.result = await work(cx); } catch (e) {
         // A gate refusal raised BEFORE anything left (no `dispatched`), and a host that could not start the CLI ("cannot run": nothing ran), are known unsent. One raised after the send, and any other throw,
         // is not known either way: `uncertain` keeps a launch or create from being offered again (the menu's launch and new rig read it).
         const msg = String(e?.message ?? e), unsent = e?.code === "GATE_REFUSED" && e.dispatched !== true, notStarted = /^cannot run /.test(msg);
-        this.result = { ok: false, text: msg, ...(unsent || notStarted ? { notSent: true } : { uncertain: true }) };
+        this.result = { ok: false, text: msg, ...(kind ? { kind } : {}), ...(unsent || notStarted ? { notSent: true } : { uncertain: true }) };
       }
       // Sent: the draft is done with. Not sent: it stays, for a retry from the menu.
       if (this.result?.ok) this.dropDraft();
@@ -724,7 +727,7 @@ export default class RigMenu extends View {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const nodes = await r.json();
         if (!Array.isArray(nodes)) throw new Error("not a list of seats");
-        this.pause = pauseSummary(nodes);
+        this.pause = pauseSummary(nodes); this.pauseSeatIds = seatIdsOf(nodes);
       } catch (e) {
         // A review that could not be read says so in a plain sentence and leaves its action disabled: the person cannot approve what they cannot see. A settings change already has its own sentence.
         this.pause = { error: e?.code === "GATE_REFUSED" ? String(e.message) : PAUSE_REVIEW_FAILED };
@@ -1243,8 +1246,39 @@ export default class RigMenu extends View {
       .when(!r.ok && r.uncertain && (step.action === "launch-spec" || step.action === "new-rig"), (el) => el.child(this.dialogButton(t,div().id("rig-check-list").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
         (_e,cx)=>{ run("rig.refresh"); this.navigate({ section: "topology" }, cx); },false,"Check the rig list")))
       // A message or an answer is never resent from here: it may have arrived. Anything else runs again.
-      .when(!r.ok && !RESEND_UNSAFE.has(step.action), (el) => el.child(this.dialogButton(t,div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
-        (_e,cx)=>this.retry(cx,target,step),false,"Retry")));
+      .when(this.retryable(step), (el) => el.child(this.dialogButton(t,div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
+        (_e,cx)=>this.retry(cx,target,step),false,step.action === "delete-rig" ? "Retry delete" : "Retry")));
+  }
+
+  /** Retry of the delete the person confirmed: the same step, redone on purpose. It re-reads the rig first and refuses (sending nothing) when the rig is gone or its seats are not the ones the person confirmed; the OpenRig settings are checked by `write()` itself. */
+  retryDelete(cx, target, step) {
+    if (this.busy) return;
+    const confirmed = this.deleteConfirmed;
+    this.busy = "Checking the rig"; cx.notify();
+    cx.spawn(async (cx) => {
+      let problem = null;
+      try {
+        const t = complete(target, this.config), conn = targetConnection(await this.currentConfig(), t);
+        if (!conn.ok || !conn.config.daemonUrl) problem = `${target.rig} can't be read any more, so it may already be deleted. Check the rig list. Nothing was sent.`;
+        else {
+          const r = await fetch(`${conn.config.daemonUrl}/api/rigs/${encodeURIComponent(t.rigId)}/nodes`); // this line has no per-connection fetch: the same read the review made
+          const nodes = r.ok ? await r.json() : null;
+          if (!Array.isArray(nodes)) problem = `${target.rig} can't be read any more, so it may already be deleted. Check the rig list. Nothing was sent.`;
+          else if (!confirmed || JSON.stringify(seatIdsOf(nodes)) !== JSON.stringify(confirmed.seats)) problem = `${target.rig} has changed since you confirmed deleting it. Nothing was sent. Close this and open it again to confirm again.`;
+        }
+      } catch (e) { problem = e?.code === "GATE_REFUSED" ? `${String(e.message)} Nothing was sent.` : `${target.rig} could not be checked. Nothing was sent. Close this and open it again to confirm again.`; }
+      this.busy = null;
+      if (problem) { this.result = { ok: false, notSent: true, text: problem }; cx.notify(); return; }
+      this.result = null; this.go(cx, target, step);
+    });
+  }
+
+  /** Whether the failed result may be retried from this dialog. A Retry re-runs the step that failed and never a later, more destructive one: in the Delete dialog (which also offers Archive, with its own pause) only a result that came from the DELETE step has a Retry, so a failed pause or archive can never lead to `rig down --delete` without the person pressing Delete. */
+  retryable(step) {
+    const r = this.result;
+    if (!r || r.ok || RESEND_UNSAFE.has(step.action)) return false;
+    if (step.action === "delete-rig") return r.kind === "delete";
+    return true;
   }
 
   /** What a success says when the CLI printed no message of its own. */
@@ -1253,6 +1287,7 @@ export default class RigMenu extends View {
   /** Run again: lifecycle actions re-read the rig first; a message or answer has no Retry; the rest re-run. */
   retry(cx, target, step) {
     if (RESEND_UNSAFE.has(step.action)) return;
+    if (step.action === "delete-rig") { if (this.retryable(step)) this.retryDelete(cx, target, step); return; } // only the delete step has a Retry here (see retryable)
     if (step.action === "pause" || step.action === "resume") {
       this.run(cx, "Re-reading the rig", async () => {
         const ps = await this.read(["ps", "--nodes", "--rig", target.rig]);
@@ -1312,6 +1347,7 @@ export default class RigMenu extends View {
       return;
     }
     if (step.action === "delete-rig") {
+      this.deleteConfirmed = { seats: this.pauseSeatIds ?? null }; // what the person confirmed (the dialog is for one rig, read by its id): the seats a Retry of this delete must still find
       if (target.rig === "kernel") { this.result = { ok: false, notSent: true, text: "The kernel is OpenRig's own rig: it isn't deleted or archived from here." }; cx.notify(); return; }
       this.run(cx, `Deleting ${target.rig}`, async () => {
         const r = await this.write(this.argsFor(target, "delete-rig"));
@@ -1327,7 +1363,7 @@ export default class RigMenu extends View {
           run("rig.refresh");
         }
         return { ...r, kind: "delete" };
-      });
+      }, { kind: "delete" });
       return;
     }
     if (step.action === "new-rig") {
