@@ -1,5 +1,6 @@
 // One approval owns helper installation, verification and the final local routing choice.
 // Host file operations are injected only for the two fixed app-home files, never from remote metadata.
+import {parseConfig} from "./rig-lib.js";
 import {RemoteMachine} from "./rig-remote.js";
 import {formatAbsoluteTime} from './rig-time.js';
 import {LEGACY_CONNECTION_ID,consentOf,consentText} from './rig-connections.js';
@@ -10,6 +11,10 @@ const parsed=text=>{
   return value;
 };
 const connectionOf=config=>config?.connectionId??LEGACY_CONNECTION_ID;
+const sameDaemonAddress=(a,b)=>{
+  const left=parseConfig(JSON.stringify({daemonUrl:a})).daemonUrl,right=parseConfig(JSON.stringify({daemonUrl:b})).daemonUrl;
+  return left===right&&(left!==null||a===b); // malformed text must not become an absent address
+};
 // With a connections list the machine lives in the connection's own record, which these flows don't edit yet (the setup screen for connections
 // does, in v0.5.0): they refuse instead of saving a root key that nothing reads and reporting success.
 export const MACHINE_SETUP_LIST="This OpenRig is set up with a connections list in its configuration. Choosing its machine here comes with the next version, so nothing was changed.";
@@ -17,7 +22,7 @@ const hasList=raw=>raw?.connections!==undefined&&raw?.connections!==null; // the
 const errorText=error=>String(error?.message??error);
 function connectionMatches(raw,config,machine){
   if(hasList(raw))throw new Error(MACHINE_SETUP_LIST);
-  if((raw.daemonUrl??config.daemonUrl)!==config.daemonUrl||raw.daemonMachine&&raw.daemonMachine!==machine)
+  if(!sameDaemonAddress(raw.daemonUrl??config.daemonUrl,config.daemonUrl)||raw.daemonMachine&&raw.daemonMachine!==machine)
     throw new Error("OpenRig's configuration changed. Refresh before choosing a machine.");
 }
 function transport(host,previous,stage,id){
@@ -65,17 +70,23 @@ export async function approveMachineSetup(host,review,onProgress=()=>{}){
 }
 
 export async function stopUsingMachine(host,config,machine){
+  let stage='checks';
   try{
     const before=await host.readConfig()??null,raw=parsed(before);
     if(hasList(raw))return {ok:false,reason:MACHINE_SETUP_LIST};
-    if(raw.daemonMachine!==machine||(raw.daemonUrl??config.daemonUrl)!==config.daemonUrl)
+    if(raw.daemonMachine!==machine||!sameDaemonAddress(raw.daemonUrl??config.daemonUrl,config.daemonUrl))
       throw new Error("OpenRig's configuration changed. Refresh before stopping this machine.");
     const previous=await host.readConsentText()??null;
+    stage='consent';
     await host.writeConsentText(consentText(previous,connectionOf(config),null),previous);
     const next={...raw};delete next.daemonMachine;
+    stage='config';
     await host.writeConfig(JSON.stringify(next,null,2)+"\n",before);
     return {ok:true,previous:consentOf(previous,connectionOf(config))};
-  }catch(error){return {ok:false,reason:`Could not finish stopping this machine. Check openrig/config.json before retrying: ${errorText(error)}`};}
+  }catch(error){return {ok:false,reason:stage==='consent'
+    ?`Clearing this machine's approval was not confirmed. Check openrig/machine-consent.json before retrying; the routing choice was not written: ${errorText(error)}`
+    :stage==='config'?`The machine approval was cleared, but saving the routing choice was not confirmed. Check openrig/config.json before retrying: ${errorText(error)}`
+    :`${errorText(error)} Nothing was changed.`};}
 }
 
 export function machineSetupReceiptLabel(receipt,timezone=null){

@@ -3,10 +3,10 @@ import {v_flex,h_flex} from "gpui-base";
 import {reviewMachineSetup,approveMachineSetup,stopUsingMachine} from "./rig-machine-setup.js";
 
 export class MachineSetupPanel {
-  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,cancelHandle,primaryHandle,copyHandles={}}={}){
+  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,cancelHandle,primaryHandle,retryHandle,copyHandles={}}={}){
     this.host=host;this.config=config;this.machine=machine;this.done=done;this.cancel=cancel;
     this.mono=mono;this.copyIcon=copyIcon;this.stop=stop;this.phase=stop?"ready":"checking";
-    this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
+    this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;this.retryHandle=retryHandle;
     this.copyHandles=copyHandles;
   }
   async check(cx){
@@ -16,23 +16,43 @@ export class MachineSetupPanel {
   }
   approve(cx){
     if(this.busy||this.phase!=="ready")return;
-    this.busy=true;this.phase="working";this.error=null;cx.notify();
+    this.busy=true;this.phase="working";this.error=null;this.warning=null;this.warningDetail=null;this.followUpRecovered=false;cx.notify();
     cx.spawn(async cx=>{
       try{
         await this.host.beforeApprove?.();
         const result=this.stop?await stopUsingMachine(this.host,this.config,this.machine):await approveMachineSetup(this.host,this.review,phase=>{
           this.progress=phase;cx.notify();
         });
-        if(result.ok){this.result=result;this.phase="done";await this.host.saved?.(result,this.stop);}
+        if(result.ok){
+          this.result=result;this.phase="done";
+          await this.finishSaved(cx);
+        }
         else if(result.needsConsent){this.phase="error";this.error="The machine or helper changed. Check again and review its details.";}
         else {this.phase="error";this.error=result.reason;}
       }catch(error){this.phase="error";this.error=String(error?.message??error);}
       finally{this.busy=false;cx.notify();const handle=this.phase==='done'?this.primaryHandle:this.stop&&this.phase==='error'?this.cancelHandle:null;if(handle)cx.timer.after(0,nextCx=>{handle.focus();nextCx.notify();});}
     });
   }
+  async finishSaved(cx){
+    this.followUpBusy=true;this.warning=null;this.warningDetail=null;cx.notify();
+    try{await this.host.saved?.(this.result,this.stop);return true;}
+    catch(error){this.warning="Herdr couldn't update its own saved state for this choice.";this.warningDetail=String(error?.message??error);return false;}
+    finally{this.followUpBusy=false;cx.notify();}
+  }
+  retrySaved(cx){
+    if(this.busy||this.phase!=='done'||!this.warning)return;
+    this.busy=true;this.retrying=true;this.followUpRecovered=false;cx.notify();
+    cx.spawn(async cx=>{
+      try{this.followUpRecovered=await this.finishSaved(cx);}
+      finally{this.busy=false;this.retrying=false;cx.notify();
+        // A successful retry removes its button. Hand keyboard ownership to the visible Done.
+        if(this.followUpRecovered&&this.primaryHandle)cx.timer.after(0,next=>{this.primaryHandle.focus();next.notify();});}
+    });
+  }
   button(id,text,callback,{disabled=false,primary=false}={}){
+    const handle=id==='machine-setup-cancel'?this.cancelHandle:id==='machine-setup-retry'?this.retryHandle:this.primaryHandle;
     return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role("button").tab_stop(!disabled)
-      .when(!disabled&&!!(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle),el=>el.track_focus(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle))
+      .when(!disabled&&!!handle,el=>el.track_focus(handle))
       .focus(el=>el.border_color(this.theme.accent))
       .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}})
       .child(div().id(id).px(10).py(6).rounded(5)
@@ -56,7 +76,7 @@ export class MachineSetupPanel {
     const c=this.review?.confirmation,done=this.phase==="done",update=!!this.review?.alreadyConfigured&&c?.fileState==="older";
     const cycle=(forward,cx)=>{
       cx.stop_propagation();
-      const copies=this.stop?[this.copyHandles.Command]:!done&&this.phase!=='checking'&&c?[this.copyHandles.Folder,this.copyHandles['SHA-256']]:[];
+      const copies=[...(this.stop?[this.copyHandles.Command]:!done&&this.phase!=='checking'&&c?[this.copyHandles.Folder,this.copyHandles['SHA-256']]:[]),...(done&&this.warning&&!this.busy&&this.retryHandle?[this.retryHandle]:[])];
       const first=copies[0]??(done?this.primaryHandle:this.cancelHandle);
       const last=this.busy?copies.at(-1):done||this.phase==='ready'||this.phase==='error'&&!this.stop?this.primaryHandle:this.cancelHandle;
       if(this.busy&&!last)return;
@@ -95,9 +115,13 @@ export class MachineSetupPanel {
     if(this.error)body=body.child(div().id("machine-setup-error").text_color(t.blocked).child(`✗ ${this.error}`));
     if(done)body=body.child(div().id("machine-setup-done").child(this.stop?`✓ Stopped using ${this.machine}. Open box tiles and the helper were left in place.`
       :`✓ Using ${this.machine}. Attach helper ${this.result.installed?"installed and verified":"already installed, verified"}.`));
-    if(this.busy)body=body.child(div().id("machine-setup-progress").text_color(t.muted).child(this.stop?"Saving…":this.progress==="install"?"Installing the Attach helper…":this.progress==="verify"?"Checking its SHA-256…":"Saving…"));
+    if(done&&this.warning)body=body.child(h_flex().gap(6).items_center().flex_wrap()
+      .child(div().id("machine-setup-warning").text_color(t.working).tooltip(this.warningDetail).child(this.warning))
+      .child(this.button('machine-setup-retry','Try again',cx=>this.retrySaved(cx),{disabled:this.busy}).tooltip(this.stop?"Retries only Herdr's follow-up. OpenRig isn't stopped again.":"Retries only Herdr's follow-up. The machine setup isn't run again.")));
+    if(done&&this.followUpRecovered)body=body.child(div().id('machine-setup-recovered').text_color(t.muted).child("✓ Herdr's saved state is up to date."));
+    if(this.busy)body=body.child(div().id("machine-setup-progress").text_color(this.retrying?t.dim:t.muted).child(this.retrying?'Trying again...':this.followUpBusy?"Updating Herdr's saved state…":this.stop?"Saving…":this.progress==="install"?"Installing the Attach helper…":this.progress==="verify"?"Checking its SHA-256…":"Saving…"));
     const footer=h_flex().gap(8).justify_end().flex_none();
-    if(done)footer.child(this.button("machine-setup-done-button","Done",cx=>this.done?.(cx,this.result),{primary:true}));
+    if(done)footer.child(this.button("machine-setup-done-button","Done",cx=>this.done?.(cx,this.result),{primary:true,disabled:this.busy}));
     else if(!this.busy){
       footer.child(this.button("machine-setup-cancel","Cancel",cx=>this.cancel?.(cx)));
       if(this.phase==="error"&&!this.stop)footer.child(this.button("machine-setup-check-again","Check again",cx=>cx.spawn(cx=>this.check(cx)),{primary:true}));

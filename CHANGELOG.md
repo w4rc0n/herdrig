@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.6
+
+- Overview keyboard navigation moves focus with the highlighted row. Enter and Space on another row leave settings alone; Tab lets you save again by keyboard, and Escape stays with an open edit, review or save.
+- Stop using a machine names which save needs checking. Try again finishes only Herdr's follow-up, leaves a newer choice alone, and focuses Done after recovery. Its hint distinguishes Use from Stop.
+- Machine setup and Stop using this machine work when the saved OpenRig address ends in a slash.
+- Archive distinguishes a completed or unconfirmed Pause from a later refusal. Actions refused before anything was sent say so.
+- If a launch or new rig may already have gone through, Check the rig list opens its Rig page without losing Back history. A command that could not start keeps its form available; uncertain outcomes are not offered again.
+- Model changes name the queue they reached. Interrupted multi-part answers name every recorded part, including when OpenRig reports an empty reason or an already-settled request.
+
+### Known issue
+
+Some other actions can still show a sidebar refresh error when the OpenRig sidebar is absent. Machine-choice recovery skips that optional refresh correctly.
+
 ## v0.4.5
 
 - After you change OpenRig's address, menus on rows still showing the old OpenRig refuse instead of acting on the new one.

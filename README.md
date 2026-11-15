@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.5
+Version: v0.4.6
 
 **OpenRig Mod for Herdr**
 

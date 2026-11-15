@@ -3405,6 +3405,11 @@ export function operationId(qitemId, revision, payload, step = 1) {
 /** Shown when `POST /api/mission-control/action` returns HTTP 401. */
 export const DECISION_TOKEN_PROTECTED = "This OpenRig protects decisions with a token; answer in the TUI's Feed (rig) or with rig queue resolve.";
 
+/** "Your earlier part (1 of 3) was" / "Your earlier parts (1 and 2 of 3) were": names every part that was recorded, not only the last one's number (cold-review #22). */
+const earlierParts = (done, total) => done === 1 ? `Your earlier part (1 of ${total}) was` : `Your earlier parts (${done === 2 ? "1 and 2" : `1 to ${done}`} of ${total}) were`;
+/** A message with the parts recorded before the failing one named (nothing added when none was recorded). */
+const withEarlierParts = (message, done, total) => (done > 0 ? `${/[.!?]$/.test(message) ? message : `${message}.`} ${earlierParts(done, total)} recorded.` : message); // daemon text with no full stop ("HTTP 502", "boom") gets one, so the parts sentence stands alone
+
 /** Shown when `POST /api/mission-control/action` fails due to a network error. */
 export const NETWORK_UNCONFIRMED_MESSAGE = "Not confirmed. It may have been recorded: check the request before sending again.";
 
@@ -3613,13 +3618,13 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         if (error.dispatched === true) {
           const later = steps.length - idx - 1;
           const lead = steps.length > 1 ? `Step ${stepNum} of ${steps.length} may have been recorded` : "It may have been recorded";
-          const earlier = idx > 0 ? ` Your earlier part (${idx} of ${steps.length}) was recorded.` : "";
+          const earlier = idx > 0 ? ` ${earlierParts(idx, steps.length)} recorded.` : "";
           const unsent = later > 0 ? ` The remaining part${later > 1 ? "s were" : " was"} not sent.` : "";
           const message = `${line} ${lead}: check this request again before answering.${earlier}${unsent}`;
           return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, unconfirmed: true, unconfirmedStep: stepNum, conflict: false, tokenProtected: false, partial: idx > 0,
             operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
         }
-        const went = idx > 0 ? ` Your earlier part (${idx} of ${steps.length}) was recorded; the rest was not sent.` : " Nothing was sent.";
+        const went = idx > 0 ? ` ${earlierParts(idx, steps.length)} recorded; the rest was not sent.` : " Nothing was sent.";
         const message = `${line}${went}`;
         return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, conflict: false, tokenProtected: false, partial: idx > 0,
           operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
@@ -3632,8 +3637,8 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         conflict: false,
         tokenProtected: false,
         operationHashPrefix: hashPrefix,
-        message: NETWORK_UNCONFIRMED_MESSAGE,
-        text: NETWORK_UNCONFIRMED_MESSAGE,
+        message: withEarlierParts(NETWORK_UNCONFIRMED_MESSAGE, idx, steps.length),
+        text: withEarlierParts(NETWORK_UNCONFIRMED_MESSAGE, idx, steps.length),
         committedQuestionIds,
         stepsCompleted: idx,
       };
@@ -3648,8 +3653,8 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         tokenProtected: true,
         conflict: false,
         operationHashPrefix: hashPrefix,
-        message: DECISION_TOKEN_PROTECTED,
-        text: DECISION_TOKEN_PROTECTED,
+        message: withEarlierParts(DECISION_TOKEN_PROTECTED, idx, steps.length),
+        text: withEarlierParts(DECISION_TOKEN_PROTECTED, idx, steps.length), // the card shows ONLY this sentence for a token refusal: it names the parts already recorded
         committedQuestionIds,
         stepsCompleted: idx,
       };
@@ -3660,7 +3665,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         const lastOpId = String(data?.lastAction?.auditNotes?.operationId ?? "");
         const partial = idx > 0 || Boolean(hashPrefix && lastOpId.startsWith(hashPrefix));
         const message = partial
-          ? "Your earlier part was recorded; choose the rest again."
+          ? (idx > 1 ? `${earlierParts(idx, steps.length)} recorded; choose the rest again.` : "Your earlier part was recorded; choose the rest again.") // one recorded part keeps the sentence it always had
           : "The request changed since you opened it. Here it is now.";
         return {
           ok: false,
@@ -3679,14 +3684,14 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
       }
       if (status === 409 && errCode === "qitem_already_terminal") {
         const settledState = String(data?.state ?? data?.currentState ?? "done");
-        const message = `This request was already settled: ${settledState}.`;
+        const message = withEarlierParts(`This request was already settled: ${settledState}.`, idx, steps.length); // parts recorded before it was settled are named too
         return {
           ok: false,
           status: 409,
           code: errCode,
           conflict: true,
           tokenProtected: false,
-          partial: false,
+          partial: idx > 0,
           operationHashPrefix: hashPrefix,
           message,
           text: message,
@@ -3695,7 +3700,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
           stepsCompleted: idx,
         };
       }
-      const message = String(data?.message ?? data?.error ?? res?.error ?? `HTTP ${status}`);
+      const message = withEarlierParts([data?.message, data?.error, res?.error].map((v) => String(v ?? "").trim()).find(Boolean) ?? `HTTP ${status}`, idx, steps.length); // an empty or blank body falls back to the HTTP status, never to ". Your earlier part..."
       return {
         ok: false,
         status,
