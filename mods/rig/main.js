@@ -379,6 +379,7 @@ export default class RigSidebar extends View {
     this.config = next;
     if (changed) {
       this.data = null; this.live = false; this.lists = {};
+      this.healthz = null; this.cliVersion = null; // the old daemon's health and version are not the new one's; a failed read of the new one leaves them unknown (routeHost's selfHostId too)
       setShared("rig.data", { topology: [], live: false, error: null, config: this.config });
       cx.notify();
     }

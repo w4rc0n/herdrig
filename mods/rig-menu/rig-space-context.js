@@ -1,3 +1,4 @@
+import { publishedUnder } from "./rig-gate.js";
 // Space identity and sidebar size state use public lists and labels, never display names.
 const qualifiedSpace = terminal => {
   const id = terminal?.labels?.["herdr.space"], address = String(terminal?.address ?? terminal?.terminal ?? "");
@@ -123,8 +124,10 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
  *  Attach and worker views all ask instead of making a second space). */
 export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl)=>`${rigName} already has a space on ${machine}, made with the address ${origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${daemonUrl}, so nothing new was opened. Close that space and open ${rigName} again, or set daemonUrl to ${origin??"that address"}.`;
 /** The rig the sidebar published (by id or name), for the sessions that vouch for a space of it; null when it isn't known. */
-export function topologyRig(host,refs){
-  const topology=host.topology?.()??host.shared?.("rig.data")?.topology??[];
+export function topologyRig(host,refs,config){
+  // The sidebar's rows vouch only for the daemon they were read from: the same gate as every other reader of `rig.data` (a refused list or no config reads nothing; other settings' rows are not used).
+  const published=host.topology?null:host.shared?.("rig.data");
+  const topology=host.topology?.()??(config&&!config.connectionsRefused&&publishedUnder(config,published)?published?.topology:null)??[];
   const wanted=(refs??[]).filter(Boolean);
   return topology.find(rig=>wanted.some(ref=>rig.id===ref||rig.name===ref))??null;
 }

@@ -92,6 +92,7 @@ export class ConfigPanel {
   }
   cancel(cx) { if(this.saving||this.model.busy)return;this.model.cancel();this.nextKey=null; this.releaseInputs(); cx.notify(); }
   keyDown(event,cx) {
+    if(event.key==="escape"&&this.more){cx.stop_propagation();this.more=null;cx.notify();return true;}
     if(event.key==="escape"&&(this.model.row||this.model.confirmation)) {
       cx.stop_propagation();if(this.saving||this.model.busy)return true;
       if(this.model.confirmation){this.model.cancelConfirmation();this.focusField(this.model.row?.key,cx);}else this.cancel(cx);cx.notify();return true;
@@ -254,14 +255,17 @@ export class ConfigPanel {
     if(event.is_held||this.keyboardLatches.get(id)===event.key)return;
     this.keyboardLatches.set(id,event.key);fn({},cx);
   }
-  focusControl(t,cx,id,child,fn,{disabled=false,handle,tabStop=true,onKey}={}){
+  focusControl(t,cx,id,child,fn,{disabled=false,handle,tabStop=true,onKey,writeActivation=true}={}){
     handle??=this.focusHandle(id,cx);
     if(!disabled&&tabStop)this.controlOrder?.push(handle);
     return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role('button')
       .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled&&tabStop).focus(el=>el.border_color(t.accent))
       .on_key_down((event,ctx)=>{
         if(onKey?.(event,ctx))return;
-        if(!disabled)this.keyboardAction(id,event,ctx,fn);
+        if(disabled)return;
+        // Reversible navigation does not share the persistent write latch.
+        if(!writeActivation){if(['enter','space',' '].includes(event.key)){ctx.stop_propagation();if(!event.is_held)fn({},ctx);}return;}
+        this.keyboardAction(id,event,ctx,fn);
       }).child(child);
   }
   tabControl(backward,cx){
@@ -298,7 +302,7 @@ export class ConfigPanel {
     if(!disabled)this.controlOrder?.push(handle);
     const model=this.model,review=model.confirmation,activation=key=>['enter','space',' '].includes(key);
     return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role('button')
-      .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled).focus(el=>el.border_color(t.accent))
+      .when(!!handle&&!disabled,el=>el.track_focus(handle)).tab_stop(!disabled).focus(el=>el.border_color(t.accent))
       // Cancel-first is the repeat safety boundary. This release gate is secondary; explicit Tab navigation arms it too.
       .on_key_up((event,cx)=>{if((activation(event.key)||event.key==='tab')&&this.model===model&&model.confirmation===review){cx.stop_propagation();this.releasedReviews.add(review);}})
       .on_key_down((event,cx)=>{if(activation(event.key)){cx.stop_propagation();if(!disabled&&!event.is_held&&this.model===model&&model.confirmation===review&&this.releasedReviews.has(review))fn({},cx);}})
@@ -421,7 +425,7 @@ export class ConfigPanel {
         }
         if(readOnly)line.child(svg(icon("rig-lock")).size(12).text_color(t.dim));
       }else line.child(this.control(t,cx));
-      if(!readOnly)line.child(this.action(t,cx,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();}));
+      if(!readOnly)line.child(this.action(t,cx,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();},{writeActivation:false}));
       row.child(line);
       if(writePause?.uncertain&&(editing||selected))row.child(div().id('config-row-write-paused').text_size(11.5).text_color(t.dim).child('Saving paused'));
       if(this.reconciledModel===m&&editing)row.child(div().id('config-reconciled-value').text_size(11.5).text_color(t.muted).child(`OpenRig currently reports: ${textValue(entry)} (${sourceName(entry)}).`));

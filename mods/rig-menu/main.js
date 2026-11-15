@@ -425,7 +425,7 @@ export default class RigMenu extends View {
 
   /** Archive, the reversible choice beside Delete: a running rig is paused first (`rig down`), then `rig archive`. */
   archive(cx, target) {
-    if (this.busy || target.rig === "kernel") return;
+    if (this.busy || target.rig === "kernel" || !this.reviewReady()) return;
     const reason = capabilityDisableReason("archive-rig", this.caps());
     if (reason) { this.result = { ok: false, kind: "archive", text: reason }; cx.notify(); return; }
     const running = this.rigRunning(target);
@@ -574,6 +574,13 @@ export default class RigMenu extends View {
     Promise.resolve(r).catch(sayRefusal).then(() => { this.pending = null; this.dismiss(); });
   }
 
+  /** A page-navigation choice: open the page, THEN close the popup (herdr drops a closed popup's runtime, and page() now reads the config first). One at a time. */
+  navigate(entry, cx) {
+    if (this.pending) return;
+    this.pending = "Opening";
+    Promise.resolve(page(entry)).catch(sayRefusal).then(() => { this.pending = null; this.dismiss(); });
+  }
+
   dismiss(discard = false) {
     this.cancelSpecPermission();
     if (discard) this.dropDraft(); else this.keepDraft();
@@ -678,6 +685,8 @@ export default class RigMenu extends View {
   }
 
   async loadPause(cx) {
+    this.pause = null; // A new review cannot reuse an earlier successful result while its read is pending.
+    cx.notify();
     cx.spawn(async (cx) => {
       const t = complete(props().target, this.config);
       // The confirmation shows the target's own daemon's seats (the write goes there too), never the default one's.
@@ -701,6 +710,8 @@ export default class RigMenu extends View {
   }
 
   caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
+
+  reviewReady() { return Number.isInteger(this.pause?.total) && this.pause.total >= 0 && !this.pause.error; }
 
   /** The actions offered for a target. Each has a vector icon (no font-dependent glyphs). */
   items(target) {
@@ -1066,7 +1077,7 @@ export default class RigMenu extends View {
         cx.stop_propagation();act(event,cx);
       };
     return div().id(`dialog-focus-${index}`).p(2).border(2).border_color('#00000000').rounded(8).flex_none()
-      .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled)
+      .when(!!handle&&!disabled,el=>el.track_focus(handle)).tab_stop(!disabled)
       .focus(el=>el.border_color(t.accent)).on_key_down(key)
       .child(element.on_click((event,cx)=>{if(!disabled)act(event,cx);}).on_key_down(key).when(content!==undefined,el=>el.child(content)));
   }
@@ -1096,12 +1107,12 @@ export default class RigMenu extends View {
       .when(!!this.handle,el=>el.track_focus(this.handle))
       .on_key_down((e,cx)=>{const choices=target.choices??[];if(!choices.length)return;
         if(e.key==="down"||e.key==="up"){this.navChoiceIndex=((this.navChoiceIndex??0)+(e.key==="down"?1:-1)+choices.length)%choices.length;cx.stop_propagation();cx.notify();}
-        else if(e.key==="enter"){cx.stop_propagation();page(choices[this.navChoiceIndex??0].entry);this.dismiss();}
+        else if(e.key==="enter"){cx.stop_propagation();this.navigate(choices[this.navChoiceIndex??0].entry,cx);}
         else if(e.key==="escape"){cx.stop_propagation();this.dismiss();}})
       .children((target.choices ?? []).map((choice,i) => h_flex().id(`page-navigation-${i}`).tab_stop(true).px(8).h(30).gap(12).items_center().rounded(5).cursor_pointer()
         .when(i===(this.navChoiceIndex??0),el=>el.bg(t.selection??t.hover)).hover(el => el.bg(t.hover))
-        .on_click(() => { page(choice.entry); this.dismiss(); })
-        .on_key_down((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();page(choice.entry);this.dismiss();}})
+        .on_click((_e,cx) => this.navigate(choice.entry,cx))
+        .on_key_down((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();this.navigate(choice.entry,cx);}})
         .child(div().flex_1().text_size(12.5).text_color(t.foreground).child(choice.label))
         .when(choice.count !== null && choice.count !== undefined, el => el.child(div().text_size(11.5).text_color(t.dim).child(String(choice.count))))));
     if (this.pending) return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
@@ -1213,6 +1224,7 @@ export default class RigMenu extends View {
     if (step.action === "pause" || step.action === "resume") {
       this.run(cx, "Re-reading the rig", async () => {
         const ps = await this.read(["ps", "--nodes", "--rig", target.rig]);
+        if (!Array.isArray(ps)) return { ok: false, text: "OpenRig couldn't read the rig's current agents. Nothing was run. Close this and open it again from the list." };
         const running = Array.isArray(ps) ? ps.filter((n) => n.sessionStatus === "running" || n.lifecycleState === "running").length : null;
         if (step.action === "pause" && running === 0) return { ok: true, text: `Already paused: no seat of ${target.rig} is running.` };
         if (step.action === "resume" && running !== null && Array.isArray(ps) && running === ps.length) return { ok: true, text: `Already running: every seat of ${target.rig} is up.` };
@@ -1227,7 +1239,7 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
-    if (step?.load === "pause" && this.pause?.error) return; // the review that this action asks the person to approve could not be read
+    if ((step?.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step?.action)) && !this.reviewReady()) return;
     const assistantReason=assistantActionRefusal(target,step.action);
     if(assistantReason){this.result={ok:false,text:assistantReason};cx.notify();return;}
     if(step.action==="confirm-spec-write"){
@@ -1871,7 +1883,8 @@ export default class RigMenu extends View {
             .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))))
           .child(div().text_color(t.dim).child("OpenRig snapshots first (best effort). Resume brings back each conversation where the harness allows."));
     } else if (step.action === "archive-rig" && !this.result && !this.busy) {
-      body = div().text_color(t.muted).child(this.rigRunning(target)
+      body = !this.pause ? div().text_color(t.muted).child("Reading the rig…") : this.pause.error ? div().text_color(t.blocked).child(this.pause.error)
+        : div().text_color(t.muted).child(this.rigRunning(target)
         ? `It pauses its agents${this.pause?.total != null ? ` (${this.pause.total})` : ""}, takes a snapshot first (best effort), and hides the rig from the list. Nothing is deleted. You can restore it any time from Archived.`
         : "It hides the stopped rig from the list. Nothing is deleted. You can restore it any time from Archived.");
     } else if (step.action === "delete-rig" && !this.result && !this.busy) {
@@ -1915,7 +1928,7 @@ export default class RigMenu extends View {
       : { pause: "Pause rig", resume: "Resume rig", fresh: "Start fresh", "design-view": "Open", send: "Send", queue: "Queue", reply: "Reply", "launch-spec": "Launch" }[step.action];
     const done = !!this.result?.ok;
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
-    const reviewFailed = step.load === "pause" && !!this.pause?.error; // the card could not read what it asks the person to approve: its action stays visible but disabled
+    const reviewFailed = (step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady(); // Loading and failed reviews both leave the visible action disabled.
     const canConfirm = !!confirmLabel && (step.action === "launch-spec" || step.action === "new-rig" || step.action === "design-view" || step.action === "change-model" ? !this.result?.ok : !this.result) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps()) : null;
     const mac = window()?.platform === "macos";

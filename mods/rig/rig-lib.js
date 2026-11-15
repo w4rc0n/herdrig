@@ -5,7 +5,7 @@
 import { attachRemoteSeat } from "./rig-remote-attach.js";
 import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
-import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING } from "./rig-gate.js";
+import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publishedUnder } from "./rig-gate.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
 import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, CONNECTIONS_LIST_REFUSED, CONNECTIONS_LIST_SUPPORTED } from "./rig-connections.js";
@@ -1005,7 +1005,7 @@ export function preserveCliDiscoveredConfig(next, prev) {
  *  list has NO address and gets none from here: a sidebar that ran before the list was added left one behind, and clears it only when its own refresh
  *  runs. Every reader of that shared address goes through this. */
 export function sharedLoopbackDaemonUrl(config, published) {
-  if (config?.connectionsRefused) return null;
+  if (config?.connectionsRefused || !publishedUnder(config, published)) return null; // another home's, machine's or connection's address is not this reader's
   const url = published?.config?.daemonUrl;
   return url && isLoopbackDaemonUrl(url) ? url : null;
 }
@@ -1014,7 +1014,9 @@ export function sharedLoopbackDaemonUrl(config, published) {
  *  reader of the shared rows goes through this (`undefined` reads like a sidebar that has published nothing). */
 export function sharedRigData(config, shared) {
   // No config yet (a mod's first moments, before it has read config.json) cannot rule a refused list out, so it reads nothing either.
-  return !config || config.connectionsRefused ? undefined : shared("rig.data");
+  if (!config || config.connectionsRefused) return undefined;
+  const published = shared("rig.data");
+  return published && !publishedUnder(config, published) ? undefined : published; // rows published under other settings are not this reader's (it falls back to its own reads)
 }
 /** Why the CLI must not run for this config, or null. A connection other than the legacy one authenticates from its OpenRig home alone (the
  *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
@@ -3605,9 +3607,20 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
       res = await runReq(req);
     } catch (error) {
       if (error?.code === "GATE_REFUSED") {
-        // The settings changed (or a connections list arrived) between steps: nothing more is sent. Say which steps went and which did not; this is NOT an unconfirmed network error.
+        // The settings changed (or a connections list arrived). Raised BEFORE the step left, it is known unsent; raised AFTER (its answer, or its failure, came under settings that are gone) the
+        // daemon may have recorded it: that step is UNCONFIRMED and the item must be read again. Only the steps that never left are said to be unsent. This is NOT a network error.
+        const line = String(error.message).trimEnd();
+        if (error.dispatched === true) {
+          const later = steps.length - idx - 1;
+          const lead = steps.length > 1 ? `Step ${stepNum} of ${steps.length} may have been recorded` : "It may have been recorded";
+          const earlier = idx > 0 ? ` Your earlier part (${idx} of ${steps.length}) was recorded.` : "";
+          const unsent = later > 0 ? ` The remaining part${later > 1 ? "s were" : " was"} not sent.` : "";
+          const message = `${line} ${lead}: check this request again before answering.${earlier}${unsent}`;
+          return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, unconfirmed: true, unconfirmedStep: stepNum, conflict: false, tokenProtected: false, partial: idx > 0,
+            operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
+        }
         const went = idx > 0 ? ` Your earlier part (${idx} of ${steps.length}) was recorded; the rest was not sent.` : " Nothing was sent.";
-        const message = `${String(error.message).trimEnd()}${went}`;
+        const message = `${line}${went}`;
         return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, conflict: false, tokenProtected: false, partial: idx > 0,
           operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
       }

@@ -10,7 +10,7 @@ import { View, div } from "gpui-kit";
 import { effectiveScopeProject } from './rig-project.js';
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
 import { appHome, readTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, openOverlay as rawOpenOverlay, props, closeOverlay, spaces, panes, terminals, hc as rawHc, layout, notify } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal, gateSameConfig, CONFIG_CHANGED } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 const fetch = gatedFetch;
 const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
@@ -270,36 +270,41 @@ export default class RigPalette extends View {
     if (this.own(cx, line)) return;
     this.busy = true; this.error = null; this.note = null; cx.notify();
     cx.spawn(async (cx) => {
-      let res = null;
-      if (this.caps().tuiResolve === false) {
-        res = resolveTuiLineFallback(line);
-        this.busy = false;
-        if (!res) { this.note = `No matches for “${line.trim()}”. Try a section name or choose a result above.`; cx.notify(); return; }
-      } else {
-        const r = await exec(...this.cli(["tui", "resolve", ...line.trim().split(/\s+/), "--json"]));
-        try { res = JSON.parse(r.stdout); } catch (_) { res = null; }
-        this.busy = false;
-        if (!res || typeof res.kind !== "string") {
-          const errText = String(res?.error?.message ?? res?.error ?? (r.stderr || r.stdout || "rig tui resolve gave no answer")).trim();
-          if (/(unknown command|too many arguments|unknown option)/i.test(errText)) {
-            res = resolveTuiLineFallback(line);
-            if (!res) { this.note = `No matches for “${line.trim()}”. Try a section name or choose a result above.`; cx.notify(); return; }
-          } else {
-            this.error = errText; cx.notify(); return;
+      try {
+        let res = null;
+        if (this.caps().tuiResolve === false) {
+          res = resolveTuiLineFallback(line);
+          this.busy = false;
+          if (!res) { this.note = `No matches for “${line.trim()}”. Try a section name or choose a result above.`; cx.notify(); return; }
+        } else {
+          const r = await exec(...this.cli(["tui", "resolve", ...line.trim().split(/\s+/), "--json"]));
+          try { res = JSON.parse(r.stdout); } catch (_) { res = null; }
+          this.busy = false;
+          if (!res || typeof res.kind !== "string") {
+            const errText = String(res?.error?.message ?? res?.error ?? (r.stderr || r.stdout || "rig tui resolve gave no answer")).trim();
+            if (/(unknown command|too many arguments|unknown option)/i.test(errText)) {
+              res = resolveTuiLineFallback(line);
+              if (!res) { this.note = `No matches for “${line.trim()}”. Try a section name or choose a result above.`; cx.notify(); return; }
+            } else {
+              this.error = errText; cx.notify(); return;
+            }
           }
         }
+        if (res.kind === "error") { this.error = res.message; cx.notify(); return; }
+        if (res.kind === "local" || res.kind === "noop") { this.error = `"${line}" is a TUI control; it does nothing here.`; cx.notify(); return; }
+        if (!res.action || typeof res.action.type !== "string") { this.error = `rig tui resolve answered "${res.kind}" without saying what to do; is this the OpenRig that installed the Rig mods?`; cx.notify(); return; }
+        const nav = shared("rig.nav") ?? { stack: [] };
+        const top = nav.stack?.at(-1) ?? { section: "topology" };
+        const route = paletteRoute({ ...res, line }, top, sharedRigData(this.config, shared)?.topology ?? []);
+        if (route.error) { this.error = route.error; cx.notify(); return; }
+        if (route.note) { this.note = route.note; cx.notify(); return; }
+        if (route.back) { setShared("rig.nav", navBack(nav)); this.finishPage(openOrFocusRigTab({run,spaces,panes,layout})); return; }
+        if (route.act) { await this.act(cx, route, top); return; }
+        this.applyRoute(route);
+      } catch (error) {
+        // A gate refusal (the settings changed while the CLI ran) is intentional; it ends the wait and says so instead of leaving the palette busy.
+        this.busy = false; this.error = String(error?.message ?? error); cx.notify();
       }
-      if (res.kind === "error") { this.error = res.message; cx.notify(); return; }
-      if (res.kind === "local" || res.kind === "noop") { this.error = `"${line}" is a TUI control; it does nothing here.`; cx.notify(); return; }
-      if (!res.action || typeof res.action.type !== "string") { this.error = `rig tui resolve answered "${res.kind}" without saying what to do; is this the OpenRig that installed the Rig mods?`; cx.notify(); return; }
-      const nav = shared("rig.nav") ?? { stack: [] };
-      const top = nav.stack?.at(-1) ?? { section: "topology" };
-      const route = paletteRoute({ ...res, line }, top, sharedRigData(this.config, shared)?.topology ?? []);
-      if (route.error) { this.error = route.error; cx.notify(); return; }
-      if (route.note) { this.note = route.note; cx.notify(); return; }
-      if (route.back) { setShared("rig.nav", navBack(nav)); this.finishPage(openOrFocusRigTab({run,spaces,panes,layout})); return; }
-      if (route.act) { await this.act(cx, route, top); return; }
-      this.applyRoute(route);
     });
   }
 
@@ -381,9 +386,12 @@ export default class RigPalette extends View {
       this.config = { ...this.config, daemonUrl: fromShared, daemonUrlSource: "cli" };
       return fromShared;
     }
+    const askedUnder = this.config;
     const status = await discoverDaemonFromCli(this.config, exec);
     // The config can turn refused while the CLI answers (a list added meanwhile): the answer is for the config that asked, so it is dropped.
     if (this.config?.connectionsRefused) throw new Error(this.config.connectionsRefused);
+    // And a config of another identity (another home, machine or address) must not be given this config's answer.
+    if (!gateSameConfig(this.config, askedUnder)) throw new Error(CONFIG_CHANGED);
     if (status.reachable && status.daemonUrl) {
       this.config = { ...this.config, daemonUrl: status.daemonUrl, daemonUrlSource: "cli" };
       return status.daemonUrl;
