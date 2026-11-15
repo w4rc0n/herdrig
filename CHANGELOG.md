@@ -3,6 +3,9 @@
 ## v0.4.5
 
 - After you change OpenRig's address, menus on rows still showing the old OpenRig refuse instead of acting on the new one.
+- Pause, Archive and Delete wait until OpenRig shows the agents affected. If that review fails, nothing runs. Pause and Resume also stop a retry if their current agents cannot be checked.
+- Enter opens and closes a settings row menu; Esc closes it too. Holding a setting's activation key still saves only once until you move away and back.
+- Menu navigation waits until the page opens. If settings change after an action was sent, the result warns that it may have been recorded and asks you to check again.
 - Settings keyboard help now names the ways out: Esc leaves the list and Ctrl+Tab switches tabs. Tab and Shift+Tab currently keep focus at the list edges.
 - Every setting can be changed with the keyboard: Tab to it, then Space or Enter. Controls show their focus; Left and Right move between enum choices without wrapping.
 - A multi-part answer that spans a settings change stops honestly and says which part was recorded.
@@ -21,7 +24,6 @@
 - Confirm setting changes beside the value you edited, with Cancel focused first. Saves show when they are still being checked, then offer Undo for a full ten seconds.
 - Click a setting to edit it, then press Enter or Tab or click away to save. Esc restores the old value; invalid text stays open. Undo restores your previous setting for ten seconds after checking for changes elsewhere. Consequential changes still ask first.
 - See connected assistants under each rig and in All seats, with their check-in status. Queue work to them, copy their address, or read their queued work without mistaking them for terminal seats.
-
 - Settings use the controls and limits OpenRig reports, while older versions keep their existing controls. New settings ask for confirmation before saving. Empty fields show an error only after you edit them.
 - Ctrl+Enter saves a spec without adding a blank line or indentation to its file; intentional blank lines stay intact.
 - A quiet OpenRig keeps its live connection instead of repeatedly reloading the sidebar. A stream that stops answering still reconnects.

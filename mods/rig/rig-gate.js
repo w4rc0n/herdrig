@@ -21,7 +21,9 @@ export const CONFIG_CHANGED_OPEN = "OpenRig's settings changed while this was op
 export const CONFIG_CHANGED = "OpenRig's settings changed while this was running, so its answer was not used.";
 
 export class GateRefusal extends Error {
-  constructor(message) { super(message); this.name = "GateRefusal"; this.code = "GATE_REFUSED"; }
+  /** `dispatched`: the refusal was raised AFTER the request, process or command had left (its answer came back, or failed, under settings that are gone). The daemon may have acted;
+   *  a caller must not say "nothing was sent" for it. A refusal that stopped the send first leaves it false. */
+  constructor(message, { dispatched = false } = {}) { super(message); this.name = "GateRefusal"; this.code = "GATE_REFUSED"; this.dispatched = dispatched; }
 }
 
 /** Commands that are not the OpenRig CLI and talk to no daemon: local read utilities a refused or unloaded config may still run. Everything else
@@ -65,9 +67,20 @@ export function gateRefusal() {
   if (current.connectionsRefused) return current.connectionsRefused;
   return null;
 }
+/** Whether rows or an address another mod published (`rig.data`) belong to the reader's settings: the same connection (when the publisher names one: the sidebar always does), machine and OpenRig home, and (when both name one) the same address. A reader that has
+ *  no address yet (the CLI has not found it) reads its home's rows; a publication that carries no config is not judged (nothing to compare). */
+export function publishedUnder(config, published) {
+  const p = published?.config;
+  if (!p) return true;
+  const n = (v) => v ?? null;
+  if ((p.connectionId && n(config?.connectionId) !== p.connectionId) || n(config?.daemonMachine) !== n(p.daemonMachine) || n(config?.openrigHome) !== n(p.openrigHome)) return false;
+  return !(config?.daemonUrl && p.daemonUrl && config.daemonUrl !== p.daemonUrl);
+}
 const refuse = () => { const reason = gateRefusal(); if (reason) throw new GateRefusal(reason); };
 // After an await: the answer belongs to the config it was asked under.
 const stillCurrent = (started) => { refuse(); if (started !== generation) throw new GateRefusal(CONFIG_CHANGED); };
+// The same check AFTER the thing was sent: its refusal says so (the outcome is unconfirmed, not "not sent").
+const stillCurrentAfterSend = (started) => { try { stillCurrent(started); } catch (error) { if (error instanceof GateRefusal) error.dispatched = true; throw error; } };
 
 const basename = (command) => String(command ?? "").split("/").pop();
 
@@ -81,16 +94,16 @@ export async function gatedFetch(url, init, since) {
   let response;
   // A request that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error.
   try { response = await globalThis.fetch(url, init); }
-  catch (error) { stillCurrent(started); throw error; }
-  stillCurrent(started);
+  catch (error) { stillCurrentAfterSend(started); throw error; }
+  stillCurrentAfterSend(started);
   return new Proxy(response, {
     get(target, prop) {
       if (prop === "json" || prop === "text" || prop === "arrayBuffer" || prop === "blob") {
         return async (...args) => {
           let value;
           try { value = await target[prop](...args); }
-          catch (error) { stillCurrent(started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
-          stillCurrent(started);
+          catch (error) { stillCurrentAfterSend(started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
+          stillCurrentAfterSend(started);
           return value;
         };
       }
@@ -109,8 +122,8 @@ export async function gatedExec(rawExec, command, args, options, since) {
   // A process that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error it could
   // read as "that command does not work, use the default".
   try { result = await rawExec(command, args, options); }
-  catch (error) { if (!local) stillCurrent(started); throw error; }
-  if (!local) stillCurrent(started);
+  catch (error) { if (!local) stillCurrentAfterSend(started); throw error; }
+  if (!local) stillCurrentAfterSend(started);
   return result;
 }
 
@@ -125,10 +138,10 @@ export async function gatedHc(rawHc, args, bytes, since) {
   const started = since ?? generation;
   let result;
   try { result = await rawHc(args, bytes); }
-  catch (error) { stillCurrent(started); throw error; }
+  catch (error) { stillCurrentAfterSend(started); throw error; }
   // The process was started under the config that is gone. It cannot be un-started, but nothing may ACT on it (select its tab, label it, report
   // success): the caller gets the refusal, as for every other gated sink.
-  stillCurrent(started);
+  stillCurrentAfterSend(started);
   return result;
 }
 

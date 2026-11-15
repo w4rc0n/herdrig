@@ -32,7 +32,7 @@ export class MachineSetupPanel {
   }
   button(id,text,callback,{disabled=false,primary=false}={}){
     return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role("button").tab_stop(!disabled)
-      .when(!!(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle),el=>el.track_focus(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle))
+      .when(!disabled&&!!(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle),el=>el.track_focus(id==='machine-setup-cancel'?this.cancelHandle:this.primaryHandle))
       .focus(el=>el.border_color(this.theme.accent))
       .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}})
       .child(div().id(id).px(10).py(6).rounded(5)
