@@ -20,6 +20,14 @@ export class ConfigPanel {
   get saving(){return this.saves.has(this.identity());}
   origin() { return this.page.config?.daemonUrl ?? ""; }
   identity() { return JSON.stringify([this.origin(),this.page.config?.daemonMachine??null,this.page.config?.connectionId??null]); }
+  hasFocus() { return Boolean(this.focusedField||[...(this.controlOrder??[]),...(this.controlHandles?.values()??[])].some(handle=>handle?.is_focused?.())); }
+  selectRow(key,cx) {
+    this.selected=key;this.selectedScope=this.page.settingsScope;this.page.pageSel=null;
+    if(cx){this.keyboardLatches?.delete(`config-toggle-${key}`);this.focusHandle(`config-row-${key}`,cx)?.focus();}
+  }
+  clearSelection() { this.selected=null;this.selectedScope=null; }
+  hasSelection() { return Boolean(this.selected&&this.selectedScope===this.page.settingsScope&&this.controlHandles?.get(`config-row-${this.selected}`)?.is_focused?.()); }
+  ownsEscape() { return Boolean(this.more||this.model.row||this.model.confirmation||this.saving||this.model.busy); }
   daemonName() { return this.page.config?.daemonMachine || `the OpenRig at ${this.origin().replace(/^https?:\/\//,"")}`; }
   definition(entry) {
     const def=configDefinition(entry);
@@ -32,7 +40,7 @@ export class ConfigPanel {
   releaseInputs() { this.blurGeneration=(this.blurGeneration??0)+1;if(this.focusedField)this.page.typing=false;this.focusedField=null;for (const input of Object.values(this.inputs)) input.release?.(); this.inputs = {}; this.dropdown=null; this.selectHandles={}; }
   sync(origin, browser, probe) {
     const identity=this.identity();
-    if (this.boundIdentity !== identity) { this.releaseInputs(); this.model = new ConfigEditor(identity); this.boundOrigin = origin;this.boundIdentity=identity;this.nextKey=null; }
+    if (this.boundIdentity !== identity) { this.releaseInputs(); this.selected=null;this.model = new ConfigEditor(identity); this.boundOrigin = origin;this.boundIdentity=identity;this.nextKey=null; }
     this.model.observe(browser);
     if(configWriteState(identity)?.uncertain){this.model.results.clear();this.model.latestReceipt=null;this.model.lastSavedText=null;}
     const editingKeys=this.model.row?.keys??this.model.confirmation?.changes.map(([key])=>key)??[];
@@ -41,7 +49,7 @@ export class ConfigPanel {
     }
     this.detected = !probe?.error && Object.hasOwn(probe?.data ?? {}, "value") && ["file","env","default"].includes(probe?.data?.source);
   }
-  open(key, cx) {
+  open(key, cx, focus=true) {
     if(this.pauseWrites(cx))return;
     if (!this.detected || this.definition(this.model.entry(key)).readOnly) return;
     if(this.saving||this.model.busy){if(this.model.row?.key!==key)this.nextKey=key;return;}
@@ -72,12 +80,12 @@ export class ConfigPanel {
       input.on('blur',(_e,cx)=>{if(!current())return;if(this.focusedField===field){this.focusedField=null;this.page.typing=false;}this.deferBlur(cx);});
       this.inputs[field] = input;
     }
-    this.editorHandle??=cx.focus_handle();this.focusField(key,cx,true);cx.notify();
+    if(focus){this.editorHandle??=cx.focus_handle();this.focusField(key,cx,true);}cx.notify();
   }
   focusField(key,cx,select=false) {
     const input=this.inputs[key]??Object.values(this.inputs)[0],row=this.model.row,generation=this.blurGeneration;
-    const focus=()=>{if(this.model.row!==row||!row||this.blurGeneration!==generation)return;input?.focus();if(select&&input)input.set_selected_range({start:0,end:String(input.value()??'').length});if(!input){const def=configDefinition(this.model.entry(key)),value=row.values[key],choice=def.choices?.[Math.max(0,def.choices.indexOf(value))]??value;(this.selectHandles[key]?.trigger??this.focusHandle(`config-choice-${key}-${choice||'unset'}`,cx))?.focus();}};
-    focus();cx.timer?.after(0,next=>{focus();next.notify();});
+    const focus=(context)=>{if(this.model.row!==row||!row||this.blurGeneration!==generation)return;input?.focus();if(select&&input)input.set_selected_range({start:0,end:String(input.value()??'').length});if(!input){const def=configDefinition(this.model.entry(key)),value=row.values[key],choice=def.choices?.[Math.max(0,def.choices.indexOf(value))]??value;(this.selectHandles[key]?.trigger??this.focusHandle(`config-choice-${key}-${choice||'unset'}`,context))?.focus();}};
+    focus(cx);cx.timer?.after(0,next=>{focus(next);next.notify();});
   }
   deferBlur(cx) {
     const row=this.model.row,generation=this.blurGeneration;
@@ -93,11 +101,11 @@ export class ConfigPanel {
   cancel(cx) { if(this.saving||this.model.busy)return;this.model.cancel();this.nextKey=null; this.releaseInputs(); cx.notify(); }
   keyDown(event,cx) {
     if(event.key==="escape"&&this.more){cx.stop_propagation();this.more=null;cx.notify();return true;}
-    if(event.key==="escape"&&(this.model.row||this.model.confirmation)) {
+    if(event.key==="escape"&&(this.model.row||this.model.confirmation||this.saving||this.model.busy)) {
       cx.stop_propagation();if(this.saving||this.model.busy)return true;
       if(this.model.confirmation){this.model.cancelConfirmation();this.focusField(this.model.row?.key,cx);}else this.cancel(cx);cx.notify();return true;
     }
-    if(["enter","space"," "].includes(event.key)&&this.selected&&!this.model.row&&!this.model.confirmation) {
+    if(["enter","space"," "].includes(event.key)&&this.hasSelection()&&!this.model.row&&!this.model.confirmation) {
       cx.stop_propagation();this.keyboardAction(`config-toggle-${this.selected}`,event,cx,()=>this.activate(this.model.entry(this.selected),cx));return true;
     }
     return false;
@@ -218,9 +226,11 @@ export class ConfigPanel {
     if(this.model.row.error){this.focusField(this.model.row.key,cx);cx.notify();return false;}
     this.execute(cx,pending);return !this.model.confirmation;
   }
-  activate(entry,cx){if(!entry||this.definition(entry).readOnly)return;this.selected=entry.key;if(configDefinition(entry).type==='bool')this.toggle(entry,cx);else this.open(entry.key,cx);}
+  activate(entry,cx){if(!entry||this.definition(entry).readOnly)return;this.selectRow(entry.key);if(configDefinition(entry).type==='bool')this.toggle(entry,cx);else this.open(entry.key,cx);}
   choose(field,value,cx){this.model.change(field,value);this.dropdown=null;this.save(cx);}
-  toggle(entry, cx) { this.open(entry.key,cx);if(this.model.row?.keys.includes(entry.key)&&!this.saving){this.model.change(entry.key,entry.value === true || entry.value === "true" ? "false" : "true");this.save(cx);} }
+  // A bool commits immediately: focusing its transient choice would leave native focus
+  // on a removed control after save, outside the card's Tab context. Keep the row/control.
+  toggle(entry, cx) { this.open(entry.key,cx,false);if(this.model.row?.keys.includes(entry.key)&&!this.saving){this.model.change(entry.key,entry.value === true || entry.value === "true" ? "false" : "true");this.save(cx);} }
   reset(entry, cx) {
     this.more=null;if(this.saving||this.model.busy)return;
     if(this.pauseWrites(cx))return;
@@ -393,11 +403,13 @@ export class ConfigPanel {
       if(paired && pair)continue;if(paired)pair=true;
       const key=entry.key, editing=m.row?.keys.includes(key), selected=this.selected===key;
       const reviewing=m.confirmation?.changes.some(([field])=>field===key||(paired&&[PRESSURE_WARNING,PRESSURE_CRITICAL].includes(field)));
+      const rowHandle=this.focusHandle(`config-row-${key}`,cx);
       const row=v_flex().id(`config-row-${key}`).p(8).gap(5).rounded(6)
+        .when(!!rowHandle,el=>el.track_focus(rowHandle)).tab_stop(false)
         .when(editing,el=>el.bg(t.raised)).when(selected,el=>el.border_l(2).border_color(t.accent))
-        .on_click((_event,ctx)=>{this.selected=key;ctx.notify();})
+        .on_click((_event,ctx)=>{this.selectRow(key,ctx);ctx.notify();})
         .on_key_down((event,ctx)=>{if(event.key==="escape"&&editing){ctx.stop_propagation();this.cancel(ctx);}
-          else if(['enter','space',' '].includes(event.key)&&selected&&!readOnly&&!editing){ctx.stop_propagation();this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>this.activate(entry,ctx));}});
+          else if(['enter','space',' '].includes(event.key)&&selected&&this.hasSelection()&&!readOnly&&!editing){ctx.stop_propagation();this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>this.activate(entry,ctx));}});
       const line=h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).text_size(12).font_family("monospace").child(paired?"health.context_pressure · warning / critical":key))
         .child(this.page.copyButton(t,key,`config-key-${key}`,"setting key"))
@@ -419,7 +431,7 @@ export class ConfigPanel {
         else {
           const value=div().id(`config-value-${key}`).max_w(340).min_w(80).px(5).py(2).rounded(4).border_1().border_color('#00000000')
             .hover(s=>s.border_color(t.border)).cursor_text().truncate().text_size(12).text_color(t.foreground).tooltip(valueLabel)
-            .on_click((_e,ctx)=>{ctx.stop_propagation();this.selected=key;this.open(key,ctx);})
+            .on_click((_e,ctx)=>{ctx.stop_propagation();this.selectRow(key,ctx);this.open(key,ctx);})
             .on_key_down((event,ctx)=>{if(['enter','space',' '].includes(event.key)){ctx.stop_propagation();this.activate(entry,ctx);}}).child(valueLabel);
           line.child(this.focusControl(t,cx,`config-value-${key}`,value,(_e,ctx)=>this.activate(entry,ctx)));
         }

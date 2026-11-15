@@ -26,7 +26,7 @@ import { rigOrigin } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { appHome, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines, commands } from "herdr";
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, gateSameConfig, CONFIG_CHANGED_OPEN, GateRefusal, gatedOperation } from "./rig-gate.js";
 // A gate refusal is the answer, not a failure to swallow: the person is told it before the menu closes.
 const sayRefusal = (error) => { if (error?.code === "GATE_REFUSED") notify({ title: "OpenRig", body: error.message, level: "warning" }); };
@@ -65,6 +65,10 @@ const page = async (entry) => {
 };
 /** A one-click action's dialog: the title, a two-line error and its hint, Retry and the footer fit unclipped. */
 const RESULT_HEIGHT = 240;
+/** What a shell or launcher prints when it could not find or run the command (exit 127 or 126): nothing ran. */
+const LAUNCHER_COULD_NOT_RUN = /not found|no such file|permission denied|cannot execute|not executable/i;
+/** The host's own wording when its exec timeout ended the child (herdr-app src/mods.rs): the child started and was stopped, so what it was doing may have finished. */
+const HOST_STOPPED_CHILD = /took longer than [\d.]+ s( on .+)? and was stopped/;
 /** Writes that may have arrived even when they failed (a timeout), or whose form stays on screen: never resent via Retry. */
 const RESEND_UNSAFE = new Set(["send", "queue", "reply", "launch-spec", "change-model", "new-rig"]);
 /** Reopens this mod as a dialog for a step (input, confirm, result). A click beside it closes it. */
@@ -241,7 +245,7 @@ export default class RigMenu extends View {
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         this.setupPanel=new MachineSetupPanel(this.machineSetupHost(cx),this.config,step.machine??step.confirmation?.machine,{
           mono:settings()?.font_family??"monospace",copyIcon:icon("rig-copy"),stop:step.action==="stop-machine",
-          cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,
+          cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,retryHandle:cx.focus_handle?.(),
           copyHandles:Object.fromEntries(['Folder','SHA-256','Command'].map(label=>[label,cx.focus_handle?.()])),
           cancel:()=>this.dismiss(),done:(_cx,result)=>{
             if(step.token){setShared("rig.machineConfirmation",step.token);run("rig.confirm-machine");}
@@ -427,14 +431,18 @@ export default class RigMenu extends View {
   archive(cx, target) {
     if (this.busy || target.rig === "kernel" || !this.reviewReady()) return;
     const reason = capabilityDisableReason("archive-rig", this.caps());
-    if (reason) { this.result = { ok: false, kind: "archive", text: reason }; cx.notify(); return; }
+    if (reason) { this.result = { ok: false, notSent: true, kind: "archive", text: reason }; cx.notify(); return; } // refused before anything was sent
     const running = this.rigRunning(target);
     this.run(cx, running ? `Pausing and archiving ${target.rig}` : `Archiving ${target.rig}`, async () => {
       let paused = null;
       if (running) {
         const d = await this.write(this.argsFor(target, "pause"));
         paused = d.json && "sessionsKilled" in d.json ? pauseOutcome(d.json) : null;
-        if (!d.ok && !paused?.ok) return { ok: false, kind: "archive", paused, text: `${target.rig} wasn't paused, so it wasn't archived: ${d.text || "the CLI gave no reason."}` };
+        if (!d.ok && !paused?.ok) {
+          // The host stopped the pause at its timeout (or it was killed): it may have paused, so never say it wasn't.
+          if (d.uncertain) return { ok: false, uncertain: true, kind: "archive", paused, text: `${target.rig} may have been paused (OpenRig didn't answer in time), and it wasn't archived. Check the rig list before trying again.` };
+          return { ok: false, kind: "archive", paused, text: `${target.rig} wasn't paused, so it wasn't archived: ${d.text || "the CLI gave no reason."}` };
+        }
       }
       const a = await this.write(this.argsFor(target, "archive-rig"));
       if (a.ok) {
@@ -445,6 +453,8 @@ export default class RigMenu extends View {
         }
         run("rig.refresh");
       }
+      // The pause already ran: whatever stopped the archive, "Nothing was sent." would be false, so the result says the pause ran and the archive did not.
+      if (running && !a.ok) { const { notSent, ...rest } = a; return { ...rest, kind: "archive", paused, text: `${target.rig} was paused, but it wasn't archived: ${a.text || "the CLI gave no reason."}` }; }
       return { ...a, kind: "archive", paused };
     });
   }
@@ -452,7 +462,7 @@ export default class RigMenu extends View {
   /** Undo an archive: `rig unarchive`. */
   unarchive(cx, target) {
     const reason = capabilityDisableReason("unarchive-rig", this.caps());
-    if (reason) { this.result = { ok: false, kind: "unarchive", text: reason }; cx.notify(); return; }
+    if (reason) { this.result = { ok: false, notSent: true, kind: "unarchive", text: reason }; cx.notify(); return; } // refused before anything was sent
     this.run(cx, `Bringing ${target.rig} back`, async () => {
       const r = await this.write(this.argsFor(target, "unarchive-rig"));
       if (r.ok) { run("rig.refresh"); notify({ title: `${target.rig} restored. It's stopped; Resume it from its row.`, level: "info" }); }
@@ -630,29 +640,38 @@ export default class RigMenu extends View {
     return this.config ?? configNow();
   }
 
-  /** Runs one CLI write as the person; returns { ok, json, text }. */
+  /** Runs one CLI write as the person; returns { ok, json, text, warning }, plus `uncertain: true` on a failure where the CLI may have run to the end without us hearing (the host stopped it at its timeout, or it was killed: launch and new rig never offer a second run after one), plus `notSent: true` on every refusal that happened BEFORE anything was sent (the footer then says nothing was sent instead of "may still have been delivered"). */
   async write(args, options, cx) {
-    if (!args) return { ok: false, text: ACTION_REFUSED };
+    if (!args) return { ok: false, notSent: true, text: ACTION_REFUSED };
     const fresh = await freshFileConfig();
-    if (fresh.connectionsRefused) return { ok: false, text: fresh.connectionsRefused }; // a list installed while this dialog was open
-    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return { ok: false, text: CONFIG_CHANGED_OPEN }; // the connection below is the one this dialog opened on
+    if (fresh.connectionsRefused) return { ok: false, notSent: true, text: fresh.connectionsRefused }; // a list installed while this dialog was open
+    if (this.openedOn && !sameDialogConfig(this.openedOn, fresh)) return { ok: false, notSent: true, text: CONFIG_CHANGED_OPEN }; // the connection below is the one this dialog opened on
     const staleRows = rowsPublishedUnder(props()?.target, fresh);
-    if (staleRows) return { ok: false, text: staleRows }; // the row is from the old address, the connection below would resolve it to the new one
+    if (staleRows) return { ok: false, notSent: true, text: staleRows }; // the row is from the old address, the connection below would resolve it to the new one
     // The connection is the target's own, from the row it came from: never a default. Without one nothing is sent.
     const conn = targetConnection(this.config, props()?.target);
-    if (!conn.ok) return { ok: false, text: conn.reason };
+    if (!conn.ok) return { ok: false, notSent: true, text: conn.reason };
     const target=props()?.target;
     if(target?.kind==='assistant'){
-      if(args[0]!=='queue'||args[1]!=='create'||args[args.indexOf('--destination')+1]!==target.session)return{ok:false,text:'Connected assistants only accept queued work.'};
-      const verified=await verifyAssistantTarget(fetch,conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done):null);if(!verified.ok)return{ok:false,text:verified.reason};
+      if(args[0]!=='queue'||args[1]!=='create'||args[args.indexOf('--destination')+1]!==target.session)return{ok:false,notSent:true,text:'Connected assistants only accept queued work.'};
+      const verified=await verifyAssistantTarget(fetch,conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done):null);if(!verified.ok)return{ok:false,notSent:true,text:verified.reason};
       // The roster await can outlive a config-file edit; observing it here also updates the send gate.
       const afterVerify=await freshFileConfig();
-      if(afterVerify.connectionsRefused)return{ok:false,text:afterVerify.connectionsRefused};
-      if(!sameDialogConfig(this.openedOn??fresh,afterVerify))return{ok:false,text:CONFIG_CHANGED_OPEN};
+      if(afterVerify.connectionsRefused)return{ok:false,notSent:true,text:afterVerify.connectionsRefused};
+      if(!sameDialogConfig(this.openedOn??fresh,afterVerify))return{ok:false,notSent:true,text:CONFIG_CHANGED_OPEN};
     }
     const cmd = writeCommand(conn.config, args, options);
-    if (!cmd) return { ok: false, text: NO_PERSON };
-    return writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
+    if (!cmd) return { ok: false, notSent: true, text: NO_PERSON };
+    // Uncertain = the CLI may have run to the end without us hearing. Only what the HOST reports says so: its exec rejects with "<cmd> took longer than N s and was stopped" when its own timeout ends the child, and
+    // reports code -1 for a child killed by a signal (or a remote result with no code). A message the CLI printed is not evidence about whether it left. A host that could not start the CLI ("cannot run ...") is not uncertain: nothing ran.
+    let raw;
+    try { raw = await exec(cmd.command, cmd.args, { timeout: 180000 }); } catch (e) {
+      if (HOST_STOPPED_CHILD.test(String(e?.message ?? e))) return { ok: false, uncertain: true, text: "OpenRig didn't answer in time." };
+      throw e;
+    }
+    const out = writeOutcome(raw);
+    if (!out.ok && (raw?.code === 127 || raw?.code === 126) && !String(raw?.stdout ?? "").trim() && LAUNCHER_COULD_NOT_RUN.test(String(raw?.stderr ?? ""))) return { ...out, notSent: true }; // the shell could not find or run `rig` (its own words on stderr): nothing ran. A bare 127 from a child `rig` forwards is not enough
+    return !out.ok && (raw?.code == null || raw.code === -1) ? { ...out, uncertain: true } : out;
   }
 
   async read(args) {
@@ -671,7 +690,12 @@ export default class RigMenu extends View {
   run(cx, label, work, { dismissOnSuccess = false } = {}) {
     this.busy = label; this.result = null; cx.notify();
     cx.spawn(async (cx) => {
-      try { this.result = await work(cx); } catch (e) { this.result = { ok: false, text: String(e?.message ?? e) }; }
+      try { this.result = await work(cx); } catch (e) {
+        // A gate refusal raised BEFORE anything left (no `dispatched`), and a host that could not start the CLI ("cannot run": nothing ran), are known unsent. One raised after the send, and any other throw,
+        // is not known either way: `uncertain` keeps a launch or create from being offered again (the menu's launch and new rig read it).
+        const msg = String(e?.message ?? e), unsent = e?.code === "GATE_REFUSED" && e.dispatched !== true, notStarted = /^cannot run /.test(msg);
+        this.result = { ok: false, text: msg, ...(unsent || notStarted ? { notSent: true } : { uncertain: true }) };
+      }
       // Sent: the draft is done with. Not sent: it stays, for a retry from the menu.
       if (this.result?.ok) this.dropDraft();
       this.busy = null;
@@ -1175,6 +1199,7 @@ export default class RigMenu extends View {
         .child(div().text_size(11.5).text_color(r.ok ? t.dim : t.blocked).child(r.ok
           ? `${target.rig} archived. Restore it any time from Topology → Archived.`
           : r.text || "It didn't work, and the CLI gave no reason."))
+        .when(!r.ok && r.notSent && !/nothing was sent/i.test(String(r.text ?? "")), (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Nothing was sent.")))
         .when(r.ok, (el) => el.child(h_flex().child(this.dialogButton(t,div().id("rig-unarchive").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
           () => { oneClick(target, "unarchive-rig"); this.dismiss(); },false,"Undo"))));
     }
@@ -1203,13 +1228,20 @@ export default class RigMenu extends View {
     return v_flex().gap(6)
       .child(div().text_size(12.5).text_color(r.ok ? t.foreground : t.blocked).child(r.ok ? (r.text || this.doneWords(target, step.action)) : r.text || "It didn't work, and the CLI gave no reason."))
       .when(!!r.warning, (el) => el.child(div().text_size(11).text_color(t.dim).child(r.warning)))
-      .when(!r.ok, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(step.action === "send" || step.action === "queue"
+      // A refusal that happened before anything left says so, for EVERY action; the uncertain line is only for a request that did leave (the CLI ran, or a refusal came after the send).
+      .when(!r.ok && r.notSent && !/nothing was sent/i.test(String(r.text ?? "")),
+        (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Nothing was sent.")))
+      .when(!r.ok && !r.notSent, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(step.action === "send" || step.action === "queue"
         ? "It may still have been delivered: check the seat or `rig queue` before trying again."
         : step.action === "reply" ? "It may still have arrived: check the request in Needs-You before answering again."
-        : step.action === "launch-spec" ? "Fix the fields above and press Launch, or check the rig list if Launch timed out."
-        : step.action === "new-rig" ? "Check the rig list before trying again."
+        : step.action === "change-model" ? `The change may already have been queued: check ${this.changeQueuedFor ? `${this.changeQueuedFor}'s queue` : "the queue it was sent to"} (\`rig queue\`) before queueing it again.`
+        : step.action === "launch-spec" ? (r.uncertain ? "The launch may already have started: check the rig list before launching again." : "Fix the fields above and press Launch, or check the rig list if Launch timed out.")
+        : step.action === "new-rig" ? (r.uncertain ? "The rig may already have been created: check the rig list before creating it again." : "Check the rig list before trying again.")
         : step.action === "delete-rig" ? "Check the rig list before trying again; Retry runs the delete again."
         : step.action === "pause" || step.action === "resume" ? "Check the current state before trying again; Retry re-reads it first." : "Retry runs it again.")))
+      // A launch or create that may have gone through offers the rig list instead of a second try; closing and reopening the dialog starts a fresh attempt.
+      .when(!r.ok && r.uncertain && (step.action === "launch-spec" || step.action === "new-rig"), (el) => el.child(this.dialogButton(t,div().id("rig-check-list").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
+        (_e,cx)=>{ run("rig.refresh"); this.navigate({ section: "topology" }, cx); },false,"Check the rig list")))
       // A message or an answer is never resent from here: it may have arrived. Anything else runs again.
       .when(!r.ok && !RESEND_UNSAFE.has(step.action), (el) => el.child(this.dialogButton(t,div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
         (_e,cx)=>this.retry(cx,target,step),false,"Retry")));
@@ -1239,9 +1271,10 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
+    if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.result && !this.result.ok && this.result.uncertain) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
     if ((step?.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step?.action)) && !this.reviewReady()) return;
     const assistantReason=assistantActionRefusal(target,step.action);
-    if(assistantReason){this.result={ok:false,text:assistantReason};cx.notify();return;}
+    if(assistantReason){this.result={ok:false,notSent:true,text:assistantReason};cx.notify();return;}
     if(step.action==="confirm-spec-write"){
       if(!step.token)return;
       setShared("rig.specWriteDecisions",{...(shared("rig.specWriteDecisions")??{}),[step.token]:"allow"});
@@ -1274,12 +1307,12 @@ export default class RigMenu extends View {
     const disableReason = capabilityDisableReason(capAction, this.caps()) ?? (this.config ? personDisableReason(step.action, this.config) : null);
     if (disableReason) {
       if (step.action === "design-view") this.designError = disableReason;
-      else this.result = { ok: false, text: disableReason };
+      else this.result = { ok: false, notSent: true, text: disableReason };
       cx.notify();
       return;
     }
     if (step.action === "delete-rig") {
-      if (target.rig === "kernel") { this.result = { ok: false, text: "The kernel is OpenRig's own rig: it isn't deleted or archived from here." }; cx.notify(); return; }
+      if (target.rig === "kernel") { this.result = { ok: false, notSent: true, text: "The kernel is OpenRig's own rig: it isn't deleted or archived from here." }; cx.notify(); return; }
       this.run(cx, `Deleting ${target.rig}`, async () => {
         const r = await this.write(this.argsFor(target, "delete-rig"));
         if (r.json?.deleted) {
@@ -1315,7 +1348,7 @@ export default class RigMenu extends View {
         if (r.ok) run("rig.refresh");
         const createdRig = r.json?.rig?.id ?? r.json?.rigId ?? r.json?.rig?.name ?? r.json?.name ?? (name || spec);
         return r.ok ? { ...r, kind: "new-rig", createdRig, text: fromSpec ? `${spec} launched${name ? ` as ${name}` : ""}.` : `${name} created with one ${runtime} seat.` }
-          : { ...r, text: /timed? ?out|timeout/i.test(r.text ?? "") ? "OpenRig didn't answer in time. Check the rig list before trying again." : `OpenRig refused: ${r.text || "no reason was reported."}` };
+          : r.notSent ? r /* refused before anything was sent: its own sentence, not "OpenRig refused" */ : { ...r, text: r.uncertain || /timed? ?out|timeout/i.test(r.text ?? "") ? "OpenRig didn't answer in time. Check the rig list before trying again." : `OpenRig refused: ${r.text || "no reason was reported."}` };
       });
       return;
     }
@@ -1328,7 +1361,7 @@ export default class RigMenu extends View {
       const drafts = { ...(shared("rig.drafts") ?? {}), "launch-host": host.trim() };
       if (!folderProblem) drafts["launch-folder"] = folder.trim();
       setShared("rig.drafts", drafts);
-      if (problem || !args) { this.result = { ok: false, text: problem ?? "Nothing to launch: the spec has no name or file." }; cx.notify(); return; }
+      if (problem || !args) { this.result = { ok: false, notSent: true, text: problem ?? "Nothing to launch: the spec has no name or file." }; cx.notify(); return; }
       this.run(cx, "Launching", async () => { const r = await this.write(args, { env: launchSpecEnv(host) }); if (r.ok) run("rig.refresh"); return r; });
       return;
     }
@@ -1360,7 +1393,7 @@ export default class RigMenu extends View {
         { seats },
       );
       if (!plan.recipient) {
-        this.result = { ok: false, text: plan.routingError ?? "No lead or advisor seat found to route the change." };
+        this.result = { ok: false, notSent: true, text: plan.routingError ?? "No lead or advisor seat found to route the change." };
         cx.notify();
         return;
       }
@@ -1370,6 +1403,7 @@ export default class RigMenu extends View {
         return;
       }
       this.swapError = null;
+      this.changeQueuedFor = plan.recipient; // the queue the change goes to: named if it may have left
       const args = this.argsFor({
         ...target,
         runtime: this.swapCurRuntime,
@@ -1393,9 +1427,9 @@ export default class RigMenu extends View {
       this.run(cx, "Sending", async () => {
         // To the target's own daemon, resolved the way `write` resolves it; nothing is sent when it can't be.
         const conn = targetConnection(await this.currentConfig(), target);
-        if (!conn.ok) return { ok: false, text: conn.reason };
+        if (!conn.ok) return { ok: false, notSent: true, text: conn.reason };
         const cfg = conn.config;
-        if (!cfg.daemonUrl) return { ok: false, text: cfg.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." };
+        if (!cfg.daemonUrl) return { ok: false, notSent: true, text: cfg.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." };
         const r = await submitMissionActions(cfg, target, {
           kind: target.reply === "resolve" ? "resolve" : "answer-text",
           text,
@@ -1929,7 +1963,8 @@ export default class RigMenu extends View {
     const done = !!this.result?.ok;
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
     const reviewFailed = (step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady(); // Loading and failed reviews both leave the visible action disabled.
-    const canConfirm = !!confirmLabel && (step.action === "launch-spec" || step.action === "new-rig" || step.action === "design-view" || step.action === "change-model" ? !this.result?.ok : !this.result) && !this.busy && !step.run;
+    // change-model: after a failure that MAY have left, no second queue button (RESEND_UNSAFE); after a refusal that sent nothing it stays (nothing could have arrived).
+    const canConfirm = !!confirmLabel && (step.action === "change-model" ? (!this.result || (!this.result.ok && this.result.notSent)) : (step.action === "launch-spec" || step.action === "new-rig" ? (!this.result?.ok && !this.result?.uncertain) : step.action === "design-view" ? !this.result?.ok : !this.result)) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps()) : null;
     const mac = window()?.platform === "macos";
     return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).text_size(12.5)
@@ -2068,25 +2103,35 @@ export default class RigMenu extends View {
 
   machineSetupHost(cx){
     const configPath=`${appHome()}/openrig/config.json`,consentPath=`${appHome()}/openrig/machine-consent.json`;
-    return {exec,hc,machines,beforeApprove:()=>{
+    let completedConfig=this.openedOn;
+    const beforeApprove=()=>{
       const token=props()?.step?.token;
       if(token&&shared("rig.machineSetupToken")!==token)throw new Error("This setup was replaced by a newer request. Close it and use the newer screen.");
-    },relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:waitWith(cx),
+    };
+    const currentChoice=async()=>{
+      const fresh=await freshFileConfig();beforeApprove();
+      if(!completedConfig||fresh.configInvalid||fresh.connectionsRefused||!sameDialogConfig(completedConfig,fresh))throw new Error(CONFIG_CHANGED_OPEN);
+    };
+    return {exec,hc,machines,beforeApprove,relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:waitWith(cx),
       health:async url=>{const r=await fetch(`${url}/healthz`);if(!r.ok)throw new Error("Cannot read the tunnel's OpenRig health.");return r.json();},
-      readConfig:()=>readTextFile(configPath).catch(()=>null),writeConfig:(text,previous)=>writeTextFile(configPath,text,previous),
+      readConfig:()=>readTextFile(configPath).catch(()=>null),writeConfig:async(text,previous)=>{await writeTextFile(configPath,text,previous);completedConfig=parseConfig(text);},
       readConsentText:()=>readTextFile(consentPath).catch(()=>null),writeConsentText:(text,previous)=>writeTextFile(consentPath,text,previous),
       saved:async(result,stop)=>{
+        await currentChoice();
+        let declined,search;
         if(stop){
           const path=`${appHome()}/openrig/state.json`,before=await readTextFile(path).catch(()=>null),state=JSON.parse(before??"{}");
-          const declined={...(state.machineDeclined??{})},search={...(state.machineSearchDeclined??{})};
+          declined={...(state.machineDeclined??{})};search={...(state.machineSearchDeclined??{})};
           const receipt=result.previous;
           if(receipt?.profileId&&receipt?.selfHostId)delete declined[JSON.stringify([receipt.profileId,receipt.selfHostId])];
           delete search[rigOrigin(this.config.daemonUrl)];
           const next={...state,machineDeclined:declined,machineSearchDeclined:search};
+          await currentChoice(); // state read may have waited while another machine choice replaced this one
           await writeTextFile(path,JSON.stringify(next,null,2)+"\n",before);
-          setShared("rig.spaceState",{...(shared("rig.spaceState")??{}),machineDeclined:declined,machineSearchDeclined:search});
         }
-        setShared("rig.machineSetup",stop?null:result.receipt);run("rig.refresh");}};
+        await currentChoice(); // a completed state write must not clear a newer shared receipt
+        if(stop)setShared("rig.spaceState",{...(shared("rig.spaceState")??{}),machineDeclined:declined,machineSearchDeclined:search});
+        setShared("rig.machineSetup",stop?null:result.receipt);if(commands().some(command=>command.name==="rig.refresh"))run("rig.refresh");}};
   }
 
   render(cx) {

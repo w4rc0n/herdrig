@@ -148,7 +148,7 @@ export default class RigView extends View {
   open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config))); }
   menu(target) { return this.open({ mod: MOD_IDS.menu, kind: "popup", width: 280, height: 320, props: { target } }); }
   oneClick(target, action, actionKey = null) { return startOneClick({ shared, setShared, run, layout, openOverlay: (spec) => this.open(spec) }, target, action, actionKey); }
-  palette(initial) { return this.open({ mod: MOD_IDS.palette, kind: "dialog", width: 560, height: 360, props: { initial } }); }
+  palette(initial) { this.configPanel?.clearSelection();return this.open({ mod: MOD_IDS.palette, kind: "dialog", width: 560, height: 360, props: { initial } }); }
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
     registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
@@ -1481,6 +1481,7 @@ export default class RigView extends View {
 
   /** Select a row on the page (a click on its body, or the keys); the page takes the keyboard. */
   selectPageRow(key, cx) {
+    this.configPanel?.clearSelection();
     this.pageSel = key;
     this.handle?.focus?.();
     cx?.notify?.();
@@ -1493,7 +1494,7 @@ export default class RigView extends View {
     const act = treeKeyNav(rows, this.pageSel, e.key, { openMap: shared("rig.open.page") ?? {}, shift: Boolean(e.modifiers?.shift) });
     if (!act) return false;
     const row = act.row ?? rows.find((r) => r.key === act.key);
-    if (act.type === "move") this.pageSel = act.key;
+    if (act.type === "move") this.selectPageRow(act.key,cx);
     else if (act.type === "expand" || act.type === "collapse") {
       if (row?.setOpen) row.setOpen(act.type === "expand");
       else toggleOpen(act.foldKey, act.type === "collapse", row?.seats);
@@ -3704,6 +3705,15 @@ export default class RigView extends View {
     setShared("rig.drafts", all);
   }
 
+  /** What the card says when the decision's flow threw. Every POST and its own refusals are worded inside `submitMissionActions`; a gate refusal that escapes BEFORE the POST callback started (the operation,
+   *  the address, the revision read, which is a GET) sent nothing. After it started a POST may have been recorded whatever the error says, so that is unconfirmed (with Retry), and so is any error that is not a gate refusal. */
+  cardFailure(error, act, posted) {
+    if (error?.code === "GATE_REFUSED" && !posted) return this.notSentResult(error.message);
+    return { ok: false, networkError: true, retryAct: { ...act }, text: NETWORK_UNCONFIRMED_MESSAGE };
+  }
+  /** A decision result for a refusal that happened before anything left: says so once (a sentence that already does is left as it is) and carries `notSent` so the card adds no "may still have arrived". */
+  notSentResult(text) { const line = String(text ?? "").trimEnd(); return { ok: false, notSent: true, text: /nothing was sent/i.test(line) ? line : `${line} Nothing was sent.` }; }
+
   /**
    * Submit a Decision Card action (`approve`, `deny`, `choices`, `freeform`, `resume`, `resolve`) via
    * `POST /api/mission-control/action`.
@@ -3719,6 +3729,7 @@ export default class RigView extends View {
     cx.notify();
     const config = this.config;
     cx.spawn(async (cx) => {
+      let posted = false;
       try {
         // One operation: the address, the revision read and the POST belong to the config this decision began under. If the address changed while the
         // revision was read, nothing is POSTed to the old daemon.
@@ -3727,7 +3738,7 @@ export default class RigView extends View {
         if (!daemonUrl) {
           box.busy = false;
           box.stepProgress = null;
-          box.result = { ok: false, text: this.lastDaemonMessage || config?.daemonMessage || "OpenRig daemon is not running." };
+          box.result = this.notSentResult(this.lastDaemonMessage || config?.daemonMessage || "OpenRig daemon is not running."); // resolveDaemonUrl turns a gate refusal into null: this is its only trace
           cx.notify();
           return;
         }
@@ -3767,6 +3778,7 @@ export default class RigView extends View {
           },
         };
         const outcome = await submitMissionActions(config, itemForAction, actWithProgress, async (req) => {
+          posted = true; // from here a POST may have left: nothing that escapes later is "nothing was sent"
           const r = await op.fetch(`${daemonUrl}${req.path}`, {
             method: req.method ?? "POST",
             headers: req.headers ?? { "content-type": "application/json" },
@@ -3832,6 +3844,7 @@ export default class RigView extends View {
               ok: false,
               conflict: Boolean(outcome.conflict),
               tokenProtected: Boolean(outcome.tokenProtected),
+              notSent: Boolean(outcome.settingsChanged && !outcome.unconfirmed), // refused before the step left: the text already says what was and was not sent
               text: outcome.text || "It didn't work, and the daemon gave no reason.",
             };
           }
@@ -3839,12 +3852,7 @@ export default class RigView extends View {
       } catch (_e) {
         box.busy = false;
         box.stepProgress = null;
-        box.result = {
-          ok: false,
-          networkError: true,
-          retryAct: { ...act },
-          text: NETWORK_UNCONFIRMED_MESSAGE,
-        };
+        box.result = this.cardFailure(_e, act, posted);
       }
       cx.notify();
     });
@@ -3933,7 +3941,7 @@ export default class RigView extends View {
       .when(!!r, (el) => el.child(v_flex().gap(4)
         .child(h_flex().gap(6).items_center().child(svg(icon(r.ok ? "check" : "rig-alert")).size(12).flex_none().text_color(r.ok ? t.working : t.blocked))
           .child(div().flex_1().text_size(12).text_color(r.ok ? t.muted : t.blocked).child(r.text)))
-        .when(!r.ok && !r.conflict && !r.tokenProtected && !r.networkError, (c) => c.child(this.dim(t, "It may still have arrived: check the request before answering again.")))
+        .when(!r.ok && !r.conflict && !r.tokenProtected && !r.networkError && !r.notSent, (c) => c.child(this.dim(t, "It may still have arrived: check the request before answering again.")))
         .when(!r.ok && Boolean(r.networkError && r.retryAct), (c) => c.child(
           h_flex().child(this.button(
             t,
@@ -4516,7 +4524,11 @@ export default class RigView extends View {
     const configCard = this.card(t, "Configuration", [
       this.status(t, cx, "/api/config?view=browser", config) ?? (entry.category === "sources"
         ? this.table(t,"sys-config",[["Setting",260],["Value"],["Group",90],["Source",80]],configRows(config.data,{category:"sources"}).map(r=>({cells:[r.key,r.value,r.group,r.source]})))
-        : v_flex().id("sys-config").gap(4).children(this.configPanel.render(t,cx,config.data,configProbe,{category:entry.category,settingKey:entry.settingKey}))),
+        : v_flex().id("sys-config").gap(4).key_context('HerdrigSettings')
+          .on_action('herdrig_settings_next',(_e,ctx)=>{if(this.configPanel?.tabControl(false,ctx))ctx.stop_propagation();})
+          .on_action('herdrig_settings_previous',(_e,ctx)=>{if(this.configPanel?.tabControl(true,ctx))ctx.stop_propagation();})
+          .on_key_down((event,ctx)=>{if(event.key==='tab'&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt&&this.configPanel?.tabControl(Boolean(event.modifiers?.shift),ctx))ctx.stop_propagation();})
+          .children(this.configPanel.render(t,cx,config.data,configProbe,{category:entry.category,settingKey:entry.settingKey}))),
     ],
       entry.settingKey || entry.category ? h_flex().id("rig-clear-config").px(8).h(22).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
         .bg(t.selected).text_size(11.5).text_color(t.foreground).on_click(() => clearConfigScope())
@@ -4738,6 +4750,9 @@ export default class RigView extends View {
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
     let entry = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null);
+    const settingsScope=JSON.stringify([entry?.section,entry?.subview,entry?.category,entry?.settingKey,entry?.filter,this.config?.connectionId,this.config?.daemonUrl,this.config?.daemonMachine]);
+    if(this.settingsScope!==settingsScope){if(this.configPanel)this.configPanel.selected=null;this.settingsScope=settingsScope;}
+    const settingsShown=entry?.section==='system'&&(!entry.subview||['overview','config'].includes(entry.subview));
     const library=this.cache?.["/api/specs/library"]?.data??[];
     const spec=entry?.section==="specs"?library.find(s=>s.id===entry.id)??library.filter(s=>s.name===entry.name).find((s,_,a)=>a.length===1):null;
     if(spec&&!entry.id)entry={...entry,id:spec.id};
@@ -4774,7 +4789,7 @@ export default class RigView extends View {
         .on_action('herdrig_settings_previous',(_e,ctx)=>{if(this.configPanel?.tabControl(true,ctx))ctx.stop_propagation();}))
       .on_size_change((size,cx)=>{if(size.width>0&&this.pageWidth!==size.width){this.pageWidth=size.width;cx.notify();}})
       // A click outside text takes the page keyboard, so Esc and Backspace work after it.
-      .on_mouse_down("left", () => this.handle.focus())
+      .on_mouse_down("left", () => {this.configPanel?.clearSelection();this.handle.focus();})
       .on_key_down((e, cx) => {
         // A key typed in a reply box is the reply's (replyBox marks it on the way up).
         if (this.typing) { this.typing = false; return; }
@@ -4782,7 +4797,7 @@ export default class RigView extends View {
         if (e.key === "backspace" && !e.modifiers?.control && !e.modifiers?.platform && !e.modifiers?.alt) this.back();
         else if (e.modifiers?.alt && String(e.key).toLowerCase()==="s")this.sectionMenu();
         else if (entry?.section === "needs" && this.routeNeedKey(e, cx, entry)) { /* open card consumes its shortcuts */ }
-        else if (entry?.section === "system" && this.configPanel?.keyDown(e,cx)) { /* configuration editor owns its Enter/Esc */ }
+        else if (settingsShown&&(entry.subview==='config'||this.configPanel?.hasFocus()||e.key==='escape'&&this.configPanel?.ownsEscape())&&this.configPanel?.keyDown(e,cx)) { /* activation needs actual Settings focus; Escape belongs to the topmost visible edit */ }
         else if (e.key === "escape" && entry?.section === "topology" && !entry.kind && this.pulseFilter) { this.pulseFilter = null; cx.notify(); }
         else if (e.key === "escape") closeInspection();
         else if (e.key === "delete" && entry?.section === "needs" && !entry.id && dismissible(this.selectedUpdate) && !this.selectedUpdate.dismissed
