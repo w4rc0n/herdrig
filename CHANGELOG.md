@@ -2,6 +2,10 @@
 
 ## v0.4.5
 
+- After you change OpenRig's address, menus on rows still showing the old OpenRig refuse instead of acting on the new one.
+- Settings keyboard help now names the ways out: Esc leaves the list and Ctrl+Tab switches tabs. Tab and Shift+Tab currently keep focus at the list edges.
+- Every setting can be changed with the keyboard: Tab to it, then Space or Enter. Controls show their focus; Left and Right move between enum choices without wrapping.
+- A multi-part answer that spans a settings change stops honestly and says which part was recorded.
 - Pause, Resume and Snapshot work again from a rig in the Spaces list. Terminal menus and All seats links keep that connection too.
 - Spec editing no longer gets stuck when settings reload quickly.
 - Settings check current values before saving. If a confirmation changed underneath you, review it again; Undo returns to the value checked before your save.
