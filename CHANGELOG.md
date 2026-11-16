@@ -8,10 +8,17 @@
 - Archive distinguishes a completed or unconfirmed Pause from a later refusal. Actions refused before anything was sent say so.
 - If a launch or new rig may already have gone through, Check the rig list opens its Rig page without losing Back history. A command that could not start keeps its form available; uncertain outcomes are not offered again.
 - Model changes name the queue they reached. Interrupted multi-part answers name every recorded part, including when OpenRig reports an empty reason or an already-settled request.
+- Open rig space reuses a rig's existing space instead of making a second one, including a space an older herdrig made and one that holds only its Rig page. It never takes over a space whose terminals carry another OpenRig's address (it makes its own beside it); when it can't tell whether a space is this OpenRig's at a different address, it says so and opens nothing.
+- Attach and a seat click no longer focus a terminal that only OpenRig's own labels describe, and such a terminal no longer hides a seat's "needs you" notification.
+- A click inside a settings text box no longer saves it while you type, and a click on the paired pressure editor's label, hint or the gap between its two boxes no longer saves a half-typed value.
+- After a launch or new rig may already have gone through, changing the name, mode or spec in the same dialog no longer brings Create back: the dialog keeps its result and its way out, Check the rig list.
+- An archive that Herdr stopped waiting for now says it may have completed, in the message, the headline and the dialog title, and a running rig's earlier pause stays stated.
 
 ### Known issue
 
 Some other actions can still show a sidebar refresh error when the OpenRig sidebar is absent. Machine-choice recovery skips that optional refresh correctly.
+
+After you point herdrig at a different OpenRig, a seat click, Attach, Focus pane or the sidebar seat preview can still use an old Attach tab from the previous OpenRig when a rig and seat have the same names, and that tab can hide a needs-you notification. Close the old tabs. Fixed in the next minor release.
 
 ## v0.4.5
 

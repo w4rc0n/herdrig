@@ -27,7 +27,7 @@ const localViewerProgram=(host,argv)=>{
 const daemonHostId = (host) => typeof host?.selfHostId === "function" ? host.selfHostId() : host?.selfHostId;
 export function ownedRigSpace(host, rig, config) {
   // Background grid activation still requires its explicit marker; recognising legacy Attach alone never starts a grid.
-  return resolveRigSpace(host,config,[rig.id,rig.name],{markedOnly:true,sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:daemonHostId(host)});
+  return resolveRigSpace(host,config,[rig.id,rig.name],{markedOnly:true,strictOrigin:true,sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:daemonHostId(host)});
 }
 
 /** Only a marked, same-origin Local grid can precede a configured box grid; display names prove nothing. */
@@ -220,13 +220,28 @@ export class RigSpaces {
     }
     const localId = (id) => machineLocalId(id, machine), qualified = (id) => machineId(id, machine);
     let space = ownedRigSpace(host, rig, config);
+    if (!space && explicit) {
+      // ONE RIG == ONE SPACE: a rig space an older herdrig left without the explicit mark is still the rig's space (the Rig page, Attach and the TUI already find it by the same labels,
+      // origin and vouching rules), so "Open rig space" adopts and marks it instead of building a second one. Only the explicit open does: background activation still needs the mark.
+      const vouch = { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host), strictOrigin: true };
+      const found = resolveRigSpace(host, config, [rig.id, rig.name], vouch);
+      if (found) {
+        try { await markRigSpace(host, config, [rig.id, rig.name], found, { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) }); }
+        catch (error) { return { ok: false, reason: String(error?.message ?? error) }; }
+        space = found;
+      } else {
+        // Several page-only spaces of this rig: ask, never guess which one is its space (nothing is built).
+        const other = unconfirmedRigSpace(host, config, [rig.id, rig.name], vouch);
+        if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig.name, machine, other.origin ?? null, config.daemonUrl, other) };
+      }
+    }
     if (space && machine) {
       // Found across a different loopback spelling of the same daemon (confirmed by its own session list): label it with today's address.
       try { await markRigSpace(host, config, [rig.id, rig.name], space, { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) }); }
       catch (error) { return { ok: false, reason: String(error?.message ?? error) }; }
     }
     if (!space && explicit && machine) {
-      const other = unconfirmedRigSpace(host, config, [rig.id, rig.name], { markedOnly: true, sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) });
+      const other = unconfirmedRigSpace(host, config, [rig.id, rig.name], { markedOnly: true, strictOrigin: true, sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) });
       if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig.name, machine, other.origin, config.daemonUrl) };
     }
     // A closed space is never recreated by polling, even when membership changes.

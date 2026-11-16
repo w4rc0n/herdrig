@@ -51,7 +51,7 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
       && relayIdentity(t.argv) === relayIdentity(argv) && (!t.state || ["running", "live"].includes(t.state)));
     const reuse = async (existing) => {
       const tab = qualified(existing.labels["herdr.tab"]);
-      const destination=resolveRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)]);
+      const destination=resolveRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)],{strictOrigin:true});
       if(destination?.tabs?.some(item=>item.id===tab))await markRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)],destination);
       host.run("space.select", { id: qualified(existing.labels["herdr.space"]) });
       host.run("tab.select", { id: tab }); host.run("pane.focus", { terminal: existing.address });
@@ -72,11 +72,11 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     // own stamps or the rig's seats vouch for it; when it still can't be confirmed, Attach asks instead of making a second space.
     // The tmux server each seat is on goes with the sessions, as it does for the pages and the grid: seats that match by name alone must not
     // confirm a space whose viewers run on another tmux server (two daemons on one machine). The topology is built once for both.
-    const names = [rig, seat.rigId], listed = topologyRig(host, names, config), vouch = { sessions: rigSessions(listed), servers: rigSeatServers(listed), hostId: remote.selfHostId };
+    const names = [rig, seat.rigId], listed = topologyRig(host, names, config), vouch = { sessions: rigSessions(listed), servers: rigSeatServers(listed), hostId: remote.selfHostId, strictOrigin: true };
     const space = resolveRigSpace(host,config,names,vouch);
     if (!space) {
       const other = unconfirmedRigSpace(host,config,names,vouch);
-      if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig, machine, other.origin, config.daemonUrl) };
+      if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig, machine, other.origin, config.daemonUrl, other) };
     }
     if(space)await markRigSpace(host,config,[rig,seat.rigId],space,vouch);
     const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;

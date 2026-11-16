@@ -347,6 +347,9 @@ export class ConfigPanel {
   control(t,cx) {
     const m=this.model,row=m.row;
     const control=v_flex().id(`config-control-${row.key}`).gap(4).min_w(140).max_w(400).flex_1()
+      // Anything pressed or clicked inside the editor (an input, a sub-label, a hint line, the gap between inputs) is the editor's: the row's click would focus the row, blur the input and save a half-typed value.
+      .on_mouse_down('left',(_e,ctx)=>ctx.stop_propagation())
+      .on_click((_e,ctx)=>ctx.stop_propagation())
       .on_mouse_down_out((_e,ctx)=>{
         if(m!==this.model||m.row!==row||m.confirmation||this.saving||m.busy)return;
         if(this.save(ctx)===false)ctx.stop_propagation();
@@ -362,7 +365,6 @@ export class ConfigPanel {
         .key_context('HerdrigConfigInput')
         .on_action('herdrig_config_next',(_e,ctx)=>{ctx.stop_propagation();this.tabField(field,false,ctx);})
         .on_action('herdrig_config_previous',(_e,ctx)=>{ctx.stop_propagation();this.tabField(field,true,ctx);})
-        .on_mouse_down('left',(_e,ctx)=>ctx.stop_propagation())
         .on_key_down((event,ctx)=>{
           if(event.key==='escape'){ctx.stop_propagation();this.cancel(ctx);}
           else if(event.key==='enter'){ctx.stop_propagation();this.save(ctx);}
