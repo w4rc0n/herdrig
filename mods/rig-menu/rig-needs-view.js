@@ -60,7 +60,12 @@ export class NeedsTracker {
     const bySession = new Map();
     for (const r of rows) { const list = bySession.get(r.seat.session) ?? []; list.push(r); bySession.set(r.seat.session, list); }
     const sameConn = (ask, rig) => ask.conn == null || rig?.conn == null || ask.conn === rig.conn;
-    const seatOf = (ask, session) => (bySession.get(session) ?? []).find((r) => sameConn(ask, r.rig));
+    const seatOf = (ask, session) => {
+      const matches = (bySession.get(session) ?? []).filter((r) => sameConn(ask, r.rig));
+      // A connection-less ask whose session exists on several OpenRigs belongs to none of them: the same session name is a different seat
+      // on each box, so attaching to the first would be a wrong-box action. It keeps its own row instead.
+      return ask.conn == null && matches.length > 1 ? null : (matches[0] ?? null);
+    };
     for (const ask of attention ?? []) {
       if (!ask?.id || isUpdateNeed(ask) || ["done", "closed", "denied", "canceled", "handed-off"].includes(ask.state)) continue;
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;

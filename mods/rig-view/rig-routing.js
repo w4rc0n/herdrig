@@ -345,7 +345,11 @@ async function home(host,config,needTui=true){
       if(remote.machine!==machine)return fail("The configured Herdr machine changed. No terminal was started.");
     }
     const scoped=state(host).homeSpaces?.[key];
-    const otherHomes=new Set(Object.entries(state(host).homeSpaces??{}).filter(([k])=>k!==key).map(([,id])=>id));
+    // Only a home recorded for ANOTHER listed connection is hidden from this one. A home recorded under any other key (another spelling of this daemon's address,
+    // a key an earlier version wrote) is this connection's own to find, as in v0.4.7: hiding it built a second home space for the same OpenRig.
+    // The own entry is left out by ID, never by key: on a default install its entry has no address (key ["",null]) while the live key carries the address the CLI found.
+    const siblingKeys=new Set((config?.connections??[]).filter(c=>c?.id!==config?.connectionId).map(c=>homeKey({daemonUrl:c?.daemonUrl,daemonMachine:c?.machine??c?.daemonMachine}))); siblingKeys.delete(key); // and never this connection's own key, even when a hand-written list gives another entry the same address
+    const otherHomes=new Set(Object.entries(state(host).homeSpaces??{}).filter(([k])=>siblingKeys.has(k)).map(([,id])=>id));
     const candidates=contexts(host).filter(c=>!otherHomes.has(c.id));
     const multiple=(config?.connections??[]).filter(c=>(c.machine??c.daemonMachine??null)===machine).length>1;
     const liveHost=hostLabelValue(remote?.selfHostId??(typeof host.selfHostId==='function'?host.selfHostId():null));

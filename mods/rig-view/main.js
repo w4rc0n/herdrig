@@ -106,18 +106,7 @@ function closeInspection() {
 }
 /** A one-click write (snapshot, follow, open a view): the sidebar runs it; a dialog opens only when it fails. */
 /** The Rig palette, started with text (Filter… starts it at the page's filter). */
-/** The shown page without its filter. */
-function clearFilter() {
-  const stack = nav().stack ?? [];
-  const top = stack.at(-1);
-  if (top) setShared("rig.nav", { stack: [...stack.slice(0, -1), { ...top, filter: "" }] });
-}
-/** The System page without its `config <category>` / `setting <key>` narrowing (the page's filter stays). */
-function clearConfigScope() {
-  const stack = nav().stack ?? [];
-  const top = stack.at(-1);
-  if (top) setShared("rig.nav", { stack: [...stack.slice(0, -1), { ...top, category: null, settingKey: null }] });
-}
+
 /** Worker views and following state from shared("rig.views") or layout. */
 const rigStack = () => (function find(n) { return !n || typeof n !== "object" ? null : n.id === STACK ? n : (n.children ?? []).map(find).find(Boolean) ?? null; })(layout());
 const stripProps = () => viewsPropsFromLayout(layout(), shared);
@@ -487,15 +476,37 @@ export default class RigView extends View {
   }
   /** The entry this tab shows: the global back stack's top when it is this tab's own connection's (or names none), else this tab's most recent own
    *  page in the stack, else the page it was opened with. Never another box's page inside this box's rig space (one rig == one space). */
+  /** The index in `stack` of the page this tab shows, or -1 for the initial entry. PURE over the stack it is given, so a caller that both
+   *  locates and rewrites uses ONE read: natively `shared()` returns a fresh copy per read (herdr-app mods.rs `to_host`), so matching an
+   *  entry by object identity across two reads never succeeds. */
+  shownIndex(stack, rawNav = shared("rig.nav")) {
+    const own = this.ownConn();
+    if (!own) return stack.length - 1;
+    const top = stack.at(-1);
+    // An unstamped entry (the cross-box Needs page, an older one) reads as the FIRST connection's (activeConnId), so it is shown only in the
+    // first connection's tab.
+    const ownsTop = top?.conn ? top.conn === own : own === this.config?.connectionId;
+    if (ownsTop) return stack.length - 1;
+    for (let i = stack.length - 1; i >= 0; i--) if (stack[i]?.conn === own) return i;
+    return -1;
+  }
   shownEntry() {
     const rawNav = shared("rig.nav"), stack = rawNav?.stack ?? [];
-    const top = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null), own = this.ownConn();
-    if (!own) return top;
-    // An unstamped entry (the cross-box Needs page, an older one) reads as the FIRST connection's (activeConnId), so it is shown only in the first
-    // connection's tab.
-    const ownsTop = top?.conn ? top.conn === own : own === this.config?.connectionId;
-    if (ownsTop) return top;
-    return [...stack].reverse().find((e) => e?.conn === own) ?? this.initialEntry;
+    if (rawNav == null) return this.initialEntry;
+    const at = this.shownIndex(stack, rawNav);
+    return at < 0 ? this.initialEntry : stack[at];
+  }
+  /** The shown page without its filter (the control is drawn on the page it acts for, which may sit below the stack top). */
+  clearFilter() { this.rewriteShownPage({ filter: "" }); }
+  /** The System page without its `config <category>` / `setting <key>` narrowing (the page's filter stays). */
+  clearConfigScope() { this.rewriteShownPage({ category: null, settingKey: null }); }
+  /** Rewrite the page this tab shows, locating it by INDEX within a single `shared("rig.nav")` read. */
+  rewriteShownPage(patch) {
+    const rawNav = shared("rig.nav"), stack = rawNav?.stack ?? [];
+    const at = stack.length ? this.shownIndex(stack, rawNav) : -1;
+    if (at < 0) return;
+    const next = stack.slice(); next[at] = { ...stack[at], ...patch };
+    setShared("rig.nav", { stack: next });
   }
   /** A link on this tab belongs to the page this tab shows: it lends this view's own shown entry, never another tab's. */
   push(entry) { return push(entry, this.shownEntry()); }
@@ -4837,7 +4848,7 @@ export default class RigView extends View {
           .children(this.configPanel.render(t,cx,config.data,configProbe,{category:entry.category,settingKey:entry.settingKey}))),
     ],
       entry.settingKey || entry.category ? h_flex().id("rig-clear-config").px(8).h(22).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
-        .bg(t.selected).text_size(11.5).text_color(t.foreground).on_click(() => clearConfigScope())
+        .bg(t.selected).text_size(11.5).text_color(t.foreground).on_click(() => this.clearConfigScope())
         .child(entry.settingKey ? `setting ${entry.settingKey}` : `category ${entry.category}`).child(svg(icon("x")).size(11).text_color(t.muted)) : null);
     const healthCard = this.healthFindingsCard(t, cx, health, entry);
     const connectionsCard = this.card(t, "Connections", [
@@ -5009,7 +5020,7 @@ export default class RigView extends View {
           return i?[svg(icon("chevron-right")).size(10).flex_none().text_color(t.dim),crumb]:[crumb];
         })))
         .when(!!entry.filter,el=>el.child(div().id("rig-clear-filter").text_size(12).text_color(t.accent).cursor_pointer()
-          .on_click(()=>clearFilter()).child(`/${entry.filter} ×`)))
+          .on_click(()=>this.clearFilter()).child(`/${entry.filter} ×`)))
         .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"})))
         .when(!tiny&&!!this.config,el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel})))
         .when(!tiny,el=>el.child(div().id("rig-close").size(24).flex_none().flex().items_center().justify_center().cursor_pointer().tooltip("Close")
