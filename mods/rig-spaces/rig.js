@@ -10,10 +10,17 @@ export const KEY = "herdrig.spaces";
 const known = () => shared(KEY) ?? {};
 const entryOf = (w) => known()[w.id] ?? null;
 const isRig = (w) => !!entryOf(w);
-/** The settings the rows these menu targets are built from were published under (the sidebar's rig.data.config): the menu judges the target by this stamp against a fresh read of config.json. */
-const rowsFor = () => { const stamp = rowsStamp(); return stamp ? { rowsConfig: stamp } : {}; };
-const rowsStamp = () => { const c = shared("rig.data")?.config; return c ? { connectionId: c.connectionId, daemonUrl: c.daemonUrl, daemonUrlSource: c.daemonUrlSource, daemonMachine: c.daemonMachine,
-  openrigHome: c.openrigHome, rig: c.rig, configInvalid: c.configInvalid } : undefined; };
+/** The settings the rows these menu targets are built from were published under (the sidebar's rig.data.config): the menu judges the target by this stamp against a fresh read of config.json. The stamp is the
+ *  ROW's own connection identity (the same fields rowsIdentityOf in rig-lib.js builds for the sidebar's own menus): a row of the second connection carries ITS address, machine and home, never the sidebar's, so
+ *  the stale-rows check judges it by its own settings. A connection that is no longer listed stamps its id alone (the menu then refuses it); the folder here has no rig-lib, so the shape is copied. */
+const rowsFor = (conn) => { const stamp = rowsStamp(conn); return stamp ? { rowsConfig: stamp } : {}; };
+const rowsStamp = (conn) => {
+  const c = shared("rig.data")?.config; if (!c) return undefined;
+  const own = !conn || conn === c.connectionId, listed = own ? null : (c.connections ?? []).find((x) => x?.id === conn);
+  if (!own && !listed) return { connectionId: conn };
+  const e = own ? c : { daemonUrl: listed.daemonUrl || undefined, daemonMachine: listed.machine || undefined, openrigHome: listed.openrigHome || undefined };
+  return { connectionId: own ? c.connectionId : listed.id, daemonUrl: e.daemonUrl, daemonUrlSource: own ? c.daemonUrlSource : undefined, daemonMachine: e.daemonMachine, openrigHome: e.openrigHome, rig: c.rig, configInvalid: c.configInvalid };
+};
 // What a stored colour name looks like on an avatar: herdr's own table, so a rig space keeps its colour under our mark.
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 const fillOf = (w, t) => {
@@ -59,7 +66,7 @@ export const rig = {
     const e = entryOf(w);
     if (!e) return false;
     openOverlay({ mod: "rig-menu", kind: "popup", width: 230, height: 320,
-      props: { target: { kind: "rigspace", conn: e.conn, space: w.id, name: w.name, rig: e.rig ?? null, rigId: e.rigId ?? null, home: !!e.home, ...rowsFor() } } });
+      props: { target: { kind: "rigspace", conn: e.conn, space: w.id, name: w.name, rig: e.rig ?? null, rigId: e.rigId ?? null, home: !!e.home, ...rowsFor(e.conn) } } });
     return true;
   },
 

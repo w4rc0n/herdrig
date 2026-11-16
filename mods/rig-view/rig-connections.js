@@ -283,8 +283,12 @@ export async function removeConnection(host, before, id) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.connections)) throw new Error("This OpenRig has no connections list to remove from. Nothing was changed.");
   const index = raw.connections.findIndex((c) => c && typeof c === "object" && c.id === id);
   if (index < 0) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
-  if (raw.connections.length < 2) throw new Error("A connections list keeps at least one OpenRig, so this one was not removed.");
-  const nextRaw = { ...raw, connections: raw.connections.filter((_, i) => i !== index) };
+  // Count USABLE entries, not raw ones: a list may hold null or unusable entries, and counting those allowed removing the last real
+  // OpenRig (`[{conn-a}, null]` looked like two), leaving a list that reads as invalid - the person's only working setup gone.
+  const remaining = raw.connections.filter((_, i) => i !== index);
+  const usable = connectionsOf({ ...raw, connections: remaining }).connections;
+  if (!usable.length) throw new Error("A connections list keeps at least one OpenRig, so this one was not removed.");
+  const nextRaw = { ...raw, connections: remaining };
   await host.writeConfig(JSON.stringify(nextRaw, null, 2) + "\n", before);
   return { removed: id };
 }
