@@ -879,7 +879,11 @@ export default class RigView extends View {
   fileView(t, cx, entry) {
     // The viewer reads THIS computer's files: a page of an OpenRig on a machine shows none (that file is on the machine, and a file at the same
     // path here is another computer's).
-    const machine = this.activeConfig()?.daemonMachine;
+    // A page whose connection is no longer set up shows nothing: its entry keeps only the connection's id, so whether the file was on a
+    // machine can't be told, and a file at that path here may be another computer's (as spec pages do).
+    const pageConfig = this.activeConfig();
+    if (this.config && !pageConfig) return this.dim(t, "This page's OpenRig is no longer set up, so its file isn't shown here.");
+    const machine = pageConfig?.daemonMachine;
     if (machine) return this.dim(t, `This file is on ${machine}, so it isn't shown here.`);
     const path = entry.path;
     let f = this.files[path];
