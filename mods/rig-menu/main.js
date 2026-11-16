@@ -349,8 +349,11 @@ export default class RigMenu extends View {
     });
   }
 
+  /** Clears the shown result for a form change, except after a launch or create that may have gone through: that result (and its way out) stays. */
+  forgetResult() { if (!this.uncertainAttempt) this.result = null; }
+
   pickNewSpec(cx, spec, toggle = false) {
-    this.newSpec = spec; this.result = null;
+    this.newSpec = spec; this.forgetResult();
     this.newSpecFocus = this.newSpecs?.indexOf(spec) ?? 0;
     this.newExpandedSpec = toggle && this.newExpandedSpec === spec ? null : spec;
     if (this.newExpandedSpec) this.loadNewSpecPreview(cx, spec);
@@ -456,6 +459,8 @@ export default class RigMenu extends View {
         run("rig.refresh");
       }
       // The pause already ran: whatever stopped the archive, "Nothing was sent." would be false, so the result says the pause ran and the archive did not.
+      // The host stopped the archive at its timeout (or it was killed): it may have completed, so never say it wasn't archived.
+      if (!a.ok && a.uncertain) return { ok: false, uncertain: true, kind: "archive", paused, text: `${running ? `${target.rig} was paused. ` : ""}Archiving ${target.rig} didn't answer in time, so it may have been archived: check the rig list before trying again.` };
       if (running && !a.ok) { const { notSent, ...rest } = a; return { ...rest, kind: "archive", paused, text: `${target.rig} was paused, but it wasn't archived: ${a.text || "the CLI gave no reason."}` }; }
       return { ...a, kind: "archive", paused };
     }, { kind: "archive" });
@@ -700,6 +705,8 @@ export default class RigMenu extends View {
         this.result = { ok: false, text: msg, ...(kind ? { kind } : {}), ...(unsent || notStarted ? { notSent: true } : { uncertain: true }) };
       }
       // Sent: the draft is done with. Not sent: it stays, for a retry from the menu.
+      // A launch or create that may have gone through is remembered for this dialog: a form change (a spec pick, the mode) clears the result but never this.
+      if (this.result && !this.result.ok && this.result.uncertain) this.uncertainAttempt = true; // read only by launch and new rig (a dialog has one action)
       if (this.result?.ok) this.dropDraft();
       this.busy = null;
       if (dismissOnSuccess && this.result?.ok) { this.dismiss(); return; }
@@ -1196,7 +1203,7 @@ export default class RigMenu extends View {
     if ((step.action === "delete-rig" || step.action === "archive-rig") && r.kind === "archive") {
       const paused = r.paused;
       return v_flex().id("archive-result").gap(4)
-        .child(div().text_size(13).font_semibold().text_color(r.ok ? t.foreground : t.blocked).child(r.ok ? `Archived ${target.rig}` : `${target.rig} wasn't archived`))
+        .child(div().text_size(13).font_semibold().text_color(r.ok ? t.foreground : t.blocked).child(r.ok ? `Archived ${target.rig}` : r.uncertain ? `${target.rig} may have been archived` : `${target.rig} wasn't archived`))
         .when(!!paused, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(paused.headline))
           .children(paused.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note))))
         .child(div().text_size(11.5).text_color(r.ok ? t.dim : t.blocked).child(r.ok
@@ -1306,7 +1313,7 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.busy) return;
-    if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.result && !this.result.ok && this.result.uncertain) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
+    if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.uncertainAttempt) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
     if ((step?.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step?.action)) && !this.reviewReady()) return;
     const assistantReason=assistantActionRefusal(target,step.action);
     if(assistantReason){this.result={ok:false,notSent:true,text:assistantReason};cx.notify();return;}
@@ -1373,7 +1380,7 @@ export default class RigMenu extends View {
         this.newProblem = createReason ?? problem ?? "Nothing to run.";
         this.newProblemField = this.newMode === "spec" && /spec|\.yaml/i.test(this.newProblem) ? "spec"
           : /rig.*name|name.*rig/i.test(this.newProblem) ? "name" : /folder|path.*absolute/i.test(this.newProblem) ? "folder" : "spec";
-        this.result = null; cx.notify(); return;
+        this.forgetResult(); cx.notify(); return;
       }
       this.newProblem = null;
       const folder = (this.folder?.value() ?? "").trim(), name = (this.rigName?.value() ?? "").trim();
@@ -1864,7 +1871,7 @@ export default class RigMenu extends View {
     this.dialogLastControl=null;
     const result = this.result;
     const title = ["delete-rig", "archive-rig", "unarchive-rig"].includes(step.action) && result
-      ? result.kind === "archive" ? (result.ok ? `${target.rig} archived` : `Couldn't archive ${target.rig}`)
+      ? result.kind === "archive" ? (result.ok ? `${target.rig} archived` : result.uncertain ? `${target.rig} may be archived` : `Couldn't archive ${target.rig}`)
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
@@ -2000,7 +2007,7 @@ export default class RigMenu extends View {
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
     const reviewFailed = (step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady(); // Loading and failed reviews both leave the visible action disabled.
     // change-model: after a failure that MAY have left, no second queue button (RESEND_UNSAFE); after a refusal that sent nothing it stays (nothing could have arrived).
-    const canConfirm = !!confirmLabel && (step.action === "change-model" ? (!this.result || (!this.result.ok && this.result.notSent)) : (step.action === "launch-spec" || step.action === "new-rig" ? (!this.result?.ok && !this.result?.uncertain) : step.action === "design-view" ? !this.result?.ok : !this.result)) && !this.busy && !step.run;
+    const canConfirm = !!confirmLabel && (step.action === "change-model" ? (!this.result || (!this.result.ok && this.result.notSent)) : (step.action === "launch-spec" || step.action === "new-rig" ? (!this.result?.ok && !this.uncertainAttempt) : step.action === "design-view" ? !this.result?.ok : !this.result)) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps()) : null;
     const mac = window()?.platform === "macos";
     return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).text_size(12.5)
@@ -2119,8 +2126,8 @@ export default class RigMenu extends View {
       }));
     return v_flex().id("new-rig-view").gap(8).on_mouse_down('left',()=>{this.newFocusTouched=true;})
       .child(h_flex().id("new-rig-mode").gap(4)
-        .child(pill("new-rig-mode-spec", "From a spec", !seat, () => { this.newMode = "spec"; this.newProblem = null; this.result = null; }))
-        .child(pill("new-rig-mode-seat", "One seat", seat, () => { this.newMode = "seat"; this.newProblem = null; this.result = null; })))
+        .child(pill("new-rig-mode-spec", "From a spec", !seat, () => { this.newMode = "spec"; this.newProblem = null; this.forgetResult(); }))
+        .child(pill("new-rig-mode-seat", "One seat", seat, () => { this.newMode = "seat"; this.newProblem = null; this.forgetResult(); })))
       .when(!seat, (el) => el.child(v_flex().gap(3).child(label("Spec")).child(specList)
         .when(!!this.newProblem && this.newProblemField === "spec", x => x.child(div().id("new-rig-spec-error").text_size(11.5).text_color(t.blocked).child(this.newProblem))))
         .child(field("Working folder", this.folder))

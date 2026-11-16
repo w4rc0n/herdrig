@@ -7,7 +7,7 @@ import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen } from "./rig-routing.js";
 import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publishedUnder } from "./rig-gate.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
-import { resolveRigSpace, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
+import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
 import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, CONNECTIONS_LIST_REFUSED, CONNECTIONS_LIST_SUPPORTED } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
@@ -2765,6 +2765,8 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
       (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig))
     );
     if (!isAttach && !isNativeSeat) continue;
+    // A native-namespace terminal is never focused (rule Y: nothing on it names this daemon).
+    if (isNativeSeat && !isAttach) continue;
     if (cells.some((c) => c.terminal === t.address)) continue;
     const paneHit = pn.find((p) => p?.terminal === t.address);
     const tab = paneHit?.tab ?? t.labels?.["herdr.tab"] ?? null;
@@ -6017,12 +6019,9 @@ export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", 
   const candidates = tm.filter((t) => {
     if (!t?.address || (t.state !== undefined && t.state !== "live" && t.state !== "running")) return false;
     const isAttach = t.labels?.["herdr-openrig.role"] === "attach" && t.labels?.["herdr-openrig.attach"] === session;
-    const isNativeSeat = t.labels?.["openrig.role"] === "seat" && (
-      t.labels?.["openrig.session"] === session ||
-      t.labels?.["openrig.seat"] === session ||
-      (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig))
-    );
-    return isAttach || isNativeSeat;
+    // Only OUR herdr-openrig.* labels count (rule Y, every caller: Attach reuse focuses the hit, needs-view's silent flag is set by it). A terminal labelled only in OpenRig's native namespace (openrig.role=seat,
+    // openrig.seat, ...) carries nothing that names this daemon, and a same-named rig on another OpenRig has the same seat names, so it is never "this seat's terminal". Native seats are not released (v0.5.0: by openrig.node).
+    return isAttach;
   });
   if (!candidates.length) return null;
   const resolveTab = (t) => {
@@ -6122,7 +6121,7 @@ async function attachSeatOnce(host, seat, config, options) {
   const sp = live("spaces"), pn = live("panes"), tm = live("terminals");
 
   const reuse = async (existing) => {
-    const destination=resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId]);
+    const destination=resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true});
     if(destination?.tabs?.some(tab=>tab.id===existing.tab)){
       try{await markRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],destination);}
       catch(error){return{ok:false,reason:String(error?.message??error)};}
@@ -6172,10 +6171,15 @@ async function attachSeatOnce(host, seat, config, options) {
   const appeared = findAttachedSeat(live("terminals"), live("spaces"), session, live("panes"), { logicalId, rig: rigName });
   if (appeared) return reuse(appeared);
   if (typeof host.hc !== "function") return { ok: false, reason: "Attach needs Herdr's labelled terminal start. Open the Rig sidebar and try again; no terminal was started." };
-  const rigSpace = resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId]);
+  const rigSpace = resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true});
   if(rigSpace){
     try{await markRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],rigSpace);}
     catch(error){return{ok:false,reason:String(error?.message??error)};}
+  }
+  if(!rigSpace){
+    // Several page-only spaces of this rig: Attach asks instead of building a second one (or guessing which).
+    const other=unconfirmedRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true});
+    if(other)return{ok:false,unconfirmedSpace:true,reason:unconfirmedSpaceReason(rigName,null,other.origin??null,effectiveDaemonUrl,other)};
   }
   const newRigSpace = !rigSpace;
   // Local mode never derives a machine or destination from focus, including Operator.

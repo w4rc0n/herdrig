@@ -101,28 +101,70 @@ function vouched(host,space,rigNames,{sessions=null,hostId=null,servers=null}={}
 }
 /** The same vouching, for a caller that only reads (the Spaces list marks): "same", "other" or "unknown"; it never writes a label. */
 export const vouchedSpace=vouched;
-function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,servers=null}={}){
+/** A rig space whose only content is the Rig page (its seat and Attach tabs were closed): no terminal is left to carry a label, and a mod pane carries none, so nothing durable names the rig.
+ *  It is recognised by OUR creation signature plus the rig's name, never by a name alone: the id starts `sp-openrig-` (and is not the OpenRig home space), the space has no terminal at
+ *  all, exactly one tab and that tab holds only a Rig page. */
+function pageOnlyRigSpace(host,context,rigNames){
+  const {space}=context,id=String(space.id),local=id.includes("/")?id.slice(id.indexOf("/")+1):id;
+  if(context.home||!local.startsWith("sp-openrig-")||local.startsWith("sp-openrig-home-")||!rigNames.has(space.name))return false;
+  if((space.tabs??[]).length!==1)return false;
+  if(get(host,"terminals").some(t=>qualifiedSpace(t)===space.id))return false;
+  const tabs=new Set(space.tabs.map(t=>t.id)),inSpace=get(host,"panes").filter(p=>tabs.has(p.tab));
+  return inSpace.length>0&&inSpace.every(p=>!p.terminal&&p.mod==="rig-view");
+}
+function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,servers=null,strictOrigin=false}={}){
   const expected=rigOrigin(config?.daemonUrl);if(!expected)return {space:null,unconfirmed:null};
   const rigNames=nameSet(names),machine=config?.daemonMachine||null;
   const state=host.routeState?.()??host.shared?.("rig.spaceState")??{};
   const onMachine=openRigSpaceContext(get(host,"spaces"),get(host,"terminals"),get(host,"panes"),state)
     .filter(context=>(context.space.machine??(context.id.includes("/")?context.id.split("/")[0]:null))===machine);
   const links=context=>markedOnly?context.markedRigLinks:context.rigLinks;
-  const exact=onMachine.filter(context=>links(context).some(link=>rigNames.has(link.rig)&&sameOrigin(link.origin,expected)));
+  // strictOrigin (every path that adopts, marks or builds into a space): a rig terminal with an origin must carry THIS daemon's. One WITHOUT an origin counts only when it carries OUR rig label
+  // (herdr-openrig.rig: a space an older herdrig wrote before the origin label existed, which markRigSpace never gave one); a terminal labelled only in OpenRig's native namespace
+  // (openrig.rig, openrig.seat, ...) never does, whatever its seat names say: two OpenRigs with a same-named rig have identical session names (<member>@<rig>). A space whose rig terminals are
+  // all of that kind is never adopted, marked or built into: the open asks and writes nothing.
+  const counts=(link,machineAlias=null)=>strictOrigin?(link.origin?sameOrigin(link.origin,expected,machineAlias):link.ours):sameOrigin(link.origin,expected,machineAlias);
+  // Another daemon's explicit origin on a rig terminal is positive evidence the space is theirs (an alias spelling of this daemon's address on a box is not another daemon), so under strictOrigin it vetoes the space (not for the marked lookup: our own mark is our own adoption record, and a copied-label terminal inside our grid is handled by the grid) even when
+  // one of our origin-less legacy terminals sits in it (devops.sec R9-1).
+  const foreign=context=>strictOrigin&&!markedOnly&&links(context).some(link=>rigNames.has(link.rig)&&link.origin&&!sameOrigin(link.origin,expected,machine));
+  const exact=onMachine.filter(context=>!foreign(context)&&links(context).some(link=>rigNames.has(link.rig)&&counts(link)));
   if(exact.length)return {space:(exact.find(context=>context.space.active)??exact[0]).space,unconfirmed:null};
-  if(!machine)return {space:null,unconfirmed:null};
-  const loose=onMachine.filter(context=>links(context).some(link=>rigNames.has(link.rig)&&sameOrigin(link.origin,expected,machine)))
+  if(strictOrigin){
+    const bare=onMachine.filter(context=>{const mine=links(context).filter(link=>rigNames.has(link.rig));return mine.length>0&&mine.every(link=>!link.origin&&!link.ours);});
+    const labelledAlias=onMachine.some(context=>links(context).some(link=>rigNames.has(link.rig)&&link.origin&&machine&&sameOrigin(link.origin,expected,machine)));
+    if(bare.length&&!labelledAlias)return {space:null,unconfirmed:{space:bare[0].space,origin:null,unvouched:true}};
+  }
+  // A rig space made with an origin that is not this daemon's (and no terminal of ours in it) is either CONFIRMED to be another OpenRig's (its host stamp is another daemon's: the open builds its own space beside it) or
+  // CANNOT BE TOLD (no stamp, or a stamp we cannot compare: it may be this daemon at a new address): the open asks and writes nothing (RC9e), the same way it asks for a space it cannot vouch for.
+  if(strictOrigin&&!markedOnly){
+    const undecided=onMachine.filter(foreign).map(context=>({context,verdict:vouched(host,context.space,rigNames,{sessions,hostId,servers})})).find(item=>item.verdict!=="other");
+    if(undecided){
+      const link=links(undecided.context).find(item=>rigNames.has(item.rig)&&item.origin&&!sameOrigin(item.origin,expected,machine));
+      return {space:null,unconfirmed:{space:undecided.context.space,origin:link?.origin??null,foreign:true}};
+    }
+  }
+  // The last resort for the open that may adopt (not background activation): the rig's page-only space. One candidate is adopted; several are asked about, never guessed.
+  const pageOnly=()=>{
+    if(markedOnly)return {space:null,unconfirmed:null};
+    // A page-only space names no daemon (a mod pane carries no label): with two OpenRig connections on this machine it may be the other one's, so the rule does not apply.
+    if((config?.connections??[]).filter(c=>(c?.machine??null)===machine).length>1)return {space:null,unconfirmed:null};
+    const found=onMachine.filter(context=>pageOnlyRigSpace(host,context,rigNames));
+    if(found.length===1)return {space:found[0].space,unconfirmed:null};
+    return found.length>1?{space:null,unconfirmed:{space:found[0].space,origin:null,ambiguous:found.length}}:{space:null,unconfirmed:null};
+  };
+  if(!machine)return pageOnly();
+  const loose=onMachine.filter(context=>!foreign(context)&&links(context).some(link=>rigNames.has(link.rig)&&counts(link,machine)))
     .map(context=>({context,verdict:vouched(host,context.space,rigNames,{sessions,hostId,servers})}));
   const same=loose.filter(item=>item.verdict==="same").map(item=>item.context);
   if(same.length)return {space:(same.find(context=>context.space.active)??same[0]).space,unconfirmed:null};
   const unknown=loose.find(item=>item.verdict==="unknown")?.context;
   const origin=unknown?(links(unknown).find(link=>rigNames.has(link.rig))?.origin??null):null;
-  return {space:null,unconfirmed:unknown?{space:unknown.space,origin}:null};
+  return unknown?{space:null,unconfirmed:{space:unknown.space,origin}}:pageOnly();
 }
 
 /** What every open path says, and nothing new opens, when the rig's space on a machine can't be confirmed (ONE RIG == ONE SPACE: the grid,
  *  Attach and worker views all ask instead of making a second space). */
-export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl)=>`${rigName} already has a space on ${machine}, made with the address ${origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${daemonUrl}, so nothing new was opened. Close that space and open ${rigName} again, or set daemonUrl to ${origin??"that address"}.`;
+export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl,other=null)=>other?.foreign?`${rigName} already has a space${machine?` on ${machine}`:""} whose terminals were made with ${other.origin??"another address"}, not ${daemonUrl}, so Herdr cannot tell whether it is another OpenRig's or this OpenRig at a new address: nothing was opened, marked or built. If it is another OpenRig's, leave it and open ${rigName} from that one. If it is this OpenRig's, close that space and open ${rigName} again, or set daemonUrl to ${other.origin??"that address"}.`:other?.unvouched?`${rigName} already has a space${machine?` on ${machine}`:""} made of OpenRig's own native seats of a rig of that name, but none of its terminals carry ${daemonUrl}'s address, so Herdr cannot tell whose it is: nothing was opened, marked or built. If it is another OpenRig's, leave it and open ${rigName} from that one. This mod does not open a space of native seats as the rig space yet, so use those seats' own tabs.`:other?.ambiguous?`${rigName} has more than one rig space that holds only its Rig page (${other.ambiguous}), so nothing was opened or built: Herdr cannot tell which one is its space. Close the extra ones and open ${rigName} again.`:`${rigName} already has a space${machine?` on ${machine}`:""}, made with the address ${origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${daemonUrl}, so nothing new was opened. Close that space and open ${rigName} again, or set daemonUrl to ${origin??"that address"}.`;
 /** The rig the sidebar published (by id or name), for the sessions that vouch for a space of it; null when it isn't known. */
 export function topologyRig(host,refs,config){
   // The sidebar's rows vouch only for the daemon they were read from: the same gate as every other reader of `rig.data` (a refused list or no config reads nothing; other settings' rows are not used).
@@ -191,6 +233,8 @@ export async function markRigSpace(host,config,names,space,{sessions=null,hostId
   for(const terminal of get(host,"terminals")){
     const labels=terminal.labels??{};
     if(qualifiedSpace(terminal)!==space.id||!rigNames.has(labels["herdr-openrig.rig"]??labels["openrig.rig"]))continue;
+    // Backstop: a terminal with no origin is stamped only when it carries OUR rig label; OpenRig's native seats (openrig.* labels alone) are never ours to stamp.
+    if(!labels["herdr-openrig.origin"]&&!labels["herdr-openrig.rig"])continue;
     const exact=sameOrigin(labels["herdr-openrig.origin"],expected);
     if(!exact&&!(adopted&&sameOrigin(labels["herdr-openrig.origin"],expected,machine)))continue;
     if(!ownsRigSpace(labels))continue;
@@ -224,7 +268,7 @@ export function openRigSpaceContext(spaces = [], terminals = [], panes = [], sta
         rigOwned = true;
         const rig = labels["herdr-openrig.rig"] || labels["openrig.rig"];
         if (rig) {
-          const link={rig,origin:labels["herdr-openrig.origin"]??null};rigs.add(rig);rigLinks.push(link);
+          const link={rig,origin:labels["herdr-openrig.origin"]??null,ours:Boolean(labels["herdr-openrig.rig"])};rigs.add(rig);rigLinks.push(link);
           if(labels["herdr-openrig.space"]==="1")markedRigLinks.push(link);
         }
       }

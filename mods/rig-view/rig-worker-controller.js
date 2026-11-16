@@ -147,11 +147,11 @@ export class HostWorkerViews{
         const move=rigSpaceRelocation(host,rig,config);
         if(move)return {ok:false,needsRelocation:true,relocation:move,reason:"Move the Local rig space before opening its worker view on the box."};
         // The same vouching inputs the pages and the grid use; a space that still can't be confirmed is asked about, never answered with a new one.
-        const vouch={sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),servers:rigSeatServers({seats:nodes}),hostId:remote.selfHostId}; // the tmux server too: a session name is unique only within one server
+        const vouch={sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),servers:rigSeatServers({seats:nodes}),hostId:remote.selfHostId,strictOrigin:true}; // rule Y (it writes hc run and pane.split into the space): an origin-less terminal counts only with our herdr-openrig.rig label. The tmux server too: a session name is unique only within one server
         space=resolveRigSpace(host,config,[rig.id,rig.name],vouch);
         if(!space){
           const other=unconfirmedRigSpace(host,config,[rig.id,rig.name],vouch);
-          if(other)return {ok:false,unconfirmedSpace:true,reason:unconfirmedSpaceReason(rig.name,config.daemonMachine,other.origin,config.daemonUrl)};
+          if(other)return {ok:false,unconfirmedSpace:true,reason:unconfirmedSpaceReason(rig.name,config.daemonMachine,other.origin,config.daemonUrl,other)};
         }
       }
       if(!space&&!rig)space=openRigSpaceContext(list(host,"spaces"),list(host,"terminals"),list(host,"panes"),host.routeState?.()??{})
