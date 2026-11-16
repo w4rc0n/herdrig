@@ -504,7 +504,14 @@ export default class RigView extends View {
   rewriteShownPage(patch) {
     const rawNav = shared("rig.nav"), stack = rawNav?.stack ?? [];
     const at = stack.length ? this.shownIndex(stack, rawNav) : -1;
-    if (at < 0) return;
+    if (at < 0) {
+      // The tab shows the page it was OPENED with (the stack holds only another connection's pages, or nothing): put the cleared page on top as this tab's own, only when the tab would show it there;
+      // the other connections' entries stay as they are.
+      if (!this.initialEntry) return;
+      const next = [...stack, { ...this.initialEntry, ...patch }];
+      if (this.shownIndex(next, rawNav) === next.length - 1) setShared("rig.nav", { stack: next });
+      return;
+    }
     const next = stack.slice(); next[at] = { ...stack[at], ...patch };
     setShared("rig.nav", { stack: next });
   }
@@ -541,6 +548,14 @@ export default class RigView extends View {
   /** A page entry that names a connection is judged by it (a removed one gives null: nothing is sent, never another connection's, even when one
    *  connection is left); a page with none acts for its own config, exactly as before. */
   specConfig() { return this.shownEntry()?.conn ? this.activeConfig() : this.config; }
+  /** A spec editor box (and its auto-edit mark) belongs to a connection as well as a spec: spec ids are path-derived, so two OpenRigs can show the same id.
+   *  The legacy connection keeps the bare id (one connection is unchanged); every other connection's boxes carry its id. A page whose connection is no
+   *  longer set up still names it in its entry, so its box (and the note that nothing more is sent) stays found there. An operation that awaited passes
+   *  the connection it began under. */
+  specBoxKey(id, config = this.specConfig()) {
+    const conn = config === null ? this.shownEntry()?.conn ?? null : config?.connectionId;
+    return conn && conn !== LEGACY_CONNECTION_ID ? JSON.stringify([conn, id]) : id;
+  }
   /** The connection a row or menu target on this page names: the page entry's own (passed as is: the menu dispatcher judges it, a stale one is
    *  refused there), else the page's config. Never adopted to a live connection here, which would hide a stale claim. */
   shownConnId() { const conn = this.shownEntry()?.conn; return conn ?? this.config?.connectionId; }
@@ -2063,7 +2078,7 @@ export default class RigView extends View {
             .child(div().text_size(12.5).font_semibold().text_color(t.muted).child(g.title))
             .child(div().text_size(11.5).text_color(t.dim).child(`${g.items.length}${f ? ` of ${g.total}` : ""}${g.yours ? ` · ${g.yours} yours` : ""}`)))
           .when(expanded, el => el.children(g.items.map((s, i) => {
-        const shown = !!open[`spec:${s.id}`], box = this.specBoxes?.[s.id];
+        const shown = !!open[`spec:${s.id}`], box = this.specBoxes?.[this.specBoxKey(s.id)];
         const builtin = s.sourceType === "builtin" || !s.sourcePath;
         const key = `spec:${s.id}`;
         this.pageRows?.push({ key, foldKey: key, parentKey: `spec-kind:${g.kind}`, expandable: true, isOpen: shown, open: () => toggle(s.id) });
@@ -2122,10 +2137,10 @@ export default class RigView extends View {
     if(!config)return this.dim(t,"This page's connection isn't set up any more, so its spec isn't shown and nothing is sent from here. Open the spec again from the sidebar.");
     const isBuiltin = s.sourceType === "builtin" || !s.sourcePath;
     const sfx = (name, plain = false) => (single && plain ? name : `${name}-${s.id}`);
-    let box = (this.specBoxes ??= Object.create(null))[s.id];
+    let box = (this.specBoxes ??= Object.create(null))[this.specBoxKey(s.id)];
     if (!box) {
-      const startEditing = Boolean(this.specAutoEdit?.delete?.(s.id)) && !isBuiltin;
-      box = this.specBoxes[s.id] = { loading: true, editing: startEditing };
+      const startEditing = Boolean(this.specAutoEdit?.delete?.(this.specBoxKey(s.id))) && !isBuiltin;
+      box = this.specBoxes[this.specBoxKey(s.id)] = { loading: true, editing: startEditing };
       this.loadSpec(cx, s, isBuiltin, box);
     }
     const mac = window()?.platform === "macos";
@@ -2141,7 +2156,7 @@ export default class RigView extends View {
     const copyReason = isBuiltin ? personDisableReason("specs-add", config) : null;
     const remoteEdit = !isBuiltin && Boolean(config.daemonMachine);
     const guidance = box.note || (remoteEdit ? this.remoteSpecGuidance() : null);
-    const copyNote = this.specCopyNotes?.[s.id];
+    const copyNote = this.specCopyNotes?.[this.specBoxKey(s.id)];
     const saveDisabled = isBuiltin || !editing || !dirty || Boolean(box.saving || box.awaitingPermission);
     const openDisabled = !s.sourcePath || Boolean(config.daemonMachine);
     const toolbar = h_flex().gap(8).items_center().flex_wrap()
@@ -2329,7 +2344,7 @@ export default class RigView extends View {
 
   /** Toggle editable mode; Copy & edit copies a built-in into the user library. */
   toggleEditSpec(cx, s, isBuiltin) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box) return;
     box.view="yaml";
     const current=nav().stack?.at(-1);
@@ -2360,7 +2375,7 @@ export default class RigView extends View {
   }
 
   confirmDiscardEditSpec(cx, s, isBuiltin) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box) return;
     setDraft(specDraftKey(s.id,this.specConfig()), null);
     box.editing = false;
@@ -2378,11 +2393,12 @@ export default class RigView extends View {
    *  comes back only against the text it was started from: if the file moved on since, the draft stays against its own
    *  base and the conflict says so, so Save can't overwrite the newer file unseen. */
   loadSpec(cx, s, isBuiltin, box) {
+    const config = this.specConfig(); // the restored draft belongs to the connection this load began for, not the page shown after the await
     cx.spawn(async (cx) => {
       await Promise.resolve();
       try {
         const text = await this.specText(s);
-        const key = specDraftKey(s.id,this.specConfig()), raw = (shared("rig.drafts") ?? {})[key];
+        const key = specDraftKey(s.id,config), raw = (shared("rig.drafts") ?? {})[key];
         const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
         let initial = text;
         box.loaded = text; box.diskText = null; box.restoredDraft = false;
@@ -2407,18 +2423,18 @@ export default class RigView extends View {
 
   /** Reload from disk, losing the edits: with edits it asks first (a second press discards them). */
   reloadSpec(cx, s, isBuiltin) {
-    const box = this.specBoxes[s.id];
+    const box = this.specBoxes[this.specBoxKey(s.id)];
     if (this.specDirty(box) && !box.confirmReload) { box.confirmReload = true; cx.notify(); return; }
     setDraft(specDraftKey(s.id,this.specConfig()), null);
-    this.specBoxes[s.id] = { loading: true, editing: false, view:box.view };
-    this.loadSpec(cx, s, isBuiltin, this.specBoxes[s.id]);
+    this.specBoxes[this.specBoxKey(s.id)] = { loading: true, editing: false, view:box.view };
+    this.loadSpec(cx, s, isBuiltin, this.specBoxes[this.specBoxKey(s.id)]);
     box.state?.release?.();
     cx.notify();
   }
 
   /** The conflict banner's other way out: keep the text, and let the next Save replace the file as it is now. */
   keepEditing(cx, s) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box) return;
     box.conflict = null; box.confirmReload = false; box.editing = true;
     box.loaded = box.diskText ?? box.loaded; box.diskText = null;
@@ -2428,7 +2444,7 @@ export default class RigView extends View {
 
   /** The restored edits' Discard: back to the file's text, draft gone, and return to read-only. */
   discardDraft(cx, s) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box?.state) return;
     setDraft(specDraftKey(s.id,this.specConfig()), null);
     box.restoredDraft = false; box.confirmRevert = false; box.confirmDiscardEdit = false; box.editing = false;
@@ -2438,7 +2454,7 @@ export default class RigView extends View {
 
   /** Revert asks first when there are edits (a second press discards them); nothing to discard reverts at once. */
   revertSpec(cx, s) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box?.state) return;
     if (this.specDirty(box) && !box.confirmRevert) { box.confirmRevert = true; cx.notify(); return; }
     box.state.set_value(box.loaded);
@@ -2450,7 +2466,7 @@ export default class RigView extends View {
   /** Save = validate (daemon, by kind) → compare-and-swap write → sync the library → re-read. Invalid is never written.
    *  Its checks run at once; the rest runs as a task, whose own `cx` every later notify and read uses. */
   saveSpec(cx, s) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box?.state || box.saving || !box.editing || s.sourceType === "builtin" || !s.sourcePath || !this.specDirty(box)) return;
     const edited = box.state.value();
     box.errors = null; box.conflict = null; box.note = null; box.savedText = null;
@@ -2496,10 +2512,10 @@ export default class RigView extends View {
         const synced = await this.syncLibrary(op, daemonUrl);
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
         box.savedText = synced?.ok ? "Saved." : synced?.refused ? "Saved; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up." : "Saved; library re-index failed.";
-        delete this.specCopyNotes?.[s.id];
+        delete this.specCopyNotes?.[this.specBoxKey(s.id, shown)];
         if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
-        const key = specDraftKey(s.id,this.specConfig()), now = box.state.value();
+        const key = specDraftKey(s.id,shown), now = box.state.value();
         setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
         if (now === edited) {
           box.editing = false;
@@ -2551,7 +2567,15 @@ export default class RigView extends View {
   /** Writes `text` as a new file in the first local spec folder, under a name made from the spec's (never a path the
    *  daemon sent), taking a name free in every local spec folder because the CLI also copies into its library.
    *  Returns the file written. */
-  async writeSpecCopy(s, text, op = null) {
+  async writeSpecCopy(s, text, op = null, began = null) {
+    // The copy belongs to the OpenRig it BEGAN for (`began`, the connection copySpec started under): a page switch in between must never pick the other OpenRig's folder and leave a file there.
+    // Its folders are resolved for that connection (`config`); without `began` (a direct caller) it is the page's own.
+    const config = began ?? this.activeConfig();
+    const pageChanged = () => { const shownNow = this.specConfig(); return Boolean(began && shownNow && (shownNow.connectionId ?? LEGACY_CONNECTION_ID) !== (began.connectionId ?? LEGACY_CONNECTION_ID)); };
+    const changed = "The page changed while the copy was starting, so nothing was written. Copy it again from this page.";
+    const refused = cliRefusal(config); // a connection without its own OpenRig home writes nothing (HOME_NEEDED), whatever folders the page holds
+    if (refused) throw new Error(refused);
+    if (pageChanged()) throw new Error(changed);
     // A page opened after a load that resolved for another machine's page holds no folders, so resolve
     // for THIS page when it holds none. The folders stay in `this.specRoots`, which is what every path check below reads - and folders it
     // already holds are respected, never re-resolved over (a caller may have chosen them, and a new address is a new load anyway).
@@ -2562,9 +2586,14 @@ export default class RigView extends View {
     // Resolve only when the field does not already hold THIS page's folders or a caller's chosen ones: re-resolving over a caller's choice is
     // what made a copy land somewhere other than where the page said.
     const fieldIsChosen = Array.isArray(this.specRoots) && this.specRoots !== this.specRootsPublished;
-    if (!fieldIsChosen) await this.specRootsFor(this.activeConfig()); // else a caller already put this page's folders here
+    if (!fieldIsChosen) await this.specRootsFor(config); // the connection the copy began under; else a caller already put this page's folders here
+    if (pageChanged()) throw new Error(changed); // re-checked after the await: a switch while the folders resolved would write into the other OpenRig's folder
     const roots = this.specRoots ?? [];
     if (!roots[0]) throw new Error(this.specRefusal());
+    // The folders the page now holds must still be that connection's: a tab switched to another OpenRig meanwhile publishes ITS folders, and the
+    // copy would land there. Nothing is written then (a caller's own chosen folders are its choice).
+    if (!fieldIsChosen && (this.specRootsConn ?? LEGACY_CONNECTION_ID) !== (config?.connectionId ?? LEGACY_CONNECTION_ID))
+      throw new Error("This page now shows another OpenRig, so the copy wasn't made. Open the spec again to copy it.");
     const root = this.specRoots[0]; // read from the field: the security rule traces this shape as a write path
     if (!root) throw new Error(this.specRefusal());
     const base = specCopyName(s.name);
@@ -2586,13 +2615,14 @@ export default class RigView extends View {
    *  the daemon named, which the CLI would read on this machine and upload. Then sync, re-read, and open the user copy
    *  in edit mode. */
   copySpec(cx, s) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box || box.copying) return;
     if (!this.config?.person) { box.note = NO_PERSON; cx.notify(); return; }
     // A built-in rig spec that has a folder of its own is copied as that whole folder, so the copy can launch.
     if (folderCopyable(s)) { this.copyFolder(cx, s); return; }
     const shown = this.specConfig(); // the connection this page shows decides the route
     if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one."; cx.notify(); return; }
+    const fromConn = this.shownEntry()?.conn ?? null; // the page the copy began on: only that page moves to the copy, which keeps its connection
     if(shown.daemonMachine){
       this.remoteSpecWrite(cx,s,{verb:"copy",name:s.name});return;
     }
@@ -2605,7 +2635,7 @@ export default class RigView extends View {
         const prepared = copyableSpecText(source, s.sourcePath);
         if (prepared.refused) { box.note = prepared.refused; return; }
         const text = prepared.text;
-        const written = await this.writeSpecCopy(s, text, op);
+        const written = await this.writeSpecCopy(s, text, op, shown);
         // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
         const roots = await this.specRootsFor(shown); // THIS acted-on connection's own folders
         const file = await resolveInSpecRoots(written, roots, execFor(shown));
@@ -2630,15 +2660,16 @@ export default class RigView extends View {
           }
         } catch (e) { rethrowGate(null)(e); /* a gate refusal stops the copy flow; otherwise the list stays as it was */ }
         if (made !== s.id) {
-          delete this.specBoxes?.[made];
-          (this.specAutoEdit ??= new Set()).add(made);
+          delete this.specBoxes?.[this.specBoxKey(made, shown)];
+          (this.specAutoEdit ??= new Set()).add(this.specBoxKey(made, shown));
           const lacking = s.sourceType === "user_file" ? null : siblingFileNote(siblingFileNames(text));
-          if (lacking) (this.specCopyNotes ??= Object.create(null))[made] = lacking;
+          if (lacking) (this.specCopyNotes ??= Object.create(null))[this.specBoxKey(made, shown)] = lacking;
         }
         setOpen(`spec:${made}`, true);
         // On the one-spec page the page itself moves to the copy.
         const stack = nav().stack ?? [], top = stack.at(-1);
-        if (copy && top?.section === "specs" && top.id === s.id) setShared("rig.nav", { stack: [...stack.slice(0, -1), { section: "specs", id: made, name: copy.name ?? s.name }] });
+        if (copy && top?.section === "specs" && top.id === s.id && (top.conn ?? null) === fromConn)
+          setShared("rig.nav", { stack: [...stack.slice(0, -1), { section: "specs", id: made, name: copy.name ?? s.name, ...(fromConn ? { conn: fromConn } : {}) }] });
       } catch (e) { box.note = String(e?.message ?? e); }
       finally { box.copying = false; cx.notify(); }
     });
@@ -2818,8 +2849,10 @@ export default class RigView extends View {
   }
 
   /** Copy & edit of a built-in rig spec as a whole folder, then open the copy in edit mode. */
+  /** The whole-folder copy (a seam, so a test can hold it at its await). */
+  copyBuiltinFolderFor(host, s, consent) { return copyBuiltinFolder(host, s, consent); }
   copyFolder(cx, s, consent = null) {
-    const box = this.specBoxes?.[s.id];
+    const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box || box.copying || box.awaitingPermission) return;
     const shown = this.specConfig();
     if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one."; cx.notify(); return; }
@@ -2831,11 +2864,11 @@ export default class RigView extends View {
     box.copying = true; box.note = null; box.errors = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const daemonUrl = await this.resolveDaemonUrl(this.specConfig());
+        const daemonUrl = await this.resolveDaemonUrl(config);
         if (!daemonUrl) throw new Error("The daemon address isn't known yet.");
         op.check(); // the address resolved above is for the config that asked
         const host = this.folderHost(cx, config, daemonUrl, op);
-        const out = await copyBuiltinFolder(host, s, consent);
+        const out = await this.copyBuiltinFolderFor(host, s, consent);
         if (out.needsConsent) {
           if (this.specPermission) throw new Error("Finish the open spec permission dialog first.");
           const token = `spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -2844,10 +2877,10 @@ export default class RigView extends View {
           this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 420, props: { target: { kind: "spec", id: s.id }, step: { action: "confirm-spec-write", token, confirmation: out.confirmation } } });
           return;
         }
-        if (out.exists) { await this.openExistingCopy(cx, s, host, out.folder, box); return; }
+        if (out.exists) { await this.openExistingCopy(cx, s, host, out.folder, box, config); return; }
         if (!out.ok) { box.errors = out.errors ?? null; box.note = out.reason; return; }
         if (config.daemonMachine) this.specConsentMachine = config.daemonMachine;
-        this.showSpecCopy(cx, out.copy);
+        this.showSpecCopy(cx, out.copy, null, config);
       } catch (error) {
         box.note = error?.folder && /differs from the built-in/.test(String(error.message))
           ? `Your copy of ${s.name} at ${error.folder} was changed since it was made, so Copy & edit didn't overwrite it.`
@@ -2859,29 +2892,30 @@ export default class RigView extends View {
   }
 
   /** The copy's page, in edit mode, with an optional note above its editor. */
-  showSpecCopy(cx, copy, note = null) {
-    if (!this.specDirty(this.specBoxes?.[copy.id])) delete this.specBoxes?.[copy.id];
-    (this.specAutoEdit ??= new Set()).add(copy.id);
-    if (note) (this.specCopyNotes ??= Object.create(null))[copy.id] = note;
-    else delete this.specCopyNotes?.[copy.id];
+  showSpecCopy(cx, copy, note = null, config = this.specConfig()) {
+    const key = this.specBoxKey(copy.id, config);
+    if (!this.specDirty(this.specBoxes?.[key])) delete this.specBoxes?.[key];
+    (this.specAutoEdit ??= new Set()).add(key);
+    if (note) (this.specCopyNotes ??= Object.create(null))[key] = note;
+    else delete this.specCopyNotes?.[key];
     this.push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml" });
     this.read(cx, "/api/specs/library", true); run("rig.refresh");
   }
 
   /** The built-in's folder already has a copy: open a finished one, finish an unfinished one (its fixed text is put in the editor;
    *  the person's Save is the write), and never overwrite or delete anything. */
-  async openExistingCopy(cx, s, host, folder, box) {
+  async openExistingCopy(cx, s, host, folder, box, config = this.specConfig()) {
     const found = await findExistingCopy(host, s, folder);
     if (found.state === "unindexed") {
       box.note = found.reason ?? "You already have a copy folder for this built-in, but the spec library doesn't list it yet. Refresh the library, then try again.";
       return;
     }
-    if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`); return; }
-    const key=specDraftKey(found.entry.id,this.specConfig()),draft=(shared("rig.drafts")??{})[key];
-    const retained=this.specDirty(this.specBoxes?.[found.entry.id]) || typeof draft==='string' || typeof draft?.text==='string';
+    if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`, config); return; }
+    const key=specDraftKey(found.entry.id,config),draft=(shared("rig.drafts")??{})[key];
+    const retained=this.specDirty(this.specBoxes?.[this.specBoxKey(found.entry.id, config)]) || typeof draft==='string' || typeof draft?.text==='string';
     if(!retained)setDraft(key, { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
     this.showSpecCopy(cx, found.entry, retained ? null
-      : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`);
+      : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`, config);
   }
 
   remoteSpecController(cx, op = null) {
@@ -2905,15 +2939,15 @@ export default class RigView extends View {
 
   /** Remote targets go only to the pinned box helper; registration is HTTP-only. */
   remoteSpecWrite(cx,s,request,consent=null) {
-    const box=this.specBoxes?.[s.id];if(!box||box.saving||box.copying||box.awaitingPermission)return;
+    const box=this.specBoxes?.[this.specBoxKey(s.id)];if(!box||box.saving||box.copying||box.awaitingPermission)return;
     const shown=this.specConfig();
     if(!shown){box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one. Unsaved text stays here.";cx.notify();return;}
     const refused=cliRefusal(shown);if(refused){box.note=refused;cx.notify();return;} // a connection without its own OpenRig home: HOME_NEEDED, nothing sent
-    const config={...shown};box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
+    const config={...shown},fromConn=this.shownEntry()?.conn??null;box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
     cx.spawn(async cx=>{
       try{
         const op=this.writeOperation(config); // the validation below is only good for the connection and config this write began under
-        const daemonUrl=await this.resolveDaemonUrl(this.specConfig());if(!daemonUrl)throw Error("The daemon address isn't known yet.");
+        const daemonUrl=await this.resolveDaemonUrl(config);if(!daemonUrl)throw Error("The daemon address isn't known yet.");
         let content=request.content??await this.specText(s,op);
         if(request.verb==="copy"){
           const prepared=copyableSpecText(content,s.sourcePath);
@@ -2940,8 +2974,8 @@ export default class RigView extends View {
         if(request.verb==="save"){
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
           box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:synced?.refused?`Saved on ${config.daemonMachine}; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
-          delete this.specCopyNotes?.[s.id];
-          const now=box.state.value();setDraft(specDraftKey(s.id,this.specConfig()),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
+          delete this.specCopyNotes?.[this.specBoxKey(s.id, config)];
+          const now=box.state.value();setDraft(specDraftKey(s.id,config),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
           if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true);}
         }else{
           if(!synced?.ok)throw Error(synced?.refused?`The copy was saved on ${config.daemonMachine}, but OpenRig's settings changed before the library could be updated. Refresh the library before copying again.`:`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
@@ -2949,10 +2983,10 @@ export default class RigView extends View {
           const list=JSON.parse(await response.text()),copy=list.find(x=>x.sourceType==="user_file"&&x.sourcePath===result.path);
           if(!copy)throw Error("The copy was saved, but isn't indexed yet. Refresh before copying again.");
           this.cache["/api/specs/library"]={data:list,at:Date.now()};
-          (this.specAutoEdit??=new Set()).add(copy.id);delete this.specBoxes[copy.id];
+          (this.specAutoEdit??=new Set()).add(this.specBoxKey(copy.id,config));delete this.specBoxes[this.specBoxKey(copy.id,config)];
           const lacking=s.sourceType==="user_file"?null:siblingFileNote(siblingFileNames(content));
-          if(lacking)(this.specCopyNotes??=Object.create(null))[copy.id]=lacking;
-          this.push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml"});
+          if(lacking)(this.specCopyNotes??=Object.create(null))[this.specBoxKey(copy.id,config)]=lacking;
+          if((this.shownEntry()?.conn??null)===fromConn)this.push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml",...(fromConn?{conn:fromConn}:{})});
         }
         this.read(cx,"/api/specs/library",true);run("rig.refresh");
       }catch(error){
