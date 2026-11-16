@@ -112,6 +112,9 @@ export function nowLine(content, runtime = "") {
   return { line: line.slice(0, 200), lines: visible.map(b => plain(b.text)).filter(Boolean).slice(-10), working: active, elapsed };
 }
 
+/** A seat's place in the cache: its `key` when the caller gives one (the connection and session: two OpenRigs can run seats with the same
+ *  name), else its session. */
+const tailKey = (s) => s.key ?? s.session;
 /** Per-view cache: only clean screen text is retained; callers supply the currently expanded rows each refresh. */
 export class NowTailCache {
   constructor(fetchTail, changed = () => {}) {
@@ -119,11 +122,11 @@ export class NowTailCache {
     this.inflight = new Set(); this.wanted = new Set(); this.cursors = { working: 0, other: 0 }; this.closed = false;
   }
   refresh(seats, { visible = true, now = Date.now() } = {}) {
-    const valid = visible ? [...new Map(seats.filter(s => !s.terminal && !s.hidden && /^[A-Za-z0-9_.@-]+$/.test(s.session ?? "")).map(s => [s.session, s])).values()] : [];
-    this.wanted = new Set(valid.map(s => s.session));
-    this.pending = this.pending.filter(s => this.wanted.has(s.session));
-    const eligible = s => !this.inflight.has(s.session) && !this.pending.some(p => p.session === s.session)
-      && now - (this.records.get(s.session)?.attemptAt ?? -Infinity) >= 5000;
+    const valid = visible ? [...new Map(seats.filter(s => !s.terminal && !s.hidden && /^[A-Za-z0-9_.@-]+$/.test(s.session ?? "")).map(s => [tailKey(s), s])).values()] : [];
+    this.wanted = new Set(valid.map(tailKey));
+    this.pending = this.pending.filter(s => this.wanted.has(tailKey(s)));
+    const eligible = s => !this.inflight.has(tailKey(s)) && !this.pending.some(p => tailKey(p) === tailKey(s))
+      && now - (this.records.get(tailKey(s))?.attemptAt ?? -Infinity) >= 5000;
     const picked = valid.filter(s => s.open && eligible(s)).slice(0, 1);
     for (const group of ["working", "other"]) {
       const rows = valid.filter(s => !s.open && (group === "working" ? /^(?:active|working|running)$/.test(s.status ?? "") : !/^(?:active|working|running)$/.test(s.status ?? "")));
@@ -140,8 +143,8 @@ export class NowTailCache {
   pump(now = Date.now()) {
     if (this.closed) return;
     while (this.inflight.size < 4 && this.pending.length) {
-      const seat = this.pending.shift(); if (!this.wanted.has(seat.session)) continue;
-      const key = seat.session, previous = this.records.get(key);
+      const seat = this.pending.shift(); if (!this.wanted.has(tailKey(seat))) continue;
+      const key = tailKey(seat), previous = this.records.get(key);
       this.records.set(key, { ...previous, attemptAt: now }); this.inflight.add(key);
       Promise.resolve().then(() => this.fetchTail(seat)).then(response => {
         if (this.closed) return;

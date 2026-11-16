@@ -1207,6 +1207,13 @@ export default class RigView extends View {
     return rig ? { entry: { ...entry, rigId: rig.id, conn: rig.conn } } : { view: this.dim(t, `No rig ${rigName} on this daemon.`) };
   }
 
+  /** The sidebar's published rows for the connection this page shows. The top-level rows merge every connection, and names repeat across
+   *  OpenRigs (every one has a kernel rig, and seats can share names), so a lookup by name reads this connection's own entry. One connection:
+   *  the publication itself, as before. */
+  pageRigData() {
+    const published = sharedRigData(this.config, shared);
+    return (this.config?.connections ?? []).length > 1 ? published?.byConnection?.[this.activeConnId()] : published;
+  }
   /** A rig's nodes: this page's read, else what the sidebar already holds (so a block isn't empty while its own read lands). */
   nodesOf(cx, rigId) {
     const got = this.read(cx, `/api/rigs/${encodeURIComponent(rigId)}/nodes`);
@@ -1220,7 +1227,9 @@ export default class RigView extends View {
   resetNowTails(cx) {
     this.nowTails?.close(); this.nowDue = true; this.nowWidths = Object.create(null); this.nowSignature = null;
     this.nowTails = new NowTailCache(async seat => {
-      const cfg = this.activeConfig(); // the connection the page shows: its address, its gate scope
+      // The seat's own connection (named when it was queued), as the settings say now: never the page shown when the request leaves.
+      const cfg = seat.conn ? configOfConnection(this.config, seat.conn) : this.activeConfig();
+      if (!cfg) return { ok: false, error: "This seat's OpenRig is no longer set up." };
       const op = gatedOperationOrRefusal(cfg?.connectionId);
       const origin = await this.resolveDaemonUrl(cfg);
       if (!origin) return { ok: false, error: "OpenRig daemon is unavailable." };
@@ -1230,12 +1239,18 @@ export default class RigView extends View {
   }
   refreshNowTails(cx) {
     if (!this.nowTails || this.closed || !this.config || this.config.missing) return;
-    const seats = [...(this.nowSeats?.values() ?? [])], signature = seats.map(s => `${s.session}:${s.open ? "open" : s.status}`).join("|");
+    const seats = [...(this.nowSeats?.values() ?? [])], signature = seats.map(s => `${s.key}:${s.open ? "open" : s.status}`).join("|");
     if (!this.nowDue && signature === this.nowSignature) return;
     this.nowDue = false; this.nowSignature = signature;
     // This is called only by native render, not by a poll callback. The current page has no virtual-range API:
     // use the approved expanded-rig/pod fallback, bounded by NowTailCache to 12 seats and four requests.
     cx.spawn(async () => { this.nowTails?.refresh(seats); });
+  }
+  /** A seat as the screen-text cache knows it: its connection and session (two OpenRigs can run seats with the same name). The legacy
+   *  connection keeps the bare session, so one connection is unchanged. */
+  nowSeat(seat) {
+    const conn = seat.conn ?? this.activeConnId() ?? LEGACY_CONNECTION_ID;
+    return { ...seat, conn, key: conn === LEGACY_CONNECTION_ID ? seat.session : JSON.stringify([conn, seat.session]) };
   }
   nowLines(t, state, key) {
     return v_flex().max_h(240).overflow_y_scrollbar().p(8).gap(3).rounded(6).bg(t.raised)
@@ -1246,7 +1261,7 @@ export default class RigView extends View {
     return file ? () => this.push(fileEntry(file, `${seat.logicalId ?? seat.session} transcript`)) : null;
   }
   nowRow(t, seat, openSeat) {
-    const state = nowTailPresentation(this.nowTails?.records.get(seat.session),Date.now(),this.uiTimezone);
+    const state = nowTailPresentation(this.nowTails?.records.get(this.nowSeat(seat).key),Date.now(),this.uiTimezone);
     const openTranscript = this.nowTranscript(seat);
     const line = h_flex().w_full().h(20).min_w(0).gap(4).items_center().overflow_hidden().text_size(12)
       .when(state.stale, el => el.child(div().flex_none().text_color(t.dim).child(state.prefix)));
@@ -1273,7 +1288,7 @@ export default class RigView extends View {
       .when(Boolean(state.line) && this.nowWidths?.[seat.session] !== false, el => el.child(HoverCard.new(`now-hover-${seat.session}`).open_delay(600).trigger(line).content(hover)));
   }
   nowBlock(t, seat, openTranscript) {
-    const state = nowTailPresentation(this.nowTails?.records.get(seat.session),Date.now(),this.uiTimezone);
+    const state = nowTailPresentation(this.nowTails?.records.get(this.nowSeat(seat).key),Date.now(),this.uiTimezone);
     const { compact } = pageBodyLayout(this.pageWidth);
     return this.card(t, "Now", [
       (compact ? v_flex() : h_flex()).id("seat-now-meta").w_full().gap(8).when(!compact, el => el.items_center()).child(div().when(!compact, el => el.flex_1()).min_w(0)
@@ -1515,11 +1530,13 @@ export default class RigView extends View {
         })),
       }],
     }));
-    const topo = (sharedRigData(this.config, shared)?.topology?.length ? sharedRigData(this.config, shared).topology : null) ?? fallbackTopology;
+    // The page's own connection's rows: a seat is matched by session or name, and those repeat across OpenRigs (every kernel has an operator).
+    const own = this.pageRigData();
+    const topo = (own?.topology?.length ? own.topology : null) ?? fallbackTopology;
     const missions = Array.isArray(scopesGot.data?.missions) ? scopesGot.data.missions : null;
     const attentionItems = Array.isArray(attGot.data?.items)
       ? attGot.data.items
-      : (Array.isArray(sharedRigData(this.config, shared)?.attention?.items) ? sharedRigData(this.config, shared).attention.items : null);
+      : (Array.isArray(own?.attention?.items) ? own.attention.items : null);
     const rows = recentTransitionRows(got.data, topo, { missions, attentionItems, timezone:this.uiTimezone });
     if (!rows.length) return this.dim(t, "Nothing yet.");
     return v_flex().id(`${idPrefix}-list`).gap(2).children(rows.map((r, i) => {
@@ -1604,7 +1621,7 @@ export default class RigView extends View {
   seatChip(t, rig, s, lifecycle, { nativeSeat = null, seatNeed = null } = {}) {
     const { compact, tight } = pageBodyLayout(this.pageWidth);
     const rowStatus = seatNeed ? "needs_input" : s.status;
-    if (!s.terminal) this.nowSeats?.set(s.session, s);
+    if (!s.terminal) { const seat = this.nowSeat(s); this.nowSeats?.set(seat.key, seat); }
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
     const click = seatClickTarget(stripProps(), activeRigViewId(), s.session, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, s.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(s.session) === true);
     const seatTarget = {
@@ -1754,7 +1771,7 @@ export default class RigView extends View {
     const n = nodes.data.find((x) => x.logicalId === entry.name || x.canonicalSessionName === entry.session);
     if (!n) return this.dim(t, `${entry.name} isn't in ${entry.rig} any more.`);
     const rawStatus = seatStatus(n);
-    if (!isTerminalSeat(n)) this.nowSeats?.set(n.canonicalSessionName, { session: n.canonicalSessionName, runtime: n.runtime, status: rawStatus, open: true });
+    if (!isTerminalSeat(n)) { const seat = this.nowSeat({ session: n.canonicalSessionName, runtime: n.runtime, status: rawStatus, open: true }); this.nowSeats?.set(seat.key, seat); }
     const look = statusLook(rawStatus);
     const stoppedSeat = rawStatus === "stopped" || rawStatus === "exited" || n.lifecycleState === "stopped" || n.lifecycleState === "recoverable" || n.attachable === false;
     const rawCtx = n.contextUsage?.usedPercentage;
@@ -2055,7 +2072,8 @@ export default class RigView extends View {
       const wait = this.status(t, cx, "/api/specs/library", lib);
       if (wait) return wait;
       const want = entry.specOf;
-      const node = Object.values(sharedRigData(this.config, shared)?.nodesByRig ?? {}).flat()
+      // The seat is found among the page's OWN connection's nodes: two OpenRigs can run seats with the same name and different specs.
+      const node = Object.values(this.pageRigData()?.nodesByRig ?? {}).flat()
         .find((n) => n.logicalId === want || n.canonicalSessionName === want || n.logicalId?.split(".").pop() === want);
       if (!node?.resolvedSpecName) return this.dim(t, node ? `${want} names no agent spec.` : `No seat ${want} in the rigs this window reads.`);
       const hit = lib.data.find((x) => x.kind === "agent" && x.name === node.resolvedSpecName && (!node.resolvedSpecVersion || x.version === node.resolvedSpecVersion))
@@ -2856,16 +2874,38 @@ export default class RigView extends View {
    *  daemon this page talks to is this computer's (a copy made here is invisible to another machine's daemon). */
   async localAddFolder(request, daemonUrl, cx, config = this.config, op = gatedOperationOrRefusal()) {
     op.check(); // the CLI and the helper run under the settings this copy began with (the gate judges each result; the operation judges the start)
-    const status = parseDaemonStatusJson((await exec("rig", ["status", "--json"], { timeout: 15000 })).stdout);
-    op.check();
-    if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
     const health = async (url) => { const r = await op.fetch(`${url}/healthz`); if (!r.ok) throw new Error("OpenRig isn't answering."); return JSON.parse(await r.text()); };
-    const [here, there] = await Promise.all([health(status.daemonUrl), health(daemonUrl)]);
-    if (!sameDaemon(here, there)) // the same host id isn't enough: a host.name-seeded id can be shared by two OpenRigs on this computer
-      throw new Error("The OpenRig this page reads isn't this computer's own, so a copy made here would never be seen by it. Set up the machine first.");
+    const notHere = "The OpenRig this page reads isn't this computer's own, so a copy made here would never be seen by it. Set up the machine first.";
+    const several = (config?.connections?.length ?? 0) > 1;
     const helper = attachRelayPath(appHome(), MOD_IDS.view).replace(/rig-attach-relay\.cjs$/, "rig-spec-files.cjs");
+    if (several) {
+      // With several OpenRigs the gate makes `rig status` carry this page's own address, so it would only echo that address back. The proof comes from
+      // the copy's own destination instead: the helper's `rig` copies into ITS spec library (the helper reports its folders first), which must be one of
+      // this page's connection's spec folders, and the daemon that library's OpenRig home records (daemon.json: its pid and port) must be the one this
+      // page reads.
+      const answer = await execFor(config)("node", [helper, "roots"], { timeout: 30000 });
+      op.check();
+      let library = null; try { library = JSON.parse(answer.stdout)?.roots?.[0] ?? null; } catch (_) { library = null; }
+      const mine = await this.specRootsFor(config);
+      op.check();
+      if (typeof library !== "string" || !/\/specs$/.test(library) || !mine.includes(library))
+        throw new Error(`With more than one OpenRig, Copy & edit of a built-in's folder works on this computer only for the OpenRig whose spec library \`rig\` copies into here${typeof library === "string" ? ` (${library})` : ""}. Nothing was copied.`);
+      let recorded = null; try { recorded = JSON.parse(await readTextFile(`${library.replace(/\/specs$/, "")}/daemon.json`) ?? "null"); } catch (_) { recorded = null; }
+      op.check();
+      if (!recorded || !Number.isInteger(recorded.pid) || !Number.isInteger(recorded.port)) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
+      const there = await health(daemonUrl), port = Number(new URL(daemonUrl).port || 80);
+      if (there?.pid !== recorded.pid || port !== recorded.port || !isLoopbackDaemonUrl(daemonUrl)) throw new Error(notHere);
+    } else {
+      const status = parseDaemonStatusJson((await exec("rig", ["status", "--json"], { timeout: 15000 })).stdout);
+      op.check();
+      if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
+      const [here, there] = await Promise.all([health(status.daemonUrl), health(daemonUrl)]);
+      if (!sameDaemon(here, there)) // the same host id isn't enough: a host.name-seeded id can be shared by two OpenRigs on this computer
+        throw new Error(notHere);
+    }
     op.check();
-    const r = await exec("node", [helper, "copy-folder", "--local", "--", request.sourcePath], { timeout: 150000 });
+    // With several OpenRigs the helper runs under this page's own connection; with one, as it always did.
+    const r = several ? await execFor(config)("node", [helper, "copy-folder", "--local", "--", request.sourcePath], { timeout: 150000 }) : await this.localCopyHelper(helper, request);
     op.check();
     let out; try { out = JSON.parse(r.stdout); } catch (_) { throw new Error(r.stderr || "The copy helper gave no answer."); }
     if (out.error) throw Object.assign(new Error(out.error), { code: out.code, folder: out.folder });
@@ -2881,6 +2921,12 @@ export default class RigView extends View {
     try { await writeTextFile(file, request.content, current); }
     catch { throw new Error(conflict); }
     return { ok: true, path: out.path, folder: out.folder };
+  }
+
+  /** One connection: the shipped helper copies the folder on this computer (its exec is the page's own, as one connection always had). */
+  async localCopyHelper(helper, request) {
+    const r = await exec("node", [helper, "copy-folder", "--local", "--", request.sourcePath], { timeout: 150000 });
+    return r;
   }
 
   /** Copy & edit of a built-in rig spec as a whole folder, then open the copy in edit mode. */
@@ -3078,8 +3124,11 @@ export default class RigView extends View {
               .text_size(11.5).font_semibold().text_color(p.error ? t.blocked : on ? (t.solid_foreground ?? t.background) : t.muted)
               .on_click(() => {
                 setShared("rig.project", p.id);
-                const prior = (nav().stack ?? []).filter((e) => e?.section !== "scopes");
-                setShared("rig.nav", { stack: [...prior, { section: "scopes", project: p.id }] });
+                // A new project drops this connection's Scopes drill-downs (as before) and opens that project's Scopes page for the SAME
+                // connection; another connection's Scopes pages (another tab's) stay as they are.
+                const conn = this.shownEntry()?.conn ?? null;
+                const kept = (nav().stack ?? []).filter((e) => e?.section !== "scopes" || (e.conn ?? null) !== conn);
+                setShared("rig.nav", { stack: [...kept, { section: "scopes", project: p.id, ...(conn ? { conn } : {}) }] });
                 this.read(cx, `/api/scopes?detail=1&project=${encodeURIComponent(p.id)}`, true);
               })
               .child(p.name ?? p.id)
@@ -3279,7 +3328,7 @@ export default class RigView extends View {
     }
     const wait = this.status(t, cx, fullPath, preview);
     if (wait) return wait;
-    const normalized = normalizeTerminalPreview(preview.data?.composed, viewKey, sharedRigData(this.config, shared)?.topology ?? []);
+    const normalized = normalizeTerminalPreview(preview.data?.composed, viewKey, this.pageRigData()?.topology ?? []); // the page's own rigs: a rig is found by name
     const opened = normalized.opened;
     const absent = normalized.absent;
     const degraded = normalized.degraded;
