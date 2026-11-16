@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.6
+Version: v0.4.7
 
 **OpenRig Mod for Herdr**
 
@@ -70,6 +70,8 @@ you.
 Herdr doesn't review mods: check what your agent runs and which keys it changes.
 
 ## Updating
+
+After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
 
 Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with the new
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.

@@ -50,7 +50,7 @@ export async function applySpacesMode(host, shown, target) {
   // Every tree this operation has put on the layout. The rollback may only restore a tree we wrote or the one we read: anything
   // else is someone else's edit, and restoring over it would reverse their change. Tracking all of them (not just the last) is
   // what makes a retry safe without a shape heuristic — a heuristic misses structural edits, which is how the first version of
-  // this fix could still overwrite a reorder or a removal (devops.sec, review of a20865874).
+  // this fix could still overwrite a reorder or a removal.
   const issued = [];
   const ours = (candidate) => candidate !== null && issued.some((tree) => sameTree(candidate, tree));
   for (let attempt = 1; attempt <= 2; attempt++) {

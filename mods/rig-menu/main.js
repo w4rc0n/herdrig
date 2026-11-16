@@ -1487,7 +1487,7 @@ export default class RigMenu extends View {
     this.run(cx, label, taskCx => this.write(this.argsFor(target, step.action, text),undefined,taskCx));
   }
 
-  /** Modal body: change seat harness, model, and effort ("Always via lead" + advisor for orch.lead). */
+  /** Modal body: change seat harness, model, and effort (via the lead, or the advisor for a lead change). */
   changeModelView(t, cx, target) {
     const seats = this.rigSeats(target);
     const plan = changeModelPlan(
