@@ -2869,16 +2869,33 @@ export function pauseSummary(nodes) {
   return { total: seats.length, busy, seats };
 }
 
+/** What a teardown left behind, beside what it stopped: sessions joined with rig attach (`leftRunning`), sessions OpenRig
+ *  didn't start and so released instead of stopping (`released`: still running as their owner's), and panes stopped whose
+ *  harness's own processes may keep running (`paneOnly`). One note per list. Once anything was released, the headline counts
+ *  the released and rig-attach sessions as left running. */
+function teardownLeft(json) {
+  const list = (key) => (Array.isArray(json?.[key]) ? json[key].filter((s) => typeof s === "string" && s) : []);
+  const left = list("leftRunning"), released = list("released"), paneOnly = list("paneOnly");
+  const notes = [
+    ...(left.length ? [`Still running (joined with rig attach, which OpenRig doesn't stop): ${left.join(", ")}`] : []),
+    ...(released.length ? [`Released, not stopped (OpenRig didn't start these, so it leaves them running): ${released.join(", ")}`] : []),
+    ...(paneOnly.length ? [`Pane stopped; the agent's own processes may keep running: ${paneOnly.join(", ")}`] : []),
+  ];
+  // Counted once anything was released: then the released sessions and those joined with rig attach are both still running.
+  const stillRunning = released.length ? `, ${released.length + left.length} left running` : "";
+  return { notes, stillRunning };
+}
+
 /** `rig down <rig> --yes --json` (`TeardownResult`) in the person's words, with what didn't stop. */
 export function pauseOutcome(json) {
   const errors = Array.isArray(json?.errors) ? json.errors : [];
-  const left = Array.isArray(json?.leftRunning) ? json.leftRunning : [];
   const n = Number(json?.sessionsKilled ?? 0);
-  const headline = json?.alreadyStopped ? "Already paused: nothing was running."
-    : `Paused · ${n} agent${n === 1 ? "" : "s"} stopped`;
+  const left = teardownLeft(json);
+  const headline = json?.alreadyStopped && !left.stillRunning ? "Already paused: nothing was running."
+    : `Paused · ${n} agent${n === 1 ? "" : "s"} stopped${left.stillRunning}`;
   const notes = [
     json?.snapshotId ? `Snapshot ${json.snapshotId} taken first.` : "No snapshot was taken.",
-    ...(left.length ? [`Still running (joined with rig attach, which OpenRig doesn't stop): ${left.join(", ")}`] : []),
+    ...left.notes,
     ...errors.map((e) => `Error: ${e}`),
   ];
   return { ok: errors.length === 0, headline, notes };
@@ -2887,15 +2904,16 @@ export function pauseOutcome(json) {
 /** `rig down <rig> --delete --yes --json` (`TeardownResult` with `deleted` / `deleteBlocked`) in the person's words. */
 export function deleteOutcome(json, rig) {
   const errors = Array.isArray(json?.errors) ? json.errors : [];
-  const left = Array.isArray(json?.leftRunning) ? json.leftRunning : [];
   const n = Number(json?.sessionsKilled ?? 0);
   const deleted = json?.deleted === true;
-  const headline = deleted ? (json?.alreadyStopped ? `Removed stopped rig ${rig}` : n > 0 ? `Deleted ${rig} · ${n} agent${n === 1 ? "" : "s"} stopped` : `Deleted ${rig}`)
+  const left = teardownLeft(json);
+  const headline = deleted ? (json?.alreadyStopped && !left.stillRunning ? `Removed stopped rig ${rig}`
+      : n > 0 || left.stillRunning ? `Deleted ${rig} · ${n} agent${n === 1 ? "" : "s"} stopped${left.stillRunning}` : `Deleted ${rig}`)
     : json?.deleteBlocked ? `${rig} wasn't deleted: some sessions couldn't be stopped`
     : `${rig} wasn't deleted`;
   const notes = [
     json?.snapshotId ? `Snapshot ${json.snapshotId} taken first.` : "No snapshot was taken.",
-    ...(left.length ? [`Still running (joined with rig attach, which OpenRig doesn't stop): ${left.join(", ")}`] : []),
+    ...left.notes,
     ...errors.map((e) => `Error: ${e}`),
   ];
   return { ok: deleted && errors.length === 0, headline, notes };

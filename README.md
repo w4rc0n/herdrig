@@ -135,7 +135,7 @@ to the daemon. This version copies only the spec text OpenRig served.
 
 ## Worker views (OpenRig 0.7.12 and later)
 
-v0.5.0's native checks ran on OpenRig 0.7.14 and 0.7.16 with herdr-app 0.1.16 (on 0.7.16: install from the release package, an upgrade from 0.7.14, Attach and Needs on two machines). The API/CLI compatibility smoke ran on OpenRig 0.7.13, and native worker-view checks on 0.7.12.
+v0.5.0's native checks ran on OpenRig 0.7.14, 0.7.16 and 0.7.17 with herdr-app 0.1.16 (on 0.7.16 and 0.7.17: install from the release package, an upgrade from 0.7.14 and 0.7.16 respectively, Attach and Needs on two machines). The API/CLI compatibility smoke ran on OpenRig 0.7.13, and native worker-view checks on 0.7.12.
 
 [The herdr-app provider](https://github.com/mvschwarz/openrig/pull/2744) opens worker
 views in the Herdr window on the **same machine as OpenRig**. Worker view, **Show in worker view**, and saved-view
