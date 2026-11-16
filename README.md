@@ -75,7 +75,7 @@ Herdr doesn't review mods: check what your agent runs and which keys it changes.
 
 ## Updating
 
-After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
+After updating, Attach again to each seat whose Attach tab you opened before the update and choose **Replace viewer**: it stops the old helper, closes its tab and starts the current one. Closing those tabs and attaching again does the same. A tab left open keeps using the old helper until it is replaced or closed.
 v0.5.0 updates the Attach helper, so Herdr asks you once to approve it again on each configured Herdr machine. Local
 Attach doesn't ask.
 
@@ -231,9 +231,9 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
   Attach and Seats grids work on each machine.
 - If a machine's OpenRig address changes, Herdrig asks once before it treats that machine's existing rig spaces as its
   own.
-- **Copy & edit** of a built-in spec that has its own folder (such as `starter`) doesn't work on this computer while
-  more than one OpenRig is added: it is refused and nothing is changed. The changelog's Known issues show how to copy
-  one by hand with `rig`.
+- With more than one OpenRig added, **Copy & edit** of a built-in spec that has its own folder (such as `starter`) works
+  on this computer only for the OpenRig that uses this computer's default OpenRig home (`~/.openrig`). For another
+  OpenRig on this computer it says why it can't copy there, and nothing is copied.
 
 ## Known limitations
 

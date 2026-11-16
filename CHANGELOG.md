@@ -4,7 +4,7 @@
 
 ### Updating from v0.4.7
 
-- When OpenRig stops answering after three failed or timed-out checks, Attach tiles clear their status dot instead of showing "Needs you" or raising a notice. The sidebar says OpenRig is not answering, and the seat status returns when it answers again. Checks are bounded, never overlap, and back off when OpenRig is slow. After updating, close every Attach tab opened before the update, then Attach again and approve the updated helper once per configured Herdr machine. Tabs left open keep the old helper and may still show a false "Needs you". Local Attach does not ask for approval.
+- When OpenRig stops answering after three failed or timed-out checks, Attach tiles clear their status dot instead of showing "Needs you" or raising a notice. The sidebar says OpenRig is not answering, and the seat status returns when it answers again. Checks are bounded, never overlap, and back off when OpenRig is slow. After updating, Attach again to each seat whose Attach tab was opened before the update and choose **Replace viewer**: it stops the old helper, closes its tab and starts the current one in its place. (Closing the old tabs and attaching again does the same.) The updated helper is approved once per configured Herdr machine; local Attach does not ask for approval. Until then, tabs left open keep the old helper and may still show a false "Needs you".
 
 ### Use more than one OpenRig
 
@@ -41,6 +41,10 @@ machines. Each one is a connection in `<appHome>/openrig/config.json`.
 - A spec page names its own machine and launches on that OpenRig, and a removed connection offers no spec actions.
   Palette Launch opens the dialog for the OpenRig whose spec you selected, and the Launch dialog's folder hint names
   that spec's machine. New rig, seat focus and worker-view progress stay with the OpenRig the page shows.
+- **Copy & edit** of a built-in spec that has its own folder (such as `starter`) works on this computer for the OpenRig
+  that uses this computer's default OpenRig home (`~/.openrig`): it copies the folder, points the copy's agents at the
+  built-in's, and opens the copy renamed, as with one OpenRig. For another OpenRig on this computer it says why it can't
+  copy there, and nothing is copied. On a machine, Copy & edit works as before.
 - A page opened for another OpenRig keeps that OpenRig when it finds the seat that asked, shows connected assistants
   or graph activity, and offers Resume from a stopped terminal view, even without the sidebar.
 - Worker view and Follow work for each machine's OpenRig: where it offers them, Herdrig opens its own worker pages, and
@@ -111,12 +115,6 @@ machines. Each one is a connection in `<appHome>/openrig/config.json`.
 Some other actions can still show a sidebar refresh error when the OpenRig sidebar is absent. Machine-choice recovery skips that optional refresh correctly.
 
 After you point herdrig at a different OpenRig, a seat click, Attach, Focus pane or the sidebar seat preview can still use an old Attach tab from the previous OpenRig when a rig and seat have the same names, and that tab can hide a needs-you notification. Close the old tabs.
-
-With more than one OpenRig added, Copy & edit of a built-in spec that has its own folder (such as `starter`) is refused on this computer with "This needs to know which OpenRig it is for, and it didn't say. Nothing was sent." Nothing is changed. To copy one by hand, in a terminal on this computer (with two OpenRigs on this computer, first set `OPENRIG_HOME` to the OpenRig home of the one you want, as its connection names it, so each `rig` command reaches that one):
-
-1. `rig specs show <name>` prints the built-in's `rig.yaml` path. `rig specs add <the folder that holds it>` copies the folder into your spec library.
-2. In the copy's `rig.yaml`, change each `agent_ref: "local:…"` to `path:` and the full path that the `local:` path names from the built-in's folder. For `starter`, `local:../../../agents/development/implementer` becomes `path:<full path>/agents/development/implementer`, where `<full path>` is the folder three levels above `starter`'s. Without this the copy doesn't launch.
-3. Give the copy its own name. `rig specs rename <name> <new name>` refuses because two specs share the name, and lists both IDs with their paths: run it again with the ID whose path is in your spec library. (The ID `rig specs add` printed is the built-in's, which can't be renamed.)
 
 Tested with OpenRig 0.7.14 and 0.7.16, and herdr-app 0.1.16.
 

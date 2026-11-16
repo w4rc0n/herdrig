@@ -11,7 +11,7 @@ Inside Herdr, use Herdrig’s views. If opening OpenRig’s own terminal view th
 
 ## Updating
 
-After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
+After updating, Attach again to each seat whose Attach tab you opened before the update and choose **Replace viewer**: it stops the old helper, closes its tab and starts the current one. Closing those tabs and attaching again does the same. A tab left open keeps using the old helper until it is replaced or closed.
 v0.5.0 updates the Attach helper, so Herdr asks you once to approve it again on each configured Herdr machine. Local
 Attach doesn't ask.
 
