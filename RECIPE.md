@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.6
+Version: v0.4.7
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
@@ -8,6 +8,8 @@ The busy words stay visible. Hover a shortened name or label to read the full te
 context stays below the full name. Graphs keep their header detail reveal, and Now keeps its transcript hover card.
 
 ## Updating
+
+After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
 
 Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with this
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.

@@ -131,6 +131,31 @@ function mapNode(n) {
 function tmuxFailureMessage(session) {
   return `Couldn't open ${session}'s tmux session here. Check that the seat is running (rig ps) and that this account can open OpenRig's tmux.\n`;
 }
+// v0.4.7: a status dot does not need sub-2s freshness; 4 s cuts one relay's steady-state request rate by ~2.7x versus the
+// old 1.5 s default, and combined with jitter below keeps 16 tiles from ever polling in lockstep. 5 s per fetch is well
+// under the old incident's ~125 s daemon response time, so a struggling daemon is given up on long before that; the
+// interval then doubles (capped at 60 s: state for an idle-looking seat is not worth polling for more than once a
+// minute) until the daemon answers again, at which point the very next success resets it to the default.
+const DEFAULT_POLL_INTERVAL_MS = 4000;
+const MAX_POLL_INTERVAL_MS = 60000;
+const DEFAULT_POLL_FETCH_TIMEOUT_MS = 5000;
+const POLL_JITTER_RATIO = 0.2;
+/** The next poll interval: double `current` (capped at `max`) after a slow or failed answer, else back to `base`. Pure. */
+function nextPollInterval(current, backOff, base = DEFAULT_POLL_INTERVAL_MS, max = MAX_POLL_INTERVAL_MS) {
+  return backOff ? Math.min(current * 2, max) : base;
+}
+/** A configured base poll interval, clamped to `max`: a seat-supplied value above the cap (or one so large it would
+ *  wrap a 32-bit timer into firing almost immediately) must not bypass the backoff cap it's meant to respect. Pure. */
+function resolveBaseIntervalMs(raw, fallback = DEFAULT_POLL_INTERVAL_MS, max = MAX_POLL_INTERVAL_MS) {
+  const n = Number(raw);
+  return Math.min(n > 0 ? n : fallback, max);
+}
+/** `ms` randomized by +/- `ratio` (default the module's own jitter ratio), so several relays whose intervals started
+ *  out equal drift apart over time instead of staying in lockstep. `random` is injectable for exact tests. */
+function jitteredPollInterval(ms, random = Math.random, ratio = POLL_JITTER_RATIO) {
+  const span = ms * ratio;
+  return Math.max(1, Math.round(ms + (random() * 2 - 1) * span));
+}
 const MAX_PAYLOAD_BYTES = 16384;
 function decodeRelayPayload(value) {
   if (typeof value !== "string" || !value || value.length > 4 * Math.ceil(MAX_PAYLOAD_BYTES / 3)) throw new Error("payload is missing or too large");
@@ -198,44 +223,75 @@ function main(payloadArg) {
   // The rig's id, else its name (the daemon takes either in /api/rigs/:id/nodes); a name it refuses is looked up in the
   // summary once. What comes back is only read for the seat's state.
   let rigId = String(cfg.rigId || cfg.rig || "");
-  const fetchNodes = async () => {
+  // v0.4.7 (urgent): 16 of these relays once polled a struggling OpenRig (/nodes took ~125 s) with no guard against
+  // overlapping requests and no fetch timeout, piling up requests without limit until the daemon jammed. Every fetch
+  // below (the retry-by-name fallback included) carries its own timeout, so THIS RELAY'S OWN wait can never hang
+  // forever on a slow or unreachable daemon; an in-flight guard makes a tick that lands while the previous fetch is
+  // still pending a no-op, so this relay alone can never have more than one request outstanding on the wire at once,
+  // however slow the daemon is. Aborting our own wait does not stop OpenRig's own work on an abandoned request (its
+  // request queue has no abort hook), so a struggling daemon may keep working on it for a time regardless. A failed
+  // answer, or one that arrives but took over half the timeout (still struggling, just not dead yet), backs the poll
+  // interval off (doubling, capped); the next fast success resets it.
+  const fetchNodes = async (timeoutMs) => {
     if (!daemonUrl || !rigId) return null;
-    const r = await fetch(`${daemonUrl}/api/rigs/${encodeURIComponent(rigId)}/nodes`);
+    const r = await fetch(`${daemonUrl}/api/rigs/${encodeURIComponent(rigId)}/nodes`, { signal: AbortSignal.timeout(timeoutMs) });
     if (r.ok) return listOf(await r.json());
     if (cfg.rig && rigId === cfg.rig) {
-      const sr = await fetch(`${daemonUrl}/api/rigs/summary`);
+      const sr = await fetch(`${daemonUrl}/api/rigs/summary`, { signal: AbortSignal.timeout(timeoutMs) });
       const list = sr.ok ? await sr.json() : null;
       const hit = Array.isArray(list) ? list.find((x) => x && (x.name === cfg.rig || x.id === cfg.rig)) : null;
       if (hit && typeof hit.id === "string" && hit.id !== rigId) {
         rigId = hit.id;
-        const r2 = await fetch(`${daemonUrl}/api/rigs/${encodeURIComponent(rigId)}/nodes`);
+        const r2 = await fetch(`${daemonUrl}/api/rigs/${encodeURIComponent(rigId)}/nodes`, { signal: AbortSignal.timeout(timeoutMs) });
         if (r2.ok) return listOf(await r2.json());
       }
     }
-    return null;
+    throw new Error(`rig-attach-relay: /nodes answered ${r.status}`);
+  };
+  const baseIntervalMs = resolveBaseIntervalMs(cfg.pollIntervalMs);
+  const fetchTimeoutMs = Number(cfg.pollFetchTimeoutMs) > 0 ? Number(cfg.pollFetchTimeoutMs) : DEFAULT_POLL_FETCH_TIMEOUT_MS;
+  let pollInFlight = false, currentPollInterval = baseIntervalMs, pollTimer = null, stopped = false;
+  const reschedulePoll = (ms) => {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(poll, jitteredPollInterval(ms));
+    pollTimer.unref?.();
   };
   const poll = async () => {
+    if (pollInFlight) return; // the storm guard: a tick that lands while the previous fetch is still pending is a no-op
+    pollInFlight = true;
+    let backOff = false;
+    const startedAt = Date.now();
     try {
-      const nodes = await fetchNodes();
-      if (!Array.isArray(nodes)) return;
-      // The seat is found by its exact session name, and only its state is read.
-      const hit = nodes.find((n) => n && n.canonicalSessionName === cfg.session);
-      if (!hit) return;
-      const mapped = mapNode(hit);
-      if (mapped.clearAfter) {
-        if (lastSeq !== "done:clear") { emit(mapped.state, mapped.kind); emit("clear"); lastSeq = "done:clear"; }
-      } else emit(mapped.state, mapped.kind);
-    } catch (_) {}
+      const nodes = await fetchNodes(fetchTimeoutMs);
+      // A slow answer (over half the timeout) means the daemon is still struggling even though it didn't fail
+      // outright; back off the same as a failure so this relay doesn't keep leaning on a daemon that's barely coping.
+      if (Date.now() - startedAt > fetchTimeoutMs / 2) backOff = true;
+      if (Array.isArray(nodes)) {
+        // The seat is found by its exact session name, and only its state is read.
+        const hit = nodes.find((n) => n && n.canonicalSessionName === cfg.session);
+        if (hit) {
+          const mapped = mapNode(hit);
+          if (mapped.clearAfter) {
+            if (lastSeq !== "done:clear") { emit(mapped.state, mapped.kind); emit("clear"); lastSeq = "done:clear"; }
+          } else emit(mapped.state, mapped.kind);
+        }
+      }
+    } catch (_) {
+      backOff = true;
+    } finally {
+      pollInFlight = false;
+    }
+    currentPollInterval = nextPollInterval(currentPollInterval, backOff, baseIntervalMs);
+    if (!stopped) reschedulePoll(currentPollInterval);
   };
   void poll();
-  const timer = setInterval(poll, Number(cfg.pollIntervalMs) > 0 ? Number(cfg.pollIntervalMs) : 1500);
-  timer.unref?.();
+  reschedulePoll(currentPollInterval);
 
   const childEnv = { ...process.env };
   delete childEnv.TMUX;
   childEnv.TERM = termFor(childEnv.TERM);
   const child = spawn("tmux", argv, { stdio: "inherit", env: childEnv, shell: false });
-  const cleanup = () => { clearInterval(timer); emit("clear"); };
+  const cleanup = () => { stopped = true; clearInterval(pollTimer); emit("clear"); };
   child.on("error", (e) => { process.stderr.write(`rig-attach-relay: tmux didn't start (${e.message})\n${tmuxFailureMessage(cfg.session)}`); cleanup(); process.exit(1); });
   child.on("exit", (code) => { if (code) process.stderr.write("Attach viewer ended. Close this tab, then Attach again if needed.\n"); cleanup(); process.exit(code ?? 0); });
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { cleanup(); try { child.kill(sig); } catch (_) {} });
@@ -352,5 +408,5 @@ async function gridMain(payload) {
   child.on("error", (e) => park(`Rig grid: tmux did not start (${e.message})\n${tmuxFailureMessage(cfg.session)}`));
   child.on("exit", (code) => park(code ? tmuxFailureMessage(cfg.session) : `The viewer for ${cfg.session} ended. Its tmux session may have stopped.`));
 }
-module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage, decodeRelayPayload, MAX_PAYLOAD_BYTES, gridMain, viewerArgs, ignoreSizeArgs, sizingClients, sizingChange, SIZING_INTERVAL_MS };
+module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage, decodeRelayPayload, MAX_PAYLOAD_BYTES, gridMain, viewerArgs, ignoreSizeArgs, sizingClients, sizingChange, SIZING_INTERVAL_MS, nextPollInterval, resolveBaseIntervalMs, jitteredPollInterval, DEFAULT_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS, DEFAULT_POLL_FETCH_TIMEOUT_MS, POLL_JITTER_RATIO };
 if (require.main === module) main(process.argv[2]);

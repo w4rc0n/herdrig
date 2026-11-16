@@ -2,7 +2,9 @@
 "use strict";
 const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
-const RELAY_SHA256 = "2262f8a2be1899555e79edbfded474c2858468d72eeec66ca6df603017aa3e66";
+// v0.4.7: the relay's content changed (the poll-storm fix: an in-flight guard, a fetch timeout, backoff and jitter);
+// the person re-approves the new hook/hash once on update, as every relay change requires.
+const RELAY_SHA256 = "628a06f715b24e2e19af3fda5cce434836e130c56204366777ac90eb6a0765d4";
 const RELAY_FOLDER = ".local/share/herdr-openrig";
 const goodHome = (s) => typeof s === "string" && s.startsWith("/") && s !== "/" && !/[\x00-\x1f\x7f]/.test(s) && s.split("/").slice(1).every((p) => p && p !== "." && p !== "..");
 const line = (value) => String(value ?? "").replace(/\r?\n$/, "");

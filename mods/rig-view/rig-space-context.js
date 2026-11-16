@@ -125,7 +125,7 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   // all of that kind is never adopted, marked or built into: the open asks and writes nothing.
   const counts=(link,machineAlias=null)=>strictOrigin?(link.origin?sameOrigin(link.origin,expected,machineAlias):link.ours):sameOrigin(link.origin,expected,machineAlias);
   // Another daemon's explicit origin on a rig terminal is positive evidence the space is theirs (an alias spelling of this daemon's address on a box is not another daemon), so under strictOrigin it vetoes the space (not for the marked lookup: our own mark is our own adoption record, and a copied-label terminal inside our grid is handled by the grid) even when
-  // one of our origin-less legacy terminals sits in it (devops.sec R9-1).
+  // one of our origin-less legacy terminals sits in it.
   const foreign=context=>strictOrigin&&!markedOnly&&links(context).some(link=>rigNames.has(link.rig)&&link.origin&&!sameOrigin(link.origin,expected,machine));
   const exact=onMachine.filter(context=>!foreign(context)&&links(context).some(link=>rigNames.has(link.rig)&&counts(link)));
   if(exact.length)return {space:(exact.find(context=>context.space.active)??exact[0]).space,unconfirmed:null};

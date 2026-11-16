@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.7
+
+- Fixed: with many Attach tabs open, herdrig could ask OpenRig for status so often that OpenRig stopped answering. Each tile now waits for its last answer, gives up after a few seconds, and backs off when OpenRig is slow or not answering. With a configured Herdr machine, the first new Attach or space open asks you once to approve the updated Attach helper.
+- After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
+
 ## v0.4.6
 
 - Overview keyboard navigation moves focus with the highlighted row. Enter and Space on another row leave settings alone; Tab lets you save again by keyboard, and Escape stays with an open edit, review or save.

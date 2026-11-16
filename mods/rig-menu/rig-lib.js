@@ -1634,8 +1634,8 @@ export function filterAllowedModels(models) {
 
 /**
  * Compute the seat hot-swap plan, continuity tier, and lead/advisor queue payload.
- * - Every request routes via a durable queue item (`queue create`) to `orch-lead@<rig>`, or to `orch-advisor@<rig>`
- *   when the target seat IS `orch.lead`.
+ * - Every request routes via a durable queue item (`queue create`) to the rig's lead, or to its advisor
+ *   when the target seat is the lead.
  * - Tier 1 (same harness): Lossless (`requiresConfirm: false`).
  * - Tier 2 (`codex <-> claude-code`): Handover (`requiresConfirm: true`).
  * - Tier 3 (cross-harness involving `agy`, `copilot`, `omp`, `pi`): Re-import (`requiresConfirm: true`).
@@ -5997,7 +5997,9 @@ export function buildAttachRelayArgv(config, seat = {}, relayPath = null) {
     app: runtime || "openrig",
     titleB64: base64EncodeUtf8(title),
     initialState: mapSeatStateToOsc7501(seat),
-    pollIntervalMs: Number(seat.pollIntervalMs ?? 1500) || 1500,
+    // v0.4.7: matches the relay's own default (rig-attach-relay.cjs DEFAULT_POLL_INTERVAL_MS); kept explicit here too
+    // so a seat override (seat.pollIntervalMs) still takes effect, and so this default moves with that one.
+    pollIntervalMs: Number(seat.pollIntervalMs ?? 4000) || 4000,
   }));
   return [nodeBin, relayPath, payload];
 }
