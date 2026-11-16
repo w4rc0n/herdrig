@@ -212,7 +212,12 @@ export default class RigView extends View {
       if(!decision&&Date.now()<pending.expires)return;
       this.specPermission=null;const rest={...decisions};delete rest[pending.token];setShared("rig.specWriteDecisions",rest);
       pending.box.awaitingPermission=false;
-      if(decision==="allow"){if(pending.request?.verb==="copy-folder")this.copyFolder(cx,pending.spec,pending.confirmation);else this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation);}
+      if(decision==="allow"){
+        // The answer continues the write the dialog was opened for, on ITS connection as the settings say now (a removed one sends nothing), never the
+        // connection the tab happens to show when the answer comes back.
+        const again=pending.began?this.specOperation(configOfConnection(this.config,pending.began.config.connectionId),pending.began.fromConn):null;
+        if(pending.began&&!again){pending.box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one.";cx.notify();return;}
+        if(pending.request?.verb==="copy-folder")this.copyFolder(cx,pending.spec,pending.confirmation,again);else this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation,again);}
       else {pending.box.note="Nothing was saved on the box.";cx.notify();}
     });
     cx.spawn(async (cx) => {
@@ -556,6 +561,28 @@ export default class RigView extends View {
     const conn = config === null ? this.shownEntry()?.conn ?? null : config?.connectionId;
     return conn && conn !== LEGACY_CONNECTION_ID ? JSON.stringify([conn, id]) : id;
   }
+  /** A spec operation: the connection it began on, captured once and synchronously, before its first await. Everything the operation does after an
+   *  await goes through this object, never through whatever the page shows by then: its boxes, drafts, notes, read cache, daemon address, folder
+   *  refusal and library re-read. `onPage()` is the one guard for a step that acts on the PAGE (moving it to a copy, unfolding a row, writing into
+   *  the folders the page holds): it is true only while this tab still shows the connection the operation began on. Null when the page's connection is no longer set up (nothing is sent). */
+  specOperation(config = this.specConfig(), fromConn = this.shownEntry()?.conn ?? null) {
+    if (!config) return null;
+    const conn = config.connectionId ?? LEGACY_CONNECTION_ID, base = config === this.config;
+    // The page's own config may learn its address after the operation began (a CLI discovery on a default install replaces it): the same connection's
+    // newer copy is used then, never another connection's.
+    const current = () => (base && this.config && (this.config.connectionId ?? LEGACY_CONNECTION_ID) === conn ? this.config : config);
+    return {
+      config, fromConn,
+      boxKey: (id) => this.specBoxKey(id, config),
+      draftKey: (id) => specDraftKey(id, config),
+      cache: () => this.cacheFor(config.connectionId),
+      daemonUrl: () => this.resolveDaemonUrl(current()),
+      read: (cx, path, force = false) => this.read(cx, path, force, null, current()),
+      refusal: () => this.specRefusal(config),
+      // A page whose connection is no longer set up shows nothing: no operation is on it (the legacy id included).
+      onPage: () => { const shownNow = this.specConfig(); return !!shownNow && (shownNow.connectionId ?? LEGACY_CONNECTION_ID) === conn; },
+    };
+  }
   /** The connection a row or menu target on this page names: the page entry's own (passed as is: the menu dispatcher judges it, a stale one is
    *  refused there), else the page's config. Never adopted to a live connection here, which would hide a stale claim. */
   shownConnId() { const conn = this.shownEntry()?.conn; return conn ?? this.config?.connectionId; }
@@ -592,7 +619,7 @@ export default class RigView extends View {
   /** A write operation for `cfg`: with several connections it is scoped to that connection; with one, exactly as before (the gate's only scope). */
   writeOperation(cfg) { return gatedOperation((this.config?.connections ?? []).length > 1 ? cfg?.connectionId : undefined); }
   /** A read operation for the connection this page shows (refusal-shaped, as the page's other reads). */
-  readOperation() { return gatedOperationOrRefusal((this.config?.connections ?? []).length > 1 ? this.activeConfig()?.connectionId : undefined); }
+  readOperation(cfg = this.activeConfig()) { return gatedOperationOrRefusal((this.config?.connections ?? []).length > 1 ? cfg?.connectionId : undefined); }
   /** The page's read cache of the shown connection: one per connection, so two OpenRigs never answer each other's paths. */
   cacheFor(id) { return (this.caches ??= {})[id ?? ""] ??= {}; }
 
@@ -628,8 +655,9 @@ export default class RigView extends View {
 
   /** A cached GET: returns what's known now and fetches in the background when missing, stale or asked again. What it
    *  had stays drawn until the new answer replaces it (the sidebar's `list` does the same). */
-  read(cx, path, force = false, onData = null) {
-    const conn = this.activeConnId(), cache = this.cacheFor(conn), cfg = this.activeConfig();
+  read(cx, path, force = false, onData = null, as = null) {
+    // `as`: a spec operation's own connection (its library re-read after a write), never the page shown when the write ends.
+    const conn = as ? as.connectionId : this.activeConnId(), cache = this.cacheFor(conn), cfg = as ?? this.activeConfig();
     this.reading?.add(path);
     const hit = cache[path];
     if ((!hit || force || hit.stale) && cfg && !hit?.loading) {
@@ -2115,12 +2143,13 @@ export default class RigView extends View {
     this.graphs??=new Map();if(!this.graphs.has(key))this.graphs.set(key,new RigGraph());return this.graphs.get(key);
   }
 
-  loadSpecGraph(cx,s,box) {
+  loadSpecGraph(cx,s,box,spec=this.specOperation()) {
     box.graphLoading=true;box.graphError=null;box.graph=null;
     cx.spawn(async cx=>{
       try{
-        const op=this.readOperation();
-        const url=await this.resolveDaemonUrl();if(!url)throw new Error("Connect OpenRig before opening the saved spec graph.");
+        if(!spec)throw new Error("This page's OpenRig is no longer set up, so its spec graph can't be read. Reopen the page.");
+        const op=this.readOperation(spec.config);
+        const url=await spec.daemonUrl();if(!url)throw new Error("Connect OpenRig before opening the saved spec graph.");
         // This is the same public structured review used by rig specs preview in OpenRig0.7.11.
         // It stays on the person's existing HTTP/tunnel origin and needs no local or remote CLI.
         box.graph=await readRigSpecPreview(op.fetch,url,s);
@@ -2214,7 +2243,7 @@ export default class RigView extends View {
         .child(this.button(t, `spec-keep-editing-${s.id}`, "Keep editing", (_e, cx) => this.keepEditing(cx, s))))))
       .children(errors.map((e, i) => div().id(`spec-error-${s.id}-${i}`).text_size(12).text_color(t.blocked).child(String(e))))
       .when(graphView&&dirty,el=>el.child(this.dim(t,"Showing the saved spec. Save to update the graph.")))
-      .child(graphView ? (box.graph?this.graphFor(`spec:${s.id}`).render(t,cx,box.graph,{id:`spec-graph-${s.id}`,assets:ASSETS})
+      .child(graphView ? (box.graph?this.graphFor(`spec:${this.specBoxKey(s.id)}`).render(t,cx,box.graph,{id:`spec-graph-${s.id}`,assets:ASSETS})
         :box.graphError?v_flex().gap(6).child(div().text_size(12).text_color(t.blocked).child(box.graphError))
           .child(this.button(t,`spec-graph-retry-${s.id}`,"Retry",(_e,cx)=>this.loadSpecGraph(cx,s,box),{small:true})):this.skeleton(t)) : box.state
         ? div().id(`spec-editor-${s.id}`).h(320).border_1().border_color(editing ? t.accent : t.border).rounded(6)
@@ -2226,8 +2255,8 @@ export default class RigView extends View {
   }
 
   /** Creates and wires an EditorState for a spec box with the requested `readonly` state. */
-  makeSpecEditorState(s, box, value, readonly) {
-    const key = specDraftKey(s.id,this.specConfig());
+  makeSpecEditorState(s, box, value, readonly, config = this.specConfig()) {
+    const key = specDraftKey(s.id,config); // an operation that awaited passes the connection it began on: the editor's drafts are that connection's
     box.secondaryEnterTask?.cancel?.();box.secondaryEnterBase=null;
     box.state?.release?.();
     const state = EditorState.new({ language: "yaml", value, readonly: Boolean(readonly), font_family: settings().font_family });
@@ -2288,13 +2317,13 @@ export default class RigView extends View {
       return [];
     }
     const roots = await localSpecRoots(config, execFor(config), home());
-    if (publishing) { this.specRoots = roots; this.specRootsConn = config.connectionId ?? LEGACY_CONNECTION_ID; this.specRootsPublished = roots; }
+    // Decided again after the await: the page may show another connection by now, and the flat field is the page's (its readers check the owner too).
+    if (publishing && (this.activeConfig()?.connectionId ?? config.connectionId ?? LEGACY_CONNECTION_ID) === (config.connectionId ?? LEGACY_CONNECTION_ID)) { this.specRoots = roots; this.specRootsConn = config.connectionId ?? LEGACY_CONNECTION_ID; this.specRootsPublished = roots; }
     return roots;
   }
   /** The page's own folders for a synchronous reader: what the last resolution published (the load's, or specRootsFor's). Empty on a
    *  connection on a machine, whose specs are there. */
-  pageSpecRoots() {
-    const cfg = this.activeConfig();
+  pageSpecRoots(cfg = this.activeConfig()) {
     if (cfg?.daemonMachine) return [];
     // The field wins when it was NOT this file's own publish (a caller or a test that chose folders, including an empty list meaning "none"), and
     // it belongs to the acted-on connection. A field this file published for ANOTHER connection is never handed over: that was the review's finding, a
@@ -2307,8 +2336,8 @@ export default class RigView extends View {
     return []; // nothing resolved for this page yet: the async paths resolve for it
   }
   /** Explain a local edit refusal without inferring locality from missing folders. */
-  specRefusal() {
-    return specFolderRefusal(this.pageSpecRoots(), { machine: this.activeConfig()?.daemonMachine, realpathAvailable: this.specRealpathAvailable }); // the page's own OpenRig
+  specRefusal(config = this.activeConfig()) {
+    return specFolderRefusal(this.pageSpecRoots(config), { machine: config?.daemonMachine, realpathAvailable: this.specRealpathAvailable }); // the page's own OpenRig, or an operation's
   }
 
   specNoteView(t, note, id, information = false) {
@@ -2337,8 +2366,8 @@ export default class RigView extends View {
     return `Save writes this spec on ${machine ?? "this computer"}.`+(this.specConsentMachine===machine?"":" The first save asks for permission.");
   }
 
-  specConflictMessage(){
-    const machine=this.activeConfig()?.daemonMachine; // the page's own OpenRig, no fallback
+  specConflictMessage(config=this.activeConfig()){
+    const machine=config?.daemonMachine; // the page's own OpenRig (or an operation's), no fallback
     return machine?`The spec changed on ${machine} since you opened it. Reload shows the new version and discards your unsaved edits. Keep editing keeps your version; saving then replaces the change on ${machine}.`:"The file changed on disk since you opened it.";
   }
 
@@ -2347,7 +2376,7 @@ export default class RigView extends View {
     const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box) return;
     box.view="yaml";
-    const current=nav().stack?.at(-1);
+    const current=this.shownEntry(); // the page THIS tab shows (with its connection), never the shared stack's top, which can be another tab's page
     if(current?.section==="specs"&&(current.id===s.id||current.name===s.name))this.push({...current,specTab:"yaml"});
     if (isBuiltin) {
       box.builtinEditNote = "Copy & edit makes your own copy; the built-in stays unchanged.";
@@ -2393,12 +2422,13 @@ export default class RigView extends View {
    *  comes back only against the text it was started from: if the file moved on since, the draft stays against its own
    *  base and the conflict says so, so Save can't overwrite the newer file unseen. */
   loadSpec(cx, s, isBuiltin, box) {
-    const config = this.specConfig(); // the restored draft belongs to the connection this load began for, not the page shown after the await
+    const spec = this.specOperation(); // the text, the restored draft and the editor belong to the connection this load began for
     cx.spawn(async (cx) => {
       await Promise.resolve();
       try {
-        const text = await this.specText(s);
-        const key = specDraftKey(s.id,config), raw = (shared("rig.drafts") ?? {})[key];
+        if (!spec) throw new Error("This page's OpenRig is no longer set up, so its spec can't be read. Reopen the page.");
+        const text = await this.specText(s, null, spec);
+        const key = spec.draftKey(s.id), raw = (shared("rig.drafts") ?? {})[key];
         const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
         let initial = text;
         box.loaded = text; box.diskText = null; box.restoredDraft = false;
@@ -2409,12 +2439,12 @@ export default class RigView extends View {
           if (draft.baseText === text || (draft.baseHash && draft.baseHash === simpleHash(text))) box.restoredDraft = true;
           else {
             box.loaded = draft.baseText ?? text; box.diskText = text;
-            box.conflict = this.specConflictMessage();
+            box.conflict = this.specConflictMessage(spec.config);
           }
         }
         box.editing = Boolean(box.editing) && !isBuiltin;
         box.lastText = box.prevText = initial;
-        this.makeSpecEditorState(s, box, initial, isBuiltin || !box.editing);
+        this.makeSpecEditorState(s, box, initial, isBuiltin || !box.editing, spec.config);
         box.loading = false; box.error = null;
       } catch (e) { box.loading = false; box.error = String(e?.message ?? e); }
       cx.notify();
@@ -2471,7 +2501,7 @@ export default class RigView extends View {
     const edited = box.state.value();
     box.errors = null; box.conflict = null; box.note = null; box.savedText = null;
     const refused = this.specRefusal();
-    const shown = this.specConfig(); // the connection this page shows decides the route, never the first connection
+    const spec = this.specOperation(), shown = spec?.config; // the connection this page shows decides the route, never the first connection
     if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one. Unsaved text stays here."; cx.notify(); return; }
     if (shown.daemonMachine) {
       this.remoteSpecWrite(cx,s,{verb:"save",target:s.sourcePath,baseText:box.loaded,content:edited});return;
@@ -2480,18 +2510,18 @@ export default class RigView extends View {
     if (this.specFoldersReady === false) { box.note = "The spec folders are still loading. Try saving again."; cx.notify(); return; }
     if (unsafeSpecWritePath(s.sourcePath)) { box.note = refused; cx.notify(); return; }
     if (!this.config) { box.note = "The daemon address isn't known yet."; cx.notify(); return; }
+    // One operation, begun here with the connection captured: the address and the validation belong to the config this save began under. If the
+    // settings change in between (a list installed, an address edited), the save was NOT validated: nothing is written, and the person is told why.
+    let op; try { op = this.writeOperation(shown); } catch (e) { box.note = String(e?.message ?? e); cx.notify(); return; }
     box.saving = true; cx.notify();
     const conflict = (onDisk) => { box.conflict = "The file changed on disk since you opened it."; if (onDisk != null) box.diskText = onDisk; };
     cx.spawn(async (cx) => {
       try {
-        // One operation: the address and the validation belong to the config this save began under. If the settings change in between (a list installed,
-        // an address edited), the save was NOT validated: nothing is written, and the person is told why.
-        const op = this.writeOperation(shown);
         // Written only inside the local spec folders, at the resolved path: a symlink out of them is refused.
         const roots = await this.specRootsFor(shown); // THIS acted-on connection's own folders, keyed by connection
         const file = await resolveInSpecRoots(s.sourcePath, roots, execFor(shown));
         if (!file) { box.note = refused; return; }
-        const daemonUrl = await this.resolveDaemonUrl();
+        const daemonUrl = await spec.daemonUrl(); // the save's own connection, not the page shown after the folder checks
         if (!daemonUrl) { box.note = "The daemon address isn't known yet."; return; }
         const route = s.kind === "agent" ? "/api/agents/validate" : "/api/rigs/import/validate";
         const r = await op.fetch(`${daemonUrl}${route}`, { method: "POST", headers: { "content-type": "text/yaml" }, body: edited });
@@ -2512,16 +2542,16 @@ export default class RigView extends View {
         const synced = await this.syncLibrary(op, daemonUrl);
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
         box.savedText = synced?.ok ? "Saved." : synced?.refused ? "Saved; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up." : "Saved; library re-index failed.";
-        delete this.specCopyNotes?.[this.specBoxKey(s.id, shown)];
-        if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box);
+        delete this.specCopyNotes?.[spec.boxKey(s.id)];
+        if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box,spec);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
-        const key = specDraftKey(s.id,shown), now = box.state.value();
+        const key = spec.draftKey(s.id), now = box.state.value();
         setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
         if (now === edited) {
           box.editing = false;
-          this.makeSpecEditorState(s, box, edited, true);
+          this.makeSpecEditorState(s, box, edited, true, shown);
         }
-        this.read(cx, "/api/specs/library", true);
+        spec.read(cx, "/api/specs/library", true);
         run("rig.refresh");
       } catch (e) { box.note = String(e?.message ?? e); }
       finally { box.saving = false; cx.notify(); }
@@ -2537,12 +2567,13 @@ export default class RigView extends View {
 
   /** User specs may read their file inside the local spec folders with symlinks resolved. All other entries use only
    *  the daemon's own copy, even when their sourcePath happens to name a local spec. */
-  async specText(s, outer = null) {
-    const op = outer ?? this.readOperation(); // the address resolved below belongs to the connection and config this read began under
+  async specText(s, outer = null, spec = this.specOperation()) {
+    // The read belongs to the spec operation that asked (its connection, captured before any await), else to the page as it is now.
+    const cfg = spec?.config ?? null;
+    const op = outer ?? this.readOperation(cfg); // the address resolved below belongs to the connection and config this read began under
     const path=rigSpecLibraryPath(s);if(!path)throw new Error("This library entry has no usable spec id.");
-    // The page's own connection decides, and its realpath runs through that connection's exec (a bare one is refused with
+    // That connection decides, and its realpath runs through that connection's exec (a bare one is refused with
     // several OpenRigs). No fallback to the sidebar's config: a page whose connection is gone has no spec to read, so refuse plainly.
-    const cfg = this.activeConfig();
     if (!cfg) throw new Error("This page's OpenRig is no longer set up, so its spec can't be read. Reopen the page.");
     // The page's roots as it holds them; resolved only when it holds none (a page opened after a load ran for another machine's page).
     // This page's own folders, resolved only when it has none - never over folders a caller (or the page) already chose.
@@ -2551,7 +2582,7 @@ export default class RigView extends View {
     const file = !cfg.daemonMachine && s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, roots, execFor(cfg)) : null;
     let text = file ? await readTextFile(file).catch(() => null) : null;
     if (text == null && this.config) {
-      const daemonUrl = await this.resolveDaemonUrl();
+      const daemonUrl = await spec.daemonUrl(); // after the folder awaits: still the read's own connection
       if (daemonUrl) {
         const r = await op.fetch(`${daemonUrl}${path}`);
         const body = await r.text();
@@ -2567,11 +2598,13 @@ export default class RigView extends View {
   /** Writes `text` as a new file in the first local spec folder, under a name made from the spec's (never a path the
    *  daemon sent), taking a name free in every local spec folder because the CLI also copies into its library.
    *  Returns the file written. */
-  async writeSpecCopy(s, text, op = null, began = null) {
-    // The copy belongs to the OpenRig it BEGAN for (`began`, the connection copySpec started under): a page switch in between must never pick the other OpenRig's folder and leave a file there.
-    // Its folders are resolved for that connection (`config`); without `began` (a direct caller) it is the page's own.
-    const config = began ?? this.activeConfig();
-    const pageChanged = () => { const shownNow = this.specConfig(); return Boolean(began && shownNow && (shownNow.connectionId ?? LEGACY_CONNECTION_ID) !== (began.connectionId ?? LEGACY_CONNECTION_ID)); };
+  async writeSpecCopy(s, text, op = null, spec = null) {
+    // The copy belongs to the OpenRig it BEGAN for (`spec`, the operation copySpec started; a bare config from a direct caller): a page switch in
+    // between must never pick the other OpenRig's folder and leave a file there. Its folders are resolved for that connection (`config`); without
+    // one it is the page's own.
+    const began = typeof spec?.boxKey === "function" ? spec : spec ? this.specOperation(spec) : null;
+    const config = began?.config ?? this.activeConfig();
+    const pageChanged = () => Boolean(began && !began.onPage()); // the operation's one guard: the tab no longer shows the connection the copy began on
     const changed = "The page changed while the copy was starting, so nothing was written. Copy it again from this page.";
     const refused = cliRefusal(config); // a connection without its own OpenRig home writes nothing (HOME_NEEDED), whatever folders the page holds
     if (refused) throw new Error(refused);
@@ -2589,13 +2622,13 @@ export default class RigView extends View {
     if (!fieldIsChosen) await this.specRootsFor(config); // the connection the copy began under; else a caller already put this page's folders here
     if (pageChanged()) throw new Error(changed); // re-checked after the await: a switch while the folders resolved would write into the other OpenRig's folder
     const roots = this.specRoots ?? [];
-    if (!roots[0]) throw new Error(this.specRefusal());
+    if (!roots[0]) throw new Error(this.specRefusal(config));
     // The folders the page now holds must still be that connection's: a tab switched to another OpenRig meanwhile publishes ITS folders, and the
     // copy would land there. Nothing is written then (a caller's own chosen folders are its choice).
     if (!fieldIsChosen && (this.specRootsConn ?? LEGACY_CONNECTION_ID) !== (config?.connectionId ?? LEGACY_CONNECTION_ID))
       throw new Error("This page now shows another OpenRig, so the copy wasn't made. Open the spec again to copy it.");
     const root = this.specRoots[0]; // read from the field: the security rule traces this shape as a write path
-    if (!root) throw new Error(this.specRefusal());
+    if (!root) throw new Error(this.specRefusal(config));
     const base = specCopyName(s.name);
     for (let i = 0; i < 20; i++) {
       const name = `${base}${i === 0 ? "" : i === 1 ? "-copy" : `-copy-${i}`}.yaml`;
@@ -2620,33 +2653,34 @@ export default class RigView extends View {
     if (!this.config?.person) { box.note = NO_PERSON; cx.notify(); return; }
     // A built-in rig spec that has a folder of its own is copied as that whole folder, so the copy can launch.
     if (folderCopyable(s)) { this.copyFolder(cx, s); return; }
-    const shown = this.specConfig(); // the connection this page shows decides the route
+    const spec = this.specOperation(), shown = spec?.config; // the connection this page shows decides the route
     if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one."; cx.notify(); return; }
-    const fromConn = this.shownEntry()?.conn ?? null; // the page the copy began on: only that page moves to the copy, which keeps its connection
+    const fromConn = spec.fromConn; // the page the copy began on: only that page moves to the copy, which keeps its connection
     if(shown.daemonMachine){
       this.remoteSpecWrite(cx,s,{verb:"copy",name:s.name});return;
     }
+    // Begun with the captured connection, before the task: the library re-read below belongs to the connection and config this copy began under.
+    let op; try { op = this.writeOperation(shown); } catch (e) { box.note = String(e?.message ?? e); cx.notify(); return; }
     box.copying = true; box.note = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const op = this.writeOperation(shown); // the library re-read below belongs to the connection and config this copy began under
-        const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s, op) : await this.specText(s, op);
+        const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s, op, spec) : await this.specText(s, op, spec);
         // Agent refs relative to the original's folder are made absolute (text only); a copy that couldn't find its agents is never written.
         const prepared = copyableSpecText(source, s.sourcePath);
         if (prepared.refused) { box.note = prepared.refused; return; }
         const text = prepared.text;
-        const written = await this.writeSpecCopy(s, text, op, shown);
+        const written = await this.writeSpecCopy(s, text, op, spec);
         // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
         const roots = await this.specRootsFor(shown); // THIS acted-on connection's own folders
         const file = await resolveInSpecRoots(written, roots, execFor(shown));
-        if (!file) { box.note = this.specRefusal(); return; }
+        if (!file) { box.note = spec.refusal(); return; }
         if (cliRefusal(shown)) { box.note = cliRefusal(shown); return; } // no home of its own: no CLI run, and the person is told
         op.check(); // the path resolution above awaited
         const cmd = writeCommand(shown, ["specs", "add", "--", file]);
         if (!cmd) { box.note = NO_PERSON; return; }
         const r = writeOutcome(await execFor(shown)(cmd.command, cmd.args, { timeout: 180000 }));
         if (!r.ok) { box.note = r.text; return; }
-        const daemonUrl = await this.resolveDaemonUrl(shown);
+        const daemonUrl = await spec.daemonUrl();
         const copySynced = daemonUrl ? await this.syncLibrary(op, daemonUrl) : null;
         if (copySynced?.refused) { box.note = "The copy was made, but OpenRig's settings changed before the library could be updated. Refresh the library to see it."; return; }
         let made = s.id, copy = null;
@@ -2654,17 +2688,18 @@ export default class RigView extends View {
           const res = daemonUrl ? await op.fetch(`${daemonUrl}/api/specs/library`) : null;
           const list = res ? JSON.parse(await res.text()) : null;
           if (res?.ok && Array.isArray(list)) {
-            this.cache["/api/specs/library"] = { data: list, at: Date.now() };
+            spec.cache()["/api/specs/library"] = { data: list, at: Date.now() }; // the copy's own connection's cache, not the page's by now
             copy = list.find((x) => x.name === s.name && x.kind === s.kind && x.sourceType !== "builtin" && x.sourcePath) ?? null;
             made = copy?.id ?? s.id;
           }
         } catch (e) { rethrowGate(null)(e); /* a gate refusal stops the copy flow; otherwise the list stays as it was */ }
         if (made !== s.id) {
-          delete this.specBoxes?.[this.specBoxKey(made, shown)];
-          (this.specAutoEdit ??= new Set()).add(this.specBoxKey(made, shown));
+          delete this.specBoxes?.[spec.boxKey(made)];
+          (this.specAutoEdit ??= new Set()).add(spec.boxKey(made));
           const lacking = s.sourceType === "user_file" ? null : siblingFileNote(siblingFileNames(text));
-          if (lacking) (this.specCopyNotes ??= Object.create(null))[this.specBoxKey(made, shown)] = lacking;
+          if (lacking) (this.specCopyNotes ??= Object.create(null))[spec.boxKey(made)] = lacking;
         }
+        if (!spec.onPage()) return; // the tab shows another page by now: the copy is made and marked, and that page is left alone
         setOpen(`spec:${made}`, true);
         // On the one-spec page the page itself moves to the copy.
         const stack = nav().stack ?? [], top = stack.at(-1);
@@ -2791,21 +2826,21 @@ export default class RigView extends View {
     // `op` was created by the caller at the moment it captured `config` (before any await): every send of this copy flow belongs to that config.
     const post = (path, init) => op.fetch(`${daemonUrl}${path}`, { method: "POST", ...init });
     return {
-      specText: (spec) => this.specText(spec, op),
+      specText: (spec) => this.specText(spec, op, this.specOperation(config)), // read for the copy's own connection, not the page shown when it is asked
       validate: async (text) => {
         const checked = await post("/api/rigs/import/validate", { headers: { "content-type": "text/yaml" }, body: text });
         let v; try { v = JSON.parse(await checked.text()); } catch (e) { v = rethrowGate(null)(e); }
         return { ok: checked.ok && v?.valid !== false, errors: v?.errors ?? (v?.error ? [v.error] : undefined) };
       },
       addFolder: (request, grant) => config.daemonMachine
-        ? this.remoteSpecController(cx).perform(config, { verb: "copy-folder", ...request }, grant)
+        ? this.remoteSpecController(cx, null, config).perform(config, { verb: "copy-folder", ...request }, grant)
         : this.localAddFolder(request, daemonUrl, cx, config, op),
       library: async (fresh) => {
         if (fresh) await post("/api/specs/library/sync").catch(rethrowGate(null));
         const res = await op.fetch(`${daemonUrl}/api/specs/library`);
         if (!res.ok) throw new Error("The copy was made, but the library couldn't be read. Refresh before copying again.");
         const list = JSON.parse(await res.text());
-        this.cache["/api/specs/library"] = { data: list, at: Date.now() };
+        this.cacheFor(config.connectionId)["/api/specs/library"] = { data: list, at: Date.now() }; // the copy's own connection's cache
         return list;
       },
       rename: async (id, name) => {
@@ -2836,11 +2871,11 @@ export default class RigView extends View {
     if (out.error) throw Object.assign(new Error(out.error), { code: out.code, folder: out.folder });
     const roots = await this.specRootsFor(config); // the connection this copy began for
     const file = await resolveInSpecRoots(out.path, roots, execFor(config));
-    if (!file) throw new Error(this.specRefusal());
+    if (!file) throw new Error(this.specRefusal(config));
     const current = await readTextFile(file);
     if (current == null) throw new Error("The copied spec couldn't be read back.");
     const conflict = `The copied spec at ${file} changed before it could be rewritten. Your copy was kept; reopen it to review the changes.`;
-    if (!/^[a-f0-9]{64}$/.test(out.sha256 ?? "") || await this.remoteSpecController(cx).hashText(config, current) !== out.sha256)
+    if (!/^[a-f0-9]{64}$/.test(out.sha256 ?? "") || await this.remoteSpecController(cx, null, config).hashText(config, current) !== out.sha256)
       throw new Error(conflict);
     op.check(); // the helper, the realpath and the readback awaited: the rewrite belongs to the settings this copy began under
     try { await writeTextFile(file, request.content, current); }
@@ -2851,10 +2886,11 @@ export default class RigView extends View {
   /** Copy & edit of a built-in rig spec as a whole folder, then open the copy in edit mode. */
   /** The whole-folder copy (a seam, so a test can hold it at its await). */
   copyBuiltinFolderFor(host, s, consent) { return copyBuiltinFolder(host, s, consent); }
-  copyFolder(cx, s, consent = null) {
-    const box = this.specBoxes?.[this.specBoxKey(s.id)];
+  copyFolder(cx, s, consent = null, began = null) {
+    // `began`: the operation a permission dialog was opened for; its answer continues THAT copy, whatever the tab shows when it comes back.
+    const spec = began ?? this.specOperation(), shown = spec?.config;
+    const box = this.specBoxes?.[spec ? spec.boxKey(s.id) : this.specBoxKey(s.id)];
     if (!box || box.copying || box.awaitingPermission) return;
-    const shown = this.specConfig();
     if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one."; cx.notify(); return; }
     const refused = shown.daemonMachine ? cliRefusal(shown) : null; if (refused) { box.note = refused; cx.notify(); return; } // a box connection without its own home: HOME_NEEDED
     const config = { ...shown };
@@ -2873,14 +2909,14 @@ export default class RigView extends View {
           if (this.specPermission) throw new Error("Finish the open spec permission dialog first.");
           const token = `spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           box.awaitingPermission = true;
-          this.specPermission = { token, spec: s, request: { verb: "copy-folder" }, box, confirmation: out.confirmation, expires: Date.now() + 300000 };
+          this.specPermission = { token, spec: s, request: { verb: "copy-folder" }, box, confirmation: out.confirmation, expires: Date.now() + 300000, began: spec };
           this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 420, props: { target: { kind: "spec", id: s.id }, step: { action: "confirm-spec-write", token, confirmation: out.confirmation } } });
           return;
         }
-        if (out.exists) { await this.openExistingCopy(cx, s, host, out.folder, box, config); return; }
+        if (out.exists) { await this.openExistingCopy(cx, s, host, out.folder, box, spec); return; }
         if (!out.ok) { box.errors = out.errors ?? null; box.note = out.reason; return; }
         if (config.daemonMachine) this.specConsentMachine = config.daemonMachine;
-        this.showSpecCopy(cx, out.copy, null, config);
+        this.showSpecCopy(cx, out.copy, null, spec);
       } catch (error) {
         box.note = error?.folder && /differs from the built-in/.test(String(error.message))
           ? `Your copy of ${s.name} at ${error.folder} was changed since it was made, so Copy & edit didn't overwrite it.`
@@ -2892,36 +2928,41 @@ export default class RigView extends View {
   }
 
   /** The copy's page, in edit mode, with an optional note above its editor. */
-  showSpecCopy(cx, copy, note = null, config = this.specConfig()) {
+  showSpecCopy(cx, copy, note = null, spec = this.specOperation()) {
+    // `spec`: the copy's operation (a bare config from a direct caller). Its marks are that connection's; the page moves to the copy only while
+    // this tab still shows the page the copy began on, and the copy's page names the copy's connection.
+    const op = typeof spec?.boxKey === "function" ? spec : null, config = op ? op.config : spec;
     const key = this.specBoxKey(copy.id, config);
     if (!this.specDirty(this.specBoxes?.[key])) delete this.specBoxes?.[key];
     (this.specAutoEdit ??= new Set()).add(key);
     if (note) (this.specCopyNotes ??= Object.create(null))[key] = note;
     else delete this.specCopyNotes?.[key];
-    this.push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml" });
-    this.read(cx, "/api/specs/library", true); run("rig.refresh");
+    const conn = op ? op.fromConn : config?.connectionId && config.connectionId !== this.config?.connectionId ? config.connectionId : null;
+    if (!op || op.onPage()) this.push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml", ...(conn ? { conn } : {}) });
+    this.read(cx, "/api/specs/library", true, null, config ?? null); run("rig.refresh");
   }
 
   /** The built-in's folder already has a copy: open a finished one, finish an unfinished one (its fixed text is put in the editor;
    *  the person's Save is the write), and never overwrite or delete anything. */
-  async openExistingCopy(cx, s, host, folder, box, config = this.specConfig()) {
+  async openExistingCopy(cx, s, host, folder, box, spec = this.specOperation()) {
+    const config = typeof spec?.boxKey === "function" ? spec.config : spec; // the copy's own connection (an operation, or a bare config)
     const found = await findExistingCopy(host, s, folder);
     if (found.state === "unindexed") {
       box.note = found.reason ?? "You already have a copy folder for this built-in, but the spec library doesn't list it yet. Refresh the library, then try again.";
       return;
     }
-    if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`, config); return; }
+    if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`, spec); return; }
     const key=specDraftKey(found.entry.id,config),draft=(shared("rig.drafts")??{})[key];
     const retained=this.specDirty(this.specBoxes?.[this.specBoxKey(found.entry.id, config)]) || typeof draft==='string' || typeof draft?.text==='string';
     if(!retained)setDraft(key, { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
     this.showSpecCopy(cx, found.entry, retained ? null
-      : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`, config);
+      : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`, spec);
   }
 
-  remoteSpecController(cx, op = null) {
+  remoteSpecController(cx, op = null, config = this.specConfig()) {
     const bridge=attachRelayPath(appHome(),MOD_IDS.view).replace(/rig-attach-relay\.cjs$/,"rig-spec-transport.cjs");
     // With the write's operation, every helper call first checks it: once the settings it began under are gone it refuses to START (each call otherwise takes the generation current at its own start).
-    const cfg=this.specConfig(); // the connection this page shows: its own gate scope for the helper calls
+    const cfg=config; // the write's own connection (the page's when none is passed): its own gate scope for the helper calls
     if(!cfg){const refuse=async()=>{throw Error(UNKNOWN_CONNECTION);};return{perform:refuse,hashText:refuse,checked:refuse};} // a removed connection: nothing runs, never another connection's
     return new RemoteSpecs({exec:op?async(c,a,o)=>{op.check();return execFor(cfg)(c,a,o);}:execFor(cfg),hc:op?async(a,b)=>{op.check();return hcFor(cfg)(a,b);}:hcFor(cfg),machines,wait:waitWith(cx),appHome:appHome(),specBridgePath:bridge,
       health:async url=>{const r=await this.writeOperation(cfg).fetch(`${url}/healthz`);if(!r.ok)throw Error("OpenRig isn't answering.");return JSON.parse(await r.text());},
@@ -2938,17 +2979,20 @@ export default class RigView extends View {
   }
 
   /** Remote targets go only to the pinned box helper; registration is HTTP-only. */
-  remoteSpecWrite(cx,s,request,consent=null) {
-    const box=this.specBoxes?.[this.specBoxKey(s.id)];if(!box||box.saving||box.copying||box.awaitingPermission)return;
-    const shown=this.specConfig();
+  remoteSpecWrite(cx,s,request,consent=null,began=null) {
+    // `began`: the operation a permission dialog was opened for; its answer continues THAT write, whatever the tab shows when it comes back.
+    const spec=began??this.specOperation(),shown=spec?.config;
+    const box=this.specBoxes?.[spec?spec.boxKey(s.id):this.specBoxKey(s.id)];if(!box||box.saving||box.copying||box.awaitingPermission)return;
     if(!shown){box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one. Unsaved text stays here.";cx.notify();return;}
     const refused=cliRefusal(shown);if(refused){box.note=refused;cx.notify();return;} // a connection without its own OpenRig home: HOME_NEEDED, nothing sent
-    const config={...shown},fromConn=this.shownEntry()?.conn??null;box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
+    const config={...shown},fromConn=spec.fromConn;
+    // Begun with the captured connection, before the task: the validation below is only good for the connection and config this write began under.
+    let op;try{op=this.writeOperation(config);}catch(e){box.note=String(e?.message??e);cx.notify();return;}
+    box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
     cx.spawn(async cx=>{
       try{
-        const op=this.writeOperation(config); // the validation below is only good for the connection and config this write began under
         const daemonUrl=await this.resolveDaemonUrl(config);if(!daemonUrl)throw Error("The daemon address isn't known yet.");
-        let content=request.content??await this.specText(s,op);
+        let content=request.content??await this.specText(s,op,spec);
         if(request.verb==="copy"){
           const prepared=copyableSpecText(content,s.sourcePath);
           if(prepared.refused)throw Error(prepared.refused);
@@ -2960,12 +3004,12 @@ export default class RigView extends View {
         let validation;try{validation=JSON.parse(await checked.text());}catch(e){validation=rethrowGate(undefined)(e);}
         if(!checked.ok||validation?.valid===false){box.errors=validation?.errors??[validation?.error??"Validation failed."];return;}
         op.check();
-        const result=await this.remoteSpecController(cx,op).perform(config,operation,consent);
+        const result=await this.remoteSpecController(cx,op,config).perform(config,operation,consent);
         if(result.needsConsent){
           if(this.specPermission)throw Error("Finish the open spec permission dialog first.");
           const token=`spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           box.awaitingPermission=true;
-          this.specPermission={token,spec:s,request:operation,box,confirmation:result.confirmation,expires:Date.now()+300000};
+          this.specPermission={token,spec:s,request:operation,box,confirmation:result.confirmation,expires:Date.now()+300000,began:spec};
           this.open({mod:MOD_IDS.menu,kind:"dialog",width:560,height:340,props:{target:{kind:"spec",id:s.id},step:{action:"confirm-spec-write",token,confirmation:result.confirmation}}});return;
         }
         if(!result.ok)throw Error(result.reason??"The box did not confirm the write.");
@@ -2974,25 +3018,25 @@ export default class RigView extends View {
         if(request.verb==="save"){
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
           box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:synced?.refused?`Saved on ${config.daemonMachine}; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
-          delete this.specCopyNotes?.[this.specBoxKey(s.id, config)];
-          const now=box.state.value();setDraft(specDraftKey(s.id,config),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
-          if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true);}
+          delete this.specCopyNotes?.[spec.boxKey(s.id)];
+          const now=box.state.value();setDraft(spec.draftKey(s.id),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
+          if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true,spec.config);}
         }else{
           if(!synced?.ok)throw Error(synced?.refused?`The copy was saved on ${config.daemonMachine}, but OpenRig's settings changed before the library could be updated. Refresh the library before copying again.`:`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
           const response=await op.fetch(`${daemonUrl}/api/specs/library`);if(!response.ok)throw Error("The copy was saved, but the library couldn't be read. Refresh before copying again.");
           const list=JSON.parse(await response.text()),copy=list.find(x=>x.sourceType==="user_file"&&x.sourcePath===result.path);
           if(!copy)throw Error("The copy was saved, but isn't indexed yet. Refresh before copying again.");
-          this.cache["/api/specs/library"]={data:list,at:Date.now()};
-          (this.specAutoEdit??=new Set()).add(this.specBoxKey(copy.id,config));delete this.specBoxes[this.specBoxKey(copy.id,config)];
+          spec.cache()["/api/specs/library"]={data:list,at:Date.now()}; // the copy's own connection's cache, not the page's by now
+          (this.specAutoEdit??=new Set()).add(spec.boxKey(copy.id));delete this.specBoxes[spec.boxKey(copy.id)];
           const lacking=s.sourceType==="user_file"?null:siblingFileNote(siblingFileNames(content));
-          if(lacking)(this.specCopyNotes??=Object.create(null))[this.specBoxKey(copy.id,config)]=lacking;
-          if((this.shownEntry()?.conn??null)===fromConn)this.push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml",...(fromConn?{conn:fromConn}:{})});
+          if(lacking)(this.specCopyNotes??=Object.create(null))[spec.boxKey(copy.id)]=lacking;
+          if(spec.onPage())this.push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml",...(fromConn?{conn:fromConn}:{})});
         }
-        this.read(cx,"/api/specs/library",true);run("rig.refresh");
+        spec.read(cx,"/api/specs/library",true);run("rig.refresh");
       }catch(error){
         if(error.code==="conflict"){
-          box.conflict=this.specConflictMessage();
-          try{box.diskText=await this.specText(s);}catch{}
+          box.conflict=this.specConflictMessage(config);
+          try{box.diskText=await this.specText(s,null,spec);}catch{}
         }else if(error.machineNotice&&String(error.message).startsWith(`${config.daemonMachine} is unreachable.`)){
           box.note=`${config.daemonMachine} is unreachable, so nothing was saved. Your edits are still here. Run hc machine login ${config.daemonMachine}, then save again.`;
         }else box.note=String(error.message??error);
