@@ -1,6 +1,6 @@
 import {rigOrigin} from "./rig-space-context.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { stampConnection, adoptConnection, connectionConfig, configOfConnection, targetConnection, UNKNOWN_CONNECTION, consentOf, consentText, LEGACY_CONNECTION_ID, connectionBoxLabel } from "./rig-connections.js";
+import { stampConnection, adoptConnection, qualifyKey, connectionConfig, configOfConnection, targetConnection, UNKNOWN_CONNECTION, consentOf, consentText, LEGACY_CONNECTION_ID, connectionBoxLabel } from "./rig-connections.js";
 import {workerViewDetails,workerMissingReason} from "./rig-worker-views.js";
 import { machineSetupReceiptLabel } from "./rig-machine-setup.js";
 import { connectionBlocks } from "./rig-connections-view.js";
@@ -675,8 +675,9 @@ export default class RigView extends View {
         };
         if (outcome.ok && typeof outcome.data?.qitemId === "string" && path.startsWith("/api/queue/")) {
           const row = outcome.data, at = cache[path].at;
+          const readConn = adoptConnection(this.config, conn) ?? null; // the row is this read's OpenRig's: only its own requests' boxes observe it
           for (const [id, box] of Object.entries(this.replies ?? {})) {
-            if (box.target?.qitemId === row?.qitemId && observeNeedDecision(box, row, at)) {
+            if (box.target?.qitemId === row?.qitemId && (adoptConnection(this.config, box.target?.conn) ?? null) === readConn && observeNeedDecision(box, row, at)) {
               delete this.answered[id];
               delete this.questionChoices[id];
             }
@@ -876,6 +877,10 @@ export default class RigView extends View {
 
   // ---- the file viewer: herdr's Files, look-alike -------------------------------------------------------------------
   fileView(t, cx, entry) {
+    // The viewer reads THIS computer's files: a page of an OpenRig on a machine shows none (that file is on the machine, and a file at the same
+    // path here is another computer's).
+    const machine = this.activeConfig()?.daemonMachine;
+    if (machine) return this.dim(t, `This file is on ${machine}, so it isn't shown here.`);
     const path = entry.path;
     let f = this.files[path];
     if (!f) {
@@ -926,10 +931,15 @@ export default class RigView extends View {
     const cache=this.cacheFor(config.connectionId),key=`/api/queue/hosted-members:${config.connectionId}`,cached=cache[key];
     if((!cached||cached.stale)&&!cached?.loading&&typeof cx?.spawn==='function'){
       cache[key]={loading:true};
-      cx.spawn(async task=>{(this.hostedReaders??={})[config.connectionId]??=new HostedMembersReader();const data=await this.hostedReaders[config.connectionId].read(fetchFor(config),config,(ms,done)=>task.timer.after(ms,done));
-        const now=this.activeConfig(),same=now?.connectionId===config.connectionId&&now?.daemonUrl===config.daemonUrl;
-        if(same||this.config?.connectionId===config.connectionId)cache[key]={data,at:Date.now(),...(cache[key]?.stale?{stale:true}:{})};
-        task.notify();});
+      cx.spawn(async task=>{
+        try{(this.hostedReaders??={})[config.connectionId]??=new HostedMembersReader();const data=await this.hostedReaders[config.connectionId].read(fetchFor(config),config,(ms,done)=>task.timer.after(ms,done));
+          const now=this.activeConfig(),same=now?.connectionId===config.connectionId&&now?.daemonUrl===config.daemonUrl;
+          if(same||this.config?.connectionId===config.connectionId)cache[key]={data,at:Date.now(),...(cache[key]?.stale?{stale:true}:{})};
+        }finally{
+          // A read that was dropped (the page moved to another connection) or failed never leaves its marker: it would block every later read.
+          if(cache[key]?.loading)delete cache[key];
+          task.notify();
+        }});
     }
     const got=cache[key]?.data;
     return got?.conn===config.connectionId&&got.origin===config.daemonUrl?got:null;
@@ -3208,7 +3218,10 @@ export default class RigView extends View {
       const hasWorkflows=workflowView(missionWorkflows.data,{mission:mTitle,project:workflowProject}).instances.length>0;
       const firstSlicePath = (m.slices ?? []).map((s) => s.slicePath ?? paths.get(s.dirName) ?? paths.get(s.id)).find(Boolean);
       const missionFolder = m.missionPath ?? (firstSlicePath ? firstSlicePath.split(/[\\/]/).slice(0, -2).join("/") : null);
-      const missionFiles = Array.isArray(m.files)
+      // Mission and slice files are read on THIS computer: an OpenRig on a machine has its files there, so its page offers no file chips.
+      const filesOn = this.activeConfig()?.daemonMachine ?? null;
+      const missionFiles = filesOn ? []
+        : Array.isArray(m.files)
         ? m.files.map((name) => [name, missionFolder ? `${missionFolder}/${name}` : name])
         : missionFolder
           ? MISSION_FILES.map((name) => [name, `${missionFolder}/${name}`, this.exists(cx, `${missionFolder}/${name}`)]).filter(([, , on]) => on === true)
@@ -3230,6 +3243,7 @@ export default class RigView extends View {
             .child(svg(icon("file-text")).size(11).flex_none().text_color(t.muted))
             .child(div().text_size(11).text_color(t.foreground).child(name))
             .child(this.copyButton(t, filePath, `mission-file-${mKey}-${name}`, "path"))))
+        .when(Boolean(filesOn) && Boolean(missionFolder || m.files), (el) => el.child(div().id(`mission-files-on-${mKey}`).text_size(11).text_color(t.dim).child(`Files are on ${filesOn}`)))
         .child(div().text_size(11.5).text_color(t.dim).child(`${(m.slices ?? []).length} slice${m.slices?.length===1?"":"s"}`));
       const rows = slices.map((s, si) => {
         const sKey = s.id ?? s.slug ?? s.dirName ?? `s-${si}`;
@@ -3250,12 +3264,13 @@ export default class RigView extends View {
           setShared("rig.open.page", { ...cur, [openKey]: next, [altOpenKey]: next });
         };
         const folder = s.slicePath ?? paths.get(sDir) ?? paths.get(sKey) ?? null;
-        const knownFiles = Array.isArray(s.files)
+        const knownFiles = filesOn ? []
+          : Array.isArray(s.files)
           ? s.files.map((name) => [name, folder ? `${folder}/${name}` : name])
           : folder
             ? SLICE_FILES.map((name) => [name, `${folder}/${name}`, this.exists(cx, `${folder}/${name}`)]).filter(([, , on]) => on === true)
             : [];
-        const readingFiles = !Array.isArray(s.files) && folder
+        const readingFiles = !filesOn && !Array.isArray(s.files) && folder
           ? SLICE_FILES.some((name) => this.exists(cx, `${folder}/${name}`) === null)
           : false;
         const followReason = capabilityDisableReason("follow", this.caps());
@@ -3462,16 +3477,16 @@ export default class RigView extends View {
     if(assistant){const rig=this.currentTopology(cx).find(r=>r.name===assistant.rig&&r.conn===assistant.conn);this.push({section:'topology',kind:'assistant',session:assistant.seat,conn:assistant.conn,rig:assistant.rig,rigId:rig?.id,name:assistant.name});return;}
     const resolved = resolveAskerSeat(asker, this.currentTopology(cx), n?.conn ?? null); // the request's OWN connection: a name two OpenRigs share is never the first one's
     if (!resolved.found) {
-      this.askerNotes[n.id] = resolved.message;
+      this.askerNotes[this.replyKey(n)] = resolved.message;
       cx?.notify?.();
       return;
     }
-    delete this.askerNotes[n.id];
+    delete this.askerNotes[this.replyKey(n)];
     cx.spawn(async (cx) => {
       const res = await this.attachTarget(cx, resolved.seat);
       if (res?.needsViewerRefresh) { this.reviewViewerReplace(res, resolved.seat); }
       else if (res && res.ok === false && res.reason) {
-        this.askerNotes[n.id] = res.reason;
+        this.askerNotes[this.replyKey(n)] = res.reason;
       }
       cx.notify();
     });
@@ -3680,7 +3695,7 @@ export default class RigView extends View {
         const hidden = dismissals.hidden().find((r) => r.item.id === entry.id);
         if (hidden) return v_flex().gap(8).child(this.dim(t, hidden.note ?? "Dismissed here."))
           .child(this.button(t, "restore-open-update", "Restore", () => this.updateAction("restore", hidden.key), { small: true }));
-        const answered = this.answered[entry.id];
+        const answered = this.answered[this.replyKey(entry)]; // the page's request: its id on its own OpenRig
         if (answered?.text) return v_flex().gap(10).child(this.title(t, answered.summary))
           .child(h_flex().id(`need-result-${entry.id}`).gap(6).items_start().min_w(0)
             .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(this.dim(t, answered.text).flex_1().min_w(0)));
@@ -3693,7 +3708,10 @@ export default class RigView extends View {
         ;
     }
     // Replies sent from here whose item has left the list: said for a moment, then gone.
-    const gone = Object.entries(this.answered).filter(([id, a]) => Date.now() - a.at < STATUS_MS && !items.some((n) => n.id === id));
+    // Each is said on its own OpenRig's page only, and only while no listed item is that request (both by the request's key).
+    const pageConn = adoptConnection(this.config, this.activeConnId()) ?? null;
+    const gone = Object.entries(this.answered).filter(([key, a]) => Date.now() - a.at < STATUS_MS && (a.conn ?? pageConn) === pageConn
+      && !items.some((n) => this.replyKey(n) === key));
     if (gone.length) this.ticking = true;
     // The daemon names each source it read; one that is down makes an empty list unknown, not empty.
     const coverage = attentionCoverage(att.data.sources ?? []);
@@ -3745,7 +3763,7 @@ export default class RigView extends View {
     const toggle = (n) => {
       this.selectedUpdate = dismissible(n) ? n : null;
       const now = shared("rig.open.page") ?? {}, next = !now[`needs:${n.id}`];
-      if (next && n.reply !== "none") this.replies[n.id] ??= this.makeReply(n);
+      if (next && n.reply !== "none") this.replies[this.replyKey(n)] ??= this.makeReply(n);
       if (!next && shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
       setShared("rig.open.page", { ...now, [`needs:${n.id}`]: next });
     };
@@ -3795,13 +3813,13 @@ export default class RigView extends View {
   requestRows(t, cx, items, perspective) {
     const filter = this.filter?.toLowerCase();
     if (filter) items = items.filter(n => [n.summary, n.asker].some(s => String(s ?? "").toLowerCase().includes(filter)));
-    const toggle = (n) => { if (n.criticalHealth) { this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) }); return; } this.selectedNeed = n.id; if (n.reply !== "none") this.replies[n.id] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
+    const toggle = (n) => { if (n.criticalHealth) { this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) }); return; } this.selectedNeed = this.replyKey(n); this.selectedNeedId = n.id; if (n.reply !== "none") this.replies[this.replyKey(n)] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
     return v_flex().id("need-request-list").on_key_down((e, cx) => {
       if (!["up", "down", "enter"].includes(e.key)) return;
       cx.stop_propagation();
-      let i = items.findIndex(n => n.id === this.selectedNeed);
+      let i = items.findIndex(n => this.replyKey(n) === this.selectedNeed);
       if (e.key === "enter") { if (i >= 0) toggle(items[i]); }
-      else { i = Math.max(0, Math.min(items.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = items[i]?.id; }
+      else { i = Math.max(0, Math.min(items.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = items[i] ? this.replyKey(items[i]) : undefined; this.selectedNeedId = items[i]?.id; }
       cx.notify();
     }).children(items.length ? items.map((n, i) => {
       if (n.criticalHealth) return this.healthNeedsLine(t, n);
@@ -3813,7 +3831,7 @@ export default class RigView extends View {
       const age = Date.parse(n.at ?? ""), mins = Number.isFinite(age) ? Math.max(0, Math.floor((Date.now() - age) / 60000)) : null;
       const shown = Boolean((shared("rig.open.page") ?? {})[`needs:${n.id}`]);
       return v_flex().min_w(0).child(h_flex().id(`needs-${i}`).px(8).h(34).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
-        .when(this.selectedNeed === n.id, el => el.bg(t.selection ?? t.raised))
+        .when(this.selectedNeed === this.replyKey(n), el => el.bg(t.selection ?? t.raised))
         .on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
         .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(text.headline))
@@ -3855,9 +3873,12 @@ export default class RigView extends View {
 
   routeNeedKey(e, cx, entry) {
     if (e.modifiers?.control || e.modifiers?.platform || e.modifiers?.alt || !["r", "d", "escape"].includes(String(e.key).toLowerCase())) return false;
-    const id = entry.id ?? this.selectedNeed ?? shared("rig.focusNeed");
+    // The selection is kept as the request's key (its OpenRig and id); the open fold is kept by id.
+    const id = entry.id ?? (this.selectedNeed ? this.selectedNeedId : null) ?? shared("rig.focusNeed");
     if (!id || (!entry.id && !(shared("rig.open.page") ?? {})[`needs:${id}`])) return false;
-    const key = this.replies[id]?.cardKey;
+    // The card's box is the request's on its own OpenRig: the page's request, else the row selected in the list (with its connection).
+    const boxKey = entry.id ? this.replyKey(entry) : this.selectedNeed && id === this.selectedNeedId ? this.selectedNeed : this.replyKey({ id });
+    const key = this.replies[boxKey]?.cardKey;
     if (!key) return false;
     key(e, cx); return true;
   }
@@ -3887,7 +3908,7 @@ export default class RigView extends View {
     const recordedKey = `need-recorded:${id}`, recordedOpen = Boolean((shared("rig.open.page") ?? {})[recordedKey]);
     const busy = Boolean(box?.busy), receipt = box?.result?.ok && qState.openCount === 0 && !qState.needsResume;
     const whose = whoseQueueSummary(perspective, this.config, n);
-    const targetBox = () => this.replies[id] ??= this.makeReply(n);
+    const targetBox = () => this.replies[this.replyKey(n)] ??= this.makeReply(n);
     const openComposer = (cx, denying = false) => {
       if (!verb || n.native || busy) return;
       const b = targetBox(); b.cardMode = true; b.composerOpen = true; b.denying = denying; b.result = null;
@@ -3961,7 +3982,7 @@ export default class RigView extends View {
         .child(div().tooltip(this.time(at,{exact:true})).child(`· waiting ${age}`))
         .when(Boolean(owner), el => el.child(div().id(`need-open-asker-${id}`).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { cx.stop_propagation(); this.openAskerSeat(cx, { ...n, asker: owner }); }).child(connectedAsker?'Open assistant page':"Open seat")))
         .when(Boolean(project), el => el.child(`· ${project}`)))
-      .when(Boolean(this.askerNotes[id]), el => el.child(div().id(`need-asker-note-${id}`).text_size(11.5).text_color(t.muted).child(this.askerNotes[id])))
+      .when(Boolean(this.askerNotes[this.replyKey(n)]), el => el.child(div().id(`need-asker-note-${id}`).text_size(11.5).text_color(t.muted).child(this.askerNotes[this.replyKey(n)])))
       .when(Boolean(whose?.onSomeoneElsesAsk), el => el.child(this.dim(t, whose.onSomeoneElsesAsk)))
       .when(Boolean(box?.result), el => el.child(h_flex().id(`need-result-${id}`).gap(6).items_start()
         .child(svg(icon(box.result.ok ? "check" : "rig-alert")).size(12).text_color(box.result.ok ? t.working : t.blocked))
@@ -3988,7 +4009,8 @@ export default class RigView extends View {
           .children(evidenceFiles.map((file, i) => {
             const path = typeof file === "string" ? file : file.path ?? "";
             return h_flex().gap(6).child(div().id(`need-evidence-${id}-${i}`).flex_1().text_size(12).text_color(t.accent).cursor_pointer()
-              .on_click(() => this.push(fileEntry(path, typeof file === "object" ? file.label : path.split("/").pop()))).child(path))
+              // The request's own OpenRig names the file (the Needs page lends no connection): a file of a box's request is never read here.
+              .on_click(() => this.push({ ...fileEntry(path, typeof file === "object" ? file.label : path.split("/").pop()), ...((this.config?.connections ?? []).length > 1 && n.conn ? { conn: n.conn } : {}) })).child(path))
               .child(this.copyButton(t, path, `need-evidence-path-${id}-${i}`, "evidence path"));
           }))
           .child(v_flex().gap(4).child(h_flex().id(`need-recorded-toggle-${id}`).gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
@@ -4033,8 +4055,8 @@ export default class RigView extends View {
 
     const box = !isUpdateNeed(mergedItem) ? this.replyFor(cx, mergedItem) : null;
     if (box && queueRow && observeNeedDecision(box, queueRow, queueRes.at)) {
-      delete this.answered[n.id];
-      delete this.questionChoices[n.id];
+      delete this.answered[this.replyKey(n)];
+      delete this.questionChoices[this.replyKey(n)];
     }
     const strip = tierStripFor(mergedItem);
     const stripColor = strip.tone === "blocked" ? t.blocked : strip.tone === "accent" ? t.accent : t.dim;
@@ -4049,7 +4071,7 @@ export default class RigView extends View {
     const scope = String(mergedItem.scope ?? n.scope ?? "").replace(/\bproject unknown\b/g, "Not linked to a project") || null;
     const since = mergedItem.at ?? n.at ?? null;
     const unblocks = mergedItem.unblocks ?? n.unblocks ?? null;
-    const askerNote = this.askerNotes[n.id] ?? null;
+    const askerNote = this.askerNotes[this.replyKey(n)] ?? null;
 
     if (!isUpdateNeed(mergedItem)) return this.requestCard(t, cx, {
       n: mergedItem, queueRow, detailItem, detailLines, recordedLines, evidenceFiles, qState, box, standalone,
@@ -4088,18 +4110,19 @@ export default class RigView extends View {
     const f = shared("rig.replyFocus");
     const want = f?.id === n.id && f.at !== this.focusSeen;
     if (want) this.focusSeen = f.at;
-    if ((!this.replies[n.id] && !this.making?.has(n.id)) || want) {
-      (this.making ??= new Set()).add(n.id);
+    if ((!this.replies[this.replyKey(n)] && !this.making?.has(this.replyKey(n))) || want) {
+      (this.making ??= new Set()).add(this.replyKey(n));
       cx.spawn(async (cx) => {
         await Promise.resolve();
-        const box = this.replies[n.id] ??= this.makeReply(n);
-        this.making.delete(n.id);
-        if (want && !box.busy) box.composerOpen = true;
-        if (want && !box.busy) { box.input.set_value((shared("rig.drafts") ?? {})[box.key] ?? ""); box.result = null; box.input.focus(); }
+        try {
+          const box = this.replies[this.replyKey(n)] ??= this.makeReply(n);
+          if (want && !box.busy) box.composerOpen = true;
+          if (want && !box.busy) { box.input.set_value((shared("rig.drafts") ?? {})[box.key] ?? ""); box.result = null; box.input.focus(); }
+        } finally { this.making.delete(this.replyKey(n)); } // a box that failed to be made is tried again on the next render, never stuck
         cx.notify();
       });
     }
-    const box = this.replies[n.id];
+    const box = this.replies[this.replyKey(n)];
     if (box) box.target = n;
     return box ?? null;
   }
@@ -4121,6 +4144,9 @@ export default class RigView extends View {
     return input;
   }
 
+  /** A request's reply state (its box and typed text, its answered note, chosen options, asker note) belongs to its OpenRig and id: two connected
+   *  OpenRigs can hold the same queue id (a queue copied, restored or snapshotted from the other). The legacy connection keeps the bare id. */
+  replyKey(n) { return qualifyKey(adoptConnection(this.config, n?.conn), n?.id); }
   makeReply(n) {
     const key = draftKey(n, "reply");
     const box = { input: null, key, target: n, busy: false, result: null, denying: false, stepProgress: null, recordedChoiceByQuestion: {} };
@@ -4152,8 +4178,12 @@ export default class RigView extends View {
    * Never uses `X-OpenRig-Session` or `rig queue answer`.
    */
   submitCardDecision(cx, n, detailItem, queueRow, act) {
-    const box = this.replies[n.id] ??= this.makeReply(n);
+    const box = this.replies[this.replyKey(n)] ??= this.makeReply(n);
     if (box.busy) return;
+    // A box holds the text typed for ITS request: an answer is sent only for a request on the same OpenRig as the box's own.
+    if ((adoptConnection(this.config, box.target?.conn) ?? null) !== (adoptConnection(this.config, n?.conn) ?? null)) {
+      box.result = this.notSentResult("This answer box belongs to a request on another OpenRig."); cx.notify(); return;
+    }
     this.keepDraft(box);
     box.busy = true;
     box.stepProgress = null;
@@ -4230,9 +4260,9 @@ export default class RigView extends View {
         box.stepProgress = null;
         if (outcome.ok) {
           if (act.mode === "choices") {
-            const nextChoices = { ...(this.questionChoices[n.id] ?? {}) };
+            const nextChoices = { ...(this.questionChoices[this.replyKey(n)] ?? {}) };
             for (const c of act.choices ?? []) delete nextChoices[c.questionId];
-            this.questionChoices[n.id] = nextChoices;
+            this.questionChoices[this.replyKey(n)] = nextChoices;
           } else {
             const all = { ...(shared("rig.drafts") ?? {}) };
             delete all[box.key];
@@ -4243,12 +4273,12 @@ export default class RigView extends View {
               this.bindReplyInput(box, (n.reply === "resolve" || n.verb === "resolve") ? "Your decision, in your own words" : "Your answer, in your own words");
             }
             box.confirmResolve = false;
-            delete this.questionChoices[n.id];
+            delete this.questionChoices[this.replyKey(n)];
           }
           if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
           const sentText = this.sentNeedConfirmation(itemForAction, queueRow, act);
           const confirmation = `${sentText} ${outcome.text}`;
-          this.answered[n.id] = { summary: requestHeadline(n), text: confirmation, at: Date.now() };
+          this.answered[this.replyKey(n)] = { summary: requestHeadline(n), text: confirmation, at: Date.now(), conn: adoptConnection(this.config, n?.conn) ?? null };
           box.composerOpen = false; box.changedSinceAnswered = false;
           box.result = { ok: true, text: confirmation };
           box.receipt = { at: Date.now(), revision: outcome.decisionRevision, body: queueRow?.body,
@@ -4261,9 +4291,9 @@ export default class RigView extends View {
         } else {
           if (outcome.conflict || outcome.settingsChanged) { // a settings change mid-answer also leaves recorded steps: the card drops them and re-reads the item
             if (Array.isArray(outcome.committedQuestionIds) && outcome.committedQuestionIds.length > 0) {
-              const nextChoices = { ...(this.questionChoices[n.id] ?? {}) };
+              const nextChoices = { ...(this.questionChoices[this.replyKey(n)] ?? {}) };
               for (const qId of outcome.committedQuestionIds) delete nextChoices[qId];
-              this.questionChoices[n.id] = nextChoices;
+              this.questionChoices[this.replyKey(n)] = nextChoices;
             }
             this.read(cx, `/api/attention?item=${encodeURIComponent(n.id)}`, true);
             if (qid) this.read(cx, `/api/queue/${encodeURIComponent(qid)}`, true);
@@ -4309,8 +4339,9 @@ export default class RigView extends View {
     if (box.busy || !text) return;
     const n = box.target;
     const qid = n?.qitemId ?? (String(n?.id ?? "").startsWith("queue:") ? String(n.id).slice(6) : null);
-    const queueRow = qid ? this.cache[`/api/queue/${encodeURIComponent(qid)}`]?.data : null;
-    const detailItem = this.cache[`/api/attention?item=${encodeURIComponent(n.id)}`]?.data?.detail?.item ?? null;
+    const cache = this.cacheFor(adoptConnection(this.config, n?.conn) ?? this.activeConnId()); // the request's own OpenRig's reads, not the page shown now
+    const queueRow = qid ? cache[`/api/queue/${encodeURIComponent(qid)}`]?.data : null;
+    const detailItem = cache[`/api/attention?item=${encodeURIComponent(n.id)}`]?.data?.detail?.item ?? null;
     if (box.denying) {
       this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "deny", decision: text });
       return;

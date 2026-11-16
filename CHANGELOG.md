@@ -116,7 +116,7 @@ Some other actions can still show a sidebar refresh error when the OpenRig sideb
 
 After you point herdrig at a different OpenRig, a seat click, Attach, Focus pane or the sidebar seat preview can still use an old Attach tab from the previous OpenRig when a rig and seat have the same names, and that tab can hide a needs-you notification. Close the old tabs.
 
-Tested with OpenRig 0.7.14 and 0.7.16, and herdr-app 0.1.16.
+Tested with OpenRig 0.7.14, 0.7.16 and 0.7.17, and herdr-app 0.1.16.
 
 ## v0.4.7
 
