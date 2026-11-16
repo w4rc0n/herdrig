@@ -18,8 +18,17 @@ export class ConfigPanel {
   constructor(page) { this.page = page; this.model = new ConfigEditor(); this.inputs = {}; this.selected = null; this.releasedReviews=new WeakSet();this.reviewConfigs=new WeakMap();this.saves=new Map();this.writeWatches=new Map();this.reconcileStopped=new Set();this.writeOwner={}; }
   close(){this.disposed=true;closeConfigWrites(this.writeOwner);for(const handle of this.controlHandles?.values()??[])handle.release();this.controlHandles?.clear();}
   get saving(){return this.saves.has(this.identity());}
-  origin() { return this.page.config?.daemonUrl ?? ""; }
-  identity() { return JSON.stringify([this.origin(),this.page.config?.daemonMachine??null,this.page.config?.connectionId??null]); }
+  /** The connection this page SHOWS (v0.5.0: a page opened for box B reads and writes B). Null when that connection is no longer set up: the
+   *  panel then has no origin and sends nothing; it never falls back to another connection (the first one above all). */
+  cfg() { return typeof this.page.activeConfig === "function" ? this.page.activeConfig() : this.page.config; }
+  origin() { return this.cfg()?.daemonUrl ?? ""; }
+  identity() { const c=this.cfg();return JSON.stringify([this.origin(),c?.daemonMachine??null,c?.connectionId??null]); }
+  daemonNameOf(identity) { try { const [origin,machine]=JSON.parse(identity);return machine||`the OpenRig at ${String(origin??"").replace(/^https?:\/\//,"")}`; } catch (_) { return "the earlier OpenRig"; } }
+  /** The gate scope the bound identity was taken under: every send of a save or a reconcile names it. */
+  scopeOf(identity) {
+    if (!((this.page.config?.connections ?? []).length > 1)) return undefined; // one connection: the gate's only scope, exactly as before
+    try { return JSON.parse(identity)?.[2] ?? null; } catch (_) { return null; }
+  }
   hasFocus() { return Boolean(this.focusedField||[...(this.controlOrder??[]),...(this.controlHandles?.values()??[])].some(handle=>handle?.is_focused?.())); }
   selectRow(key,cx) {
     this.selected=key;this.selectedScope=this.page.settingsScope;this.page.pageSel=null;
@@ -28,7 +37,7 @@ export class ConfigPanel {
   clearSelection() { this.selected=null;this.selectedScope=null; }
   hasSelection() { return Boolean(this.selected&&this.selectedScope===this.page.settingsScope&&this.controlHandles?.get(`config-row-${this.selected}`)?.is_focused?.()); }
   ownsEscape() { return Boolean(this.more||this.model.row||this.model.confirmation||this.saving||this.model.busy); }
-  daemonName() { return this.page.config?.daemonMachine || `the OpenRig at ${this.origin().replace(/^https?:\/\//,"")}`; }
+  daemonName() { return this.cfg()?.daemonMachine || `the OpenRig at ${this.origin().replace(/^https?:\/\//,"")}`; }
   definition(entry) {
     const def=configDefinition(entry);
     if([PRESSURE_WARNING,PRESSURE_CRITICAL].includes(entry?.key)){
@@ -40,7 +49,13 @@ export class ConfigPanel {
   releaseInputs() { this.blurGeneration=(this.blurGeneration??0)+1;if(this.focusedField)this.page.typing=false;this.focusedField=null;for (const input of Object.values(this.inputs)) input.release?.(); this.inputs = {}; this.dropdown=null; this.selectHandles={}; }
   sync(origin, browser, probe) {
     const identity=this.identity();
-    if (this.boundIdentity !== identity) { this.releaseInputs(); this.selected=null;this.model = new ConfigEditor(identity); this.boundOrigin = origin;this.boundIdentity=identity;this.nextKey=null; }
+    if (this.boundIdentity !== identity) {
+      // The page now shows another connection (or this one's address changed). An open edit is NOT dropped: its typed values are frozen
+      // as a draft the person can copy, nothing is sent, and the panel rebinds to the new connection.
+      const row=this.model?.row,touched=row?Object.keys(row.touched??{}).filter(k=>row.values?.[k]!==row.initial?.[k]):[];
+      if(this.boundIdentity!==undefined&&row&&touched.length)this.frozenDraft={from:this.daemonNameOf(this.boundIdentity),values:touched.map(k=>[k,row.values[k]])};
+      this.releaseInputs(); this.selected=null;this.model = new ConfigEditor(identity); this.boundOrigin = origin;this.boundIdentity=identity;this.nextKey=null;
+    }
     this.model.observe(browser);
     if(configWriteState(identity)?.uncertain){this.model.results.clear();this.model.latestReceipt=null;this.model.lastSavedText=null;}
     const editingKeys=this.model.row?.keys??this.model.confirmation?.changes.map(([key])=>key)??[];
@@ -135,7 +150,7 @@ export class ConfigPanel {
   }
   watchWrites(cx,binding={origin:this.origin(),model:this.model,identity:this.identity()}){
     const {origin,model,identity,rejected}=binding;
-    const op=binding.op??gatedOperationOrRefusal(); // the reconciling reads belong to the generation the origin was captured under
+    const op=binding.op??gatedOperationOrRefusal(this.scopeOf(identity)); // the reconciling reads belong to the generation and the connection the origin was captured under
     if(configWriteState(identity)?.ownerClosed||this.reconcileStopped.has(identity)||this.writeWatches.get(identity)?.model===model)return;
     const watch={model};this.writeWatches.set(identity,watch);
     cx.spawn(async next=>{
@@ -170,7 +185,7 @@ export class ConfigPanel {
     if (!pending) {
       if(this.model.confirmation){
         const confirmation=this.model.confirmation;this.cancelHandle??=cx.focus_handle?.();this.confirmHandle??=cx.focus_handle?.();
-        if(!this.reviewConfigs.has(confirmation))this.reviewConfigs.set(confirmation,{...this.page.config,rig:Array.isArray(this.page.config?.rig)?[...this.page.config.rig]:this.page.config?.rig});
+        const shown=this.cfg();if(!this.reviewConfigs.has(confirmation))this.reviewConfigs.set(confirmation,{...shown,rig:Array.isArray(shown?.rig)?[...shown.rig]:shown?.rig});
         const handle=this.cancelHandle;handle?.focus?.();
         cx.timer?.after(16,next=>{if(this.model.confirmation===confirmation)handle?.focus();next.notify();});
       }
@@ -178,11 +193,11 @@ export class ConfigPanel {
     }
     if(this.saving||this.model.busy)return;
     if(this.pauseWrites(cx))return;
-    const origin = this.boundOrigin, model = this.model,identity=this.boundIdentity,draft=model.row;
-    const op=gatedOperationOrRefusal(); // the origin above belongs to this generation: a deferred send after the settings changed is refused
+    const origin = this.boundOrigin, model = this.model,identity=this.boundIdentity,draft=model.row,expectedHost=this.cfg()?.expectedHostId??null;
+    const op=gatedOperationOrRefusal(this.scopeOf(identity)); // the origin above belongs to this generation and this connection: a deferred send after the settings changed is refused
     const reviewed=this.reviewConfigs.get(pending);
     const checkCurrent=()=>{
-      if(this.identity()!==identity||this.model!==model||(reviewed&&!sameReviewConfig(reviewed,this.page.config)))throw new GateRefusal(CONFIG_CHANGED_OPEN);
+      if(this.identity()!==identity||this.model!==model||(reviewed&&!sameReviewConfig(reviewed,this.cfg())))throw new GateRefusal(CONFIG_CHANGED_OPEN);
       op.check();
     };
     const request=configOperationRequest((...args)=>{checkCurrent();return op.fetch(...args);},(ms,fn)=>cx.timer.after(ms,fn),identity,this.writeOwner,this.daemonName());
@@ -191,7 +206,11 @@ export class ConfigPanel {
       let rejected;
       try{await model.save(pending, (key, value, reset) => {
         if (this.identity() !== identity || this.model !== model) return { ok:false, error:"OpenRig connection changed; reopen the setting" };
-        return writeDaemonConfig({origin,key,value,reset,entry:model.entry(key),detected:this.detected},request)
+        // A connection that recorded its OpenRig's host id writes only to that OpenRig: its address answering as another one refuses before the write
+        // (the same rule as a box spec save). A null expectedHostId (the legacy connection) is decided by the address, as before.
+        const sameHost=expectedHost?request(`${origin}/healthz`).then(async r=>{let h;try{h=await r.json();}catch{h=null;}return h?.selfHostId===expectedHost?null:h?.selfHostId??'';}):Promise.resolve(null);
+        return sameHost.then(other=>other!==null?{ok:false,error:`This setting wasn't saved: ${this.daemonNameOf(identity)}'s connection now reaches a different OpenRig. Nothing was written.`}
+          :writeDaemonConfig({origin,key,value,reset,entry:model.entry(key),detected:this.detected},request))
           .then(result=>{if(!result.ok)rejected={key,value:hidden(model.entry(key))?null:reset?'the default':value};return {...result,daemon:this.daemonName()};});
       }, () => this.refresh(origin,request,model,identity),Date.now,async key=>{
         if(this.identity()!==identity||this.model!==model)throw new Error('OpenRig connection changed; Undo is no longer available');
@@ -391,6 +410,15 @@ export class ConfigPanel {
     if (!this.detected) out.push(div().id("config-edit-unavailable").text_size(11.5).text_color(t.dim)
       .child(probe?.status ? configWriteError(probe.status,probe.errorData)
         : "This OpenRig hasn't confirmed support for editing settings from Herdr. Use rig config set on that machine."));
+    if(this.frozenDraft){
+      const d=this.frozenDraft,text=d.values.map(([k,v])=>`${k} = ${v}`).join("\n");
+      out.push(v_flex().id("config-connection-draft").gap(4).p(8).rounded(6).bg(t.raised??t.hover).border_1().border_color(t.border)
+        .child(div().text_size(13.5).text_color(t.foreground).child("This page's OpenRig changed, so nothing more is sent from it."))
+        .child(div().text_size(12).text_color(t.muted).child(`Your edit for ${d.from} wasn't saved: ${d.values.map(([k,v])=>`${k} = ${v}`).join(", ")}. Copy it, then set it again where you want it.`))
+        .child(h_flex().gap(8).items_center()
+          .child(h_flex().id("config-connection-draft-copy").gap(4).items_center().child(this.page.copyButton(t,text,"config-connection-draft","my text")).child(div().text_size(12).text_color(t.muted).child("Copy my text")))
+          .child(div().id("config-connection-draft-dismiss").text_size(12).text_color(t.muted).cursor_pointer().on_click((_e,ctx)=>{this.frozenDraft=null;ctx.notify();}).child("Dismiss"))));
+    }
     if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(m.errorTone==='working'?t.working:t.blocked).child(m.error));
     if(this.reconciledModel===m){
       const rejected=this.reconciledRejectedModel===m,message=rejected?(this.reconciledRejectedText??configRejectedSaveResidual()):'OpenRig’s current settings were checked. Review your draft before saving again.';

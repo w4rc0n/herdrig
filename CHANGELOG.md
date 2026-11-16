@@ -1,9 +1,128 @@
 # Changelog
 
+## v0.5.0
+
+### Updating from v0.4.7
+
+- When OpenRig stops answering after three failed or timed-out checks, Attach tiles clear their status dot instead of showing "Needs you" or raising a notice. The sidebar says OpenRig is not answering, and the seat status returns when it answers again. Checks are bounded, never overlap, and back off when OpenRig is slow. After updating, close every Attach tab opened before the update, then Attach again and approve the updated helper once per configured Herdr machine. Tabs left open keep the old helper and may still show a false "Needs you". Local Attach does not ask for approval.
+
+### Use more than one OpenRig
+
+Herdrig can now work with several OpenRigs at once, for example one on this computer and one on each of your Herdr
+machines. Each one is a connection in `<appHome>/openrig/config.json`.
+
+- Add a machine from the sidebar. When the space you are in is on a Herdr machine where OpenRig runs but isn't added
+  yet, Herdrig offers to add it, shows how this computer reaches it, and checks it before saving. **Add a machine…** is
+  also in the sidebar's **⋯** menu. With two or more OpenRigs, **System › Connections** lists them, with
+  **Add a machine…** and **Remove…**.
+- The sidebar follows the space you are in. In a rig's space on a machine, you see that machine's OpenRig. Outside
+  OpenRig's spaces you see the OpenRig you used last. The header names the OpenRig it is showing. To look at another
+  one, open the picker from the header (Alt+S); your choice holds until you switch spaces. Choosing an OpenRig while
+  no space is open keeps your choice.
+- Requests waiting for you on another OpenRig show as **◆ N elsewhere** in the header and on the picker's rows, so a
+  decision is never hidden because you are looking at another machine.
+- Each rig gets one space per machine. A rig named `demo` on two machines has two spaces, each under its own machine
+  in Herdr's Spaces list. Each machine has its own **OpenRig** home space, and its operator's space is named after its
+  rig (`kernel`), as on this computer.
+- Actions, pages, the palette, Attach, the Operator and Need cards act on the OpenRig the row or page came from. Pages
+  and the palette name their machine. Configuration and the other System pages open in that OpenRig's home space.
+- Sidebar actions use the OpenRig of the row you selected, so another OpenRig's missing feature never blocks or
+  enables them. Right-click menus on Specs, Scopes and Terminals rows, and Close cell, act on the OpenRig the sidebar
+  shows.
+- Each Rig tab shows only its own OpenRig's pages. After a restart, a machine's rig space no longer shows another
+  machine's page, and a link clicked there stays with that machine. Switching sections from a page's breadcrumb keeps
+  that page's OpenRig, and section-menu counts belong to it.
+- After a restart, a Rig tab in a machine's space keeps to that machine's OpenRig, even when another machine's space
+  was active while Herdr restored its tabs. A Rig tab opened before this version may show another machine's page once
+  after a restart, until you open that tab again; then it stays with its own machine.
+- Settings, spec editing and health links act for the OpenRig the page shows. Saving a setting on one machine's page
+  never changes another machine's OpenRig. A spec is saved on its own machine, through that machine's helper. Each
+  OpenRig's Health page and System badge refresh on that OpenRig's own changes.
+- A spec page names its own machine and launches on that OpenRig, and a removed connection offers no spec actions.
+  Palette Launch opens the dialog for the OpenRig whose spec you selected, and the Launch dialog's folder hint names
+  that spec's machine. New rig, seat focus and worker-view progress stay with the OpenRig the page shows.
+- A page opened for another OpenRig keeps that OpenRig when it finds the seat that asked, shows connected assistants
+  or graph activity, and offers Resume from a stopped terminal view, even without the sidebar.
+- Worker view and Follow work for each machine's OpenRig: where it offers them, Herdrig opens its own worker pages, and
+  the tiles run on that machine. The palette and the Worker view button open the same rig-named space.
+- Move rig space uses the selected rig's own OpenRig and machine.
+- Connected assistants show for each machine's OpenRig, including on a Rig page that reads them before the sidebar
+  has.
+- Each OpenRig remembers its own sidebar view, expanded groups and selected row, when you switch or restart Herdr.
+- One machine's OpenRig going quiet doesn't stop the others: its rows say "isn't answering" with **Retry**, and the
+  rest keep working.
+- Each OpenRig shows its own notice when it runs without its operator. Machine approval names the OpenRig it is for,
+  and a narrow sidebar keeps the OpenRig's name readable in the header before it shortens anything else.
+
+### Behaviour changes
+
+- When Herdrig can't tell which OpenRig something is for, it asks or refuses instead of guessing. Every refusal says
+  that nothing was sent or written. An edit you were typing is kept, with **Copy my text**.
+- If you remove a connection while one of its pages is open, that page stops sending anything, and nothing is sent to
+  another OpenRig in its place. Removing one no longer shows notices for spaces that don't exist, and another
+  OpenRig's home space no longer offers to move its tabs into yours.
+- Herdrig checks that a machine's address still reaches the OpenRig it was set up for before saving a setting or a
+  spec there. If the address now answers as a different OpenRig, nothing is saved.
+- With more than one OpenRig, each connection needs its own address and its own OpenRig home on this computer (the
+  folder `rig` uses for that OpenRig's settings and sign-in). That folder stays on this computer: it's never sent to a
+  machine. An entry that can't be used is skipped, and a list with no usable entry sends nothing.
+- One OpenRig per added machine. Herdrig reaches each added machine's default OpenRig. With two OpenRigs added on the
+  same machine, commands for them there say "Two OpenRigs on <machine> need a home for each; this version supports
+  one per machine." and nothing is sent. Two OpenRigs on one machine keep separate home spaces.
+- Worker views for an OpenRig added on another Herdr machine never send it this computer's app home, a path that means
+  nothing there. Where that OpenRig doesn't offer Herdrig's worker pages, Worker view, Show in worker view and Follow
+  for it say they aren't available from this computer yet, and nothing is sent. A single `daemonMachine` setup works
+  as before.
+- If a machine's OpenRig address changes, Herdrig checks the OpenRig at the new address and asks once before treating
+  that machine's existing rig spaces as its own; their tabs stay open. Opening the space while Attach checks it shows
+  one review, and Cancel cancels both.
+- After it recognises the space, Herdrig lists Attach tabs still using the earlier address by their seats or tab
+  titles and explains how to replace their viewers; running tabs stay untouched until you choose. The seat menu that
+  started the review dims behind it and closes when the choice finishes.
+- A send that OpenRig recorded but didn't deliver (or held while the seat's input is busy) now shows as not sent and
+  keeps your text, with the reason. A queued item whose destination isn't running stays queued and says so.
+- A sidebar read that fails inside Herdr now shows the error instead of saying OpenRig isn't answering.
+
+### Other changes
+
+- Rig and pod Needs-you counts match terminal seats with an open request. A pod opened directly checks its own OpenRig
+  for requests.
+- Unconfirmed-space choices are clearer: keep another OpenRig's space open, or save your work before deliberately
+  replacing your own space.
+- Degraded seats have more room to explain why their terminals couldn't open, and the Terminals preview shows a seat
+  that needs attention with OpenRig's reason, such as "tiles need ssh".
+- Installing from source keeps your saved OpenRig address. Use `--rediscover` only when you want the installer to find
+  it again.
+- Failed space-open choices stay visible until dismissed. Send, Queue and Reply keep their text when nothing was sent,
+  and a timed-out Pause no longer says the rig may have been archived.
+- The README explains using Herdrig's views inside Herdr, or `rig terminal open --window` for OpenRig's own terminal
+  view.
+- Stop using a machine says when nothing changed. If stopping succeeds but refreshing Herdr fails, the success stays
+  visible with a warning.
+- On System › Overview, Escape cancels a setting's review without closing the page, and Enter or Space activates the
+  row you just selected.
+- Enter and Space on Health or another page no longer change the last selected setting. Switching pages or OpenRig
+  clears that selection.
+- Rig pages no longer stay on "Reading OpenRig's settings…" when startup retries overlap a slow spec-permission read.
+- Release packages are checked so that internal review notes stay out of shipped files.
+
+### Known issues
+
+Some other actions can still show a sidebar refresh error when the OpenRig sidebar is absent. Machine-choice recovery skips that optional refresh correctly.
+
+After you point herdrig at a different OpenRig, a seat click, Attach, Focus pane or the sidebar seat preview can still use an old Attach tab from the previous OpenRig when a rig and seat have the same names, and that tab can hide a needs-you notification. Close the old tabs.
+
+With more than one OpenRig added, Copy & edit of a built-in spec that has its own folder (such as `starter`) is refused on this computer with "This needs to know which OpenRig it is for, and it didn't say. Nothing was sent." Nothing is changed. To copy one by hand, in a terminal on this computer (with two OpenRigs on this computer, first set `OPENRIG_HOME` to the OpenRig home of the one you want, as its connection names it, so each `rig` command reaches that one):
+
+1. `rig specs show <name>` prints the built-in's `rig.yaml` path. `rig specs add <the folder that holds it>` copies the folder into your spec library.
+2. In the copy's `rig.yaml`, change each `agent_ref: "local:…"` to `path:` and the full path that the `local:` path names from the built-in's folder. For `starter`, `local:../../../agents/development/implementer` becomes `path:<full path>/agents/development/implementer`, where `<full path>` is the folder three levels above `starter`'s. Without this the copy doesn't launch.
+3. Give the copy its own name. `rig specs rename <name> <new name>` refuses because two specs share the name, and lists both IDs with their paths: run it again with the ID whose path is in your spec library. (The ID `rig specs add` printed is the built-in's, which can't be renamed.)
+
+Tested with OpenRig 0.7.14 and 0.7.16, and herdr-app 0.1.16.
+
 ## v0.4.7
 
 - Fixed: with many Attach tabs open, herdrig could ask OpenRig for status so often that OpenRig stopped answering. Each tile now waits for its last answer, gives up after a few seconds, and backs off when OpenRig is slow or not answering. With a configured Herdr machine, the first new Attach or space open asks you once to approve the updated Attach helper.
-- After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
 
 ## v0.4.6
 

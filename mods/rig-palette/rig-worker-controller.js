@@ -2,7 +2,7 @@
 import {isValidSessionName,rigSeatServers} from "./rig-lib.js";
 import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
-import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue} from "./rig-space-context.js";
+import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue,prepareRigSpaceAdoption} from "./rig-space-context.js";
 import {rigSpaceRelocation} from "./rig-spaces.js";
 import {LEGACY_CONNECTION_ID} from "./rig-connections.js";
 
@@ -57,16 +57,33 @@ export class HostWorkerViews{
   sync(config,view,options={}){
     if(typeof view!=="string"||!view.trim()||view.length>256||/[\u0000-\u001f\u007f-\u009f]/.test(view))
       return Promise.resolve({ok:false,reason:"Choose a valid worker view."});
-    const key=keyFor(config,view),prior=this.pending.get(key)??Promise.resolve();
-    const job=prior.catch(()=>{}).then(()=>this.update(config,view,key,options));this.pending.set(key,job);
+    const key=keyFor(config,view),running=this.pending.get(key);
+    // Coalesced: while a refresh of this view runs, at most ONE more waits, and a newer request replaces it (an explicit open's
+    // options are not replaced by a later event's). A burst of events gives one more refresh, not one per event.
+    if(running){
+      this.queued??=new Map();const waiting=this.queued.get(key);
+      if(waiting){waiting.config=config;if(options.explicit||!waiting.options.explicit)waiting.options={...options,explicit:!!(options.explicit||waiting.options.explicit)};return waiting.promise;}
+      const next={config,options};
+      next.promise=running.catch(()=>{}).then(()=>{if(this.queued.get(key)===next)this.queued.delete(key);return this.sync(next.config,view,next.options);});
+      this.queued.set(key,next);return next.promise;
+    }
+    const job=Promise.resolve().then(()=>this.update(config,view,key,options));this.pending.set(key,job);
     return job.finally(()=>{if(this.pending.get(key)===job)this.pending.delete(key);});
   }
+  /** A read or Herdr call that doesn't answer in `ms` fails with `reason` (the view's catch keeps the tiles and pauses following). */
+  timed(promise,ms,reason){
+    if(!this.host.deadline)return promise; // a host without a clock for deadlines (a unit test) waits as before
+    return Promise.race([promise,this.host.deadline(ms).then(()=>{throw new Error(reason);})]);
+  }
+  // The live settings of THIS config's own connection (with several OpenRigs, another connection's change leaves this one's work alone).
   current(config){
-    if(this.closed||!config?.daemonMachine||!rigOrigin(config.daemonUrl)||this.host.currentConfig&&identity(this.host.currentConfig())!==identity(config))
+    if(this.closed||!config?.daemonMachine||!rigOrigin(config.daemonUrl)||this.host.currentConfig&&identity(this.host.currentConfig(config))!==identity(config))
       throw new Error("OpenRig's connection changed. The worker view was left in place.");
   }
-  async hc(args){
-    const result=await this.host.hc(args);
+  // Every Herdr call goes through the synced connection's own send scope when the host offers one (an unscoped send is refused with several OpenRigs).
+  run(config,name,args){return (this.host.runFor?this.host.runFor(config):this.host.run)(name,args);}
+  async hc(args,config){
+    const result=await this.timed((this.host.hcFor?this.host.hcFor(config):this.host.hc)(args),15000,"Herdr didn't answer in time. Couldn't refresh this view; tiles kept.");
     if(result?.code!==0)throw new Error(result?.stderr||"Herdr could not update this worker view.");
     return result.stdout;
   }
@@ -81,6 +98,8 @@ export class HostWorkerViews{
       if(!String(addr(terminal)??"").startsWith(prefix)||!String(pane.tab).startsWith(prefix)
         ||labels["herdr-openrig.role"]!=="worker-view"||labels["herdr-openrig.view"]!==view
         ||labels["herdr-openrig.machine"]!==config.daemonMachine||rigOrigin(labels["herdr-openrig.origin"])!==expected
+        // Rule Y: positive evidence. A stamped tile is ours only with THIS daemon's host id; an unstamped one (older herdrig) only for the legacy connection.
+        ||(labels["herdr-openrig.host"]?labels["herdr-openrig.host"]!==hostLabelValue(remote.selfHostId):own(config).length>0)
         ||labels["herdr.tab"]!==machineLocalId(pane.tab,config.daemonMachine)
         ||!list(this.host,"spaces").some(s=>s.id===machineId(labels["herdr.space"],config.daemonMachine)&&s.tabs?.some(t=>t.id===pane.tab)))return [];
       let argv=terminal.argv;
@@ -102,7 +121,7 @@ export class HostWorkerViews{
     });
   }
   async update(config,view,key,options){
-    const host=this.host,previous=this.entries.get(key)??host.loadViews?.()?.[key]??null;
+    let host=this.host;const previous=this.entries.get(key)??host.loadViews?.()?.[key]??null;
     if(!options.explicit&&previous?.paused)return {...previous,ok:false,paused:true};
     try{
       this.current(config);
@@ -110,12 +129,18 @@ export class HostWorkerViews{
         if(previous){this.entries.set(key,{...previous,paused:true,error:remote.reason});await this.save();this.schedule();}return remote;
       }
       this.current(config);
-      const [preview,nodes]=await Promise.all([host.preview(config,view),host.nodes(config)]);
+      // One status source per (connection, rig): the view's own rig's seats when it names one.
+      const rigId=(options.target??previous?.target)?.id??null;
+      const [preview,nodes]=await this.timed(Promise.all([host.preview(config,view),host.nodes(config,rigId)]),10000,"Couldn't refresh this view; tiles kept.");
       this.current(config);
       if(options.expectedPlan&&preview?.planId!==options.expectedPlan)
         return {ok:false,reason:"This worker view changed since preview. Refresh it before opening."};
       const plan=hostWorkerPlan(preview,nodes,remote,view);
-      const existing=this.owned(config,view,remote);
+      const target=options.target??previous?.target;
+      const adoption=target&&options.explicit?await prepareRigSpaceAdoption(host,config,[target.id,target.name],{sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),servers:rigSeatServers({seats:nodes})}):{ok:true};
+      if(!adoption.ok)return adoption;
+      if(adoption.host)host=adoption.host;
+      const existing=this.owned(config,view,remote).filter(tile=>list(host,"panes").some(p=>p.pane===tile.pane.pane));
       for(const tile of existing.filter(t=>t.session&&t.programArgv[0]!=="sleep")){
         const wanted=plan.pages.flatMap(p=>p.tiles).find(t=>t.session===tile.session&&!t.placeholder);
         if(wanted&&!!payloadFrom(tile.programArgv[2]).readOnly!==wanted.readOnly)
@@ -124,7 +149,9 @@ export class HostWorkerViews{
       if(!options.explicit&&previous&&!existing.length){
         this.entries.delete(key);await this.save();return {ok:true,closed:true};
       }
-      const entry={...previous,view,config:{daemonUrl:config.daemonUrl,daemonMachine:config.daemonMachine,...(config.rig?{rig:[...config.rig]}:{})},target:options.target??previous?.target??null,
+      // Another connection's entry keeps its own id and home, so its identity (and its events) stay its own; the legacy entry keeps its old shape.
+      const entry={...previous,view,config:{daemonUrl:config.daemonUrl,daemonMachine:config.daemonMachine,...(config.rig?{rig:[...config.rig]}:{}),
+        ...(own(config).length?{connectionId:config.connectionId,...(config.openrigHome?{openrigHome:config.openrigHome}:{})}:{})},target:options.target??previous?.target??null,
         following:options.following??previous?.following??plan.kind==="following",
         pruneMs:options.pruneMs??previous?.pruneMs??0,planId:plan.planId,name:plan.name,missing:plan.missing,
         members:plan.pages.flatMap(p=>p.tiles).filter(t=>!t.blank).map(({session,label,runtime,readOnly})=>({session,label,runtime,readOnly})),
@@ -141,7 +168,7 @@ export class HostWorkerViews{
         if(!checked.ok)throw new Error(checked.reason);
         if(JSON.stringify(checked)!==JSON.stringify(remote))throw new Error("The Herdr machine changed. Existing worker tiles were kept.");
       };
-      let space=existing.length?list(host,"spaces").find(s=>s.tabs?.some(t=>t.id===existing[0].pane.tab)):null;
+      let space=adoption.space??(existing.length?list(host,"spaces").find(s=>s.tabs?.some(t=>t.id===existing[0].pane.tab)):null);
       const rig=entry.target;
       if(!space&&rig){
         const move=rigSpaceRelocation(host,rig,config);
@@ -164,6 +191,7 @@ export class HostWorkerViews{
         `herdr-openrig.origin=${config.daemonUrl}`,`herdr-openrig.seat=${tile.session??""}`,`herdr-openrig.page=${page}`,
         `herdr-openrig.blank=${tile.blank?"1":"0"}`,`herdr-openrig.viewer-argv=${JSON.stringify(argv)}`,
         ...(rig?[`herdr-openrig.rig=${rig.name}`]:["herdr-openrig.home=1"]),
+        ...(hostLabelValue(remote.selfHostId)?[`herdr-openrig.host=${hostLabelValue(remote.selfHostId)}`]:[]), // the daemon's host id: which OpenRig these tiles show
       ];
       const fresh=new Set(),newTabs=new Set();
       const start=async(tile,page,tab,parent=null,direction="right")=>{
@@ -172,15 +200,15 @@ export class HostWorkerViews{
           const liveParent=this.owned(config,view,remote).find(t=>sameSplitTarget(parent,t,config,remote));
           if(!liveParent||liveParent.pane.focused&&!fresh.has(parent.pane.terminal))throw new Error("The worker split target changed or has focus. It was left alone.");
           const before=new Set(list(host,"panes").map(p=>p.pane)),argv=["env",`HERDR_OPENRIG_VIEW_TILE=${nonce()}`,...tile.argv];
-          host.run("pane.split",{pane:parent.pane.pane,direction,argv});
+          this.run(config,"pane.split",{pane:parent.pane.pane,direction,argv});
           pane=await this.waitFor(()=>list(host,"panes").find(p=>p.tab===tab&&!before.has(p.pane)&&list(host,"terminals")
             .some(t=>addr(t)===p.terminal&&JSON.stringify(t.argv)===JSON.stringify(argv))),"worker tile adoption");
-          const record=JSON.parse(await this.hc(["get","--json","--",pane.terminal]));
+          const record=JSON.parse(await this.hc(["get","--json","--",pane.terminal],config));
           if(record.parent||record.terminal?.parent)throw new Error("Herdr assigned a parent to a worker tile. No parent was closed.");
-          await this.hc(["label",pane.terminal,...labels(tile,page,argv,tab)]);
+          await this.hc(["label",pane.terminal,...labels(tile,page,argv,tab)],config);
         }else{
           const result=JSON.parse(await this.hc(["run","--on",config.daemonMachine,"--bg","--json","--no-parent","--no-notify",
-            ...labels(tile,page,tile.argv,tab).flatMap(label=>["--label",label]),"--",...tile.argv]));
+            ...labels(tile,page,tile.argv,tab).flatMap(label=>["--label",label]),"--",...tile.argv],config));
           pane=await this.waitFor(()=>list(host,"panes").find(p=>p.terminal===result.address&&p.tab===tab),"worker page adoption");
         }
         fresh.add(pane.terminal);
@@ -195,7 +223,7 @@ export class HostWorkerViews{
           throw new Error("An old empty tile changed during refresh. Both empty tiles were kept.");
         if(!this.owned(config,view,remote).some(t=>t.pane.pane===next.pane.pane&&t.blank))
           throw new Error("Herdr did not confirm the new empty tile. The old tile was kept.");
-        host.run("pane.close",{pane:old.pane.pane});
+        this.run(config,"pane.close",{pane:old.pane.pane});
       }
       const desired=new Map(plan.pages.flatMap(p=>p.tiles).filter(t=>t.session).map(t=>[t.session,t])),retire=[];
       const present=new Set(existing.filter(t=>t.session).flatMap(t=>{
@@ -210,7 +238,7 @@ export class HostWorkerViews{
         const oldTitle=list(host,"spaces").flatMap(space=>space.tabs??[]).find(item=>item.id===tab)?.name;
         // Only migrate the generated old title; a person's renamed tab stays theirs.
         if(tab&&view.startsWith("rig:")&&(oldTitle===view||oldTitle===`${view} · ${index+1}/${plan.pages.length}`))
-          host.run("tab.rename",{id:tab,name:page.name});
+          this.run(config,"tab.rename",{id:tab,name:page.name});
         if(!wanted.some(t=>!t.blank))continue;
         if(anchors.length){
           for(const tile of wanted.filter(t=>!t.blank)){
@@ -223,23 +251,23 @@ export class HostWorkerViews{
           tab=machineId("tb-worker-"+nonce(),config.daemonMachine);pages.push(tab);newTabs.add(tab);
           const first=await start(wanted[0],index,tab),columns=[first];
           for(let col=1;col<page.columns;col++)columns.push(await start(wanted[col],index,tab,columns.at(-1),"right"));
-          for(const tile of columns){this.current(config);host.run("layout.resize",{id:tile.pane.pane,weight:1});}
+          for(const tile of columns){this.current(config);this.run(config,"layout.resize",{id:tile.pane.pane,weight:1});}
           for(let col=0;col<page.columns;col++){
             let parent=columns[col];for(let row=1;row<page.rows;row++)parent=await start(wanted[row*page.columns+col],index,tab,parent,"down");
           }
-          for(const tile of this.owned(config,view,remote).filter(t=>t.pane.tab===tab)){this.current(config);host.run("layout.resize",{id:tile.pane.pane,weight:1});}
+          for(const tile of this.owned(config,view,remote).filter(t=>t.pane.tab===tab)){this.current(config);this.run(config,"layout.resize",{id:tile.pane.pane,weight:1});}
           for(const tile of wanted)if(tile.session)present.add(tile.session);
         }
-        if(newTabs.has(tab))host.run("tab.rename",{id:tab,name:page.name});
+        if(newTabs.has(tab))this.run(config,"tab.rename",{id:tab,name:page.name});
       }
       for(const tile of retire){
         await ready();const current=this.owned(config,view,remote).find(t=>t.pane.pane===tile.pane.pane);
         if(current&&!current.pane.focused&&current.snapshot===tile.snapshot
-          &&this.owned(config,view,remote).some(t=>t.session===tile.session&&t.pane.pane!==tile.pane.pane&&t.programArgv?.[0]!=="sleep"))host.run("pane.close",{pane:tile.pane.pane});
+          &&this.owned(config,view,remote).some(t=>t.session===tile.session&&t.pane.pane!==tile.pane.pane&&t.programArgv?.[0]!=="sleep"))this.run(config,"pane.close",{pane:tile.pane.pane});
       }
       if(newSpace&&pages.length){
         const base=rig?.name??"OpenRig",collision=list(host,"spaces").some(s=>s.id!==spaceId&&s.name===base);
-        host.run("space.rename",{id:spaceId,name:collision?`${base} · ${config.daemonMachine}`:base});
+        this.run(config,"space.rename",{id:spaceId,name:collision?`${base} · ${config.daemonMachine}`:base});
       }
       for(const tile of this.owned(config,view,remote).filter(t=>t.session))if(inactive(bySession.get(tile.session)))entry.inactiveSince[tile.session]??=now;
       if(entry.following&&entry.pruneMs){
@@ -251,17 +279,17 @@ export class HostWorkerViews{
           await ready();
           const current=this.owned(config,view,remote).find(t=>t.pane.pane===tile.pane.pane);
           if(!current||current.pane.focused||current.snapshot!==tile.snapshot)continue;
-          const record=JSON.parse(await this.hc(["get","--json","--",tile.pane.terminal]));
+          const record=JSON.parse(await this.hc(["get","--json","--",tile.pane.terminal],config));
           if(JSON.stringify(record.argv)!==JSON.stringify(tile.terminal.argv)||record.pid!==tile.terminal.pid&&tile.terminal.pid!==undefined
             ||record.created_ms!==tile.terminal.created_ms&&tile.terminal.created_ms!==undefined)continue;
           const final=this.owned(config,view,remote).find(t=>t.pane.pane===tile.pane.pane);
           if(!final||final.pane.focused||final.snapshot!==tile.snapshot)continue;
-          this.current(config);host.run("pane.close",{pane:tile.pane.pane});entry.pruned[tile.session]=true;
+          this.current(config);this.run(config,"pane.close",{pane:tile.pane.pane});entry.pruned[tile.session]=true;
         }
       }
       entry.pages=pages.map((tab,index)=>({tab,name:plan.pages[index]?.name??`${plan.name} · ${index+1}`}));entry.space=spaceId;
       this.entries.set(key,entry);await this.save();this.schedule();
-      if(options.explicit&&entry.pages.length){host.run("space.select",{id:spaceId});host.run("tab.select",{id:entry.pages[0].tab});}
+      if(options.explicit&&entry.pages.length){this.run(config,"space.select",{id:spaceId});this.run(config,"tab.select",{id:entry.pages[0].tab});}
       return {ok:true,...entry};
     }catch(error){
       if(previous){this.entries.set(key,{...previous,paused:true,error:String(error?.message??error)});await this.save();this.schedule();}
@@ -270,16 +298,21 @@ export class HostWorkerViews{
   }
   async save(){await this.host.saveViews?.(Object.fromEntries(this.entries));this.host.changed?.(Object.fromEntries(this.entries));}
   schedule(){
-    const version=++this.wakeVersion,now=this.host.now?.()??Date.now(),due=[];
+    const version=++this.wakeVersion,now=this.host.now?.()??Date.now(),due=[],configs=new Map();
     for(const entry of this.entries.values())if(entry.following&&!entry.paused&&entry.pruneMs)
-      for(const [session,since] of Object.entries(entry.inactiveSince))if(!entry.pruned[session]&&since+entry.pruneMs>now)due.push(since+entry.pruneMs);
-    if(due.length)this.host.after?.(Math.max(0,Math.min(...due)-now),()=>{if(version===this.wakeVersion)this.event(this.host.currentConfig());});
+      for(const [session,since] of Object.entries(entry.inactiveSince))if(!entry.pruned[session]&&since+entry.pruneMs>now){due.push(since+entry.pruneMs);configs.set(identity(entry.config),entry.config);}
+    // The wake refreshes each due entry's OWN connection, with that connection's live settings (a removed one has none and is left alone).
+    if(due.length)this.host.after?.(Math.max(0,Math.min(...due)-now),async()=>{
+      if(version!==this.wakeVersion)return;
+      for(const saved of configs.values()){const live=this.host.currentConfig?this.host.currentConfig(saved):saved;if(live)await this.event(live);}
+    });
   }
   async event(config){
     for(const entry of [...this.entries.values()])if(entry.following&&!entry.paused&&identity(entry.config)===identity(config))await this.sync(config,entry.view);
   }
   focusChanged(config,focus){
-    const key=JSON.stringify([focus?.pane,focus?.terminal]);if(this.lastFocus===key)return;this.lastFocus=key;
+    // Remembered per connection: each connection's views are judged once per focus change, not only the first one asked.
+    const key=JSON.stringify([focus?.pane,focus?.terminal]),id=identity(config);this.lastFocus??=new Map();if(this.lastFocus.get(id)===key)return;this.lastFocus.set(id,key);
     const now=this.host.now?.()??Date.now();
     if([...this.entries.values()].some(e=>identity(e.config)===identity(config)&&e.following&&!e.paused&&e.pruneMs
       &&Object.entries(e.inactiveSince??{}).some(([session,since])=>!e.pruned?.[session]&&since+e.pruneMs<=now)))

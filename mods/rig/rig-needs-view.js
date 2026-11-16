@@ -2,7 +2,8 @@
 // (https://github.com/herdrdev/herdr-app), licensed under the Apache License, Version 2.0.
 // Modified for herdrig: OpenRig seats and asks instead of herdr agents; see Third-party code in README.md.
 // This file is licensed under the Apache License, Version 2.0 (LICENSES/herdr-app-Apache-2.0.txt).
-import { needsToastFor, diffNeedsNotifications, findAttachedSeat, statusMarkElement, isUpdateNeed, requestHeadline, statusNeedHalo, resolveAskerSeat } from "./rig-lib.js";
+import { qualifyKey } from "./rig-connections.js";
+import { needsToastFor, diffNeedsNotifications, findAttachedSeat, seatOrigin, statusMarkElement, isUpdateNeed, requestHeadline, statusNeedHalo, resolveAskerSeat } from "./rig-lib.js";
 
 export const PRIORITY_GROUPS = [
   { rank: 4, label: "Needs you", tone: "blocked" }, { rank: 3, label: "Done", tone: "ansi4" },
@@ -36,6 +37,11 @@ export function priorityDuration(ms) {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
+/** Whether `focus` (the sidebar's `focusedSeat`: `{ session, conn }`, or a bare session) is this rig's seat. A focus that names its
+ *  connection matches only that connection's seat: the same session name on another OpenRig is a different seat. */
+export const isFocusedSeat = (focus, session, conn) => focus != null && (typeof focus === "string" ? focus === session
+  : focus.session === session && (focus.conn == null || conn == null || focus.conn === conn));
+
 /** State changes survive a restart; viewing Done acknowledges it but holds its place until left. */
 export class NeedsTracker {
   constructor(storage) {
@@ -47,14 +53,18 @@ export class NeedsTracker {
 
   update(topology = [], attention = [], { now = Date.now(), focusedSession = null, terminals = [] } = {}) {
     const rows = topology.flatMap((rig) => rig.pods.flatMap((pod) => pod.seats.map((seat) => ({
-      key: `seat:${seat.session}`, kind: "seat", seat, rig, pod: pod.name, name: seat.logicalId, asks: [],
+      key: qualifyKey(rig.conn, `seat:${seat.session}`), kind: "seat", seat, rig, pod: pod.name, name: seat.logicalId, asks: [], // the same session on two OpenRigs is two rows
       helpers: helpersOf(seat, terminals),
     }))));
-    const bySession = new Map(rows.map((r) => [r.seat.session, r]));
+    // A request belongs to the seat of ITS OWN connection: the same session name (every kernel has operator-agent@kernel) exists on each OpenRig.
+    const bySession = new Map();
+    for (const r of rows) { const list = bySession.get(r.seat.session) ?? []; list.push(r); bySession.set(r.seat.session, list); }
+    const sameConn = (ask, rig) => ask.conn == null || rig?.conn == null || ask.conn === rig.conn;
+    const seatOf = (ask, session) => (bySession.get(session) ?? []).find((r) => sameConn(ask, r.rig));
     for (const ask of attention ?? []) {
       if (!ask?.id || isUpdateNeed(ask) || ["done", "closed", "denied", "canceled", "handed-off"].includes(ask.state)) continue;
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
-      const owner = bySession.get(session) ?? bySession.get(resolveAskerSeat(session, topology).seat?.session);
+      const owner = seatOf(ask, session) ?? seatOf(ask, resolveAskerSeat(session, topology.filter((r) => sameConn(ask, r))).seat?.session);
       if (owner && !excluded(owner.seat)) owner.asks.push(ask);
       else rows.push({ key: `ask:${ask.id}`, kind: "ask", ask, seat: owner?.seat, rig: owner?.rig, name: requestHeadline(ask), helpers: [], asks: [ask] });
     }
@@ -76,7 +86,7 @@ export class NeedsTracker {
         record.strong = (!changed && prev?.strong === true) || (typeof source === "string" && source.trim() !== "" && source !== "window-sampling");
       }
       if (excluded(s)) record.done = false;
-      const looking = s.session === focusedSession;
+      const looking = isFocusedSeat(focusedSession, s.session, row.rig?.conn);
       const held = looking && this.held === row.key && record.done;
       row.rank = raw === "idle" && record.done && (!record.seen || held) ? 3 : RANK[raw];
       if (looking && row.rank === 3) { record.seen = true; this.held = row.key; }
@@ -107,15 +117,15 @@ export function diffPriorityNotifications(topology, attention, previous, options
     if (!needs(seat)) continue;
     const evidence = String(seat.arbitratedNeedsInput?.kind ?? seat.needsInputEvidence?.kind ?? "").toLowerCase();
     const reason = seat.status === "failed" ? "startup failed" : evidence.includes("mcp") ? "an MCP approval" : /perm|auth|trust/.test(evidence) ? "a permission prompt" : /question|input/.test(evidence) ? "a question" : "";
-    candidates.push({ id: `seat:${seat.session}`, at: "", isUrgent: true, isEscalation: false,
-      silent: options.focusedSession === seat.session || !!findAttachedSeat(options.terminals ?? [], options.spaces ?? [], seat.session),
+    candidates.push({ id: qualifyKey(rig.conn, `seat:${seat.session}`), at: "", isUrgent: true, isEscalation: false,
+      silent: isFocusedSeat(options.focusedSession, seat.session, rig.conn) ||!!findAttachedSeat(options.terminals ?? [], options.spaces ?? [], seat.session, [], { origin: seatOrigin(options.config, rig.conn) }),
       toast: { title: `${seat.logicalId} needs you`, body: `${rig.name}${reason ? ` · ${reason}` : ""}`, level: "error", timeout: 12000,
         action: { name: `rig.open-seat:${seat.session}`, args: { session: seat.session } } } });
   }
   return diffNeedsNotifications(attention, previous, { ...options, candidates, transitionOnly: true, maxSeen: Number.MAX_SAFE_INTEGER });
 }
 
-/** Herdr's compact exclamation and pill; other statuses use round-six marks. */
+/** Herdr's compact exclamation and pill; other statuses use the shared status marks. */
 export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
   if (key !== "needs_input") return statusMarkElement(ui, t, key, { iconOf, pulse });
   const { div } = ui;
@@ -124,7 +134,7 @@ export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
   return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
 }
 
-export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, askOwner, now = Date.now() }) {
+export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, askOwner, machineOf = null, now = Date.now() }) {
   const { div, svg, h_flex } = ui;
   const out = [];
   const many = rows.filter((r) => r.kind === "seat").length > 12;
@@ -141,8 +151,10 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
     if (!expanded) continue;
     for (const row of members) {
       const helperKey = `priority-helpers:${row.key}`, helpersOpen = folds[helperKey] ?? true;
-      const context = row.ask?.criticalHealth ? "health" : askOwner?.(row.ask) ?? (row.kind === "ask" && row.seat
+      const where = machineOf?.(row) ?? null; // with more than one OpenRig: show seat, rig, then machine
+      const context0 = row.ask?.criticalHealth ? "health" : askOwner?.(row.ask) ?? (row.kind === "ask" && row.seat
         ? [row.seat.logicalId, row.rig?.name].filter(Boolean).join(" · ") : row.rig?.name ?? "no seat");
+      const context = where && context0 !== "health" ? `${context0} · ${where}` : context0;
       register({ key: row.key, foldKey: helperKey, expandable: row.helpers.length > 0, isOpen: helpersOpen, parentKey: key, priorityRow: row });
       out.push(h_flex().id(`priority-${row.key}`).px(12).h(30).gap(7).rounded(8).items_center().cursor_pointer()
         .when(row.focused || selected === row.key, (el) => el.bg(t.selected ?? t.selection ?? t.raised))

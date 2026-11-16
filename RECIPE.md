@@ -1,15 +1,19 @@
 # Herdrig
 
-Version: v0.4.7
+Version: v0.5.0
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
 The busy words stay visible. Hover a shortened name or label to read the full text; existing read-only and other
 context stays below the full name. Graphs keep their header detail reveal, and Now keeps its transcript hover card.
 
+Inside Herdr, use Herdrig’s views. If opening OpenRig’s own terminal view there, use `rig terminal open --window`. The development-only chrome copies use `herdrig-cell-header`, `herdrig-pad` and `herdrig-ended`; they are not installed or packaged.
+
 ## Updating
 
 After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
+v0.5.0 updates the Attach helper, so Herdr asks you once to approve it again on each configured Herdr machine. Local
+Attach doesn't ask.
 
 Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with this
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
@@ -80,6 +84,13 @@ Keep the loopback daemon tunnel, and set `"daemonMachine": "box"` in
 Alternatively, when Herdrig offers a matching connected machine, choose **Use**. The setup screen names the
 machine, account, helper path and SHA-256 before saving the machine choice or installing anything. **Not now**
 keeps the current setup. **Stop using** in Connections removes Herdrig's saved choice and approval.
+
+**Another OpenRig, on a machine.** To see a machine's own OpenRig beside this computer's, use **Add `<machine>`…**
+when the sidebar offers it (or **Add a machine…** from the sidebar's **⋯** menu). Start the SSH tunnel the screen shows,
+then **Check**, then **Save**. This adds an entry to the `connections` list in `<appHome>/openrig/config.json`
+(`id`, `machine`, `daemonUrl`, `openrigHome`). Your existing `daemonUrl` / `daemonMachine` keys stay as they are,
+as the first connection. Each added machine is one OpenRig, its default. The helper approval above still comes
+once per machine, at its first Attach.
 
 The first Attach, Operator or rig-space open asks once, naming the machine/account, destination and file hash.
 Herdr machine access means full shell access for local programs to that account's commands, files and terminals.
@@ -461,8 +472,7 @@ on a currentColor fill, 16 px nominal, so they dim and tint with the theme rathe
 
 ## Watch out
 
-A Herdr change to keep the active space in view has merged: [herdrdev/herdr-app#977](https://github.com/herdrdev/herdr-app/pull/977).
-This does not claim that the change is in the person's installed Herdr release.
+Herdr-app [v0.1.16](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.16) includes [#977](https://github.com/herdrdev/herdr-app/pull/977), which keeps the active space in view. Update Herdr if the person is using an older version.
 
 **Activity and times.** A running seat with no usable activity report is **not reported**, in its own neutral
 group and filter, never Idle. Explicit idle remains idle. Absolute times honour UTC/Etc/UTC exactly; other

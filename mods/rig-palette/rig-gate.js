@@ -12,9 +12,12 @@
 //
 // What it does NOT cover (documented, each by reason): the .cjs helpers (rig-attach-relay.cjs, rig-spec-files.cjs, rig-remote-files.cjs,
 // rig-spec-transport.cjs) run in other processes (a terminal, the box), started only through gatedHc/gatedExec with an argv the mod built.
+// rig-spec-files.cjs and rig-remote-files.cjs carry no daemon destination in a payload (a folder and a hash, never an address): nothing for the gate to compare. If one ever does, the attach relay's shape
+// applies: its payload is read with rig-relay-payload.js and judged by the token after the script (test/relay-payload-parity.test.mjs pins that reading to the real relay).
 //
 // A refused call THROWS `GateRefusal`: every caller already has a catch for a failed request, and its message is the sentence for the person.
-import { CONNECTIONS_LIST_REFUSED } from "./rig-connections.js";
+import { LEGACY_CONNECTION_ID, NO_CONNECTION, UNKNOWN_CONNECTION } from "./rig-connections.js";
+import { decodeRelayToken, relayDaemonOrigin } from "./rig-relay-payload.js";
 
 export const CONFIG_LOADING = "OpenRig's settings are still loading. Try again in a moment.";
 export const CONFIG_CHANGED_OPEN = "OpenRig's settings changed while this was open. Close it and open it again.";
@@ -29,81 +32,221 @@ export class GateRefusal extends Error {
 /** Commands that are not the OpenRig CLI and talk to no daemon: local read utilities a refused or unloaded config may still run. Everything else
  *  (`env`, which carries the rig CLI, `rig`, `node` running it) is refused. Listed by name so a new one is a decision, not an accident. */
 export const NON_DAEMON_COMMANDS = Object.freeze(["false", "git", "printenv", "realpath", "tmux", "which"]);
-let current; // undefined: never observed (unloaded). Otherwise the last non-null config.
-let generation = 0, identityKey = null, discovered = null;
+// SCOPES (v0.5.0, several connections; DESIGN-gate-per-connection.md rev 3). One scope per connection id. A scope's IDENTITY is [id, the address the FILE names,
+// machine, OpenRig home] plus the configured `rig` argv; a change to any element of ONE connection's tuple moves THAT scope's generation and no other. An address the
+// CLI found is not file identity (a default install's first discovery must not drop calls that began before it finished) and is recorded only while exactly ONE scope is
+// open (with several, the CLI could find any daemon). A scope whose id leaves the list is closed: every call naming it refuses.
+const scopes = new Map(); // id -> { id, tuple, generation, open, address, home, machine, discovered }
+let loaded = false;
+let invalid = null; // the line of an invalid config (a connections list with no usable entry): nothing is sent under it
+let rigJson = "null";
+// A bare "was the config reassigned at all" counter, for a caller with no connection scope yet to key a generation
+// to (the machine-setup gate: adding a connection has no id until it is saved). It over-invalidates on purpose
+// (any reassignment bumps it, even one that leaves this one connection's own tuple unchanged) rather than under-
+// invalidating, which is the safe direction for a recheck. Never scope it to one field: a caller that needs that
+// precision has an existing connection id and belongs on the per-scope generation above instead.
+let configGeneration = 0;
+export const gateConfigGeneration = () => configGeneration;
 
-// What makes a config a different one for the requests already in flight: the list refusal, the connection, the address THE FILE names, the machine
-// the OpenRig home and the configured rig command (another wrapper can select another OpenRig home). An address the CLI found is NOT part of that identity: a default install has no daemonUrl, so its first discovery turns the same
-// file config into one with an address, and calls that began before it finished (the menu and New rig both ask at once) must not be dropped for it.
-// A DIFFERENT address found later (the daemon moved) is a change, tracked on its own below.
-const fileAddress = (config) => (config.daemonUrlSource === "cli" || config.daemonUrlSource === "default" ? null : (config.daemonUrl ?? null));
-const identity = (config) => JSON.stringify([config.connectionsRefused ?? null, config.connectionId ?? null, fileAddress(config), config.daemonMachine ?? null, config.openrigHome ?? null, config.rig ?? null]);
+const fileAddress = (config) => (config?.daemonUrlSource === "cli" || config?.daemonUrlSource === "default" ? null : (config?.daemonUrl ?? null));
+/** The connection descriptors a config lists: its `connections`, or (a config that carries none) the one connection it is. */
+const descriptorsOf = (config) => {
+  const own = { id: config?.connectionId ?? LEGACY_CONNECTION_ID, address: fileAddress(config), machine: config?.daemonMachine ?? null, home: config?.openrigHome ?? null };
+  if (!(Array.isArray(config?.connections) && config.connections.length)) return [own];
+  // The config's own connection is what its top-level fields say (they are what the mod acts on, and what an enrichment or a test edits); the others are as listed.
+  return config.connections.map((c) => (c.id === own.id ? own : { id: c.id, address: c.daemonUrl ?? null, machine: c.machine ?? null, home: c.openrigHome ?? null }));
+};
+const tupleOf = (d) => JSON.stringify([d.id, d.address, d.machine, d.home, rigJson]);
 
-/** Whether two configs are the same one for what is in flight (the file's identity; an address the CLI found is not a change). A dialog that captured
- *  its config when it opened compares it with a fresh read before it sends. */
+/** What makes a config a different one for what is in flight, for ITS OWN connection: the connection, the address the file names, the machine, the OpenRig home and the configured
+ *  rig command. (Another connection's edit is not this one's change.) */
+const identity = (config) => { if (config?.configInvalid) return JSON.stringify(["invalid", config.configInvalid]); const [d] = descriptorsOf(config?.connections ? { ...config, connections: config.connections.filter((c) => c.id === (config.connectionId ?? c.id)) } : config); return JSON.stringify([d.id, d.address, d.machine, d.home, JSON.stringify(config?.rig ?? null)]); };
 export const gateSameConfig = (a, b) => identity(a) === identity(b);
 /** The same identity as a string, for a fingerprint a flow keeps between a review and a later confirm. */
 export const gateIdentity = (config) => identity(config ?? {});
 
-/** Called by every assignment of a mod's `config`. Null and undefined are ignored (a constructor's placeholder is not a config). */
+/** Called by every assignment of a mod's `config`. Null and undefined are ignored (a constructor's placeholder is not a config). It reconciles the scope map from the
+ *  connections the config lists: a new id opens a scope, a changed identity moves that scope's generation, an unchanged one keeps its scope, a removed id closes it. */
 export function observeConfig(config) {
   if (config === null || config === undefined || typeof config !== "object") return;
-  current = config;
-  const key = identity(config);
-  if (key !== identityKey) { identityKey = key; discovered = null; generation++; }
-  // The address the CLI found: null to an address is the same config being enriched (no change); one address to another is the daemon moving (a change).
-  // A config that carries no found address (a fresh read of config.json) does not make the mod forget the one it knows.
-  if (config.daemonUrlSource === "cli" && config.daemonUrl) {
-    if (discovered !== null && discovered !== config.daemonUrl) generation++;
-    discovered = config.daemonUrl;
+  configGeneration++; // every real assignment, including one that turns out invalid below
+  loaded = true;
+  invalid = config.configInvalid ?? null;
+  if (invalid) { for (const s of scopes.values()) if (s.open) { s.open = false; s.generation++; } return; } // an invalid config opens no scope: everything in flight is dropped
+  const nextRig = JSON.stringify(config.rig ?? null), rigMoved = nextRig !== rigJson; rigJson = nextRig;
+  const listed = descriptorsOf(config), ids = new Set(listed.map((d) => d.id));
+  for (const d of listed) {
+    const tuple = tupleOf(d), had = scopes.get(d.id);
+    if (!had) scopes.set(d.id, { id: d.id, tuple, generation: 1, open: true, address: d.address, home: d.home, machine: d.machine, discovered: null });
+    else if (had.tuple !== tuple || !had.open || rigMoved) { Object.assign(had, { tuple, generation: had.generation + 1, open: true, address: d.address, home: d.home, machine: d.machine, discovered: null }); }
+  }
+  for (const s of scopes.values()) if (!ids.has(s.id) && s.open) { s.open = false; s.generation++; }
+  // The address the CLI found: recorded only with exactly one open scope. null to an address is the same config being enriched; one address to another is the daemon moving.
+  const open = [...scopes.values()].filter((s) => s.open);
+  // The moment a SECOND scope is open, no found address stands: the CLI could have found any daemon, so a found address is forgotten (and calls that began under it are dropped).
+  if (open.length >= 2) for (const s of open) if (s.discovered !== null) { s.discovered = null; s.generation++; }
+  if (config.daemonUrlSource === "cli" && config.daemonUrl && open.length === 1) {
+    const s = open[0];
+    if (s.discovered !== null && s.discovered !== config.daemonUrl) s.generation++;
+    s.discovered = config.daemonUrl;
   }
 }
-/** Test seam only: forgets everything (a fresh module). */
-export function resetGate() { current = undefined; generation = 0; identityKey = null; discovered = null; }
-export const gateGeneration = () => generation;
-/** Why nothing may be sent now, or null: the list line, or "still loading" for a mod that has never been given a config. */
-export function gateRefusal() {
-  if (current === undefined) return CONFIG_LOADING;
-  if (current.connectionsRefused) return current.connectionsRefused;
-  return null;
+/** Numbered config reads for ONE mod copy (the menu, the palette): the returned function takes a loader (`() => parsed config`) and number each call when it STARTS. Only the newest completed read is
+ *  installed (observed by the gate); an older read that finishes after a newer one has installed returns the INSTALLED config instead and observes nothing, so it can never re-open a connection a newer
+ *  read closed. One helper for every reader, so a new reader cannot forget it. */
+export function numberedConfigReads() {
+  let started = 0, installedAt = 0, installed = null;
+  return async (load) => {
+    const mine = ++started;
+    const cfg = await load();
+    if (mine < installedAt && installed) return installed;
+    installedAt = mine; installed = cfg; observeConfig(cfg);
+    return cfg;
+  };
 }
+/** Test seam only: forgets everything (a fresh module). */
+export function resetGate() { scopes.clear(); loaded = false; invalid = null; rigJson = "null"; configGeneration = 0; }
+export const gateGeneration = (id) => (id === undefined ? (soleOpen()?.generation ?? 0) : (scopes.get(id)?.generation ?? 0));
+const soleOpen = () => { const open = [...scopes.values()].filter((s) => s.open); return open.length === 1 ? open[0] : null; };
+/** Why nothing may be sent now, or null: "still loading" for a mod that has never been given a config. */
+export function gateRefusal() { return loaded ? invalid : CONFIG_LOADING; }
 /** Whether rows or an address another mod published (`rig.data`) belong to the reader's settings: the same connection (when the publisher names one: the sidebar always does), machine and OpenRig home, and (when both name one) the same address. A reader that has
  *  no address yet (the CLI has not found it) reads its home's rows; a publication that carries no config is not judged (nothing to compare). */
+export function publishedConfigFor(config, published) {
+  const id = config?.connectionId, entries = published?.byConnection;
+  if (entries && id && entries[id]?.config) return entries[id].config;
+  if (entries && id && !entries[id] && published?.config?.connectionId !== id && published?.config) return null;
+  return published?.config ?? null;
+}
 export function publishedUnder(config, published) {
-  const p = published?.config;
+  // With several connections the sidebar publishes each connection's own state (and config) under `byConnection[id]`: a reader is judged against the entry for ITS connection, never
+  // against another's (a connection that is not published is not this reader's). A publication with no per-connection entries is judged by its own config.
+  const id = config?.connectionId;
+  const entries = published?.byConnection;
+  const p = entries && id && entries[id]?.config ? entries[id].config : (entries && id && !entries[id] && published?.config?.connectionId !== id && published?.config ? null : published?.config);
+  if (p === null) return false;
   if (!p) return true;
   const n = (v) => v ?? null;
   if ((p.connectionId && n(config?.connectionId) !== p.connectionId) || n(config?.daemonMachine) !== n(p.daemonMachine) || n(config?.openrigHome) !== n(p.openrigHome)) return false;
+  // The configured rig command (another wrapper can select another OpenRig home): a publication that names one is judged on it, as the gate's own identity is.
+  if (Array.isArray(p.rig) && JSON.stringify(p.rig) !== JSON.stringify(config?.rig ?? null)) return false;
   return !(config?.daemonUrl && p.daemonUrl && config.daemonUrl !== p.daemonUrl);
 }
-const refuse = () => { const reason = gateRefusal(); if (reason) throw new GateRefusal(reason); };
-// After an await: the answer belongs to the config it was asked under.
-const stillCurrent = (started) => { refuse(); if (started !== generation) throw new GateRefusal(CONFIG_CHANGED); };
+
+/** The scope a send belongs to. A scope id is named by the caller; with none, it resolves only when exactly ONE scope is open (a single-connection install) and
+ *  otherwise refuses: a bare sink never defaults to the first or the legacy connection. */
+const scopeFor = (id) => {
+  if (!loaded) throw new GateRefusal(CONFIG_LOADING);
+  if (invalid) throw new GateRefusal(invalid);
+  if (id === undefined || id === null) { const only = soleOpen(); if (!only) throw new GateRefusal(NO_CONNECTION); return only; }
+  const s = scopes.get(id);
+  if (!s || !s.open) throw new GateRefusal(UNKNOWN_CONNECTION);
+  return s;
+};
+// After an await: the answer belongs to the config (the scope's identity) it was asked under.
+const stillCurrent = (s, started) => { if (!loaded) throw new GateRefusal(CONFIG_LOADING); if (invalid) throw new GateRefusal(invalid); if (!s.open) throw new GateRefusal(UNKNOWN_CONNECTION); if (started !== s.generation) throw new GateRefusal(CONFIG_CHANGED); };
 // The same check AFTER the thing was sent: its refusal says so (the outcome is unconfirmed, not "not sent").
-const stillCurrentAfterSend = (started) => { try { stillCurrent(started); } catch (error) { if (error instanceof GateRefusal) error.dispatched = true; throw error; } };
+const stillCurrentAfterSend = (s, started) => { try { stillCurrent(s, started); } catch (error) { if (error instanceof GateRefusal) error.dispatched = true; throw error; } };
+const before = (s, since) => { if (since !== undefined && since !== s.generation) throw new GateRefusal(CONFIG_CHANGED); return since ?? s.generation; };
 
 const basename = (command) => String(command ?? "").split("/").pop();
 
-/** An HTTP request. The body of the answer is read under the same check, so a list that arrives while it is read still drops it. */
-export async function gatedFetch(url, init, since) {
-  refuse();
+// THE DESTINATION CHECK (one function): a send that names an OpenRig must name the scope's own. Exact after `new URL` (scheme, host, port); no equivalence logic.
+const originOf = (url) => { try { const u = new URL(String(url)); return u.protocol + "//" + u.host; } catch { return null; } };
+/** Two listed OpenRigs on one machine: v0.5.0 reaches each added machine's default OpenRig, so it can't tell them apart there. */
+export const TWO_ON_ONE_MACHINE = (machine) => `Two OpenRigs on ${machine} need a home for each; this version supports one per machine. Nothing was sent.`;
+const WRONG_DESTINATION = (expected) => `That request was built for a different OpenRig than the one it was about to reach${expected ? ` (this one is ${expected})` : ""}. Nothing was sent.`;
+const knownAddress = (s) => s.address ?? s.discovered ?? null;
+const checkUrl = (s, url) => {
+  if (soleOpenCount() < 2) return; // one connection: nothing else to be mistaken for (the v0.4.5 behaviour); the destination check is for several scopes
+  const target = originOf(url), known = knownAddress(s), expected = known ? originOf(known) : null;
+  if (target === null) throw new GateRefusal(WRONG_DESTINATION(expected));
+  if (expected !== null) { if (target !== expected) throw new GateRefusal(WRONG_DESTINATION(expected)); return; }
+  if (soleOpenCount() !== 1) throw new GateRefusal(WRONG_DESTINATION(null)); // several scopes and none knows its address: nothing reaches a daemon
+};
+const soleOpenCount = () => [...scopes.values()].filter((s) => s.open).length;
+const flatten = (value) => (Array.isArray(value) ? value.flatMap(flatten) : [String(value ?? "")]);
+const envValues = (tokens, name) => tokens.filter((t) => t.startsWith(name + "=")).map((t) => t.slice(name.length + 1));
+/** The rig CLI's destination in an argv (as `cliEnv(config)` writes it): OPENRIG_URL and OPENRIG_HOME. ABSENCE is not a match when several scopes are open. */
+const checkArgv = (s, tokens) => {
+  if (soleOpenCount() < 2) return;
+  const urls = envValues(tokens, "OPENRIG_URL"), homes = envValues(tokens, "OPENRIG_HOME"), several = soleOpenCount() > 1;
+  const known = knownAddress(s), expected = known ? originOf(known) : null;
+  if (urls.length > 1 || homes.length > 1) throw new GateRefusal(WRONG_DESTINATION(expected));
+  if (urls.length === 1) { if (originOf(urls[0]) === null || expected === null || originOf(urls[0]) !== expected) throw new GateRefusal(WRONG_DESTINATION(expected)); }
+  else if (several || (expected !== null && s.address)) { if (several) throw new GateRefusal(WRONG_DESTINATION(expected)); }
+  if (homes.length === 1) { if (s.home === null || homes[0] !== s.home) throw new GateRefusal(WRONG_DESTINATION(expected)); }
+  else if (several && s.home !== null && s.id !== LEGACY_CONNECTION_ID) throw new GateRefusal(WRONG_DESTINATION(expected));
+};
+/** A command run on a Herdr machine: its destination is that machine, which must be the scope's own (the identity of a connection includes its machine). One scope: unchanged. */
+const checkOnMachine = (s, on) => {
+  if (soleOpenCount() < 2) return;
+  if (s.machine === null || s.machine === undefined || on !== s.machine) throw new GateRefusal(WRONG_DESTINATION(knownAddress(s) ? originOf(knownAddress(s)) : null));
+};
+/** Whether an argv runs the OpenRig CLI (it carries OPENRIG_* settings or `rig`): the payloads that name an OpenRig destination. */
+const carriesOpenRig = (tokens) => {
+  let configured = []; try { configured = JSON.parse(rigJson) ?? []; } catch (_) { configured = []; }
+  // The CONFIGURED rig command (`rig: ["/usr/bin/node", "/opt/openrig/cli.mjs"]`) is the rig CLI whatever its name: every element of it in the argv.
+  if (Array.isArray(configured) && configured.length && (configured.every((x) => tokens.includes(String(x))) || (configured.length > 1 && tokens.includes(String(configured.at(-1)))))) return true; // the script alone is enough: another interpreter path is the same CLI
+  return tokens.some((t) => /^OPENRIG_(URL|HOME)=/.test(t) || t === "rig" || /(^|\/)rig$/.test(t) || /rig\.js$/.test(t));
+};
+
+/** The home a rig CLI argv names must be the scope's own (absence refuses for a non-legacy scope with several scopes): the same rule as checkArgv's home half, for a command run ON a machine (no tunnel address there). */
+const checkHomeOnly = (s, tokens) => {
+  if (soleOpenCount() < 2) return;
+  const homes = envValues(tokens, "OPENRIG_HOME"), expected = knownAddress(s) ? originOf(knownAddress(s)) : null;
+  // No address check here: on a machine the CLI names that MACHINE's own daemon (an alias of the tunnel, never equal to it).
+  // On a machine the CLI reaches that machine's DEFAULT OpenRig: a connection's `openrigHome` is a folder on THIS computer and never names an
+  // OpenRig there (v0.5.0 supports one OpenRig per added machine; a home on the machine itself is not supported yet). So any OPENRIG_HOME
+  // on a machine is refused: it is either this computer's path or another OpenRig's home.
+  if (homes.length > 0) throw new GateRefusal(WRONG_DESTINATION(expected));
+  // Without a home the CLI reaches the machine's DEFAULT OpenRig, which is right for ONE OpenRig per machine. With two listed connections on the
+  // same machine it could be the other one's: refused plainly until a home on the machine is supported, and nothing is sent.
+  if (s.machine && [...scopes.values()].filter((o) => o.open && o.machine === s.machine).length > 1) throw new GateRefusal(TWO_ON_ONE_MACHINE(s.machine));
+};
+/** The attach relay's destination (the payload decoder and the relay's own loopback rule are shared with the relay's parity test): its argv is [node, <...>/rig-attach-relay.cjs, base64 JSON].
+ *  Returns the payload's daemon as the relay would read it (an origin, or "" when it names no local daemon: it reaches nothing), null for a relay whose payload can't be read, undefined when the argv is no relay. */
+const isRelayPayload = (p) => p !== null && (typeof p.session === "string" || p.mode === "grid" || p.mode === "pad");
+const relayDestinations = (tokens) => {
+  // The relay reads the token AFTER its own script: with the file name present that token alone is judged (an earlier relay-shaped token is not what runs). Without the name, EVERY token a relay
+  // would read as a payload is judged. Each result is an origin, "" (the payload names no local daemon: it reaches nothing) or null (an unreadable payload on a relay file).
+  const named = tokens.findIndex((t) => /(^|\/)rig-attach-relay\.cjs$/.test(t));
+  if (named >= 0) { const payload = decodeRelayToken(tokens[named + 1]); return [payload === null ? null : relayDaemonOrigin(payload.daemonUrl)]; }
+  const found = [];
+  for (let i = 1; i < tokens.length; i++) { const p = decodeRelayToken(tokens[i]); if (isRelayPayload(p)) found.push(relayDaemonOrigin(p.daemonUrl)); }
+  return found;
+};
+/** Every process-starting sink: the rig CLI is checked by its OPENRIG_* tokens, an attach relay by the daemon its payload names. */
+const checkProcess = (s, tokens, on) => {
+  // Started ON a Herdr machine (`hc run --on box`): where it runs is its destination (a relay there names that machine's own daemon, not the tunnel), and a rig CLI there must carry the scope's home.
+  if (typeof on === "string" && on !== "") { checkOnMachine(s, on); if (carriesOpenRig(tokens)) checkHomeOnly(s, tokens); return; }
+  if (carriesOpenRig(tokens)) checkArgv(s, tokens);
+  for (const relay of relayDestinations(tokens)) {
+    if (relay === null) { if (soleOpenCount() > 1) throw new GateRefusal(WRONG_DESTINATION(knownAddress(s) ? originOf(knownAddress(s)) : null)); }
+    else if (relay !== "") checkUrl(s, relay); // "": the relay reaches no daemon, nothing to be mistaken for
+  }
+};
+
+/** An HTTP request. The body of the answer is read under the same check, so a settings change that arrives while it is read still drops it. */
+export async function gatedFetch(url, init, since, scope) {
+  const s = scopeFor(scope);
   // `since`: the generation an operation began under (gatedOperation). An address captured before an await belongs to that generation, so a send
   // after the config changed is refused BEFORE it reaches the old daemon, not merely checked when its answer comes back.
-  if (since !== undefined && since !== generation) throw new GateRefusal(CONFIG_CHANGED);
-  const started = since ?? generation;
+  const started = before(s, since);
+  checkUrl(s, url);
   let response;
   // A request that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error.
   try { response = await globalThis.fetch(url, init); }
-  catch (error) { stillCurrentAfterSend(started); throw error; }
-  stillCurrentAfterSend(started);
+  catch (error) { stillCurrentAfterSend(s, started); throw error; }
+  stillCurrentAfterSend(s, started);
   return new Proxy(response, {
     get(target, prop) {
-      if (prop === "json" || prop === "text" || prop === "arrayBuffer" || prop === "blob") {
+      if (prop === "json" || prop === "text") {
         return async (...args) => {
           let value;
           try { value = await target[prop](...args); }
-          catch (error) { stillCurrentAfterSend(started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
-          stillCurrentAfterSend(started);
+          catch (error) { stillCurrentAfterSend(s, started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
+          stillCurrentAfterSend(s, started);
           return value;
         };
       }
@@ -113,80 +256,91 @@ export async function gatedFetch(url, init, since) {
   });
 }
 
-/** A process run for the mod (the OpenRig CLI is `env ... rig ...`). Under a refused or unloaded config only the listed local utilities run. */
-export async function gatedExec(rawExec, command, args, options, since) {
+/** A process run for the mod (the OpenRig CLI is `env ... rig ...`). Local utilities pass; everything else names an OpenRig and is checked against the scope. */
+export async function gatedExec(rawExec, command, args, options, since, scope) {
   const local = NON_DAEMON_COMMANDS.includes(basename(command));
-  if (!local) { refuse(); if (since !== undefined && since !== generation) throw new GateRefusal(CONFIG_CHANGED); }
-  const started = since ?? generation;
+  let s = null, started = 0;
+  if (!local) {
+    s = scopeFor(scope); started = before(s, since);
+    const tokens = flatten([command, args]), on = options && typeof options === "object" ? options.on : undefined;
+    // A command run ON a Herdr machine is aimed by WHERE it runs: it carries no tunnel address (its rig CLI reads that machine's own OpenRig), so the machine is the destination and it must be the
+    // scope's own. Anything else is judged like every other sink: only an argv that carries an OpenRig destination (the rig CLI, or OPENRIG_*) is checked; a helper that is not the rig CLI names none.
+    // The same judgement as every other process sink: on a machine (machine AND home), otherwise the rig CLI's tokens and an attach relay's payload.
+    checkProcess(s, tokens, on);
+  }
   let result;
   // A process that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error it could
   // read as "that command does not work, use the default".
   try { result = await rawExec(command, args, options); }
-  catch (error) { if (!local) stillCurrentAfterSend(started); throw error; }
-  if (!local) stillCurrentAfterSend(started);
+  catch (error) { if (!local) stillCurrentAfterSend(s, started); throw error; }
+  if (!local) stillCurrentAfterSend(s, started);
   return result;
 }
 
 /** A Herdr command. Verbs that only drive Herdr itself (ls, get, label, space, tab, pane, machine...) send nothing to a daemon and start no process:
- *  they pass. `run` and `exec` start a process (a TUI, an attach relay, a spec helper), so under a refused or unloaded config they are refused. */
+ *  they pass. `run` and `exec` start a process (a TUI, an attach relay, a spec helper): they are checked against the scope when their argv runs the rig CLI. */
 export const PROCESS_VERBS = Object.freeze(["run", "exec", "file"]); // `file` writes on another machine
-export async function gatedHc(rawHc, args, bytes, since) {
+export async function gatedHc(rawHc, args, bytes, since, scope) {
   const verb = Array.isArray(args) ? args[0] : null;
   if (!PROCESS_VERBS.includes(verb)) return rawHc(args, bytes);
-  refuse();
-  if (since !== undefined && since !== generation) throw new GateRefusal(CONFIG_CHANGED);
-  const started = since ?? generation;
+  const s = scopeFor(scope), started = before(s, since);
+  const tokens = flatten(args), onAt = Array.isArray(args) ? args.indexOf("--on") : -1;
+  checkProcess(s, tokens, onAt >= 0 ? args[onAt + 1] : undefined);
   let result;
   try { result = await rawHc(args, bytes); }
-  catch (error) { stillCurrentAfterSend(started); throw error; }
+  catch (error) { stillCurrentAfterSend(s, started); throw error; }
   // The process was started under the config that is gone. It cannot be un-started, but nothing may ACT on it (select its tab, label it, report
   // success): the caller gets the refusal, as for every other gated sink.
-  stillCurrentAfterSend(started);
+  stillCurrentAfterSend(s, started);
   return result;
 }
 
 /** A Herdr `run(name, args)`. Verbs that only move Herdr's own UI (space.new with a machine, tab.select, terminal.peek, mod.open...) pass. A verb that
- *  carries a command to start (`argv`, `command`, `cmd`: tab.new, pane.split, space.new with a program) starts a process just like `hc run`, so under a
- *  refused or unloaded config it is refused. */
+ *  carries a command to start (`argv`, `command`, `cmd`, `program`: tab.new, pane.split, space.new with a program) starts a process just like `hc run`, so it is checked against the scope. */
 export const COMMAND_KEYS = Object.freeze(["argv", "command", "cmd", "program"]);
-export function gatedRun(rawRun, name, args) {
-  if (args && typeof args === "object" && COMMAND_KEYS.some((key) => args[key] !== undefined && args[key] !== null)) refuse();
+export function gatedRun(rawRun, name, args, scope) {
+  if (args && typeof args === "object" && COMMAND_KEYS.some((key) => args[key] !== undefined && args[key] !== null)) {
+    const s = scopeFor(scope), tokens = flatten(COMMAND_KEYS.map((key) => args[key]).filter((v) => v !== undefined && v !== null));
+    // A process started in a pane of a Herdr machine (its address is `<machine>/<pane>`) runs ON that machine: it is judged by where it runs, like `hc run --on`.
+    const machine = typeof args.pane === "string" && args.pane.includes("/") ? args.pane.slice(0, args.pane.indexOf("/")) : undefined;
+    checkProcess(s, tokens, machine);
+  }
   return rawRun(name, args);
 }
 
-/** A multi-step operation (resolve an address, read a revision, POST): it captures the generation once, at its start, and every request it sends
- *  through `.fetch` is refused if the config changed since. `check()` is for a step that is not a request (before writing a file). */
-export function gatedOperation() {
-  refuse();
-  const since = generation;
+/** A multi-step operation (resolve an address, read a revision, POST): it fixes ONE scope and that scope's generation at its start, and every request it sends
+ *  through `.fetch` is refused if the config changed since or if it names another OpenRig than its scope's. `check()` is for a step that is not a request. */
+export function gatedOperation(scope) {
+  const s = scopeFor(scope), since = s.generation, id = s.id;
   return {
-    since,
-    fetch: (url, init) => gatedFetch(url, init, since),
+    since, scope: id,
+    fetch: (url, init) => gatedFetch(url, init, since, id),
     // The rig CLI and Herdr's process verbs under the same generation: they refuse to START after a change, and their results are judged by it.
-    exec: (rawExec, command, args, options) => gatedExec(rawExec, command, args, options, since),
-    hc: (rawHc, args, bytes) => gatedHc(rawHc, args, bytes, since),
-    check: () => { refuse(); if (since !== generation) throw new GateRefusal(CONFIG_CHANGED); },
+    exec: (rawExec, command, args, options) => gatedExec(rawExec, command, args, options, since, id),
+    hc: (rawHc, args, bytes) => gatedHc(rawHc, args, bytes, since, id),
+    check: () => stillCurrent(s, since),
   };
 }
 
-/** `gatedOperation()` for a caller that has no place to catch the refusal where it starts (a view method): under a refused or unloaded config the
- *  operation exists and every request, process and check of it fails with that refusal, exactly as a plain gated call would. */
-export function gatedOperationOrRefusal() {
-  try { return gatedOperation(); }
+/** `gatedOperation()` for a caller that has no place to catch the refusal where it starts (a view method): under an unloaded config, or with several scopes and none named,
+ *  the operation exists and every request, process and check of it fails with that refusal, exactly as a plain gated call would. */
+export function gatedOperationOrRefusal(scope) {
+  try { return gatedOperation(scope); }
   catch (error) {
     const fail = () => Promise.reject(error);
-    return { since: -1, fetch: fail, exec: fail, hc: fail, check: () => { throw error; } };
+    return { since: -1, scope: scope ?? null, fetch: fail, exec: fail, hc: fail, check: () => { throw error; } };
   }
 }
 
 /** An event-stream connection. The socket it returns is closed if the config changed while it was being made. */
-export async function gatedConnect(rawConnect, host, port) {
-  refuse();
-  const started = generation;
+export async function gatedConnect(rawConnect, host, port, scope) {
+  const s = scopeFor(scope), started = s.generation, known = knownAddress(s);
+  if (soleOpenCount() < 2) { /* one connection: no destination to mistake */ } else if (known !== null) { let u = null; try { u = new URL(known); } catch (_) { /* below */ } if (!u || u.hostname.replace(/^\[|\]$/g, "") !== String(host).replace(/^\[|\]$/g, "") || String(u.port || (u.protocol === "https:" ? "443" : "80")) !== String(port)) throw new GateRefusal(WRONG_DESTINATION(originOf(known))); }
+  else throw new GateRefusal(WRONG_DESTINATION(null));
   let socket;
   try { socket = await rawConnect(host, port); }
-  catch (error) { stillCurrent(started); throw error; } // a connect that fails after the settings changed failed for the old settings
-  try { stillCurrent(started); } catch (error) { try { socket?.close?.(); } catch (_) {} throw error; }
+  catch (error) { stillCurrent(s, started); throw error; } // a connect that fails after the settings changed failed for the old settings
+  try { stillCurrent(s, started); } catch (error) { try { socket?.close?.(); } catch (_) {} throw error; }
   return socket;
 }
 /** For a `.catch` that swallows failures on purpose (a read that falls back to a default): a gate refusal is NOT a failure to swallow, it is the answer
@@ -196,6 +350,5 @@ export const rethrowGate = (fallback) => (error) => {
   return typeof fallback === "function" ? fallback(error) : fallback;
 };
 /** The line a refused argv hand-off (the attach relay's daemon address) gives. Callers that build an argv for another process call this first. */
-export function assertMaySend() { refuse(); }
+export function assertMaySend(scope) { scopeFor(scope); }
 
-export { CONNECTIONS_LIST_REFUSED };

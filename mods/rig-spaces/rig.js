@@ -13,7 +13,7 @@ const isRig = (w) => !!entryOf(w);
 /** The settings the rows these menu targets are built from were published under (the sidebar's rig.data.config): the menu judges the target by this stamp against a fresh read of config.json. */
 const rowsFor = () => { const stamp = rowsStamp(); return stamp ? { rowsConfig: stamp } : {}; };
 const rowsStamp = () => { const c = shared("rig.data")?.config; return c ? { connectionId: c.connectionId, daemonUrl: c.daemonUrl, daemonUrlSource: c.daemonUrlSource, daemonMachine: c.daemonMachine,
-  openrigHome: c.openrigHome, rig: c.rig, connectionsRefused: c.connectionsRefused } : undefined; };
+  openrigHome: c.openrigHome, rig: c.rig, configInvalid: c.configInvalid } : undefined; };
 // What a stored colour name looks like on an avatar: herdr's own table, so a rig space keeps its colour under our mark.
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 const fillOf = (w, t) => {
@@ -31,8 +31,8 @@ export const rig = {
   keep(rows) { return rig.only() ? rows.filter((r) => isRig(r.w)) : rows; },
 
   /** A row's rig changes, drawn over the row's own content (the hook sits after the avatar, so these paint on top of it; positions are
-   *  within that content row, whose first 18 px is the avatar): the OpenRig icon on the home space (D1), a small rig mark on a rig
-   *  space's avatar (A1) and the rig's own status at the row's right (B1). A worktree row and any other space get nothing. */
+   *  within that content row, whose first 18 px is the avatar): the OpenRig icon on the home space, a small rig mark on a rig
+   *  space's avatar and the rig's own status at the row's right. A worktree row and any other space get nothing. */
   row(w, t, tree) {
     const e = entryOf(w);
     if (!e || tree) return none();

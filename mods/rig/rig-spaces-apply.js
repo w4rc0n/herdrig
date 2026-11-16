@@ -43,7 +43,7 @@ export async function applySpacesMode(host, shown, target) {
   if (!plan.ok) return { ok: false, reason: plan.reason, cloned };
   // The way back first: a crash between here and the change still leaves a record of what was meant.
   await host.writeState({ layout: working, cloned, from: plan.from, to: plan.to, at: Date.now(), base: BASE_HERDR });
-  // CodeRabbit 4560854899/4560854954: writeState awaits, so the active layout or the tree can change under us. Re-check both
+  // writeState awaits, so the active layout or the tree can change under us. Re-check both
   // immediately before EVERY write and stop without writing when either moved; writing the plan into a layout the person just
   // switched to would apply it to the wrong place.
   const switched = () => ({ ok: false, cloned, reason: "The active layout changed before the change could be written. Nothing was changed." });
@@ -69,7 +69,7 @@ export async function applySpacesMode(host, shown, target) {
     }
   }
   // Put back what was read, then LOOK before saying so: "Nothing was changed" is only said when the read-back matches.
-  // CodeRabbit 4560854919/4560854963: the rollback must never overwrite a tree this operation does not own. If our write landed
+  // The rollback must never overwrite a tree this operation does not own. If our write landed
   // and something else was edited alongside it, restoring would silently reverse that edit and could undo a change that in fact
   // succeeded. Keep the tree and say so plainly instead.
   let back = false;

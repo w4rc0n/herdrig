@@ -1,7 +1,7 @@
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
 import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8, rigSeatServers } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure, goodHome } from "./rig-remote.js";
-import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigSessions, rigOrigin, hostLabelValue } from "./rig-space-context.js";
+import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigSessions, rigOrigin, hostLabelValue, prepareRigSpaceAdoption } from "./rig-space-context.js";
 
 const ROLE = "rig-grid";
 const get = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
@@ -213,13 +213,16 @@ export class RigSpaces {
   async update(rig, config, explicit, key, rebuild, moving = false) {
     if (this.closed.has(key) && !explicit) return { ok: true, closed: true };
     if (explicit) this.closed.delete(key);
-    const host = { ...this.host }, url = origin(config), machine = config?.daemonMachine || null;
+    let host = { ...this.host };const url = origin(config), machine = config?.daemonMachine || null;
     if(explicit&&!moving){
       const relocation=rigSpaceRelocation(host,rig,config);
       if(relocation)return {ok:false,needsRelocation:true,relocation,reason:"Move the existing Local rig space before opening its box grid."};
     }
     const localId = (id) => machineLocalId(id, machine), qualified = (id) => machineId(id, machine);
-    let space = ownedRigSpace(host, rig, config);
+    const adoption=explicit?await prepareRigSpaceAdoption(host,config,[rig.id,rig.name],{sessions:rigSessions(rig),servers:rigSeatServers(rig)}):{ok:true};
+    if(!adoption.ok)return {recovery:null,...adoption}; // a refusal offers no tile recovery, the same shape as sync's other refusals
+    if(adoption.host)host=adoption.host;
+    let space = adoption.space??ownedRigSpace(host, rig, config);
     if (!space && explicit) {
       // ONE RIG == ONE SPACE: a rig space an older herdrig left without the explicit mark is still the rig's space (the Rig page, Attach and the TUI already find it by the same labels,
       // origin and vouching rules), so "Open rig space" adopts and marks it instead of building a second one. Only the explicit open does: background activation still needs the mark.
@@ -235,7 +238,7 @@ export class RigSpaces {
         if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig.name, machine, other.origin ?? null, config.daemonUrl, other) };
       }
     }
-    if (space && machine) {
+    if (space && machine && !adoption.space) {
       // Found across a different loopback spelling of the same daemon (confirmed by its own session list): label it with today's address.
       try { await markRigSpace(host, config, [rig.id, rig.name], space, { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) }); }
       catch (error) { return { ok: false, reason: String(error?.message ?? error) }; }
@@ -298,7 +301,11 @@ export class RigSpaces {
       && rebuild.tiles.some((s) => JSON.stringify(s) === JSON.stringify(tileSnapshot(t, p)));
     const focused = () => get(host, "spaces").some((s) => s.active && s.tabs?.some((t) => t.id === tab && t.active))
       || tabPanes().some((p) => p.focused || (p.terminal && p.terminal === host.focused?.()?.terminal));
+    // ONE operation for the whole build: the viewers' argv embeds the home and address this build began under, and `pane.split` is gated per call. When the host gives a token for the
+    // settings the build began under, every close and split first checks they are still current: a change mid-build stops it rather than start the remaining tiles for the old home.
+    const gateToken = host.gateToken?.();
     const guard = () => {
+      if (gateToken !== undefined && host.gateCurrent && !host.gateCurrent(gateToken)) throw new Error("OpenRig's settings changed while this grid was being built, so the remaining tiles were not started. Open the rig space again.");
       if (!explicit && !get(host, "spaces").some(s => s.id === space?.id)) throw new Error("space-closed");
       if (!explicit && focused()) throw new Error("deferred-focus");
     };

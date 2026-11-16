@@ -1,9 +1,9 @@
 // One approval owns helper installation, verification and the final local routing choice.
 // Host file operations are injected only for the two fixed app-home files, never from remote metadata.
-import {parseConfig} from "./rig-lib.js";
 import {RemoteMachine} from "./rig-remote.js";
 import {formatAbsoluteTime} from './rig-time.js';
 import {LEGACY_CONNECTION_ID,consentOf,consentText} from './rig-connections.js';
+import {parseConfig} from './rig-lib.js';
 
 const parsed=text=>{
   const value=JSON.parse(text??"{}");
@@ -20,10 +20,20 @@ const sameDaemonAddress=(a,b)=>{
 export const MACHINE_SETUP_LIST="This OpenRig is set up with a connections list in its configuration. Choosing its machine here comes with the next version, so nothing was changed.";
 const hasList=raw=>raw?.connections!==undefined&&raw?.connections!==null; // the loader's own rule: any value but absent or null is a list it refuses
 const errorText=error=>String(error?.message??error);
+// With a list, the machine lives in the connection's own record. That record is the choice: when it already names this machine and this address
+// the approval is consent-only (the helper and its consent), and nothing in the config is written. Any other list is refused as before.
+const listedMachine=(raw,config,machine)=>{
+  const record=(Array.isArray(raw?.connections)?raw.connections:[]).find(c=>c&&typeof c==="object"&&c.id===config?.connectionId);
+  return Boolean(record&&machine&&record.machine===machine&&sameDaemonAddress(record.daemonUrl,config.daemonUrl));
+};
 function connectionMatches(raw,config,machine){
-  if(hasList(raw))throw new Error(MACHINE_SETUP_LIST);
+  if(hasList(raw)){
+    if(listedMachine(raw,config,machine))return "listed";
+    throw new Error(MACHINE_SETUP_LIST);
+  }
   if(!sameDaemonAddress(raw.daemonUrl??config.daemonUrl,config.daemonUrl)||raw.daemonMachine&&raw.daemonMachine!==machine)
     throw new Error("OpenRig's configuration changed. Refresh before choosing a machine.");
+  return "root";
 }
 function transport(host,previous,stage,id){
   return {...host,readConsent:async()=>consentOf(previous,id),writeConsent:async value=>stage(value)};
@@ -31,11 +41,11 @@ function transport(host,previous,stage,id){
 
 export async function reviewMachineSetup(host,config,machine){
   try{
-    const before=await host.readConfig()??null,raw=parsed(before);connectionMatches(raw,config,machine);
+    const before=await host.readConfig()??null,raw=parsed(before),where=connectionMatches(raw,config,machine);
     const previous=await host.readConsentText()??null;
     const result=await new RemoteMachine(transport(host,previous,()=>{},connectionOf(config))).review({...config,daemonMachine:machine});
     if(!result.ok)return result;
-    return {...result,before,alreadyConfigured:raw.daemonMachine===machine,config:{...config,daemonMachine:machine}};
+    return {...result,before,alreadyConfigured:where==="listed"||raw.daemonMachine===machine,config:{...config,daemonMachine:machine}};
   }catch(error){return {ok:false,reason:errorText(error)};}
 }
 
@@ -45,7 +55,7 @@ export async function approveMachineSetup(host,review,onProgress=()=>{}){
     if(!review?.ok||!review.confirmation?.key)throw new Error("Check the machine before approving setup.");
     const {config,confirmation}=review;
     if((await host.readConfig()??null)!==review.before)throw new Error("OpenRig's configuration changed. Check again before approving.");
-    connectionMatches(parsed(review.before),config,confirmation.machine);
+    const where=connectionMatches(parsed(review.before),config,confirmation.machine);
     const previous=await host.readConsentText()??null;let staged=null;
     const remote=new RemoteMachine(transport(host,previous,value=>{staged=value;},connectionOf(config)));
     // prepare reruns the full identity and shipped-file checks, validates the approval key, and hashes again.
@@ -59,6 +69,7 @@ export async function approveMachineSetup(host,review,onProgress=()=>{}){
     // A later config-save failure retains this verified consent; it does not enable routing.
     await host.writeConsentText(text,previous);
     stage="consent";
+    if(where==="listed")return {ok:true,receipt,installed:confirmation.fileState!=="same"};
     const raw=parsed(review.before);
     await host.writeConfig(JSON.stringify({...raw,daemonMachine:confirmation.machine},null,2)+"\n",review.before);
     return {ok:true,receipt,installed:confirmation.fileState!=="same"};

@@ -13,28 +13,32 @@ export function configRejectedSaveResidual(value=null){
 // Keep the registry on that runtime too, so a newly loaded module cannot bypass the raw request.
 const registryKey=Symbol.for('herdrig.configWrites.v1');
 const configWrites=globalThis[registryKey]??(globalThis[registryKey]=new Map());
-const writeRecord=identity=>{let r=configWrites.get(identity);if(!r){r={pending:new Set(),owners:new Map(),uncertain:false,failed:false,idle:new Set(),waiters:new Set()};configWrites.set(identity,r);}return r;};
+// The lock is ONE DAEMON's: the identity string the page builds is [origin, machine, connection], and `localhost`, `127.0.0.1` and `[::1]` on one port are the same daemon, so a write pending through one
+// spelling must still block a save through another (the gate drops the old response; it does not cancel a write already sent). Other origins keep their own spelling.
+const LOOPBACK=new Set(['localhost','127.0.0.1','::1','[::1]']);
+const lockKey=identity=>{try{const a=JSON.parse(identity);if(!Array.isArray(a))return identity;const u=new URL(String(a[0]));const origin=LOOPBACK.has(u.hostname)?`${u.protocol}//loopback:${u.port||(u.protocol==='https:'?'443':'80')}`:u.origin;return JSON.stringify([origin,...a.slice(1)]);}catch{return identity;}};
+const writeRecord=identity=>{identity=lockKey(identity);let r=configWrites.get(identity);if(!r){r={pending:new Set(),owners:new Map(),uncertain:false,failed:false,idle:new Set(),waiters:new Set()};configWrites.set(identity,r);}return r;};
 export function closeConfigWrites(owner){for(const[identity,r]of configWrites){
   if(r.pending.size&&r.owners?.has(owner)){r.ownerClosed=true;r.uncertain=true;r.daemonLabel=r.owners.get(owner);}
   else if(r.reconcileOwner===owner&&r.reconciling)finishConfigReconcile(identity,r,r.reconciling,null,new Error('The Settings page closed during verification'));
 }}
 export function configWriteState(identity){
-  const r=configWrites.get(identity);if(!r)return null;
+  const r=configWrites.get(lockKey(identity));if(!r)return null;
   const reason=r.ownerClosed?`A save on ${r.daemonLabel||'this OpenRig'} was still unanswered when its Settings tab closed. Saving stays paused until Herdr restarts. You can still use rig config in a terminal on OpenRig’s machine.`
     :r.pending.size?'A save is waiting for OpenRig to answer. Saving is paused; reopening this page will not clear the pending request.'
     :r.failed&&!r.reconciling?'OpenRig’s current value could not be confirmed on this page. Reopen this page before saving again.'
     :'The last save was not confirmed. Saving resumes once OpenRig confirms the current value.';
   return {blocked:r.uncertain||r.pending.size>0,pending:r.pending.size,uncertain:r.uncertain,ownerClosed:r.ownerClosed===true,failed:r.failed&&!r.reconciling,reason};
 }
-export function waitForConfigWrites(identity){const r=configWrites.get(identity);return !r||!r.pending.size?Promise.resolve(r):new Promise(resolve=>r.idle.add(resolve));}
-export function beginConfigReconcile(identity,r,owner){if(!r||configWrites.get(identity)!==r||!r.uncertain||r.ownerClosed||r.pending.size||r.reconciling)return null;r.failed=false;r.result=null;r.reconcileOwner=owner;return r.reconciling={};}
+export function waitForConfigWrites(identity){const r=configWrites.get(lockKey(identity));return !r||!r.pending.size?Promise.resolve(r):new Promise(resolve=>r.idle.add(resolve));}
+export function beginConfigReconcile(identity,r,owner){if(!r||configWrites.get(lockKey(identity))!==r||!r.uncertain||r.ownerClosed||r.pending.size||r.reconciling)return null;r.failed=false;r.result=null;r.reconcileOwner=owner;return r.reconciling={};}
 export function finishConfigReconcile(identity,r,token,data,error){
   if(!r||r.reconciling!==token)return;
   r.reconciling=null;r.reconcileOwner=null;r.failed=!!error;r.result=error?{ok:false}:{ok:true,data};
-  if(!error&&configWrites.get(identity)===r&&!r.pending.size)configWrites.delete(identity);
+  if(!error&&configWrites.get(lockKey(identity))===r&&!r.pending.size)configWrites.delete(lockKey(identity));
   for(const resolve of r.waiters)resolve(r.result);r.waiters.clear();
 }
-export function failConfigReconcile(identity,r){if(configWrites.get(identity)===r&&!r.reconciling){r.failed=true;r.result={ok:false};}}
+export function failConfigReconcile(identity,r){if(configWrites.get(lockKey(identity))===r&&!r.reconciling){r.failed=true;r.result={ok:false};}}
 export function configReconcileResult(r){return r?.result?Promise.resolve(r.result):r?.reconciling?new Promise(resolve=>r.waiters.add(resolve)):Promise.resolve({ok:false});}
 /** One deadline for fetch, JSON and every request in a save/Undo. Late responses never escape. */
 export function configOperationRequest(request, after, identity=null, owner=null, daemonLabel='this OpenRig') {
@@ -54,7 +58,7 @@ export function configOperationRequest(request, after, identity=null, owner=null
       }
       const response=await request(...args);return {ok:response.ok,status:response.status,data:await response.json()};
     });
-    const settled=()=>{if(record){record.pending.delete(raw);if(!record.pending.size){for(const resolve of record.idle)resolve(record);record.idle.clear();if(!record.uncertain&&configWrites.get(identity)===record)configWrites.delete(identity);}}};
+    const settled=()=>{if(record){record.pending.delete(raw);if(!record.pending.size){for(const resolve of record.idle)resolve(record);record.idle.clear();if(!record.uncertain&&configWrites.get(lockKey(identity))===record)configWrites.delete(lockKey(identity));}}};
     // If a proxy or tunnel retained the body, this interrupted save may still arrive and replace a newer value.
     // A fresh read observes the current value, not a server-side barrier against that delayed POST.
     raw.then(({ok,status,data})=>{settled();if(!expired&&!closed){waiting.delete(reject);resolve({ok,status,json:async()=>data});}},cause=>{if(record){record.uncertain=true;record.rejected=true;}settled();waiting.delete(reject);reject(cause);});

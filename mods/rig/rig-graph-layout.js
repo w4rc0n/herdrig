@@ -1,4 +1,4 @@
-// Pure geometry port of slice33 mock/layout.py. Both saved specs and running rigs use this layout.
+// Pure geometry for the rig graph. Both saved specs and running rigs use this layout.
 export const CARD_W=168, CARD_H=50, CARD_GAP=12, POD_PAD=10, POD_HEAD=26, POD_GAP=16;
 export const MARGIN=16, LANE=6, CH_BASE=20, CH_EMPTY=28, GUTTER_GAP=12, DENSE=12;
 const hierarchy=new Set(["delegates_to","spawned_by"]);

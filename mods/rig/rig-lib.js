@@ -4,21 +4,22 @@
 // needs from the host (fetch, exec, terminals) is passed in.
 import { attachRemoteSeat } from "./rig-remote-attach.js";
 import { formatAbsoluteTime } from './rig-time.js';
-import { routeOpen } from "./rig-routing.js";
-import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publishedUnder } from "./rig-gate.js";
+import { routeOpen, homeKey } from "./rig-routing.js";
+import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publishedUnder, publishedConfigFor } from "./rig-gate.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
-import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions } from "./rig-space-context.js";
-import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, CONNECTIONS_LIST_REFUSED, CONNECTIONS_LIST_SUPPORTED } from "./rig-connections.js";
+import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions, prepareRigSpaceAdoption, topologyRig } from "./rig-space-context.js";
+import { connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
+import { cleanSidebarViews } from './rig-sidebar-view-state.js';
 const SYSTEM_VIEW_LABELS = new Map(SYSTEM_PAGE_VIEWS);
 
 /** The single space-routing entry point for pages, the TUI, Attach and rig grids. */
 let routingEnvironment = null;
 /** The settings a producer's rows were read under, reduced to the fields that make a config a different one for the send gate (see rig-gate.js identity). */
 export const ROWS_STALE = "OpenRig's settings changed since these rows were loaded. Wait for the list to refresh, then try again.";
-export const rowsIdentityOf = (config) => (config ? { connectionId: config.connectionId, daemonUrl: config.daemonUrl, daemonUrlSource: config.daemonUrlSource, daemonMachine: config.daemonMachine,
-  openrigHome: config.openrigHome, rig: config.rig, connectionsRefused: config.connectionsRefused } : null);
+export const rowsIdentityOf = (config, conn) => (config ? ((c) => ({ connectionId: c.connectionId, daemonUrl: c.daemonUrl, daemonUrlSource: c.daemonUrlSource, daemonMachine: c.daemonMachine,
+  openrigHome: c.openrigHome, rig: c.rig, configInvalid: c.configInvalid }))(conn && conn !== config.connectionId ? (configOfConnection(config, conn) ?? { connectionId: conn }) : config) : null); // the stamp is the ROW's connection identity (a row of B is judged against B, never against the primary)
 /** Every producer of a menu target stamps the settings ITS rows were read under (`rowsConfig`) before it opens the menu: the sidebar, the Rig page, All seats, the palette and the Needs
  *  cards each read their own rows under their own config, and the menu judges the target by its own stamp against a fresh read of config.json (a stamp-less target is not judged:
  *  no sidebar, no rig.data, nothing to compare). A stamp already on the target (a dialog opened from a menu) is kept. */
@@ -29,12 +30,18 @@ export function stampRows(spec, identity) {
 export function registerRigRouting(cx, environment) {
   // init/render contexts expire when their call returns. Keep waits on a view-owned asynchronous task instead.
   cx.spawn(async context => {
-    routingEnvironment = () => environment(context);
+    routingEnvironment = conn => environment(context, conn);
     await new Promise(() => {});
   });
 }
+/** Rig spaces, attach, the operator and worker views are not per connection yet: a target of another connection than the config it was given
+ *  is refused (never routed through that config's address). */
+export const OTHER_CONNECTION_REFUSAL = "This is on another OpenRig, and opening it from here comes in a later update. Nothing was opened.";
+export const crossesConnections = (config, target) => Boolean(target?.conn && config?.connectionId && target.conn !== config.connectionId);
+
 export function routeRigOpen(host, config, request) {
-  const environment = routingEnvironment?.() ?? {};
+  if (crossesConnections(config, request) || crossesConnections(config, request?.entry) || crossesConnections(config, request?.seat)) return Promise.resolve({ ok: false, reason: OTHER_CONNECTION_REFUSAL });
+  const environment = routingEnvironment?.(request?.conn ?? request?.entry?.conn ?? request?.seat?.conn ?? config?.connectionId) ?? {};
   return routeOpen({ ...environment, ...host }, config ?? environment.config, request);
 }
 
@@ -371,7 +378,7 @@ export const STATE_COPY = Object.freeze({
 });
 
 /** `<app home>/openrig/config.json`, optional overrides for `person`, `daemonUrl`, `rig`, and `openrigHome`. */
-export function parseConfig(text, { connectionsList = CONNECTIONS_LIST_SUPPORTED } = {}) {
+export function parseConfig(text) {
   let raw = null;
   try { raw = JSON.parse(text ?? "null"); } catch { raw = null; }
   if (!raw || typeof raw !== "object") { const { connections } = connectionsOf(null); return { person: null, daemonUrl: null, rig: ["rig"], openrigHome: null, missing: true, connectionId: connections[0].id, connections }; }
@@ -386,18 +393,14 @@ export function parseConfig(text, { connectionsList = CONNECTIONS_LIST_SUPPORTED
   const openrigHome = typeof raw.openrigHome === "string" && raw.openrigHome.startsWith("/") ? raw.openrigHome : null;
   const capabilities = raw.capabilities && typeof raw.capabilities === "object" && !Array.isArray(raw.capabilities) ? raw.capabilities : undefined;
   // The connections this config describes (v0.5.0): the legacy daemonUrl / daemonMachine keys are connection one of a list of one, and
-  // nothing is rewritten. PR 1 runs the first connection only; the config below is that connection's, so a single-daemon setup is as it was.
-  // v0.4.5 reads one OpenRig connection: a `connections` list (any, even an empty or invalid one) is refused outright. The config is inert (no address,
-  // no home, no machine, not even the legacy keys next to the list) and says why; nothing is sent to any listed entry. v0.5.0 lifts this.
-  if (!connectionsList && raw.connections !== undefined && raw.connections !== null) {
-    return { person, daemonUrl: null, rig, openrigHome: null, missing: false, connectionId: LEGACY_CONNECTION_ID, connections: connectionsOf(null).connections,
-      connectionsRefused: CONNECTIONS_LIST_REFUSED, ...(raw.reducedMotion === true ? { reducedMotion: true } : {}) };
-  }
-  const { connections, legacy } = connectionsOf(raw);
+  // nothing is rewritten. The config below is the first connection's, so a single-daemon setup is as it was.
+  const { connections, legacy, notes, invalid } = connectionsOf(raw);
+  // A list with no usable entry is an invalid config: inert (no address, no home, no machine, not even the legacy keys next to the list), and it says why. Nothing is sent.
+  if (invalid) return { person, daemonUrl: null, rig, openrigHome: null, missing: false, connectionId: LEGACY_CONNECTION_ID, connections: [], configInvalid: invalid, connectionNotes: notes, ...(raw.reducedMotion === true ? { reducedMotion: true } : {}) };
   const first = connections[0];
   return {
     person, daemonUrl: legacy ? daemonUrl : first.daemonUrl, rig, openrigHome: legacy ? openrigHome : first.openrigHome, missing: false,
-    connectionId: first.id, connections,
+    connectionId: first.id, connections, connectionsList: !legacy, ...(notes.length ? { connectionNotes: notes } : {}), ...(!legacy && first.expectedHostId ? { expectedHostId: first.expectedHostId } : {}),
     ...(legacy ? (raw.daemonMachine !== undefined && raw.daemonMachine !== "" ? { daemonMachine: raw.daemonMachine } : {}) : (first.machine ? { daemonMachine: first.machine } : {})),
     ...(daemonUrlSource ? { daemonUrlSource } : {}),
     ...(daemonState ? { daemonState } : {}),
@@ -975,6 +978,10 @@ export function settleRead(prev, outcome, now = Date.now()) {
   return { data: prev.data, at: prev.at, ...failure, errorAt: now };
 }
 
+/** Whether two configs name the same OpenRig for address discovery: the same connection, machine, OpenRig home and `rig` command (the gate's own identity, minus the address that is being discovered). */
+const sameDiscoveryIdentity = (a, b) => (a?.connectionId ?? null) === (b?.connectionId ?? null) && (a?.daemonMachine ?? null) === (b?.daemonMachine ?? null)
+  && (a?.openrigHome ?? null) === (b?.openrigHome ?? null) && JSON.stringify(a?.rig ?? null) === JSON.stringify(b?.rig ?? null);
+
 /**
  * When `<appHome>/openrig/config.json` is absent or has no explicit `daemonUrl`, a config reload
  * (`parseConfig(...)` -> `{ daemonUrl: null, ... }`) must preserve a CLI-discovered `daemonUrl`
@@ -982,7 +989,9 @@ export function settleRead(prev, outcome, now = Date.now()) {
  */
 export function preserveCliDiscoveredConfig(next, prev) {
   if (!next || !prev) return next;
-  if (next.connectionsRefused) return next; // a refused list has no address, not even one the CLI found earlier
+  if (next.configInvalid) return next; // a refused list has no address, not even one the CLI found earlier
+  // The found address belongs to the OpenRig it was found for: a changed home, machine, `rig` command or connection is another one, and the new config rediscovers its own.
+  if (!sameDiscoveryIdentity(next, prev)) return next;
   if (!next.daemonUrl && prev.daemonUrlSource === "cli" && prev.daemonUrl) {
     const merged = {
       ...next,
@@ -1005,8 +1014,8 @@ export function preserveCliDiscoveredConfig(next, prev) {
  *  list has NO address and gets none from here: a sidebar that ran before the list was added left one behind, and clears it only when its own refresh
  *  runs. Every reader of that shared address goes through this. */
 export function sharedLoopbackDaemonUrl(config, published) {
-  if (config?.connectionsRefused || !publishedUnder(config, published)) return null; // another home's, machine's or connection's address is not this reader's
-  const url = published?.config?.daemonUrl;
+  if (config?.configInvalid || !publishedUnder(config, published)) return null; // another home's, machine's or connection's address is not this reader's
+  const url = publishedConfigFor(config, published)?.daemonUrl; // the READER's connection's entry, never the primary's
   return url && isLoopbackDaemonUrl(url) ? url : null;
 }
 /** What other mods published in the shared `rig.data` (rows, nodes, needs, versions), as a reader may RENDER or SUGGEST it. A refused connections list
@@ -1014,7 +1023,7 @@ export function sharedLoopbackDaemonUrl(config, published) {
  *  reader of the shared rows goes through this (`undefined` reads like a sidebar that has published nothing). */
 export function sharedRigData(config, shared) {
   // No config yet (a mod's first moments, before it has read config.json) cannot rule a refused list out, so it reads nothing either.
-  if (!config || config.connectionsRefused) return undefined;
+  if (!config || config.configInvalid) return undefined;
   const published = shared("rig.data");
   return published && !publishedUnder(config, published) ? undefined : published; // rows published under other settings are not this reader's (it falls back to its own reads)
 }
@@ -1022,7 +1031,7 @@ export function sharedRigData(config, shared) {
  *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
  *  and send that home's terminal token to whatever address the connection names. Every command, a read as much as a write, is refused. */
 export function cliRefusal(config) {
-  if (config?.connectionsRefused) return config.connectionsRefused; // a refused connections list: nothing of OpenRig's runs
+  if (config?.configInvalid) return config.configInvalid; // a refused connections list: nothing of OpenRig's runs
   return config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID && !config.openrigHome ? HOME_NEEDED : null;
 }
 /** A command that runs nothing of OpenRig's and fails (`false`: no shell, no output). The words for the person are `cliRefusal`'s, shown by the
@@ -1137,6 +1146,16 @@ export const NO_JSON = new Set(["snapshot"]);
  * a toast, and open the result dialog only when they fail. Pause, Resume, Relaunch fresh, Send, Queue, Reply and
  * Launch keep their dialogs.
  */
+/** The actions whose CLI command carries `--app-home <this computer's app home>` for OpenRig's herdr-app provider (see actionArgs). */
+export const PROVIDER_HOME_ACTIONS = new Set(["open-view", "open-seat", "keyboard", "follow", "unfollow", "prune", "close-view", "close-cell", "open-designed-view"]);
+/** A machine connection's provider worker views would need a window on that machine: said plainly, with nothing sent. */
+export const machineWorkerViewsRefusal = (machine) => `Worker views for ${machine} aren't available from this computer yet. Nothing was sent.`;
+/** A machine connection added through the connections list (not the legacy one, which keeps the released behaviour). */
+export const listAddedMachine = (config) => Boolean(config?.daemonMachine) && (config.connectionId ?? LEGACY_CONNECTION_ID) !== LEGACY_CONNECTION_ID;
+/** The one rule: this computer's app home never reaches a list-added machine's daemon. By action (the sidebar's dispatcher) ... */
+export const providerHomeRefusal = (config, action) => listAddedMachine(config) && PROVIDER_HOME_ACTIONS.has(action) ? machineWorkerViewsRefusal(config.daemonMachine) : null;
+/** ... and by the command itself (every runner's last check before exec: whatever built it, `--app-home` to such a daemon is refused). */
+export const appHomeArgsRefusal = (config, args) => Array.isArray(args) && args.includes("--app-home") && listAddedMachine(config) ? machineWorkerViewsRefusal(config.daemonMachine) : null;
 export const ONE_CLICK = new Set(["snapshot", "unarchive-rig", "follow", "unfollow", "prune", "close-view", "keyboard", "open-view", "open-seat", "close-cell", "open-designed-view"]);
 
 // ---- worker-view grids (designer and cell controls) ----------------------------------------------------------------
@@ -1887,10 +1906,19 @@ export function actionArgs(target, action, text, home) {
  *  words, not JSON (`rig snapshot`: "Snapshot created: <id>"), says what happened in its first line. */
 export function writeOutcome(r) {
   let json = null; try { json = JSON.parse(r?.stdout); } catch (_) { json = null; }
-  const failed = r?.code !== 0 || json?.ok === false;
+  // OpenRig can record or retain a send and exit zero without delivering it. That receipt is authoritative,
+  // unlike a timeout: keep the draft and never show success or speculate that it may have been delivered.
+  const notSent = ["recorded", "retained"].includes(json?.outcome) && json?.sent === false
+    || !json && /^(?:Recorded|Retained), not delivered to /u.test(String(r?.stdout ?? "").trimStart());
+  const failed = r?.code !== 0 || json?.ok === false || notSent;
   const reason = json?.error?.fact ?? json?.error?.message ?? (typeof json?.error === "string" ? json.error : null) ?? json?.message;
-  const text = failed ? (reason ?? (json ? `rig exited ${r?.code} without saying why.` : (r?.stderr || r?.stdout || `rig exited ${r?.code}`))) : (json ? json.message ?? "" : plainOutcome(r?.stdout));
-  return { ok: !failed, json, text: String(text).trim(), warning: json?.warning ? String(json.warning) : null };
+  const text = notSent ? (json ? [`${json.outcome === "retained" ? "Retained" : "Recorded"}, not delivered to ${json.sessionName ?? json.destinationStatus?.destinationSession ?? "the destination"}.`, json.destinationStatus?.message].filter(Boolean).join("\n") : r.stdout)
+    : failed ? (reason ?? (json ? `rig exited ${r?.code} without saying why.` : (r?.stderr || r?.stdout || `rig exited ${r?.code}`))) : (json ? json.message ?? "" : plainOutcome(r?.stdout));
+  // Queue creation is successful when its row persists even if the destination cannot be nudged. Keep that success,
+  // but show the daemon's destination advisory instead of implying the seat is available.
+  const advisories = Array.isArray(json?.advisories) ? json.advisories : [];
+  const warning = [json?.warning, ...advisories.filter(a => ["destination_status", "unmatched_destination_seat"].includes(a?.code)).map(a => a.message)].filter(v => typeof v === "string" && v.trim()).join("\n") || null;
+  return { ok: !failed, json, text: String(text).trim(), warning, ...(notSent ? { notSent: true } : {}) };
 }
 
 /** What a menu action is called in a title, a status line or a toast. */
@@ -2324,8 +2352,17 @@ export function rigSpaceMarks({ spaces = [], terminals = [], panes = [], state =
   const machine = config?.daemonMachine || null, out = {};
   const machineOf = (context) => context.space.machine ?? (String(context.id ?? "").includes("/") ? String(context.id).split("/")[0] : null);
   for (const context of openRigSpaceContext(spaces, terminals, panes, state)) {
-    if (context.home) { out[context.id] = { home: true }; continue; }
-    // CodeRabbit 4560854996: the machine restriction applies to BOTH branches below. Without it, two machines answering on the same
+    if (context.home) {
+      // With several OpenRigs each feed marks only ITS OWN home, stamped with its connection, so the Spaces menu (Open Rig page, Attach
+      // operator) acts on that OpenRig, never the one the sidebar happens to show. Ownership is the recorded home, never a name: its
+      // homeSpaces entry, else the legacy record (the first connection's) when no entry claims the space. One connection: unchanged.
+      if ((config?.connections?.length ?? 0) < 2) { out[context.id] = { home: true }; continue; }
+      const homes = state?.homeSpaces ?? {}, own = homes[homeKey(config)] === context.id
+        || (state?.homeSpace === context.id && !Object.values(homes).includes(context.id) && (config?.connectionId ?? LEGACY_CONNECTION_ID) === LEGACY_CONNECTION_ID);
+      if (own) out[context.id] = { home: true, conn: config.connectionId };
+      continue;
+    }
+    // The machine restriction applies to BOTH branches below. Without it, two machines answering on the same
     // loopback URL with a same-named rig cross-wire here — and these marks drive the Spaces menu, so an action could reach the other
     // machine's rig. `resolveRigSpace` filters by machine before choosing a space; this must agree with it.
     // With no machine configured this still filters to local spaces, which is exactly what `lookup` does: a mark must agree with
@@ -2559,12 +2596,13 @@ export const SECTION_TITLES = { topology: "Topology", specs: "Specs", scopes: "S
 
 /**
  * Normalize `/api/terminal/preview` `composed` data for a view.
- * When a `rig:<name>` view reports 0 attachable and 0 absent against a daemon that dropped unattached seats,
+ * When a `rig:<name>` view reports no opened, absent or degraded seats against a daemon that dropped unattached seats,
  * synthesizes `absent` entries (`reason: "seat-not-running"`) from the rig's topology seats so preview never reports `0 absent`.
  */
 export function normalizeTerminalPreview(composed, viewKey, topology = []) {
   const rawOpened = Array.isArray(composed?.opened) ? composed.opened : [];
   const rawAbsent = Array.isArray(composed?.absent) ? composed.absent : [];
+  const rawDegraded = Array.isArray(composed?.degraded) ? composed.degraded.filter((seat) => seat && typeof seat === "object") : [];
   const rawPages = Array.isArray(composed?.pages) ? composed.pages : [];
   const rigName = String(viewKey ?? "").startsWith("rig:") ? String(viewKey).slice(4) : null;
   const rig = rigName
@@ -2573,22 +2611,23 @@ export function normalizeTerminalPreview(composed, viewKey, topology = []) {
   const rigSeats = rig
     ? (Array.isArray(rig.seats) ? rig.seats : (rig.pods ?? []).flatMap((p) => p?.seats ?? []))
     : [];
-  const synthesizedAbsent = !rawOpened.length && !rawAbsent.length && rigSeats.length
+  const labelledUnavailable = (rows) => rows.map((a) => {
+    if (!a || typeof a !== "object") return a;
+    if (a.label) return a;
+    const rawSeat = a.seat ?? a.sessionName ?? a.logicalId ?? null;
+    const matched = rawSeat
+      ? rigSeats.find((s) => s.session === rawSeat || s.canonicalSessionName === rawSeat || s.logicalId === rawSeat)
+      : null;
+    const derivedLabel = matched?.logicalId ?? a.logicalId ?? (typeof rawSeat === "string" ? rawSeat.split("@")[0].replace(/-/g, ".") : null);
+    return derivedLabel ? { ...a, label: derivedLabel } : a;
+  });
+  const synthesizedAbsent = !rawOpened.length && !rawAbsent.length && !rawDegraded.length && rigSeats.length
     ? rigSeats.map((s) => ({
         seat: s.session ?? s.canonicalSessionName ?? s.logicalId,
         label: s.logicalId ?? s.member ?? s.session,
         reason: "seat-not-running",
       }))
-    : rawAbsent.map((a) => {
-        if (!a || typeof a !== "object") return a;
-        if (a.label) return a;
-        const rawSeat = a.seat ?? a.sessionName ?? a.logicalId ?? null;
-        const matched = rawSeat
-          ? rigSeats.find((s) => s.session === rawSeat || s.canonicalSessionName === rawSeat || s.logicalId === rawSeat)
-          : null;
-        const derivedLabel = matched?.logicalId ?? a.logicalId ?? (typeof rawSeat === "string" ? rawSeat.split("@")[0].replace(/-/g, ".") : null);
-        return derivedLabel ? { ...a, label: derivedLabel } : a;
-      });
+    : labelledUnavailable(rawAbsent);
   const allAbsentStopped = rawOpened.length === 0
     && synthesizedAbsent.length > 0
     && synthesizedAbsent.every((a) => a.reason === "seat-not-running" || /not alive/i.test(String(a.reason ?? "")));
@@ -2599,6 +2638,7 @@ export function normalizeTerminalPreview(composed, viewKey, topology = []) {
   return {
     opened: rawOpened,
     absent: synthesizedAbsent,
+    degraded: labelledUnavailable(rawDegraded),
     pages: rawPages,
     rigName,
     rig,
@@ -2619,7 +2659,7 @@ export function viewsPropsFromLayout(node, sharedFn = null) {
   const walk = (n) => {
     if (!n || typeof n !== "object" || found) return;
     const paneHeader = n.content?.pane?.header?.content;
-    if (paneHeader?.mod === "rig-cell-header" && Array.isArray(paneHeader.props?.views)) {
+    if (["rig-cell-header", "herdrig-cell-header"].includes(paneHeader?.mod) && Array.isArray(paneHeader.props?.views)) {
       found = paneHeader.props;
       return;
     }
@@ -2744,7 +2784,7 @@ export function cellsForSeat(stripProps, session) {
 }
 
 /** Resolve a seat's live pane target in an open worker view or attached/native seat tab, or `{ kind: "card" }` when none is open. */
-export function seatClickTarget(stripProps, shownChild, session, panes = [], terminals = []) {
+export function seatClickTarget(stripProps, shownChild, session, panes = [], terminals = [], origin = undefined, shared = false) {
   const cells = cellsForSeat(stripProps, session);
   const pn = Array.isArray(panes) ? panes : (Array.isArray(panes?.panes) ? panes.panes : []);
   const tm = Array.isArray(terminals) ? terminals : (Array.isArray(panes?.terminals) ? panes.terminals : []);
@@ -2756,8 +2796,10 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
     const paneHit = pn.find((p) => p?.terminal === c.terminal);
     if (paneHit?.tab) c.tab = paneHit.tab;
   }
+  let ambiguous = false;
   for (const t of tm) {
     if (!t?.address || (t.state !== undefined && t.state !== "live" && t.state !== "running")) continue;
+    if (!sameOrigin(t, origin)) continue;
     const isAttach = t.labels?.["herdr-openrig.role"] === "attach" && t.labels?.["herdr-openrig.attach"] === sess;
     const isNativeSeat = t.labels?.["openrig.role"] === "seat" && (
       t.labels?.["openrig.session"] === sess ||
@@ -2765,8 +2807,8 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
       (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig))
     );
     if (!isAttach && !isNativeSeat) continue;
-    // A native-namespace terminal is never focused (rule Y: nothing on it names this daemon).
-    if (isNativeSeat && !isAttach) continue;
+    // A native-namespace terminal is never focused (rule Y: nothing on it names this daemon); with a shared name it still says so.
+    if (isNativeSeat && !isAttach) { if (shared && origin !== undefined) ambiguous = true; continue; }
     if (cells.some((c) => c.terminal === t.address)) continue;
     const paneHit = pn.find((p) => p?.terminal === t.address);
     const tab = paneHit?.tab ?? t.labels?.["herdr.tab"] ?? null;
@@ -2777,7 +2819,7 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
   const here = cells.find((c) => c.view === shownChild || (c.tab && c.tab === shownChild));
   if (here) return { kind: "focus", terminal: here.terminal };
   if (cells[0]) return { kind: "select-then-focus", view: cells[0].view, ...(cells[0].tab ? { tab: cells[0].tab } : {}), terminal: cells[0].terminal };
-  return { kind: "card" };
+  return ambiguous ? { kind: "ambiguous" } : { kind: "card" };
 }
 export const seatPaneTarget = seatClickTarget;
 
@@ -3262,35 +3304,39 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
  * - If `id` is absent (summary toast), opens `:needs` without expanding a specific row
  * - If `Array.isArray(items)` is passed and `id` is no longer present, opens `:needs` with `notice: "This request was already answered"`
  */
-export function openNeed(id, { shared, setShared, run, items = null, layout = undefined, spaces = undefined, panes = undefined } = {}) {
+export function openNeed(id, { shared, setShared, run, items = null, layout = undefined, spaces = undefined, panes = undefined, conn = null } = {}) {
   const rawId = typeof id === "object" && id !== null ? (id.id ?? null) : id;
   const targetId = typeof rawId === "string" && rawId.trim() ? rawId.trim() : null;
   const nav = shared?.("rig.nav") ?? { stack: [] };
-  const activateRigPage = () => {
+  const activateRigPage = entry => {
     if (layout !== undefined) {
-      openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" });
+      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, section: "needs" }, entry);
     } else {
       run?.("layout.select", { stack: "rig-work", child: "rig-page" });
     }
   };
   if (!targetId) {
     setShared?.("rig.focusNeed", null);
-    setShared?.("rig.nav", navPush(nav, { section: "needs" }));
-    activateRigPage();
+    const entry={ section: "needs", ...(conn?{conn}:{}) };
+    setShared?.("rig.nav", navPush(nav, entry));
+    activateRigPage(entry);
     return { opened: "needs", id: null, expired: false };
   }
   if (Array.isArray(items) && !items.some((x) => String(x?.id ?? "") === targetId)) {
     setShared?.("rig.focusNeed", null);
-    setShared?.("rig.nav", navPush(nav, { section: "needs", expiredId: targetId, notice: "This request was already answered" }));
-    activateRigPage();
+    const entry={ section: "needs", expiredId: targetId, notice: "This request was already answered", ...(conn?{conn}:{}) };
+    setShared?.("rig.nav", navPush(nav, entry));
+    activateRigPage(entry);
     return { opened: "needs", id: targetId, expired: true };
   }
   const hit = Array.isArray(items) ? items.find((x) => String(x?.id ?? "") === targetId) : null;
   const name = hit?.summary ?? hit?.title ?? targetId;
   setShared?.("rig.open.page", { ...(shared?.("rig.open.page") ?? {}), [`needs:${targetId}`]: true });
   setShared?.("rig.focusNeed", targetId);
-  setShared?.("rig.nav", navPush(nav, { section: "needs", id: targetId, name }));
-  activateRigPage();
+  const owner=conn??hit?.conn;
+  const entry={ section: "needs", id: targetId, name, ...(owner?{conn:owner}:{}) };
+  setShared?.("rig.nav", navPush(nav, entry));
+  activateRigPage(entry);
   return { opened: "item", id: targetId, expired: false };
 }
 
@@ -3407,7 +3453,7 @@ export function operationId(qitemId, revision, payload, step = 1) {
 /** Shown when `POST /api/mission-control/action` returns HTTP 401. */
 export const DECISION_TOKEN_PROTECTED = "This OpenRig protects decisions with a token; answer in the TUI's Feed (rig) or with rig queue resolve.";
 
-/** "Your earlier part (1 of 3) was" / "Your earlier parts (1 and 2 of 3) were": names every part that was recorded, not only the last one's number (cold-review #22). */
+/** "Your earlier part (1 of 3) was" / "Your earlier parts (1 and 2 of 3) were": names every part that was recorded, not only the last one's number. */
 const earlierParts = (done, total) => done === 1 ? `Your earlier part (1 of ${total}) was` : `Your earlier parts (${done === 2 ? "1 and 2" : `1 to ${done}`} of ${total}) were`;
 /** A message with the parts recorded before the failing one named (nothing added when none was recorded). */
 const withEarlierParts = (message, done, total) => (done > 0 ? `${/[.!?]$/.test(message) ? message : `${message}.`} ${earlierParts(done, total)} recorded.` : message); // daemon text with no full stop ("HTTP 502", "boom") gets one, so the parts sentence stands alone
@@ -3531,7 +3577,7 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
 export async function submitMissionActions(config, item, act = {}, postOrOpts = {}) {
   // ONE operation for the whole answer, taken before the address is read: every POST of a multi-question answer is sent under the generation the first one began
   // with, so a settings change between two POSTs refuses the rest (a bare `gatedFetch` would start a new generation per request and send the second to the old daemon).
-  const op = gatedOperationOrRefusal();
+  const op = gatedOperationOrRefusal(config?.connectionId); // the answer's own connection (several OpenRigs: a bare operation refuses)
   let runReq;
   if (typeof postOrOpts?.post === "function") {
     runReq = (req) => postOrOpts.post(req.path, req.body, req.headers);
@@ -3935,14 +3981,21 @@ export function whoseQueueSummary(perspective, config = null, item = null) {
  * Resolve an `asker` (`<logicalId>@<rig>`) against the loaded `topology`.
  * Returns `{ found: true, seat }` or `{ found: false, message: "<asker> isn't in this OpenRig's loaded teams." }`.
  */
-export function resolveAskerSeat(asker, topology = []) {
+/** A rig by name or id within ONE connection (the page's, the one an action acts for): never the first match of another connection's rows. Rows that name no connection (one OpenRig) match any. */
+export const rigOfConnection = (topology, ref, conn = null) => (Array.isArray(topology) ? topology : []).find((r) => r && (r.name === ref || r.id === ref) && (!conn || !r.conn || r.conn === conn));
+
+export function resolveAskerSeat(asker, topology = [], conn = null) {
   const raw = String(asker ?? "").trim();
   if (!raw) return { found: false, message: "No asking seat recorded on this item." };
   const atIdx = raw.lastIndexOf("@");
   const wantLogical = atIdx > 0 ? raw.slice(0, atIdx).replace(/-/g, ".") : raw.replace(/-/g, ".");
   const wantRig = atIdx > 0 ? raw.slice(atIdx + 1) : null;
+  // The merged rows of several OpenRigs share names (every one has a `demo` and a kernel): a seat is looked up in the connection it is asked for, and a name two connections both hold with no
+  // connection named is refused, never taken from whichever comes first.
+  const hits = [];
   for (const rig of Array.isArray(topology) ? topology : []) {
     if (!rig || typeof rig !== "object") continue;
+    if (conn && rig.conn !== conn) continue;
     const rigMatch = !wantRig || rig.name === wantRig || rig.id === wantRig;
     const seats = Array.isArray(rig.seats)
       ? rig.seats
@@ -3953,13 +4006,13 @@ export function resolveAskerSeat(asker, topology = []) {
         s.session === raw ||
         (rigMatch && (s.logicalId === wantLogical || s.logicalId === raw || `${s.logicalId}@${rig.name}` === raw))
       ) {
-        return {
-          found: true,
-          seat: { ...s, rig: rig.name, rigId: rig.id, conn: rig.conn },
-        };
+        hits.push({ ...s, rig: rig.name, rigId: rig.id, conn: rig.conn });
+        break;
       }
     }
   }
+  if (new Set(hits.map((h) => h.conn ?? "")).size > 1) return { found: false, ambiguous: true, message: AMBIGUOUS_NAME };
+  if (hits.length) return { found: true, seat: hits[0] };
   return {
     found: false,
     message: `${raw} isn't in this OpenRig's loaded teams.`,
@@ -4298,7 +4351,7 @@ function routingNotReady(host, config) {
 export async function openOrFocusTui(host, config) {
   const loading = routingNotReady(host, config);
   if (loading) { (host?.notify)?.({ title: "OpenRig", body: loading, level: "warning" }); return { ok: false, reason: loading }; }
-  return routeRigOpen(host, config, { kind: "tui" });
+  return routeRigOpen(host, config, { kind: "tui", ...(config?.connectionId && (config.connections ?? []).length > 1 ? { conn: config.connectionId } : {}) }); // with several OpenRigs the request names the one it is for
 }
 
 /** The rig page's tabs (matching TUI `tab table | recent | overview | graph | health`). */
@@ -4658,9 +4711,14 @@ export function computePulseCounts(models, attentionItems = []) {
 export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], _allSeats = []) {
   if (!pulseFilter) return true;
   // Neutral lifecycle states have a home in Idle; their individual row marks stay unchanged.
-  if (seat.terminal || ["terminal", "detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
+  if (["detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
   const actionableNeeds = (Array.isArray(attentionItems) ? attentionItems : []).filter((i) => i && !i.update && i.kind !== "update");
   const rigName = rig?.name ?? rig?.id ?? "";
+  // A live terminal can own a human request even when its activity word is idle. Keep counts aligned with its row.
+  if(seat.terminal||seat.status==="terminal"){
+    const needs=isSeatNeedsYou({...seat,status:"terminal",word:"terminal"},rigName,actionableNeeds);
+    return pulseFilter==="needs"?needs:pulseFilter==="idle"&&!needs;
+  }
   if(pulseFilter==="unreported")return seat.status==="unknown"&&!matchesPulseFilter(seat,rig,"needs",attentionItems);
   if (pulseFilter === "working") {
     return !matchesPulseFilter(seat, rig, "needs", attentionItems) && !isPulseBlockedSeat(seat)
@@ -4965,6 +5023,8 @@ export function launchSpecArgs(source, folder, host) {
   return ["up", "--cwd", f, ...(h && h !== "local" ? ["--host", h] : []), "--yes", "--", s];
 }
 
+/** The Launch rig from spec dialog's height: the form and a two-line `rig up` path fit without scrolling. */
+export const LAUNCH_DIALOG_HEIGHT = 360;
 /** Why a spec source can't go to `rig up`, or null. The daemon names it, so only two shapes pass: a bare library name,
  *  or a plain absolute `.yaml` / `.yml` path with no `..` (which the daemon reads on its own machine). A GitHub link
  *  or a bundle would be downloaded or installed, and a relative path or anything starting with `-` misread. */
@@ -5362,6 +5422,19 @@ export function currentCapabilities(sharedOrData, terminals = [], measured = nul
   return base.herdrAppProvider && hasLiveSeat && !base.nativeSeats ? { ...base, nativeSeats: true } : base;
 }
 
+/** The capabilities of ONE connection's OpenRig. With several, its own measured flags (the sidebar's `rig.data.byConnection`) over its
+ *  configured ones, never the first connection's. `null` when that connection's OpenRig hasn't been read yet (no sidebar, or its first refresh
+ *  is still running): its flags are unknown, so a caller makes no early refusal and leaves the decision to the action's own dispatcher, which
+ *  judges that connection itself. With one connection, exactly as before. */
+export function connectionCapabilities(sharedFn, config, connId, terms = []) {
+  if ((config?.connections?.length ?? 0) > 1 && connId) {
+    const own = sharedFn("rig.data")?.byConnection?.[connId]?.capabilities;
+    if (!own) return null;
+    return currentCapabilities(configOfConnection(config, connId)?.capabilities ?? own, terms, own);
+  }
+  return currentCapabilities(config?.capabilities ?? sharedFn, terms, sharedFn("rig.capabilities"));
+}
+
 /**
  * Return the one-line disable reason for an action under `caps`, or `null` when the action is supported.
  * - Stock OpenRig (`herdrAppProvider === false`): disables `open-view`, `open-seat`, `follow`, `unfollow`, `prune`,
@@ -5694,6 +5767,7 @@ export function parseSidebarState(text) {
       }
     }
     const out = { open, order };
+    if(raw.sidebarViews&&typeof raw.sidebarViews==='object'&&!Array.isArray(raw.sidebarViews))out.sidebarViews=cleanSidebarViews(raw.sidebarViews);
     if (["priority", "rig"].includes(raw.topologyView)) out.topologyView = raw.topologyView;
     if (raw.notifiedNeeds && typeof raw.notifiedNeeds === "object") out.notifiedNeeds = raw.notifiedNeeds;
     if (typeof raw.lastSeenNeedsAt === "string" && raw.lastSeenNeedsAt) out.lastSeenNeedsAt = raw.lastSeenNeedsAt;
@@ -5707,7 +5781,7 @@ export function parseSidebarState(text) {
 }
 
 /** Serialize `{ open, order, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId }` into `<appHome>/openrig/state.json`, preserving any unrelated keys in `prevText`. */
-export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, notifiedNeeds } = {}) {
+export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, sidebarViews, notifiedNeeds } = {}) {
   let base = {};
   try {
     const parsed = JSON.parse(String(prevText ?? "{}"));
@@ -5728,6 +5802,7 @@ export function serializeSidebarState(prevText, { open = {}, order = {}, lastSee
     }
   }
   const next = { ...base, open: cleanOpen, order: cleanOrder };
+  if(sidebarViews!==undefined)next.sidebarViews=cleanSidebarViews(sidebarViews);
   if (["priority", "rig"].includes(topologyView)) next.topologyView = topologyView;
   if (notifiedNeeds !== undefined) next.notifiedNeeds = notifiedNeeds;
   if (lastSeenNeedsAt !== undefined) {
@@ -5957,6 +6032,29 @@ export function serverArgsRefusal(tmuxAttachCommand, session) {
   return "Refused: OpenRig's attach command for this seat isn't the plain tmux attach it writes.";
 }
 
+/**
+ * What makes two Attach viewers the same viewer: its program and relay payload, minus `initialState` (only the relay's
+ * first-paint activity). Local and remote Attach both compare this before reusing a tab: a tab kept
+ * open across an update runs the OLD relay (`hc run --bg --no-parent` outlives app and core restarts), and its payload
+ * differs from the current release's. Returns null for anything that isn't a relay argv, which never counts as stale.
+ * Portable base64/UTF-8 decode: the native mod runtime has neither Node's Buffer nor browser atob.
+ */
+export function relayIdentity(argv) {
+  if (!Array.isArray(argv) || argv.length !== 3 || !argv.every(v => typeof v === "string")
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(argv[2])) return null;
+  try {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let value = 0, bits = 0, escaped = "";
+    for (const ch of argv[2].replace(/=+$/, "")) {
+      value = (value << 6) | alphabet.indexOf(ch); bits += 6;
+      if (bits >= 8) { bits -= 8; escaped += "%" + ((value >>> bits) & 255).toString(16).padStart(2, "0"); }
+    }
+    const payload = JSON.parse(decodeURIComponent(escaped));
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+    return JSON.stringify([argv[0], argv[1], Object.keys(payload).filter(k => k !== "initialState").sort().map(k => [k, payload[k]])]);
+  } catch { return null; }
+}
+
 /** Where a mod folder's relay file is, for `node <path>`: `<appHome>/mods/<modId>/rig-attach-relay.cjs`. */
 export function attachRelayPath(appHomeDir, modId) {
   const home = String(appHomeDir ?? "");
@@ -6004,6 +6102,39 @@ export function buildAttachRelayArgv(config, seat = {}, relayPath = null) {
   return [nodeBin, relayPath, payload];
 }
 
+/** With several OpenRigs a seat NAME is not unique: an attach terminal that names another OpenRig's address is not this seat's. `origin`
+ * is undefined with one connection (nothing is filtered) and a value that matches no terminal for a connection that isn't listed. */
+const sameOrigin = (terminal, origin) => {
+  if (origin === undefined || origin === null) return true;
+  const label = terminal?.labels?.["herdr-openrig.origin"];
+  return !label || (rigOrigin(label) !== null && rigOrigin(label) === rigOrigin(origin));
+};
+export const SEAT_NAME_SHARED = "This seat name exists on more than one OpenRig; open it from its box.";
+/** Whether `session` is held by seats of more than one CONNECTION in a merged topology (rigs carry `conn`). */
+export function seatNameShared(topology, session) {
+  const conns = new Set();
+  for (const rig of topology ?? []) for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) if (seat.session === session) conns.add(rig.conn ?? null);
+  return conns.size > 1;
+}
+/** A native-placement seat terminal for `session` exists, can't be tied to this box (no origin label) and the name is shared: the caller refuses with SEAT_NAME_SHARED. */
+export function nativeSeatAmbiguous(terminals, session, meta = {}) {
+  if (!meta?.shared || meta.origin === undefined) return false;
+  const sess = String(session ?? "").trim(), at = sess.lastIndexOf("@"), logicalId = at > 0 ? sess.slice(0, at).replace(/-/g, ".") : sess, rig = at > 0 ? sess.slice(at + 1) : "";
+  return (Array.isArray(terminals) ? terminals : []).some((t) => t?.address && (t.state === undefined || t.state === "live" || t.state === "running") && t.labels?.["openrig.role"] === "seat"
+    && (t.labels?.["openrig.session"] === sess || t.labels?.["openrig.seat"] === sess || (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig))));
+}
+/** `session => boolean`: whether the name is held by more than one OpenRig. Only with several connections (undefined with one: nothing changes). */
+export function seatSharedOf(config, sharedFn) {
+  if (!Array.isArray(config?.connections) || config.connections.length < 2) return undefined;
+  return (session) => seatNameShared(sharedRigData(config, sharedFn)?.topology, session);
+}
+/** The origin to match a seat's panes against: the row's own connection, only when there are several. */
+export function seatOrigin(config, conn) {
+  if (!Array.isArray(config?.connections) || config.connections.length < 2) return undefined;
+  const own = configOfConnection(config, conn ?? undefined);
+  return own?.daemonUrl ?? "unknown:";
+}
+
 /**
  * Find an already-open Attach tab or native `herdr` seat terminal for `seatSession` in the active space (or across spaces).
  */
@@ -6018,8 +6149,10 @@ export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", 
   const pn = Array.isArray(panes) ? panes : [];
   const activeSpace = sp.find((s) => s?.active) ?? sp[0] ?? null;
   const activeTabs = new Set((activeSpace?.tabs ?? []).filter((t) => !t?.settled).map((t) => t?.id).filter(Boolean));
+  const origin = seatMeta?.origin;
   const candidates = tm.filter((t) => {
     if (!t?.address || (t.state !== undefined && t.state !== "live" && t.state !== "running")) return false;
+    if (!sameOrigin(t, origin)) return false;
     const isAttach = t.labels?.["herdr-openrig.role"] === "attach" && t.labels?.["herdr-openrig.attach"] === session;
     // Only OUR herdr-openrig.* labels count (rule Y, every caller: Attach reuse focuses the hit, needs-view's silent flag is set by it). A terminal labelled only in OpenRig's native namespace (openrig.role=seat,
     // openrig.seat, ...) carries nothing that names this daemon, and a same-named rig on another OpenRig has the same seat names, so it is never "this seat's terminal". Native seats are not released (v0.5.0: by openrig.node).
@@ -6052,6 +6185,18 @@ export function localDaemonOrigin(value) {
   if (host.startsWith("127.") && host.split(".").some((part) => Number(part) > 255 || String(Number(part)) !== part)) return "";
   if (port !== null && (port < 1 || port > 65535)) return "";
   return `${scheme}://${host}${port !== null && port !== (scheme === "https" ? 443 : 80) ? `:${port}` : ""}`;
+}
+
+/** True when two /healthz answers both report a process id and the ids differ: two daemons, whatever host id they share. */
+export const differentDaemons = (a, b) => Number.isInteger(a?.pid) && Number.isInteger(b?.pid) && a.pid !== b.pid;
+
+/** True when two /healthz answers that must come from ONE daemon on one machine do. The host id alone isn't enough: an id seeded from the
+ *  operator's host.name ("named") can be shared by two OpenRigs on that machine, so the process id must match too. Without both pids (an older
+ *  daemon), only ids that both report as "generated" are trusted. */
+export function sameDaemon(a, b) {
+  if (!a?.selfHostId || a.selfHostId !== b?.selfHostId) return false;
+  if (Number.isInteger(a.pid) && Number.isInteger(b.pid)) return !differentDaemons(a, b);
+  return a.selfHostIdSource === "generated" && b.selfHostIdSource === "generated";
 }
 
 /** True when `daemonUrl` is a local HTTP(S) origin (or absent, pending discovery). */
@@ -6087,6 +6232,7 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   const seat = { ...(isFirstHost ? second : first) };
   const refused = assistantActionRefusal(seat, 'attach');
   if (refused) return { ok: false, reason: refused };
+  if (crossesConnections(config, seat)) return { ok: false, reason: OTHER_CONNECTION_REFUSAL };
   const notReady = routingNotReady(host, config);
   if (notReady) return { ok: false, reason: notReady };
   if (!host.routeOwner && !host.prepareRemote && typeof host.layout === "function" && layoutHasMod(host.layout(), MOD_IDS.sidebar)) {
@@ -6104,6 +6250,11 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
 
 async function attachSeatOnce(host, seat, config, options) {
   if (config?.daemonMachine !== undefined && config.daemonMachine !== "") return attachRemoteSeat(host, seat, config, options);
+  // Pass the host identity like the grid does (rig-spaces.js's own daemonHostId): without it, a space vouched for
+  // only by its host stamp (a foreign-origin space on the SAME local machine, from a second OpenRig daemon) can
+  // never be told apart from one that is genuinely ours at a new address, so local Attach was stuck always asking
+  // instead of safely building its own space beside a confirmed-foreign one.
+  const hostId = typeof host?.selfHostId === "function" ? host.selfHostId() : host?.selfHostId;
   const session = String(seat?.session ?? seat?.canonicalSessionName ?? "").trim();
   const logicalId = String(seat?.logicalId ?? seat?.name ?? (session.includes("@") ? session.split("@")[0].replace(/-/g, ".") : session) ?? "seat");
   const rigName = String(seat?.rig ?? (session.includes("@") ? session.slice(session.lastIndexOf("@") + 1) : ""));
@@ -6120,20 +6271,81 @@ async function attachSeatOnce(host, seat, config, options) {
       : key === "terminals" ? !String(item.address ?? "").includes("/")
         && (!item.labels?.["herdr-openrig.origin"] || rigOrigin(effectiveDaemonUrl)!==null&&rigOrigin(item.labels["herdr-openrig.origin"])===rigOrigin(effectiveDaemonUrl))
       : !String(item.terminal ?? "").includes("/"));
-  const sp = live("spaces"), pn = live("panes"), tm = live("terminals");
+  let sp = live("spaces"), pn = live("panes"), tm = live("terminals");
+  // The viewer this Attach would run right now: `attachSeatOnce`'s discovery can happen BEFORE this point
+  // (the early reuse checks above run on the terminals known when the call started), so a tab kept open across an update
+  // runs the old relay. Its identity is compared like remote Attach compares it; a difference is never a silent reuse.
+  const currentViewerArgv = (() => {
+    try {
+      if (!effectiveDaemonUrl) return null;
+      return buildAttachRelayArgv({ ...config, daemonUrl: localDaemonOrigin(effectiveDaemonUrl) }, { ...seat, session, logicalId, rig: rigName }, host.relayPath ?? options?.relayPath ?? null);
+    } catch (_) { return null; }
+  })();
+  /** A same-session Attach viewer whose relay differs from `expectedArgv`: the old viewer of a pre-update tab (or of
+   *  another mod folder's relay). Native seat terminals are not viewers and never count. */
+  const staleViewerOf = (found, expectedArgv) => {
+    if (!found || found.role !== "attach" || !expectedArgv) return null;
+    const record = tm.find((t) => t.address === found.terminal);
+    const known = relayIdentity(record?.argv);
+    return known !== null && known !== relayIdentity(expectedArgv) ? found : null;
+  };
+  /** The person's replace: stop that viewer and close its tab — only on their click — then Attach
+   *  starts a fresh one below. Never closes a tab the person didn't ask to close: this runs solely from the offer's button. */
+  const replaceStaleViewer = async (stale) => {
+    // A refused or failed kill stops nothing further: closing the tab would leave the person with no viewer at all and
+    // the fresh start would run beside a viewer still holding the seat.
+    if (stale?.terminal) {
+      const killed = await Promise.resolve(host.hc(["kill", "--", stale.terminal]));
+      if (killed && killed.code !== undefined && killed.code !== 0) return { ok: false, reason: `The older viewer could not be stopped, so nothing was changed.` };
+    }
+    // A kill of the relay often closes the seat's tab with it. Closing a tab that is already gone errors in herdr's own
+    // toast ("tab.close failed · no tab …") after a replace that actually succeeded, so look first: the tab is closed
+    // only while it is still there. (A close that fails for any other reason is still reported: the check is the tab's
+    // existence, not a swallowed error.)
+    const spacesNow = (typeof host.spaces === "function" ? host.spaces() : sp) ?? [];
+    if (stale?.tab && spacesNow.some((s) => (s.tabs ?? []).some((t) => t.id === stale.tab))) host.run?.("tab.close", { id: stale.tab, confirmed: true });
+    return { ok: true, replaced: true };
+  };
+  const staleViewerOffer = (stale) => ({ ok: false, needsViewerRefresh: true,
+    reason: `The Attach tab for ${logicalId} is running an older viewer, from before an update. Attach offers to replace it.`,
+    staleViewer: { terminal: stale.terminal, tab: stale.tab } });
+  /** The person-approved replacement, stopped just before the fresh relay starts: never before, so a late failure leaves
+   *  the old viewer running and never without a fresh start, so nothing is closed unasked. */
+  let pendingReplace = null;
+  // Set once the person's click has actually stopped the old viewer and closed its tab: the failure messages below must
+  // say so, because the generic line reads as if nothing happened. The single source of truth is
+  // replaceStaleViewer's own return (no second state variable to drift).
+  let replaced = null;
+  // ONE operation for the whole flow: the discovery (its own exec is judged after the send), the space marking (markRigSpace awaits) and the relay start all belong to the settings this
+  // Attach began under. The last look is right before the relay starts, so a change anywhere in between refuses instead of starting it with the old home and address; with no change it is silent.
+  const op = gatedOperationOrRefusal(config?.connectionId);
+  const stale = () => { if (op.since < 0) return null; /* no operation (config not loaded, or no connection named): the gate refuses every gated send itself */ try { op.check(); return null; } catch (error) { return { ok: false, disabled: true, reason: String(error?.message ?? error) }; } };
+
+  const adoptionNames=[rigName,seat.rigId],adoptionRig=topologyRig(host,adoptionNames,config);
+  const adoption=await prepareRigSpaceAdoption(host,config,adoptionNames,{sessions:rigSessions(adoptionRig),servers:rigSeatServers(adoptionRig)});
+  if(!adoption.ok)return adoption;
+  if(adoption.host){host=adoption.host;sp=live("spaces");pn=live("panes");tm=live("terminals");}
 
   const reuse = async (existing) => {
-    const destination=resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true});
-    if(destination?.tabs?.some(tab=>tab.id===existing.tab)){
-      try{await markRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],destination);}
+    const destination=resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true,hostId});
+    if(!adoption.space&&destination?.tabs?.some(tab=>tab.id===existing.tab)){
+      try{await markRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],destination,{hostId});}
       catch(error){return{ok:false,reason:String(error?.message??error)};}
     }
     if (existing.tab) host.run?.("tab.select", { id: existing.tab });
     host.run?.("pane.focus", { terminal: existing.terminal });
     return { ok: true, reused: true, ...existing };
   };
-  const existing = findAttachedSeat(tm, sp, session, pn, { logicalId, rig: rigName });
-  if (existing) return reuse(existing);
+  const meta = { logicalId, rig: rigName, ...(typeof host.seatShared === "function" ? { origin: effectiveDaemonUrl ?? "unknown:", shared: host.seatShared(session) === true } : {}) };
+  if (nativeSeatAmbiguous(tm, session, meta)) return { ok: false, reason: SEAT_NAME_SHARED }; // a native seat can't be tied to its box and the name is on several: open nothing
+  const existing = findAttachedSeat(tm, sp, session, pn, meta);
+  if (existing) {
+    const staleViewer = staleViewerOf(existing, currentViewerArgv);
+    if (staleViewer) {
+      if (!options.replaceViewer) return staleViewerOffer(staleViewer);
+      pendingReplace = staleViewer; // the person approved it: it is stopped just before the fresh start below
+    } else return reuse(existing);
+  }
 
   const isRunning = Boolean(
     seat?.sessionAlive ||
@@ -6171,16 +6383,22 @@ async function attachSeatOnce(host, seat, config, options) {
     return { ok: false, disabled: true, reason: String(e?.message ?? e) };
   }
   const appeared = findAttachedSeat(live("terminals"), live("spaces"), session, live("panes"), { logicalId, rig: rigName });
-  if (appeared) return reuse(appeared);
+  if (appeared) {
+    const staleViewer = staleViewerOf(appeared, argv);
+    if (staleViewer) {
+      if (!options.replaceViewer) return staleViewerOffer(staleViewer);
+      pendingReplace = staleViewer; // the person approved it: it is stopped just before the fresh start below
+    } else return reuse(appeared);
+  }
   if (typeof host.hc !== "function") return { ok: false, reason: "Attach needs Herdr's labelled terminal start. Open the Rig sidebar and try again; no terminal was started." };
-  const rigSpace = resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true});
-  if(rigSpace){
-    try{await markRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],rigSpace);}
+  const rigSpace = adoption.space??resolveRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true,hostId});
+  if(rigSpace&&!adoption.space){
+    try{await markRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],rigSpace,{hostId});}
     catch(error){return{ok:false,reason:String(error?.message??error)};}
   }
   if(!rigSpace){
     // Several page-only spaces of this rig: Attach asks instead of building a second one (or guessing which).
-    const other=unconfirmedRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true});
+    const other=unconfirmedRigSpace(host,{...config,daemonUrl:effectiveDaemonUrl},[rigName,seat.rigId],{strictOrigin:true,hostId});
     if(other)return{ok:false,unconfirmedSpace:true,reason:unconfirmedSpaceReason(rigName,null,other.origin??null,effectiveDaemonUrl,other)};
   }
   const newRigSpace = !rigSpace;
@@ -6202,9 +6420,21 @@ async function attachSeatOnce(host, seat, config, options) {
       "--",
       ...argv,
     ];
+    const changedBeforeStart = stale(); if (changedBeforeStart) return changedBeforeStart; // the last look before the relay starts
+    if (pendingReplace) { const done = await replaceStaleViewer(pendingReplace); if (!done?.ok) return { ok: false, reason: "The old Attach viewer could not be stopped, so nothing was changed." }; replaced = done; }
+    // Once the person's click has stopped the old viewer and closed its tab, a failure in the fresh
+    // start must say so — the generic line reads as if nothing happened. Only when `replaced` is set (carry
+    // replaceStaleViewer's own return; no second source of truth).
+    const afterReplace = (reason) => replaced ? `The older viewer was stopped and its tab closed for this Attach, and the new one could not be confirmed. ${reason} Open Attach again.` : reason;
     let started = null;
     try { started = await Promise.resolve(host.hc(hcArgs)); }
-    catch (error) { if (error?.code === "GATE_REFUSED") return { ok: false, reason: error.message }; started = null; } // the gate's sentence, not a generic failure
+    catch (error) {
+      if (error?.code === "GATE_REFUSED") {
+        // The gate's sentence, not a generic failure. A refusal raised AFTER the relay start was dispatched (its answer came under settings that are gone) does not mean nothing started.
+        return { ok: false, reason: error.dispatched === true ? `${String(error.message).trimEnd()} A viewer may already have started: check Herdr's tabs before opening it again.` : afterReplace(error.message), ...(error.dispatched === true ? { unconfirmed: true } : {}) };
+      }
+      started = null;
+    }
     let address = null;
     try { address = JSON.parse(started?.stdout ?? "null")?.address ?? null; } catch (_) { address = null; }
     if (address && !String(address).includes("/") && (started?.code === undefined || started.code === 0)) {
@@ -6224,7 +6454,7 @@ async function attachSeatOnce(host, seat, config, options) {
       return { ok: true, reused: false, terminal: address, tab };
     }
   }
-  return { ok: false, reason: "Herdr could not confirm a labelled local Attach terminal. No fallback tab was opened; check the local core and try again." };
+  return { ok: false, reason: replaced ? `The older viewer was stopped and its tab closed for this Attach, and the new one could not be confirmed. Herdr could not confirm a labelled local Attach terminal. Open Attach again.` : "Herdr could not confirm a labelled local Attach terminal. No fallback tab was opened; check the local core and try again." };
 }
 
 /**
@@ -6232,7 +6462,7 @@ async function attachSeatOnce(host, seat, config, options) {
  * Returns `{ items, openCount, savedCount }` where `items` contains:
  * 1. Open/following worker views for `rig` (`kind: "open-view"`, `id`, `name`, `following`, `cellCount`, `rig`),
  * 2. Saved views for `rig` from `/api/terminal/views` not currently open (`kind: "saved-view"`, `id`, `name`, `rig`, `grid`),
- * 3. Always ends with `{ kind: "new-view", id: "+new-view:<rigName>", name: "+ New worker view…", rig: rig.name, rigId: rig.id, conn: rig.conn }`.
+ * 3. Always ends with `{ kind: "new-view", id: "+new-view:<rigName>", name: "+ New worker view…", rig: rig.name, rigId: rig.id }`.
  */
 export function rigViewsBranch(rig, stripProps = null, terminalViewsData = null) {
   const rigName = String(rig?.name ?? rig?.id ?? "");

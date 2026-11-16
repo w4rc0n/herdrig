@@ -1,7 +1,9 @@
 import {rigOrigin} from "./rig-space-context.js";
-import { stampConnection, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID } from "./rig-connections.js";
+import { followedConnection, spaceMachine } from "./rig-follow.js";
+import { stampConnection, adoptConnection, connectionConfig, configOfConnection, targetConnection, UNKNOWN_CONNECTION, consentOf, consentText, LEGACY_CONNECTION_ID, connectionBoxLabel } from "./rig-connections.js";
 import {workerViewDetails,workerMissingReason} from "./rig-worker-views.js";
 import { machineSetupReceiptLabel } from "./rig-machine-setup.js";
+import { connectionBlocks } from "./rig-connections-view.js";
 import { effectiveScopeProject } from './rig-project.js';
 import { workflowPath,workflowView } from './rig-workflow.js';
 import { WorkflowPanel } from './rig-workflow-view.js';
@@ -20,30 +22,36 @@ import { formatAbsoluteTime, timezoneValue } from './rig-time.js';
 // Resolve, Ctrl+Enter); the item page shows the same. Drafts are rig-menu's (`shared("rig.drafts")`, draftKey).
 import { View, div, svg } from "gpui-kit";
 import { sharedLoopbackDaemonUrl, sharedRigData, stampRows, rowsIdentityOf } from "./rig-lib.js";
-import { relativeTimeText, specRealpathAvailable } from "./rig-lib.js";
+import { relativeTimeText, specRealpathAvailable, sameDaemon, listAddedMachine } from "./rig-lib.js";
 
 import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, healthScopeTarget, healthQueueId, healthAge, validHealthQitemId, healthContextPercentage, classifyHealth, mergeHealthHistory } from "./rig-health.js";
 
 import { filterAttentionHealth, isHealthAttention } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
 import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay as rawOpenOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal, numberedConfigReads } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
-const fetch = gatedFetch;
+// A read for one connection names that connection: with several, the gate refuses a bare request (it never defaults to the first OpenRig).
+const fetchFor = (config) => (url, init) => gatedFetch(url, init, undefined, config?.connectionId);
+// ONE counter for every page of this mod copy, like the gate it feeds (rig-gate.js is one per mod copy): a counter per page would let one page's older read re-open a connection another page's newer read removed.
+const configReads = numberedConfigReads();
 const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
 const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
 const run = (name, args) => gatedRun(rawRun, name, args);
+// A send for a CONNECTION names its gate scope (several OpenRigs: a bare sink refuses). `config` is that connection's own config: a page acts for the connection it shows.
+const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId);
+const hcFor = (config) => (args, bytes) => gatedHc(rawHc, args, bytes, undefined, config?.connectionId);
+const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.connectionId);
 
-import { guardFlatStore } from "./rig-connections.js";
-let flatOwner = null; // the view whose connection is writing: the flat stores accept only the legacy connection (PR 1)
-const setShared = guardFlatStore(rawSetShared, () => flatOwner?.config?.connectionId);
+let flatOwner = null; // the view this mod copy is acting for
+const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
   configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, cliRefusal, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
   STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount,
+  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount,
   tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, attachRelayPath, waitWith,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
@@ -76,9 +84,17 @@ const STACK = "rig-work", PAGE = "rig-page";
 const CONFIG = () => `${appHome()}/openrig/config.json`;
 
 const nav = () => shared("rig.nav") ?? { stack: [] };
-function push(entry) {
+// With several OpenRigs each Rig tab shows only its OWN connection's pages (see RigView.shownEntry). A link clicked on a page belongs to the page
+// that tab shows (`from`, the clicking view's own shown entry, via RigView.push), which may not be the shared stack's top.
+function push(entry, from = null) {
+  const shownTop = () => from ?? nav().stack?.at(-1);
   // One-way sync (Sidebar → Page, never Page → Sidebar). In-Page navigation only updates `shared("rig.nav")`
   // and never mutates the sidebar's `shared("rig.sel")`, `shared("rig.open.page")`, or `shared("rig.order")`.
+  // v0.5.0: a link on a page belongs to that page's OpenRig. An entry that names no connection inherits the shown page's; one that names its own
+  // keeps it. The Needs page lists every box, so it lends none (its links name the need's own). With one connection no page carries a `conn`, so
+  // nothing is added and the entry stays byte-identical.
+  const shownConn = shownTop()?.conn;
+  if (entry && typeof entry === "object" && !("conn" in entry) && shownConn && shownTop()?.section !== "needs") entry = { ...entry, conn: shownConn };
   if (entry && "focusRig" in entry) setShared("rig.focusRig", entry.focusRig ?? null);
   else if (shared("rig.focusRig")) setShared("rig.focusRig", null);
   setShared("rig.nav", navPush(nav(), entry));
@@ -124,6 +140,7 @@ const toggleOpen = (key, now, seats) => setShared("rig.open.page", seats ? foldC
 const setOpen = (key, open) => setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [key]: open });
 /** Remote drafts belong to a connection and spec, never another daemon with the same path-derived id. */
 const specDraftKey = (id, config) => {
+  if (config === null) return `spec:no-connection:${id}`; // the page's connection is no longer set up: never another connection's key
   // The legacy connection's keys are the old ones (stored drafts stay found); another connection's carry its id.
   const own = config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID ? `${config.connectionId}:` : "";
   return config?.daemonMachine ? `remote-spec:${own}${encodeURIComponent(config.daemonUrl??"")}:${encodeURIComponent(config.daemonMachine)}:${id}` : `spec:${own}${id}`;
@@ -138,26 +155,30 @@ const inRigLayout = () => !!(function find(n) {
 })(layout());
 const usd = (v) => typeof v === "number" ? `$${v.toFixed(2)}` : "—";
 
-import {rigSpecLibraryPath} from "./rig-lib.js";
+import {rigSpecLibraryPath, LAUNCH_DIALOG_HEIGHT} from "./rig-lib.js";
 import {StatusMotion} from "./rig-status-motion.js";
 export default class RigView extends View {
   // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
   get config() { return this._config; }
   set config(value) { this._config = value; observeConfig(value); }
   /** Every overlay this instance opens is stamped with ITS OWN config (its rows were read under it), never the latest instance's. */
-  open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config))); }
+  open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config, spec?.props?.target?.conn))); }
   menu(target) { return this.open({ mod: MOD_IDS.menu, kind: "popup", width: 280, height: 320, props: { target } }); }
   oneClick(target, action, actionKey = null) { return startOneClick({ shared, setShared, run, layout, openOverlay: (spec) => this.open(spec) }, target, action, actionKey); }
   palette(initial) { this.configPanel?.clearSelection();return this.open({ mod: MOD_IDS.palette, kind: "dialog", width: 560, height: 360, props: { initial } }); }
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
-    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
+    registerRigRouting(cx, context => ({ shared, setShared, run, spaces, panes, terminals, hc, layout, notify, openOverlay:spec=>this.open(spec),config: this.config, currentConfig: () => this.config, wait: waitWith(context) }));
     this.statusMotion = new StatusMotion();
     this.pageViewMemory = {}; // Session only; never persisted with folds or navigation.
     this.pulseFilter = null; // Page-session only: never restore the legacy persisted shared filter.
     this.initialEntry = p?.entry ?? null;
+    // The space this tab lives in. Herdrig names it in the tab's props when it makes the tab (`space`), and Herdr restores a tab with its
+    // props, so it holds after a restart. A tab made before that has no `space`: it takes the active space when it is DRAWN (render), never
+    // only at init, because after a restart Herdr makes every restored tab's view while some other space is active.
+    this.propsSpaceId = typeof p?.space === "string" && p.space ? p.space : null;
+    try { this.ownSpace = this.propsSpaceId ? null : (spaces?.() ?? []).find((s) => s?.active) ?? null; } catch (_) { this.ownSpace = null; }
     this.config = null;
-    flatOwner = this;
     this.resetNowTails(cx);
     this.cache = {}; // path → { data, error, at }
     this.files = {}; // file path → { state, error, text }
@@ -210,7 +231,7 @@ export default class RigView extends View {
         const c = await nextCommand();
         if (c === "focus") this.handle.focus();
         else if (c === "back") this.back();
-        else if (c.startsWith("open:")) push({ section: c.slice(5) });
+        else if (c.startsWith("open:")) this.push({ section: c.slice(5) });
         cx.notify();
       }
     });
@@ -270,31 +291,49 @@ export default class RigView extends View {
 
   loadConfig(cx) {
     cx.spawn(async (cx) => {
-      // Loads run concurrently (the watcher, the timers): a load that was overtaken by a newer one must not install its older config, or it would reopen the
-      // send gate after the newer load closed it.
+      // Loads run concurrently (the watcher, the timers). The mod-wide numberedConfigReads
+      // returns the newest installed config; a newer read that throws cannot drop an older successful one.
+      // `loadSeq` still numbers by START and guards only the spec-folder publish below (a separate concern: the newest started load publishes its folders).
       const seq = this.loadSeq = (this.loadSeq ?? 0) + 1;
-      const next = preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())), this.config);
+      let mine = null;
+      const installed = await configReads(async () => (mine = preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())), this.config)));
+      // A newer read (this page's or another page's) installed while this one was reading: the page takes THAT config (what the file says now), never its own older one.
+      const next = this.latestRead = installed === mine ? mine : preserveCliDiscoveredConfig(installed, this.config);
+      const needsFolders=!sameConfig(next,this.config)||this.specFoldersReady===false;
+      if(needsFolders){
+        if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine || next.connectionId !== this.config.connectionId)) {
+          this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx);
+          for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
+          this.specBoxes={};
+        }
+        // Publish before the consent await: otherwise each one-second missing-config retry
+        // can overtake a valid initial load and leave the page on Reading forever.
+        this.config=next;
+        this.specFoldersReady=false;
+        this.specConsentMachine=null;
+        cx.notify();
+      }
       let consentMachine = null;
       try{
         const saved=consentOf(await readTextFile(`${appHome()}/openrig/spec-consent.json`),this.config?.connectionId??LEGACY_CONNECTION_ID),key=JSON.parse(saved?.key??"null");
         consentMachine=key?.sha256===SPEC_SHA256?key.machine:null;
       }catch{consentMachine=null;}
-      if (seq !== this.loadSeq) return; // a newer load has started: it installs its own
+      if (this.latestRead !== next) return; // a newer read installed while the consent file was read: it sets its own config
       this.specConsentMachine=consentMachine;
-      // The same config returns early only once ITS folders are published: an overtaken load that was still resolving them leaves it to the next one.
-      if (sameConfig(next, this.config) && this.specFoldersReady !== false) return;
-      if (this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine || next.connectionId !== this.config.connectionId)) {
-        this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx); // reads still in flight belong to the old daemon (or the old connection at the same address)
-        for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
-        this.specBoxes={};
-      }
-      this.config = next;
-      this.specFoldersReady = false;
-      // The spec editor's folders, from local facts only (never the daemon's list).
-      if(!next.daemonMachine){
-        const roots = await localSpecRoots(next, exec, home());
+      // Only the newest load publishes consent/folders; an identical retry still
+      // finishes folders when the prior load was overtaken during those checks.
+      if (!needsFolders) return;
+      // The spec editor's folders, from local facts only (never the daemon's list). The AUTHORITY is
+      // per-connection and per-use (specRootsFor), so a page opened after a load that resolved for another machine's page still gets its own
+      // folders. This warm for the page shown now is a head start only, and it publishes under the same "overtaken" rule as the rest of the
+      // load (the newest load wins).
+      const pageCfg = this.activeConfig();
+      if(pageCfg && !pageCfg.daemonMachine) {
+        // Resolved here for the page shown NOW and published under the load's own overtaken rule; specRootsFor is the same call for a page
+        // that needs folders later, so a tab whose first load ran on another machine's page is not left without them.
+        const warmed = await localSpecRoots(pageCfg, execFor(pageCfg), home());
         if (seq !== this.loadSeq) return; // overtaken while resolving the folders: the newer load publishes its own
-        this.specRoots = roots;
+        this.specRoots = warmed; this.specRootsConn = pageCfg.connectionId ?? LEGACY_CONNECTION_ID; this.specRootsPublished = warmed;
       }
       const realpathAvailable = await specRealpathAvailable(exec);
       if (seq !== this.loadSeq) return; // overtaken while checking realpath
@@ -304,22 +343,26 @@ export default class RigView extends View {
     });
   }
 
-  hostWorkerEntry(view){
-    const entry=Object.values(shared("rig.workerViews")??{}).find(e=>e.view===view&&e.config?.daemonMachine===this.config?.daemonMachine
-      &&rigOrigin(e.config?.daemonUrl)===rigOrigin(this.config?.daemonUrl));
+  // A worker view is its own connection's: matched by that connection's machine, origin and id (the legacy entry carries no id).
+  hostWorkerEntry(view,cfg=this.activeConfig()){
+    const entry=cfg&&Object.values(shared("rig.workerViews")??{}).find(e=>e.view===view&&e.config?.daemonMachine===cfg.daemonMachine
+      &&rigOrigin(e.config?.daemonUrl)===rigOrigin(cfg.daemonUrl)&&(e.config?.connectionId??LEGACY_CONNECTION_ID)===(cfg.connectionId??LEGACY_CONNECTION_ID));
     return entry&&entry.pages?.some(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)))?entry:null;
   }
   hostWorkerLine(t,rig,view=`rig:${rig.name}`){
+    // The ROW's connection (another box's rig shows its own view, never the first connection's); a connection no longer set up shows none.
+    const cfg=rig?.conn?configOfConnection(this.config,rig.conn):this.activeConfig();if(!cfg)return null;
     const progress=shared("rig.workerProgress");
-    if(progress?.view===view&&progress.machine===this.config?.daemonMachine
-      &&rigOrigin(progress.daemonUrl)===rigOrigin(this.config?.daemonUrl))
+    if(progress?.view===view&&progress.machine===cfg.daemonMachine
+      &&rigOrigin(progress.daemonUrl)===rigOrigin(cfg.daemonUrl))
       return div().id(`host-worker-progress-${rig.id}`).text_size(11.5).text_color(t.muted)
-        .child(`Updating ${view.startsWith("rig:")?`Workers · ${view.slice(4)}`:this.hostWorkerEntry(view)?.name??"worker view"}…`);
-    const entry=this.hostWorkerEntry(view);if(!entry)return null;
+        .child(`Updating ${view.startsWith("rig:")?`Workers · ${view.slice(4)}`:this.hostWorkerEntry(view,cfg)?.name??"worker view"}…`);
+    const entry=this.hostWorkerEntry(view,cfg);if(!entry)return null;
     const pages=entry.pages.filter(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)));
+    const where=(this.config?.connections?.length??0)>1&&cfg.daemonMachine?` Tiles run on ${cfg.daemonMachine}.`:""; // with several OpenRigs, which machine
     const details=workerViewDetails(entry);
     const missing=entry.missing?.map(m=>`${m.label} (${workerMissingReason(m.reason)})`).join(", ");
-    const message=`Worker view open here: ${pages.length} page${pages.length===1?"":"s"}.${details?` ${details}.`:""}${missing?` ${entry.missing.length} seat${entry.missing.length===1?"":"s"} not shown: ${missing}.`:""}`;
+    const message=`Worker view open here: ${pages.length} page${pages.length===1?"":"s"}.${details?` ${details}.`:""}${missing?` ${entry.missing.length} seat${entry.missing.length===1?"":"s"} not shown: ${missing}.`:""}${where}`;
     return v_flex().id(`host-worker-${rig.id}`).gap(4)
       .child(div().text_size(11.5).text_color(t.dim).child(message))
       .when(!!entry.paused,el=>el.child(div().text_size(11.5).text_color(t.working??t.muted).child("Couldn't refresh this view; tiles kept.")
@@ -329,18 +372,41 @@ export default class RigView extends View {
       .child(div().text_size(11.5).text_color(t.accent).cursor_pointer().child(`herdrig prune: ${entry.pruneMs?Math.round(entry.pruneMs/60000)+"m":"off"}…`)
         .on_click(()=>this.menu({kind:"following",target:entry.view,name:entry.name,rig:rig.name,rigId:rig.id,conn:rig.conn,enabled:entry.following,pruneAfterMs:entry.pruneMs||null})));
   }
-  caps() { return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities")); }
+  caps() {
+    if ((this.config?.connections ?? []).length > 1) {
+      const own = shared("rig.data")?.byConnection?.[this.activeConnId()]?.capabilities;
+      return currentCapabilities(this.activeConfig()?.capabilities ?? own ?? {}, terminals?.() ?? [], own ?? {herdrAppAvailable:null});
+    }
+    return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities"));
+  }
 
   /** Open or switch to the active space's TUI. The Rig sidebar does it (`rig.tui`), as the menu does: it outlives
    *  this page. Without it in the layout, a task of this view's own does, its own cx pacing the wait for a new tab:
    *  the click's cx is stale after the first await. */
   tui(cx) {
-    if (layoutHasMod(layout(), MOD_IDS.sidebar)) return run("rig.tui");
-    const config = this.config, rigLayout = inRigLayout();
+    // With several OpenRigs the sidebar's own command opens the box IT shows; a page belongs to the box it was opened for, so it asks for its own (the request names the connection).
+    if (layoutHasMod(layout(), MOD_IDS.sidebar) && !((this.config?.connections ?? []).length > 1)) return run("rig.tui");
+    const config = this.activeConfig(), rigLayout = inRigLayout(); // the connection the page shows; none when it is no longer set up
+    if (!config) { notify({ title: "Open TUI", body: UNKNOWN_CONNECTION, level: "warning" }); return; } // never another connection's TUI
     cx.spawn(async (cx) => {
-      const result = await openOrFocusTui({ spaces, panes, terminals, hc, run, layout, inRigLayout: rigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout: rigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
       if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
     });
+  }
+
+  /** Attach to a seat through the seat's OWN connection (its address, its home, its gate scope), never the page's first one. An older row with no connection is the only one's; with several it is refused. */
+  async attachTarget(cx, target) {
+    const found = targetConnection(this.config, { conn: adoptConnection(this.config, target?.conn) });
+    if (!found.ok) return { ok: false, reason: found.reason };
+    const config = found.config;
+    return attachToSeat({ exec: execFor(config), run: runFor(config), hc: hcFor(config), spaces, panes, terminals, layout, shared, setShared, openOverlay:spec=>this.open(spec), currentConfig:()=>this.config, seatShared: seatSharedOf(this.config, shared), wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, target, config);
+  }
+
+  /** An Attach tab from before an update runs an older viewer. The dialog's confirm re-runs Attach with
+   *  the replace; nothing stops or closes the old viewer before the person clicks. */
+  reviewViewerReplace(result, target) {
+    this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 320,
+      props: { target, step: { action: "replace-viewer", staleViewer: result?.staleViewer ?? null } } });
   }
 
   /** Back to where `backTarget` says; with nowhere to go it does nothing (Esc and × close the page). */
@@ -351,16 +417,20 @@ export default class RigView extends View {
 
   /** The section switch: a section pushes onto the nav stack, so Back returns. */
   goSection(section) {
-    push({ section });
+    this.push({ section });
   }
 
   navigationMenu(choices, title = "Sections") {
+    // The popup has its own runtime: carry this page's connection in each destination instead of relying on the shared nav stack.
+    const conn=(this.config?.connections?.length??0)>1?this.activeConnId():null;
+    if(conn)choices=choices.map(choice=>choice.entry&&!('conn' in choice.entry)?{...choice,entry:{...choice.entry,conn}}:choice);
     this.open({ mod: MOD_IDS.menu, kind: "popup", width: 260, height: Math.min(360, 42 + choices.length * 30),
       props: { target: { kind: "page-navigation", name: title, choices } } });
   }
 
   sectionMenu() {
-    const data = sharedRigData(this.config, shared) ?? {}, topology = data.topology ?? [];
+    const published=sharedRigData(this.config, shared);
+    const data = ((this.config?.connections?.length??0)>1?published?.byConnection?.[this.activeConnId()]:published) ?? {}, topology = data.topology ?? [];
     const items = data.attentionItems ?? this.cache?.["/api/attention"]?.data?.items ?? [];
     const health=data.health?.records??this.cache?.["/api/health"]?.data?.records;
     this.navigationMenu(pageSectionChoices({ topology: `${topology.length} rigs`, specs: data.specs?.length??this.cache?.["/api/specs/library"]?.data?.length,
@@ -374,7 +444,7 @@ export default class RigView extends View {
     const options = pageViewOptions(entry, spec, {...counts,...this.workflowCounts});
     if (!options.length) return null;
     const { tabs, more } = visiblePageTabs(options, this.pageWidth ?? 960);
-    const choose = view => push(entryWithPageView(entry, view));
+    const choose = view => this.push(entryWithPageView(entry, view));
     const keyChoose=(e,cx,act)=>{if(e.key==="enter"){cx.stop_propagation();act();}};
     const bar=h_flex().id(`${prefix}-object-tabs`).px(14).gap(16).h(34).items_center().border_b(1).border_color(t.border).flex_none()
       .when((this.pageWidth??960)<320,el=>el.h(68).flex_wrap().gap(8))
@@ -392,14 +462,119 @@ export default class RigView extends View {
       bar.child(div().flex_1());
       if((this.pageWidth??960)-28<460)bar.child(this.moreButton(t,'all-seats-order-menu',()=>this.navigationMenu(choices,'Seat order')));
       else bar.child(h_flex().id('all-seats-order').gap(8).items_center().children(choices.map(({label,entry:e})=>div().id(`all-seats-order-${e.seatsOrder}`)
-        .text_size(12).text_color((this.allSeatsOrder??'rig')===e.seatsOrder?t.foreground:t.muted).cursor_pointer().on_click(()=>push(e)).child(label))));
+        .text_size(12).text_color((this.allSeatsOrder??'rig')===e.seatsOrder?t.foreground:t.muted).cursor_pointer().on_click(()=>this.push(e)).child(label))));
     }
     return bar;
   }
 
-  async resolveDaemonUrl() {
+  /** The connection the page is showing: the shown entry's own `conn` (a request's, from the merged Needs; an older entry with none reads as the
+   *  only connection), else the first. Overview pages have none and show the first connection. */
+  /** This tab's own OpenRig, from the entry it was opened with (Herdr restores a tab with its props). Only with several connections: one
+   *  connection's page is exactly as before. */
+  ownConn() {
+    if ((this.config?.connections?.length ?? 0) <= 1) return null;
+    return this.spaceConn() ?? this.initialEntry?.conn ?? null;
+  }
+  /** The OpenRig of the MACHINE space this tab lives in, when that machine has exactly one (one rig == one space, and each machine has its
+   *  own home space: a Rig tab in box2's space is box2's, whatever entry it was first opened with: an unstamped one, or another box's page routed
+   *  there). Null for a space on this computer (its home page can show any connection's page) or a machine with none or two OpenRigs: then the
+   *  entry it was opened with decides, as before. */
+  spaceConn() {
+    const space = this.tabSpace();
+    if (!space || !spaceMachine(space)) return null;
+    const picked = followedConnection({ connections: this.config?.connections ?? [], space });
+    return picked.why === "space" ? picked.id : null;
+  }
+  /** The entry this tab shows: the global back stack's top when it is this tab's own connection's (or names none), else this tab's most recent own
+   *  page in the stack, else the page it was opened with. Never another box's page inside this box's rig space (one rig == one space). */
+  shownEntry() {
+    const rawNav = shared("rig.nav"), stack = rawNav?.stack ?? [];
+    const top = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null), own = this.ownConn();
+    if (!own) return top;
+    // An unstamped entry (the cross-box Needs page, an older one) reads as the FIRST connection's (activeConnId), so it is shown only in the first
+    // connection's tab.
+    const ownsTop = top?.conn ? top.conn === own : own === this.config?.connectionId;
+    if (ownsTop) return top;
+    return [...stack].reverse().find((e) => e?.conn === own) ?? this.initialEntry;
+  }
+  /** A link on this tab belongs to the page this tab shows: it lends this view's own shown entry, never another tab's. */
+  push(entry) { return push(entry, this.shownEntry()); }
+  activeConnId() {
+    const entry = this.shownEntry();
+    let id = entry?.conn;
+    if (!id && entry?.section === "needs" && entry.id) id = (shared("rig.data")?.attentionItems ?? []).find((i) => i?.id === entry.id)?.conn;
+    return adoptConnection(this.config, id) ?? this.config?.connectionId ?? null;
+  }
+  /** The config for the shown connection: this page's own for the first, that connection's own address and home for another, null when it is
+   *  not set up any more (nothing is read or sent: never the first connection's). */
+  /** The transcript link for the PAGE's own OpenRig. Null when the page's OpenRig is on a machine: its transcript lives on that
+   *  box, and a link to this computer's identically-named file would open the wrong seat's log. */
+  pageTranscriptPath(rig, session) {
+    const cfg = this.activeConfig(); // the page's own: no fallback, a gone connection shows no link rather than another box's log
+    if (!cfg || cfg.daemonMachine) return null;
+    return transcriptPath(cfg, rig, session);
+  }
+  activeConfig() {
+    const id = this.activeConnId();
+    if (!this.config || !id || id === this.config.connectionId) return this.config;
+    const conn = (this.config.connections ?? []).find((c) => c.id === id);
+    if (!conn) return null;
+    const memo = this.configMemo ??= new Map();
+    const hit = memo.get(id);
+    if (hit && hit.base === this.config) return hit.view;
+    const view = connectionConfig(this.config, conn);
+    memo.set(id, { base: this.config, view });
+    return view;
+  }
+  /** The config a spec write acts for: the connection this page shows, or null when it is no longer set up (nothing is sent, never the first's). */
+  /** A page entry that names a connection is judged by it (a removed one gives null: nothing is sent, never another connection's, even when one
+   *  connection is left); a page with none acts for its own config, exactly as before. */
+  specConfig() { return this.shownEntry()?.conn ? this.activeConfig() : this.config; }
+  /** The connection a row or menu target on this page names: the page entry's own (passed as is: the menu dispatcher judges it, a stale one is
+   *  refused there), else the page's config. Never adopted to a live connection here, which would hide a stale claim. */
+  shownConnId() { const conn = this.shownEntry()?.conn; return conn ?? this.config?.connectionId; }
+  /** One focus handle per connection block, created after the first render as the SDK requires and kept on the view. */
+  connectionHandles(cx) {
+    const need = (this.config?.connections ?? []).length;
+    this.connHandles ??= [];
+    if (this.connHandles.length < need && !this.connHandleTask) this.connHandleTask = cx.timer.after(0, (next) => {
+      while (this.connHandles.length < need) this.connHandles.push(next.focus_handle());
+      this.connHandleTask = null; next.notify();
+    });
+    return this.connHandles;
+  }
+  /** Each connection's state for System > Connections: ONE read of its /healthz (under its own gate scope) per settings change, never a loop, and the
+   *  machine-consent file once. Drawn only with two or more connections. */
+  connectionStates(cx) {
+    const config = this.config, list = config?.connections ?? [];
+    if (list.length < 2 || this.connStatesFor === config) return this.connStates ?? {};
+    this.connStatesFor = config; this.connStates = Object.fromEntries(list.map((c) => [c.id, { status: "checking" }]));
+    cx.timer.after(0, (next) => next.spawn(async (cx) => {
+      this.connConsent = await readTextFile(`${appHome()}/openrig/machine-consent.json`).catch(() => null);
+      await Promise.all(list.map(async (c) => {
+        let state = { status: "down" };
+        try {
+          const r = c.daemonUrl ? await fetchFor({ connectionId: c.id })(`${c.daemonUrl}/healthz`) : null;
+          if (r?.ok) { const body = await r.json(); state = { status: "connected", hostId: typeof body?.selfHostId === "string" ? body.selfHostId : null }; }
+        } catch (_) {}
+        if (this.connStatesFor === config) this.connStates = { ...this.connStates, [c.id]: state };
+      }));
+      cx.notify();
+    }));
+    return this.connStates;
+  }
+  /** A write operation for `cfg`: with several connections it is scoped to that connection; with one, exactly as before (the gate's only scope). */
+  writeOperation(cfg) { return gatedOperation((this.config?.connections ?? []).length > 1 ? cfg?.connectionId : undefined); }
+  /** A read operation for the connection this page shows (refusal-shaped, as the page's other reads). */
+  readOperation() { return gatedOperationOrRefusal((this.config?.connections ?? []).length > 1 ? this.activeConfig()?.connectionId : undefined); }
+  /** The page's read cache of the shown connection: one per connection, so two OpenRigs never answer each other's paths. */
+  cacheFor(id) { return (this.caches ??= {})[id ?? ""] ??= {}; }
+
+  async resolveDaemonUrl(cfg = this.activeConfig()) {
+    if (!cfg) return null;
+    if (cfg !== this.config) return cfg.daemonUrl ?? null; // another connection: its own written address
     if (!this.config) return null;
-    if (this.config.connectionsRefused) { this.lastDaemonMessage = this.config.connectionsRefused; return null; } // a refused list has no address, from anywhere
+    if (this.config.configInvalid) { this.lastDaemonMessage = this.config.configInvalid; return null; } // a refused list has no address, from anywhere
     if (this.config.daemonUrl) return this.config.daemonUrl;
     // Another mod's shared state may name the daemon only when it's on this machine (loopback).
     const fromShared = sharedLoopbackDaemonUrl(this.config, shared("rig.data"));
@@ -414,7 +589,7 @@ export default class RigView extends View {
     // and the reason is the gate's own sentence.
     try { status = await discoverDaemonFromCli(this.config, exec); }
     catch (error) { if (error?.code === "GATE_REFUSED") { this.lastDaemonMessage = error.message; return null; } throw error; }
-    if (this.config?.connectionsRefused) { this.lastDaemonMessage = this.config.connectionsRefused; return null; }
+    if (this.config?.configInvalid) { this.lastDaemonMessage = this.config.configInvalid; return null; }
     if (status.reachable && status.daemonUrl) {
       const nextCfg = { ...this.config, daemonUrl: status.daemonUrl, daemonUrlSource: "cli", daemonState: status.state };
       delete nextCfg.daemonMessage;
@@ -428,23 +603,24 @@ export default class RigView extends View {
   /** A cached GET: returns what's known now and fetches in the background when missing, stale or asked again. What it
    *  had stays drawn until the new answer replaces it (the sidebar's `list` does the same). */
   read(cx, path, force = false, onData = null) {
+    const conn = this.activeConnId(), cache = this.cacheFor(conn), cfg = this.activeConfig();
     this.reading?.add(path);
-    const hit = this.cache[path];
-    if ((!hit || force || hit.stale) && this.config && !hit?.loading) {
-      const sharedAt = sharedRigData(this.config, shared)?.at;
+    const hit = cache[path];
+    if ((!hit || force || hit.stale) && cfg && !hit?.loading) {
+      const sharedAt = sharedRigData(cfg, shared)?.at;
       // The read belongs to the daemon and connection it started against: a late answer, after the configuration moved, is dropped.
-      const epoch = this.cacheEpoch ?? 0, connId = this.config?.connectionId;
-      this.cache[path] = { ...(hit ?? {}), stale: false, loading: true };
+      const epoch = this.cacheEpoch ?? 0;
+      cache[path] = { ...(hit ?? {}), stale: false, loading: true };
       const finish = (outcome) => {
-        const pending = this.cache[path];
-        this.cache[path] = {
+        const pending = cache[path];
+        cache[path] = {
           ...settleRead(pending, outcome),
           sharedAt: outcome.ok ? sharedAt : pending?.sharedAt,
           // Consume invalidation when starting, not when finishing: another update may arrive mid-read.
           ...(pending?.stale ? { stale: true } : {}),
         };
         if (outcome.ok && typeof outcome.data?.qitemId === "string" && path.startsWith("/api/queue/")) {
-          const row = outcome.data, at = this.cache[path].at;
+          const row = outcome.data, at = cache[path].at;
           for (const [id, box] of Object.entries(this.replies ?? {})) {
             if (box.target?.qitemId === row?.qitemId && observeNeedDecision(box, row, at)) {
               delete this.answered[id];
@@ -455,15 +631,15 @@ export default class RigView extends View {
       };
       cx.spawn(async (cx) => {
         try {
-          const op = gatedOperationOrRefusal();
-          const daemonUrl = await this.resolveDaemonUrl();
+          const op = gatedOperationOrRefusal(cfg?.connectionId); // the read's own connection
+          const daemonUrl = await this.resolveDaemonUrl(cfg);
           if (!daemonUrl) {
             throw new Error(this.lastDaemonMessage || this.config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
           }
           const r = await op.fetch(`${daemonUrl}${path}`);
           const body = await r.text();
           if (epoch !== (this.cacheEpoch ?? 0)) return;
-          let data = null; try { data = stampConnection(JSON.parse(body), connId); } catch (_) { data = body; }
+          let data = null; try { data = stampConnection(JSON.parse(body), cfg?.connectionId); } catch (_) { data = body; }
           // onData runs here, after the await: outside render, so it may create view state (an EditorState).
           if (r.ok && onData) onData(data);
           finish(r.ok
@@ -473,7 +649,9 @@ export default class RigView extends View {
         cx.notify();
       });
     }
-    const result = this.cache[path] ?? { loading: true };
+    // A stored page can name a connection that is not configured any more: say so, instead of a skeleton that never ends. (No config yet is
+    // still "loading".)
+    const result = cache[path] ?? (this.config && !cfg ? { error: UNKNOWN_CONNECTION, status: 0 } : { loading: true });
     if (path.startsWith("/api/attention") && result.data?.items) {
       const health = this.read(cx, "/api/health");
       return { ...result, data: { ...result.data, items: filterAttentionHealth(result.data.items, health.error ? [] : health.data?.records ?? []) } };
@@ -627,7 +805,7 @@ export default class RigView extends View {
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : emptyText)]);
   }
   fileRow(t, id, path, label) {
-    return h_flex().id(id).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover)).on_click(() => push(fileEntry(path, label)))
+    return h_flex().id(id).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover)).on_click(() => this.push(fileEntry(path, label)))
       .child(svg(icon("file-text")).size(14).flex_none().text_color(t.muted))
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).tooltip(String(path.split(/[\\/]/).pop()??"")).child(path.split(/[\\/]/).pop()))
       .child(this.copyButton(t, path, `path-${id}`, "path"))
@@ -687,23 +865,24 @@ export default class RigView extends View {
 
   // ---- sections --------------------------------------------------------------------------------------------------
   hostedMembers(cx){
-    const config=this.config;
+    const config=this.activeConfig(); // the shown connection's roster: each OpenRig has its own
     if(!config?.connectionId||!config.daemonUrl)return null;
-    const supplied=sharedRigData(this.config, shared)?.hostedMembers;
+    const rig=sharedRigData(this.config, shared), supplied=rig?.byConnection?.[config.connectionId]?.hostedMembers??rig?.hostedMembers;
     if(supplied?.conn===config.connectionId&&supplied.origin===config.daemonUrl)return supplied;
-    const key=`/api/queue/hosted-members:${config.connectionId}`,cached=this.cache[key];
+    const cache=this.cacheFor(config.connectionId),key=`/api/queue/hosted-members:${config.connectionId}`,cached=cache[key];
     if((!cached||cached.stale)&&!cached?.loading&&typeof cx?.spawn==='function'){
-      this.cache[key]={loading:true};
-      cx.spawn(async task=>{this.hostedReader??=new HostedMembersReader();const data=await this.hostedReader.read(fetch,config,(ms,done)=>task.timer.after(ms,done));
-        if(this.config?.connectionId===config.connectionId&&this.config?.daemonUrl===config.daemonUrl)this.cache[key]={data,at:Date.now(),...(this.cache[key]?.stale?{stale:true}:{})};
+      cache[key]={loading:true};
+      cx.spawn(async task=>{(this.hostedReaders??={})[config.connectionId]??=new HostedMembersReader();const data=await this.hostedReaders[config.connectionId].read(fetchFor(config),config,(ms,done)=>task.timer.after(ms,done));
+        const now=this.activeConfig(),same=now?.connectionId===config.connectionId&&now?.daemonUrl===config.daemonUrl;
+        if(same||this.config?.connectionId===config.connectionId)cache[key]={data,at:Date.now(),...(cache[key]?.stale?{stale:true}:{})};
         task.notify();});
     }
-    const got=this.cache[key]?.data;
+    const got=cache[key]?.data;
     return got?.conn===config.connectionId&&got.origin===config.daemonUrl?got:null;
   }
 
   assistantCard(t,cx,entry){
-    if(!entry.conn||entry.conn!==this.config?.connectionId)return this.dim(t,'This assistant belongs to another OpenRig connection. Open it from that connection.');
+    if(!entry.conn||entry.conn!==this.activeConnId())return this.dim(t,'This assistant belongs to another OpenRig connection. Open it from that connection.');
     const roster=this.hostedMembers(cx);
     if(!roster)return this.dim(t,'Reading connected assistants…');
     if(roster.state==='unavailable')return this.dim(t,roster.line);
@@ -713,7 +892,7 @@ export default class RigView extends View {
     this.pageHeading={title:member.name,icon:'rig-queue',status:`Connected assistant · ${member.rig}`};
     this.pageActions=h_flex().gap(8).items_center().flex_wrap()
       .child(this.button(t,'assistant-queue','Queue work…',()=>this.open({mod:MOD_IDS.menu,kind:'dialog',width:460,height:300,props:{target,step:{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true}}}),{iconName:'rig-queue'}))
-      .child(this.button(t,'assistant-open-rig','Open rig page',()=>push({section:'topology',kind:'rig',conn:member.conn,rigId:entry.rigId,name:member.rig}),{small:true}));
+      .child(this.button(t,'assistant-open-rig','Open rig page',()=>this.push({section:'topology',kind:'rig',conn:member.conn,rigId:entry.rigId,name:member.rig}),{small:true}));
     const path=seatQueuePaths(member.seat).open,got=this.read(cx,path),queue=seatQueueDetails(got.data,null);
     const records=[...queue.current,...queue.pending,...queue.blocked];
     const sentence=assistantSentence(member,value=>this.time(value));
@@ -746,7 +925,7 @@ export default class RigView extends View {
       return one ? this.rigBlock(t, cx, one, { entry, rigCount: rigs.length, attentionItems }) : this.dim(t, `No rig ${entry.name} on this daemon.`);
     }
     const focusTarget = entry.focusRig ?? shared("rig.focusRig") ?? shared("rig.focus") ?? entry.focus ?? null;
-    const loadedModels=rigs.map((r)=>{const nodesState=this.nodesOf(cx,r.id);return {rig:r,...rigModel(r,nodesState.data,[],this.config?.connectionId),nodesState};});
+    const loadedModels=rigs.map((r)=>{const nodesState=this.nodesOf(cx,r.id);return {rig:r,...rigModel(r,nodesState.data,[],this.activeConnId()),nodesState};});
     const modelList = orderRigs(loadedModels, focusTarget);
     const allSeats = modelList.flatMap((m) => m.seats);
     const models = modelList.map((m) => m.rig);
@@ -755,10 +934,11 @@ export default class RigView extends View {
     this.topologyStrip=strip;
     if((entry.topologyTab??this.activePageView)==='seats'){
       this.allSeatsOrder=entry.seatsOrder??this.allSeatsOrder??'rig';
-      return allSeatsView(this,t,cx,loadedModels,attentionItems,{navigate:push,menu:(t)=>this.menu(t),hostedMembers:this.hostedMembers(cx),orderMap:shared('rig.order')??{},openSpecs:()=>push({section:'specs'}),
+      return allSeatsView(this,t,cx,loadedModels,attentionItems,{navigate:entry=>this.push(entry),menu:(t)=>this.menu(t),hostedMembers:this.hostedMembers(cx),orderMap:shared('rig.order')??{},openSpecs:()=>this.push({section:'specs'}),
         attach:(target,cx)=>cx.spawn(async cx=>{
-          const result=await attachToSeat({exec,run,hc,spaces,panes,terminals,layout,shared,setShared,wait:waitWith(cx),relayPath:attachRelayPath(appHome(),MOD_IDS.view)},target,this.config);
-          if(result?.ok===false)notify({title:`Attach ${target.logicalId}`,body:result.reason,level:'warning'});
+          const result=await this.attachTarget(cx,target);
+          if(result?.needsViewerRefresh)this.reviewViewerReplace(result,target);
+          else if(result?.ok===false)notify({title:`Attach ${target.logicalId}`,body:result.reason,level:'warning'});
         })});
     }
     const missingFocusRig = entry.focusRig && !rigs.some((r) => r.id === entry.focusRig || r.name === entry.focusRig)
@@ -771,7 +951,10 @@ export default class RigView extends View {
       .when(!!missingFocusRig, (el) => el.child(missingFocusRig))
       .children(blocks.length ? blocks : [this.dim(t, this.filter ? `No matches for /${this.filter}.` : "No rigs registered — run rig up <spec> to launch a team.")])
       // A new rig, from a spec in the library or with one seat.
-      .child(h_flex().child(this.button(t, "topology-new-rig", "New rig…", () => this.open(newRigOverlay(this.config?.connectionId)), { small: true, iconName: "plus" })));
+      .child(h_flex().child(this.button(t, "topology-new-rig", "New rig…", () => {
+        if(!this.activeConfig()){notify({title:"New rig",body:"This page's connection isn't set up any more. Open Topology from the sidebar before creating a rig.",level:"warning"});return;}
+        this.open(newRigOverlay(this.activeConnId()));
+      }, { small: true, iconName: "plus" })));
   }
 
   /** TUI parity: bounded recorded queue chronology, never a synthetic log of activity-change notifications. */
@@ -838,7 +1021,7 @@ export default class RigView extends View {
     const hostRigs = [];
     let seatCount = 0;
     for (const r of rigs) {
-      const m = rigModel(r, this.nodesOf(cx, r.id).data, [], this.config?.connectionId);
+      const m = rigModel(r, this.nodesOf(cx, r.id).data, [], this.activeConnId());
       const seatsOnHost = m.seats.filter((s) => (s.host ?? "local") === hostId);
       if (seatsOnHost.length || (m.seats.length === 0 && (r.host ?? "local") === hostId)) {
         hostRigs.push({ rig: r, model: m, seatsOnHost });
@@ -859,11 +1042,11 @@ export default class RigView extends View {
         [["Rig"], ["Lifecycle", 110], ["Seats", 80, "right"]],
         hostRigs.map(({ rig, model, seatsOnHost }) => ({
           cells: [rig.name, model.lifecycle ?? "running", String(seatsOnHost.length)],
-          onClick: () => push({ section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name }),
+          onClick: () => this.push({ section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name }),
         })),
         `No rigs on host ${hostId}.`,
       )]))
-      .children(archivedElements({ div, svg, h_flex }, t, withArchivedHosts(archived.data, id => this.read(cx, `/api/rigs/${encodeURIComponent(id)}/nodes`).data, this.config?.connectionId), { host: hostId, icon, open: Boolean(this.archivedOpen?.[hostId]),
+      .children(archivedElements({ div, svg, h_flex }, t, withArchivedHosts(archived.data, id => this.read(cx, `/api/rigs/${encodeURIComponent(id)}/nodes`).data, this.activeConnId()), { host: hostId, icon, open: Boolean(this.archivedOpen?.[hostId]),
         toggle: (_e, cx) => { (this.archivedOpen ??= {})[hostId] = !this.archivedOpen?.[hostId]; cx.notify(); },
         restore: r => this.oneClick({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }, "unarchive-rig"),
         menu: r => this.menu({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }),
@@ -881,12 +1064,12 @@ export default class RigView extends View {
     const wait = this.status(t, cx, nodesPath, nodes);
     if (wait) return wait;
     const rigObj = { id: entry.rigId, name: entry.rig, lifecycleState: entry.lifecycle ?? "running" };
-    const model = rigModel(rigObj, nodes.data, [], this.config?.connectionId);
+    const model = rigModel(rigObj, nodes.data, [], this.activeConnId());
     const podSeats = model.seats.filter((s) => s.pod === podName);
-    const counts = statusCounts(podSeats);
     const nativeSeats = this.read(cx, `/api/native-seats?rig=${encodeURIComponent(entry.rig)}`).data?.seats ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
-    const attentionItems = terminalAttention(this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [],this.hostedMembers(cx)).map(needTarget);
+    const attentionItems = terminalAttention(this.read(cx,"/api/attention").data?.items ?? [],this.hostedMembers(cx)).map(needTarget);
+    const counts = computePulseCounts([{rig:rigObj,...model,countSeats:podSeats}],attentionItems);
     return v_flex().id(`pod-page-${entry.rigId ?? entry.rig}-${podName}`).gap(12)
       .child(this.title(t, `Pod ${podName} · ${entry.rig}`))
       .child(this.card(t, "Pod", [this.kv(t, [
@@ -983,8 +1166,9 @@ export default class RigView extends View {
   resetNowTails(cx) {
     this.nowTails?.close(); this.nowDue = true; this.nowWidths = Object.create(null); this.nowSignature = null;
     this.nowTails = new NowTailCache(async seat => {
-      const op = gatedOperationOrRefusal();
-      const origin = await this.resolveDaemonUrl();
+      const cfg = this.activeConfig(); // the connection the page shows: its address, its gate scope
+      const op = gatedOperationOrRefusal(cfg?.connectionId);
+      const origin = await this.resolveDaemonUrl(cfg);
       if (!origin) return { ok: false, error: "OpenRig daemon is unavailable." };
       const response = await op.fetch(`${origin}/api/transcripts/${encodeURIComponent(seat.session)}/tail?lines=40`);
       const data = await response.json(); return { ok: response.ok, status: response.status, data };
@@ -1004,8 +1188,8 @@ export default class RigView extends View {
       .children(state.lines.map((line, i) => this.plain(t, line, `now-lines-${key}-${i}`).font_family("Geist Mono").text_size(11.5)));
   }
   nowTranscript(seat) {
-    const file = transcriptPath(this.config, seat.rig, seat.session);
-    return file ? () => push(fileEntry(file, `${seat.logicalId ?? seat.session} transcript`)) : null;
+    const file = this.pageTranscriptPath(seat.rig, seat.session); // the page's own OpenRig, and none on a machine
+    return file ? () => this.push(fileEntry(file, `${seat.logicalId ?? seat.session} transcript`)) : null;
   }
   nowRow(t, seat, openSeat) {
     const state = nowTailPresentation(this.nowTails?.records.get(seat.session),Date.now(),this.uiTimezone);
@@ -1058,7 +1242,7 @@ export default class RigView extends View {
     const { compact, tight, graphHidden } = pageBodyLayout(this.pageWidth);
     const nodesPath = `/api/rigs/${encodeURIComponent(rig.id)}/nodes`;
     const nodes = this.nodesOf(cx, rig.id);
-    const model = rigModel(rig, nodes.data, [], this.config?.connectionId);
+    const model = rigModel(rig, nodes.data, [], this.activeConnId());
     const lifecycle = model.lifecycle;
     const stoppedRig = isRigStopped(lifecycle, model.seats);
     const focusRig = entry.focusRig ?? shared("rig.focusRig");
@@ -1103,19 +1287,19 @@ export default class RigView extends View {
     const rigSelected = this.pageSel === rigRowKey;
     const resume = () => this.button(t, `rig-resume-${rig.id}`, "Resume…", () => dialog({ action: "resume", confirm: true }, 380), { small: true, iconName: "rig-play" });
     // A count filters the page to seats in that state.
-    const count = (n, word, color, key) => n ? h_flex().id(`rig-count-${key}-${rig.name}`).gap(4).items_center().cursor_pointer().on_click(() => { push({ ...(entry.section ? entry : { section: "topology" }), filter: word }); })
+    const count = (n, word, color, key) => n ? h_flex().id(`rig-count-${key}-${rig.name}`).gap(4).items_center().cursor_pointer().on_click(() => { this.push({ ...(entry.section ? entry : { section: "topology" }), filter: word }); })
       .child(div().text_size(11.5).text_color(color === "working" ? (t.ansi2 ?? t.working) : color === "blocked" ? t.blocked : color==="dim"?t.dim:t.muted).child(`${n} ${word}`)) : null;
     const lifecycleText = stoppedRig && lifecycle === "recoverable" ? "stopped (recoverable)" : (lifecycle ?? "unknown");
     if(dedicated)this.pageHeading={title:rig.name,tone,status:`${lifecycleText} · ${model.seats.length} seats · ${counts.working} working · ${counts.needs} needs you · ${counts.idle} idle${counts.unreported?` · ${counts.unreported} not reported`:""}`};
     const head = h_flex().id(`rig-head-${rig.id}`).px(4).when(!compact, el => el.h(30)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
       .when(rigSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
-      .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) push(rigEntry); else this.selectPageRow(rigRowKey, cx); })
+      .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) this.push(rigEntry); else this.selectPageRow(rigRowKey, cx); })
       .on_mouse_down("right", () => this.menu(target))
       .child(div().id(`rig-fold-${rig.id}`).w(14).flex_none().text_color(t.dim).on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(rigKey(rig.id), expanded, model.seats); })
         .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(12)))
       .child(this.dot(t, tone))
       .child(div().id(`rig-name-${rig.id}`).text_size(13).font_semibold().text_color(t.foreground).cursor_pointer().hover(el=>el.underline())
-        .tooltip(`Open ${rig.name}`).on_click((_e,cx)=>{cx.stop_propagation();push({...rigEntry,tab:"table"});}).child(rig.name))
+        .tooltip(`Open ${rig.name}`).on_click((_e,cx)=>{cx.stop_propagation();this.push({...rigEntry,tab:"table"});}).child(rig.name))
       .when(!tight, el => el.child(div().text_size(12).text_color(t.muted).child(`${lifecycleText} · ${model.seats.length} seat${model.seats.length === 1 ? "" : "s"}`)))
       .child(h_flex().id(`rig-counts-${rig.id}`).gap(8).when(compact, el => el.w_full().flex_wrap())
         .children([count(counts.working, "working", "working", "working"), count(counts.blocked, "blocked", "blocked", "blocked"), count(counts.needs, "needs you", "blocked", "needs"), count(counts.idle, "idle", "idle", "idle"),count(counts.unreported,"not reported","dim","unreported")].filter(Boolean)))
@@ -1126,14 +1310,14 @@ export default class RigView extends View {
     const body = [];
     if (showBody) {
       const followed = (stripProps()?.views ?? []).find((v) => v.following?.target === `rig:${rig.name}`);
-      const on = this.hostWorkerEntry(`rig:${rig.name}`)?.following??!!followed?.following?.enabled;
+      const on = this.hostWorkerEntry(`rig:${rig.name}`, rig.conn ? configOfConnection(this.config, rig.conn) : this.config)?.following??!!followed?.following?.enabled;
       const caps = this.caps();
       const workerReason = capabilityDisableReason("open-view", caps);
       const designReason = capabilityDisableReason("design-view", caps);
       const followReason = capabilityDisableReason(on ? "unfollow" : "follow", caps);
       this.inPageActions=dedicated;
       const actionBar=h_flex().gap(6).items_center().flex_wrap()
-        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => this.oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens here; tiles run on ${this.config.daemonMachine}.`:null), actionKey: "open-view" }))
+        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => this.oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens here; tiles run on ${(rig.conn?configOfConnection(this.config,rig.conn):this.config)?.daemonMachine}.`:null), actionKey: "open-view" }))
         .child(this.button(t, `rig-act-design-${rig.name}`, "Design view…", () => this.open({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target, step: { action: "design-view" } } }), { small: true, iconName: "rig-view", disabled: !!designReason, tooltip: designReason }))
         .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => this.oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow" }))
         .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => this.oneClick({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn }, "snapshot", `rig-snapshot-${rig.id}`), { small: true, iconName: "rig-snapshot", actionKey: "snapshot" }))
@@ -1171,8 +1355,8 @@ export default class RigView extends View {
           if(graphHidden)body.push(this.dim(t,"Widen the pane to see the graph.").id(`rig-graph-narrow-${rig.id}`));
           else if(graphGot.data)body.push(graphView.render(t,cx,graphView.projection,{
             id:`rig-graph-${rig.id}`,assets:ASSETS,running:true,reducedMotion:this.config?.reducedMotion===true,
-            events:graphActivityOf(shared,this.config?.connectionId)?.origin===this.config?.daemonUrl?graphActivityOf(shared,this.config?.connectionId).events:[],
-            open:s=>push({section:"topology",kind:"seat",rig:rig.name,rigId:rig.id,conn:rig.conn,name:s.lid}),
+            events:graphActivityOf(shared,this.activeConnId())?.origin===this.activeConfig()?.daemonUrl?graphActivityOf(shared,this.activeConnId()).events:[],
+            open:s=>this.push({section:"topology",kind:"seat",rig:rig.name,rigId:rig.id,conn:rig.conn,name:s.lid}),
             menu:s=>this.menu({...s.node,kind:"seat",session:s.session,rig:rig.name,rigId:rig.id,conn:rig.conn,logicalId:s.lid}),
           }));
           else body.push(this.status(t,cx,graphPath,graphGot)??this.skeleton(t));
@@ -1182,9 +1366,9 @@ export default class RigView extends View {
       if (nodes.data === undefined) body.push(this.status(t, cx, nodesPath, nodes));
       else if(!dedicated||entry.tab==="table")body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter) }));
       if(!dedicated||entry.tab==='table'){
-        const group=assistantGroup(t,cx,this.hostedMembers(cx),{...rig,conn:rig.conn??this.config?.connectionId},{prefix:'page',icon,rows:this.pageRows,folds:shared('rig.open.page')??{},
+        const group=assistantGroup(t,cx,this.hostedMembers(cx),{...rig,conn:rig.conn??this.activeConnId()},{prefix:'page',icon,rows:this.pageRows,folds:shared('rig.open.page')??{},
           fold:(key,open)=>{setShared('rig.open.page',{...(shared('rig.open.page')??{}),[key]:open});this.persistStatePatch(cx);},
-          select:(key,_entry,cx)=>this.selectPageRow(key,cx),open:push,menu:(t)=>this.menu(t)});
+          select:(key,_entry,cx)=>this.selectPageRow(key,cx),open:entry=>this.push(entry),menu:(t)=>this.menu(t)});
         if(group)body.push(group);
       }
     }
@@ -1223,7 +1407,7 @@ export default class RigView extends View {
       const text = counts.problems ? `${counts.problems} problem${counts.problems === 1 ? "" : "s"}` : counts.notes ? `${counts.notes} note${counts.notes === 1 ? "" : "s"}` : "Health";
       out.push(v_flex().id(`rig-health-group-${rig.id}`).gap(4)
         .child(h_flex().id(`rig-health-toggle-${rig.id}`).gap(6).items_center().cursor_pointer()
-          .on_click(() => push({ section: "system", subview: "health", healthRigId: rig.id, healthRigName: rig.name }))
+          .on_click(() => this.push({ section: "system", subview: "health", healthRigId: rig.id, healthRigName: rig.name }))
           .child(svg(icon(counts.worst === 2 ? "rig-diamond" : counts.problems ? "rig-warning" : "rig-info")).size(12).text_color(counts.worst === 2 ? t.blocked : counts.worst === 1 ? t.working : t.muted))
           .child(div().text_size(12).text_color(counts.worst === 2 ? t.blocked : counts.worst === 1 ? t.working : t.muted).child(`${text} in System → Health`))));
     }
@@ -1243,7 +1427,7 @@ export default class RigView extends View {
     if (edgesOpen) {
       const edges = graph.data?.edges ?? [];
       const names=new Map((graph.data?.nodes??[]).map(n=>[n.id,n.data?.logicalId??n.logicalId??n.id]));
-      const openGraph=()=>push({section:"topology",kind:"rig",rigId:rig.id,conn:rig.conn,name:rig.name,tab:"graph"});
+      const openGraph=()=>this.push({section:"topology",kind:"rig",rigId:rig.id,conn:rig.conn,name:rig.name,tab:"graph"});
       edgesGroup.child(div().id(`rig-open-graph-${rig.id}`).tab_stop(true).text_size(12).text_color(t.accent).cursor_pointer().hover(el=>el.underline())
         .on_click(openGraph).on_key_down((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();openGraph();}}).child("Open the graph"));
       edgesGroup.child(this.status(t, cx, graphPath, graph) ?? (edges.length
@@ -1287,7 +1471,7 @@ export default class RigView extends View {
     return v_flex().id(`${idPrefix}-list`).gap(2).children(rows.map((r, i) => {
       let el = h_flex().id(`${idPrefix}-row-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).text_size(12);
       if (r.navEntry) {
-        el = el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => push(r.navEntry));
+        el = el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => this.push(r.navEntry));
       }
       return el
         .child(div().min_w(70).flex_none().text_color(t.dim).child(r.ts))
@@ -1368,7 +1552,7 @@ export default class RigView extends View {
     const rowStatus = seatNeed ? "needs_input" : s.status;
     if (!s.terminal) this.nowSeats?.set(s.session, s);
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
-    const click = seatClickTarget(stripProps(), activeRigViewId(), s.session, panes?.() ?? [], terminals?.() ?? []);
+    const click = seatClickTarget(stripProps(), activeRigViewId(), s.session, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, s.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(s.session) === true);
     const seatTarget = {
       kind: "seat",
       rig: rig.name,
@@ -1392,7 +1576,7 @@ export default class RigView extends View {
         selectWorkerView({ viewId: click.view, viewsProps: stripProps(), spaces, panes, layout, run, stackId: STACK });
         run("pane.focus", { terminal: click.terminal });
       }
-      else push({ section: "topology", kind: "seat", rig: rig.name, rigId: rig.id, conn: rig.conn, name: s.logicalId, session: s.session });
+      else this.push({ section: "topology", kind: "seat", rig: rig.name, rigId: rig.id, conn: rig.conn, name: s.logicalId, session: s.session });
     };
     const runtimeBadge = [s.runtime, s.model, s.effort].filter(Boolean).join(" · ");
     const helpers = nativeSeat?.children ?? [];
@@ -1420,8 +1604,7 @@ export default class RigView extends View {
     const send = () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 260, props: { target: seatTarget, step: { input: true, placeholder: `Message to ${s.session}`, action: "send", multiLine: true } } });
     const queue = () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: seatTarget, step: { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true } } });
     const answer = () => quickBtn(`seat-answer-${s.session}`, "Answer", () => {
-      openNeed(setShared, { section: "needs", id: seatNeed.id });
-      openOrFocusRigTab({ run, spaces, panes, layout, section: "needs" });
+      openNeed(seatNeed.id, { shared, setShared, run, spaces, panes, layout, items: [seatNeed], conn: seatNeed.conn ?? this.activeConnId() });
     }, { primary: true });
     this.seatActions[rowKey] = { send: s.terminal || sendReason ? null : send, queue: s.terminal || queueReason ? null : queue };
     return v_flex().id(`topo-seat-${s.session}`).gap(2)
@@ -1447,9 +1630,9 @@ export default class RigView extends View {
             .font_family(settings().font_family).text_size(11).text_color(t.dim).child(runtimeBadge)))
           .when(!!s.slice && !compact, (el) => el.child(div().id(`seat-slice-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .text_size(11).text_color(t.accent).cursor_pointer()
-            .on_click((_e, cx) => { cx?.stop_propagation?.(); push({ section: "scopes", slice: s.slice }); })
+            .on_click((_e, cx) => { cx?.stop_propagation?.(); this.push({ section: "scopes", slice: s.slice }); })
             .child(String(s.slice))))
-          .when(!s.terminal && !compact, el => el.child(this.nowRow(t, { ...s, rig: rig.name }, () => push(seatEntry))))
+          .when(!s.terminal && !compact, el => el.child(this.nowRow(t, { ...s, rig: rig.name }, () => this.push(seatEntry))))
           .when(click.kind === "card" && !tight, (el) => el.child(div().id(`seat-go-${s.session}`).text_size(12).text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); }).child("›"))))
         .child(h_flex().gap(4).items_center().flex_none()
@@ -1499,7 +1682,7 @@ export default class RigView extends View {
       if (row?.setOpen) row.setOpen(act.type === "expand");
       else toggleOpen(act.foldKey, act.type === "collapse", row?.seats);
     }
-    else if (act.type === "activate") { if (row?.open) row.open(cx); else if (row?.entry) push(row.entry); }
+    else if (act.type === "activate") { if (row?.open) row.open(cx); else if (row?.entry) this.push(row.entry); }
     else if (act.type === "action") { const fn = this.seatActions?.[act.key]?.[act.action]; if (fn) fn(); }
     else if (act.type === "menu") { if (row?.target) this.menu(row.target); }
     cx?.notify?.();
@@ -1535,7 +1718,7 @@ export default class RigView extends View {
 
     // Shown for the person to read or copy; never run. Attach builds its own argv from the checked session.
     const attachCmd = n.tmuxAttachCommand ?? (isValidSessionName(n.canonicalSessionName) ? `tmux attach -t ${n.canonicalSessionName}` : "—");
-    const transcript = transcriptPath(this.config, entry.rig, n.canonicalSessionName);
+    const transcript = this.pageTranscriptPath(entry.rig, n.canonicalSessionName); // the page's own OpenRig, and none on a machine
 
     const healthGot = this.read(cx, "/api/health");
     const seatFindings = (healthGot.data?.records ?? []).filter((r) => classifyHealth(r).actionable && (
@@ -1582,7 +1765,7 @@ export default class RigView extends View {
       attachable: !stoppedSeat,
     };
     const dialog = (step, height) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
-    const live = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? []);
+    const live = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, n.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(n.canonicalSessionName) === true);
     const seatViewReason = capabilityDisableReason("open-seat", this.caps());
     const attachReason = stoppedSeat ? "Stopped: seat has no running session to attach" : null;
     const sendReason = personDisableReason("send", this.config);
@@ -1592,17 +1775,17 @@ export default class RigView extends View {
     const doAttach = (_e, cx) => {
       // As a task, so the wait outlives the click: the tab is named and selected once herdr has adopted it. A refusal (a
       // name OpenRig doesn't make, an attach command not in OpenRig's shape) says why.
-      const config = this.config;
       cx.spawn(async (cx) => {
-        const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, target, config);
-        if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" });
+        const res = await this.attachTarget(cx, target);
+        if (res?.needsViewerRefresh) this.reviewViewerReplace(res, target);
+        else if (res && res.ok === false && res.reason) notify({ title: `Attach ${target.logicalId ?? target.session}`, body: res.reason, level: "warning" });
       });
     };
     // Focusing a pane the seat already has needs nothing from OpenRig; with none, Focus pane opens a view, which needs
     // OpenRig's herdr provider (seatViewReason), like Open terminal beside it.
     const focusReason = live.kind === "focus" || live.kind === "select-then-focus" ? null : seatViewReason;
     const doFocusPane = () => {
-      const hit = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? []);
+      const hit = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, n.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(n.canonicalSessionName) === true);
       if (hit.kind === "focus") {
         if (hit.stack && hit.child) run("layout.select", { stack: hit.stack, child: hit.child });
         if (hit.tab) run("tab.select", { id: hit.tab });
@@ -1615,6 +1798,7 @@ export default class RigView extends View {
         run("pane.focus", { terminal: hit.terminal });
         return;
       }
+      if (hit.kind === "ambiguous") { notify({ title: "Focus pane", body: SEAT_NAME_SHARED, level: "warning" }); return; }
       this.oneClick(target, "open-seat", "seat-focus-pane");
     };
 
@@ -1633,7 +1817,7 @@ export default class RigView extends View {
         .child(this.button(t, "seat-act-more", "⋯", () => this.menu(target), { small: true }));
     this.inPageActions=false;
     return v_flex().id(`seat-page-${entry.name}`).gap(12)
-      .when(tab === "activity" && !isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && push(fileEntry(transcript, `${entry.name} transcript`)))))
+      .when(tab === "activity" && !isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && this.push(fileEntry(transcript, `${entry.name} transcript`)))))
       .when(!!seatViewReason, (el) => el.child(this.workerCapabilityNote(t, seatViewReason)))
       // 1. CONTEXT section
       .when(tab === "activity", el => el.child(v_flex().id("seat-section-context").child(this.card(t, ctx != null ? `CONTEXT · ${ctx}%` : "CONTEXT", [
@@ -1684,7 +1868,7 @@ export default class RigView extends View {
       // 3. HEALTH section
       .when(tab === "activity", el => el.child(v_flex().id("seat-section-health").child(this.card(t, "HEALTH", seatFindings.length
         ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click(() => push({ section: "system", subview: "health" }))
+            .on_click(() => this.push({ section: "system", subview: "health" }))
             .child(div().text_size(12).text_color(t.blocked).child(`[${f.severity ?? "warn"}]`))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(singleLineText(f.summary ?? f.id ?? "finding")??"")).child(singleLineText(f.summary ?? f.id ?? "finding")))
             .child(div().text_size(11.5).text_color(t.dim).child(f.status ?? "open"))
@@ -1727,7 +1911,7 @@ export default class RigView extends View {
           .children(seatNeeds.length
             ? [
                 ...seatNeeds.slice(0, 3).map((it, i) => h_flex().id(`seat-need-item-${i}`).px(6).h(24).overflow_hidden().gap(8).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
-                  .on_click(() => push({ section: "needs", id: it.id, name: it.summary }))
+                  .on_click(() => this.push({ section: "needs", id: it.id, name: it.summary }))
                   .child(div().text_size(11.5).text_color(t.blocked).child(`[${it.urgency ?? "normal"}]`))
                   .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).tooltip(String(singleLineText(it.summary ?? it.id)??"")).child(singleLineText(it.summary ?? it.id)))),
                 ...(seatNeeds.length > 3 ? [div().id("seat-needs-more").text_size(11.5).text_color(t.dim).child(`+${seatNeeds.length - 3} more`)] : []),
@@ -1751,13 +1935,13 @@ export default class RigView extends View {
         ]),
         h_flex().gap(8).items_center().flex_wrap()
           .child(h_flex().id("seat-link-host").px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click(() => push({ section: "topology", kind: "host", host: hostOf(n) ?? "local", name: hostOf(n) ?? "local" }))
+            .on_click(() => this.push({ section: "topology", kind: "host", host: hostOf(n) ?? "local", name: hostOf(n) ?? "local" }))
             .child(div().text_size(11.5).text_color(t.accent).child(`host ${hostOf(n) ?? "local"} ▸`)))
           .child(h_flex().id("seat-link-rig").px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click(() => push({ section: "topology", kind: "rig", rigId: entry.rigId, conn: entry.conn, name: entry.rig }))
+            .on_click(() => this.push({ section: "topology", kind: "rig", rigId: entry.rigId, conn: entry.conn, name: entry.rig }))
             .child(div().text_size(11.5).text_color(t.accent).child(`rig ${entry.rig} ▸`)))
           .child(h_flex().id("seat-link-pod").px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click(() => push({ section: "topology", kind: "pod", rig: entry.rig, rigId: entry.rigId, conn: entry.conn, pod: podName, name: podName }))
+            .on_click(() => this.push({ section: "topology", kind: "pod", rig: entry.rig, rigId: entry.rigId, conn: entry.conn, pod: podName, name: podName }))
             .child(div().text_size(11.5).text_color(t.accent).child(`pod ${podName} ▸`))),
         this.nativePart(t, cx, entry.rig, n.canonicalSessionName),
       ]))))
@@ -1765,7 +1949,7 @@ export default class RigView extends View {
       .when(tab === "files", el => el.child(v_flex().id("seat-section-spec").child(this.card(t, "SPEC", [
         n.resolvedSpecName
           ? h_flex().id("seat-spec").gap(8).items_center().cursor_pointer()
-              .on_click(() => push({ section: "specs", specOf: n.logicalId, name: `spec of ${n.logicalId}` }))
+              .on_click(() => this.push({ section: "specs", specOf: n.logicalId, name: `spec of ${n.logicalId}` }))
               .child(svg(icon("file-text")).size(13).text_color(t.muted))
               .child(div().text_size(12.5).text_color(t.accent).child(`${n.resolvedSpecName}${n.resolvedSpecVersion ? ` · ${n.resolvedSpecVersion}` : ""}`))
               .child(svg(icon("chevron-right")).size(12).text_color(t.dim))
@@ -1833,7 +2017,7 @@ export default class RigView extends View {
       if (hits.length === 1) return this.specs(t, cx, { ...entry, id: hits[0].id });
       return this.card(t, entry.name, [hits.length ? this.table(t, "spec-hits", [["Spec"], ["Kind", 90], ["Version", 80], ["Source", 80]], hits.map((s) => ({ cells: [s.name, s.kind, s.version,
         div().text_size(11).text_color(t.dim).child(s.sourceType === "builtin" || !s.sourcePath ? "Built-in" : "Yours")],
-        onClick: () => push({ section: "specs", id: s.id, name: s.name }) }))) : this.dim(t, `No spec named ${entry.name} in the library.`)]);
+        onClick: () => this.push({ section: "specs", id: s.id, name: s.name }) }))) : this.dim(t, `No spec named ${entry.name} in the library.`)]);
     }
     if (entry.id) {
       // One spec, opened by id (sidebar, palette, `spec-of`): the same expanded body the list shows in place.
@@ -1875,7 +2059,7 @@ export default class RigView extends View {
         return v_flex()
           .when(builtin && i === g.yours && i > 0, el => el.child(div().id(`spec-divider-${g.kind}`).mx(8).h(1).bg(t.border)))
           .child(h_flex().id(`specs-${lib.data.indexOf(s)}`).pl(24).pr(8).h(30).gap(10).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover((x) => x.bg(t.hover))
-            .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => this.menu({ kind: "spec", conn: this.config?.connectionId, id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
+            .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => this.menu({ kind: "spec", conn: this.shownConnId(), id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(s.name??"")).child(s.name))
             .when(this.specDirty(box), (el) => el.child(div().text_size(11.5).text_color(t.working).flex_none().child("● Unsaved changes")))
@@ -1898,7 +2082,7 @@ export default class RigView extends View {
 
   /** A pill's click: that rig on Topology (one-way sync — pushes to rig.nav without mutating rig.open). */
   openRigFromSpec(r) {
-    push({ section: "topology", kind: "rig", rigId: r.id, conn: r.conn, name: r.name });
+    this.push({ section: "topology", kind: "rig", rigId: r.id, conn: r.conn, name: r.name });
   }
 
   graphFor(key) {
@@ -1909,7 +2093,7 @@ export default class RigView extends View {
     box.graphLoading=true;box.graphError=null;box.graph=null;
     cx.spawn(async cx=>{
       try{
-        const op=gatedOperationOrRefusal();
+        const op=this.readOperation();
         const url=await this.resolveDaemonUrl();if(!url)throw new Error("Connect OpenRig before opening the saved spec graph.");
         // This is the same public structured review used by rig specs preview in OpenRig0.7.11.
         // It stays on the person's existing HTTP/tunnel origin and needs no local or remote CLI.
@@ -1923,6 +2107,8 @@ export default class RigView extends View {
    *  `Edit` enters edit mode (`Cancel edit` exits with inline discard confirmation); `Edit` on a built-in creates an
    *  editable copy in the user library; `Launch` lives on the row's right-click menu and the palette. */
   specBody(t, cx, s, single) {
+    const config=this.activeConfig();
+    if(!config)return this.dim(t,"This page's connection isn't set up any more, so its spec isn't shown and nothing is sent from here. Open the spec again from the sidebar.");
     const isBuiltin = s.sourceType === "builtin" || !s.sourcePath;
     const sfx = (name, plain = false) => (single && plain ? name : `${name}-${s.id}`);
     let box = (this.specBoxes ??= Object.create(null))[s.id];
@@ -1941,12 +2127,12 @@ export default class RigView extends View {
     const editLabel = isBuiltin
       ? (box.copying ? "Copying…" : "Copy & edit")
       : (editing ? "Cancel edit" : "Edit");
-    const copyReason = isBuiltin ? personDisableReason("specs-add", this.config) : null;
-    const remoteEdit = !isBuiltin && Boolean(this.config?.daemonMachine);
+    const copyReason = isBuiltin ? personDisableReason("specs-add", config) : null;
+    const remoteEdit = !isBuiltin && Boolean(config.daemonMachine);
     const guidance = box.note || (remoteEdit ? this.remoteSpecGuidance() : null);
     const copyNote = this.specCopyNotes?.[s.id];
     const saveDisabled = isBuiltin || !editing || !dirty || Boolean(box.saving || box.awaitingPermission);
-    const openDisabled = !s.sourcePath || Boolean(this.config?.daemonMachine);
+    const openDisabled = !s.sourcePath || Boolean(config.daemonMachine);
     const toolbar = h_flex().gap(8).items_center().flex_wrap()
       .when(rigSpec&&!single,el=>el.child(h_flex().rounded(6).border_1().border_color(t.border).children(["graph","yaml"].map(view=>
         this.button(t,`spec-view-${view}-${s.id}`,view==="graph"?"Graph":"YAML",(_e,cx)=>{box.view=view;cx.notify();},{small:true})
@@ -1956,7 +2142,7 @@ export default class RigView extends View {
         primary: !editing && !copyReason,
         iconName: editing ? "x" : "layers",
         disabled: Boolean(box.loading || box.copying || box.saving || box.awaitingPermission || copyReason),
-        tooltip: remoteEdit ? `Edit on ${this.config.daemonMachine}` : copyReason,
+        tooltip: remoteEdit ? `Edit on ${config.daemonMachine}` : copyReason,
       }))
       .when(!graphView,el=>el.child(this.button(t, sfx("spec-save", true), box.saving ? "Saving…" : `Save ${mac ? "⌘↵" : "Ctrl+↵"}`, (_e, cx) => this.saveSpec(cx, s), {
         primary: editing && dirty,
@@ -1964,11 +2150,11 @@ export default class RigView extends View {
         disabled: saveDisabled,
       })))
       .child(this.button(t, sfx("spec-open", true), "Open file", () => {
-        if (s.sourcePath && !this.config?.daemonMachine) push(fileEntry(s.sourcePath, `${s.name} · spec`));
+        if (s.sourcePath && !config.daemonMachine) this.push(fileEntry(s.sourcePath, `${s.name} · spec`));
       }, {
         iconName: "file-text",
         disabled: openDisabled,
-        tooltip: this.config?.daemonMachine ? `This file is on ${this.config.daemonMachine}.` : openDisabled ? "Built-in spec has no file path on disk" : null,
+        tooltip: config.daemonMachine ? `This file is on ${config.daemonMachine}.` : openDisabled ? "Built-in spec has no file path on disk" : null,
       }))
       .children(pills.map((r) => h_flex().id(`spec-rig-pill-${s.id}-${r.name}`).px(8).h(24).gap(5).items_center().rounded(12).text_size(12).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((e) => e.bg(t.hover)).on_click(() => this.openRigFromSpec(r))
@@ -1976,15 +2162,15 @@ export default class RigView extends View {
       .when(isBuiltin, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Built-in specs can't be edited; copy one to make your own.")))
       .when(!isBuiltin && !editing, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Read-only")))
       .when(dirty, (el) => el.child(div().text_size(11.5).text_color(t.working).child("● Unsaved changes")))
-      .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:460,height:300,
-        props:{target:{kind:"spec",id:s.id,conn:this.config?.connectionId,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{primary:true,iconName:"rig-play"})))
-      .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().flex_wrap().child(div().text_size(11.5).text_color(t.muted).child(this.config?.daemonMachine
+      .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:460,height:LAUNCH_DIALOG_HEIGHT,
+        props:{target:{kind:"spec",id:s.id,conn:config.connectionId,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{primary:true,iconName:"rig-play"})))
+      .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().flex_wrap().child(div().text_size(11.5).text_color(t.muted).child(config.daemonMachine
         ? `Restored your unsaved edits from ${this.time(box.draftAt??Date.now())}.` : "Restored unsaved edits"))
-        .child(this.button(t, `spec-discard-draft-${s.id}`, this.config?.daemonMachine?"Discard edits":"Discard", (_e, cx) => this.discardDraft(cx, s), { small: true }))));
+        .child(this.button(t, `spec-discard-draft-${s.id}`, config.daemonMachine?"Discard edits":"Discard", (_e, cx) => this.discardDraft(cx, s), { small: true }))));
     const errors = box.errors ?? [];
     if(single){this.pageActions=toolbar;this.pageHeading={title:s.name,status:`${s.kind??"spec"}${s.version?` · ${s.version}`:""}`};}
     return v_flex().gap(8)
-      .child(this.kv(t, [["Kind", s.kind], ["Version", s.version], ["Summary", s.summary], ["File", `${s.sourcePath ?? "not a file on disk"}${this.config?.daemonMachine ? ` · on ${this.config.daemonMachine}` : ""}`, true]]))
+      .child(this.kv(t, [["Kind", s.kind], ["Version", s.version], ["Summary", s.summary], ["File", `${s.sourcePath ?? "not a file on disk"}${config.daemonMachine ? ` · on ${config.daemonMachine}` : ""}`, true]]))
       .when(!single,el=>el.child(toolbar))
       .when(!!box.builtinEditNote && !guidance, (el) => el.child(this.dim(t, box.builtinEditNote)))
       .when(Boolean(box.confirmDiscardEdit || box.confirmRevert), (el) => el.child(
@@ -2015,7 +2201,7 @@ export default class RigView extends View {
 
   /** Creates and wires an EditorState for a spec box with the requested `readonly` state. */
   makeSpecEditorState(s, box, value, readonly) {
-    const key = specDraftKey(s.id,this.config);
+    const key = specDraftKey(s.id,this.specConfig());
     box.secondaryEnterTask?.cancel?.();box.secondaryEnterBase=null;
     box.state?.release?.();
     const state = EditorState.new({ language: "yaml", value, readonly: Boolean(readonly), font_family: settings().font_family });
@@ -2047,9 +2233,56 @@ export default class RigView extends View {
     return state;
   }
 
+  /** The local spec folders for ONE connection, resolved NOW from local facts (never the daemon's list) and published to the flat field so a
+   *  synchronous reader - and writeSpecCopy's write path - sees the ACTED-ON connection's folders. They
+   *  used to be resolved once per config load for whichever page was then shown, so a tab whose first load ran while another machine's page was
+   *  on top kept none and every local Save and Copy & edit was refused. Resolving per acted-on connection at use time removes that dependency.
+   *
+   *  No cache: a call per use is a handful of local execs, and a cache is what let the field hold the PREVIOUS connection's folders on a hit
+   *  (A, B, A, B and B's copy landed in A's). Resolving every time makes the field correct by construction, and the security rule
+   *  (`spec-write-path`) can trace this assignment to localSpecRoots().
+   *
+   *  A connection on a machine has its specs there, so it resolves to and publishes NO local folders: a write cannot reach folders another
+   *  page held. */
+  async specRootsFor(config, { publish = true } = {}) {
+    if (!config) return [];
+    const publishing = publish && (this.activeConfig()?.connectionId ?? config.connectionId ?? LEGACY_CONNECTION_ID)
+      === (config.connectionId ?? LEGACY_CONNECTION_ID);
+    if (config.daemonMachine) {
+      // Publish [] as OURS (owner and published mark), not as a caller's choice: an unmarked [] reads as "someone chose no folders", so a local
+      // page after any machine page action would skip resolving and refuse (fail-closed).
+      // The field and the published mark must be the SAME array: two `[]` literals are never `===`, so the field would look
+      // CALLER-CHOSEN and a later local Copy would skip resolving and refuse. The security rule wants
+      // the assignment written as a literal here, so `this.specRoots = []` and the mark follows it by identity.
+      if (publishing) {
+        this.specRoots = [];
+        this.specRootsPublished = this.specRoots;
+        this.specRootsConn = config.connectionId ?? LEGACY_CONNECTION_ID;
+      }
+      return [];
+    }
+    const roots = await localSpecRoots(config, execFor(config), home());
+    if (publishing) { this.specRoots = roots; this.specRootsConn = config.connectionId ?? LEGACY_CONNECTION_ID; this.specRootsPublished = roots; }
+    return roots;
+  }
+  /** The page's own folders for a synchronous reader: what the last resolution published (the load's, or specRootsFor's). Empty on a
+   *  connection on a machine, whose specs are there. */
+  pageSpecRoots() {
+    const cfg = this.activeConfig();
+    if (cfg?.daemonMachine) return [];
+    // The field wins when it was NOT this file's own publish (a caller or a test that chose folders, including an empty list meaning "none"), and
+    // it belongs to the acted-on connection. A field this file published for ANOTHER connection is never handed over: that was the review's finding, a
+    // copy on B writing into A's folder.
+    const key = cfg?.connectionId ?? LEGACY_CONNECTION_ID;
+    // The field wins when it is not this file's own publish (a caller or test that chose folders, including [] for "none").
+    if (Array.isArray(this.specRoots) && this.specRoots !== this.specRootsPublished) return this.specRoots;
+    // Otherwise it must belong to THIS page's connection: a field this file published for another connection is never read (the A, B, A, B case).
+    if (Array.isArray(this.specRoots) && (this.specRootsConn == null || this.specRootsConn === key)) return this.specRoots;
+    return []; // nothing resolved for this page yet: the async paths resolve for it
+  }
   /** Explain a local edit refusal without inferring locality from missing folders. */
   specRefusal() {
-    return specFolderRefusal(this.specRoots, { machine: this.config?.daemonMachine, realpathAvailable: this.specRealpathAvailable });
+    return specFolderRefusal(this.pageSpecRoots(), { machine: this.activeConfig()?.daemonMachine, realpathAvailable: this.specRealpathAvailable }); // the page's own OpenRig
   }
 
   specNoteView(t, note, id, information = false) {
@@ -2072,12 +2305,14 @@ export default class RigView extends View {
   }
 
   remoteSpecGuidance(){
-    const machine=this.config?.daemonMachine;
-    return `Save writes this spec on ${machine}.`+(this.specConsentMachine===machine?"":" The first save asks for permission.");
+    const cfg=this.activeConfig(); if(!cfg) return "This page's OpenRig is no longer set up, so its spec can't be saved from here."; // no fallback
+    const machine=cfg.daemonMachine;
+    // A page on this computer says so plainly rather than naming an empty machine.
+    return `Save writes this spec on ${machine ?? "this computer"}.`+(this.specConsentMachine===machine?"":" The first save asks for permission.");
   }
 
   specConflictMessage(){
-    const machine=this.config?.daemonMachine;
+    const machine=this.activeConfig()?.daemonMachine; // the page's own OpenRig, no fallback
     return machine?`The spec changed on ${machine} since you opened it. Reload shows the new version and discards your unsaved edits. Keep editing keeps your version; saving then replaces the change on ${machine}.`:"The file changed on disk since you opened it.";
   }
 
@@ -2087,7 +2322,7 @@ export default class RigView extends View {
     if (!box) return;
     box.view="yaml";
     const current=nav().stack?.at(-1);
-    if(current?.section==="specs"&&(current.id===s.id||current.name===s.name))push({...current,specTab:"yaml"});
+    if(current?.section==="specs"&&(current.id===s.id||current.name===s.name))this.push({...current,specTab:"yaml"});
     if (isBuiltin) {
       box.builtinEditNote = "Copy & edit makes your own copy; the built-in stays unchanged.";
       this.copySpec(cx, s);
@@ -2116,7 +2351,7 @@ export default class RigView extends View {
   confirmDiscardEditSpec(cx, s, isBuiltin) {
     const box = this.specBoxes?.[s.id];
     if (!box) return;
-    setDraft(specDraftKey(s.id,this.config), null);
+    setDraft(specDraftKey(s.id,this.specConfig()), null);
     box.editing = false;
     box.confirmDiscardEdit = false;
     box.confirmRevert = false;
@@ -2136,7 +2371,7 @@ export default class RigView extends View {
       await Promise.resolve();
       try {
         const text = await this.specText(s);
-        const key = specDraftKey(s.id,this.config), raw = (shared("rig.drafts") ?? {})[key];
+        const key = specDraftKey(s.id,this.specConfig()), raw = (shared("rig.drafts") ?? {})[key];
         const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
         let initial = text;
         box.loaded = text; box.diskText = null; box.restoredDraft = false;
@@ -2163,7 +2398,7 @@ export default class RigView extends View {
   reloadSpec(cx, s, isBuiltin) {
     const box = this.specBoxes[s.id];
     if (this.specDirty(box) && !box.confirmReload) { box.confirmReload = true; cx.notify(); return; }
-    setDraft(specDraftKey(s.id,this.config), null);
+    setDraft(specDraftKey(s.id,this.specConfig()), null);
     this.specBoxes[s.id] = { loading: true, editing: false, view:box.view };
     this.loadSpec(cx, s, isBuiltin, this.specBoxes[s.id]);
     box.state?.release?.();
@@ -2176,7 +2411,7 @@ export default class RigView extends View {
     if (!box) return;
     box.conflict = null; box.confirmReload = false; box.editing = true;
     box.loaded = box.diskText ?? box.loaded; box.diskText = null;
-    if (box.state) setDraft(specDraftKey(s.id,this.config), this.specDirty(box) ? { text: box.state.value(), baseText: box.loaded, baseHash: simpleHash(box.loaded) } : null);
+    if (box.state) setDraft(specDraftKey(s.id,this.specConfig()), this.specDirty(box) ? { text: box.state.value(), baseText: box.loaded, baseHash: simpleHash(box.loaded) } : null);
     cx.notify();
   }
 
@@ -2184,7 +2419,7 @@ export default class RigView extends View {
   discardDraft(cx, s) {
     const box = this.specBoxes?.[s.id];
     if (!box?.state) return;
-    setDraft(specDraftKey(s.id,this.config), null);
+    setDraft(specDraftKey(s.id,this.specConfig()), null);
     box.restoredDraft = false; box.confirmRevert = false; box.confirmDiscardEdit = false; box.editing = false;
     this.makeSpecEditorState(s, box, box.loaded, true);
     cx.notify();
@@ -2196,7 +2431,7 @@ export default class RigView extends View {
     if (!box?.state) return;
     if (this.specDirty(box) && !box.confirmRevert) { box.confirmRevert = true; cx.notify(); return; }
     box.state.set_value(box.loaded);
-    setDraft(specDraftKey(s.id,this.config), null);
+    setDraft(specDraftKey(s.id,this.specConfig()), null);
     box.confirmRevert = false; box.confirmDiscardEdit = false; box.errors = null; box.conflict = null; box.restoredDraft = false;
     cx.notify();
   }
@@ -2209,9 +2444,13 @@ export default class RigView extends View {
     const edited = box.state.value();
     box.errors = null; box.conflict = null; box.note = null; box.savedText = null;
     const refused = this.specRefusal();
-    if (this.config?.daemonMachine) {
+    const shown = this.specConfig(); // the connection this page shows decides the route, never the first connection
+    if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one. Unsaved text stays here."; cx.notify(); return; }
+    if (shown.daemonMachine) {
       this.remoteSpecWrite(cx,s,{verb:"save",target:s.sourcePath,baseText:box.loaded,content:edited});return;
     }
+    // loadConfig keeps the previous folders while it resolves the new ones: a save now would resolve its file against folders the new config no longer lists.
+    if (this.specFoldersReady === false) { box.note = "The spec folders are still loading. Try saving again."; cx.notify(); return; }
     if (unsafeSpecWritePath(s.sourcePath)) { box.note = refused; cx.notify(); return; }
     if (!this.config) { box.note = "The daemon address isn't known yet."; cx.notify(); return; }
     box.saving = true; cx.notify();
@@ -2220,9 +2459,10 @@ export default class RigView extends View {
       try {
         // One operation: the address and the validation belong to the config this save began under. If the settings change in between (a list installed,
         // an address edited), the save was NOT validated: nothing is written, and the person is told why.
-        const op = gatedOperation();
+        const op = this.writeOperation(shown);
         // Written only inside the local spec folders, at the resolved path: a symlink out of them is refused.
-        const file = await resolveInSpecRoots(s.sourcePath, this.specRoots, exec);
+        const roots = await this.specRootsFor(shown); // THIS acted-on connection's own folders, keyed by connection
+        const file = await resolveInSpecRoots(s.sourcePath, roots, execFor(shown));
         if (!file) { box.note = refused; return; }
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) { box.note = "The daemon address isn't known yet."; return; }
@@ -2242,13 +2482,13 @@ export default class RigView extends View {
           if (now != null && now !== box.loaded) conflict(now); else box.errors = [String(e?.message ?? e)];
           return;
         }
-        const synced = await op.fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(rethrowGate(null));
+        const synced = await this.syncLibrary(op, daemonUrl);
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
-        box.savedText = synced?.ok ? "Saved." : "Saved; library re-index failed.";
+        box.savedText = synced?.ok ? "Saved." : synced?.refused ? "Saved; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up." : "Saved; library re-index failed.";
         delete this.specCopyNotes?.[s.id];
         if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
-        const key = specDraftKey(s.id,this.config), now = box.state.value();
+        const key = specDraftKey(s.id,this.specConfig()), now = box.state.value();
         setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
         if (now === edited) {
           box.editing = false;
@@ -2261,12 +2501,27 @@ export default class RigView extends View {
     });
   }
 
+  /** The library sync that FOLLOWS a write that already happened: a gate refusal here (the settings changed) is `{ ok: false, refused: true }`, never an exception that would
+   *  skip recording what was written and call it "not used". Another failure is null, as before. */
+  async syncLibrary(op, daemonUrl) {
+    try { return await op.fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }); }
+    catch (e) { return e?.code === "GATE_REFUSED" ? { ok: false, refused: true } : null; }
+  }
+
   /** User specs may read their file inside the local spec folders with symlinks resolved. All other entries use only
    *  the daemon's own copy, even when their sourcePath happens to name a local spec. */
   async specText(s, outer = null) {
-    const op = outer ?? gatedOperationOrRefusal(); // the address resolved below belongs to the config this read began under
+    const op = outer ?? this.readOperation(); // the address resolved below belongs to the connection and config this read began under
     const path=rigSpecLibraryPath(s);if(!path)throw new Error("This library entry has no usable spec id.");
-    const file = !this.config?.daemonMachine && s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, this.specRoots, exec) : null;
+    // The page's own connection decides, and its realpath runs through that connection's exec (a bare one is refused with
+    // several OpenRigs). No fallback to the sidebar's config: a page whose connection is gone has no spec to read, so refuse plainly.
+    const cfg = this.activeConfig();
+    if (!cfg) throw new Error("This page's OpenRig is no longer set up, so its spec can't be read. Reopen the page.");
+    // The page's roots as it holds them; resolved only when it holds none (a page opened after a load ran for another machine's page).
+    // This page's own folders, resolved only when it has none - never over folders a caller (or the page) already chose.
+    const chosen = Array.isArray(this.specRoots) && this.specRoots !== this.specRootsPublished;
+    const roots = chosen ? this.specRoots : await this.specRootsFor(cfg);
+    const file = !cfg.daemonMachine && s.sourceType === "user_file" && s.sourcePath ? await resolveInSpecRoots(s.sourcePath, roots, execFor(cfg)) : null;
     let text = file ? await readTextFile(file).catch(() => null) : null;
     if (text == null && this.config) {
       const daemonUrl = await this.resolveDaemonUrl();
@@ -2286,13 +2541,26 @@ export default class RigView extends View {
    *  daemon sent), taking a name free in every local spec folder because the CLI also copies into its library.
    *  Returns the file written. */
   async writeSpecCopy(s, text, op = null) {
-    const root = this.specRoots?.[0];
+    // A page opened after a load that resolved for another machine's page holds no folders, so resolve
+    // for THIS page when it holds none. The folders stay in `this.specRoots`, which is what every path check below reads - and folders it
+    // already holds are respected, never re-resolved over (a caller may have chosen them, and a new address is a new load anyway).
+    // The page's roots as it holds them: a caller (and the test that clicks Copy) reads roots from THIS field, so the copy must land where
+    // it says. Resolved only when the page holds none: a page opened after a load ran for another machine's page.
+    // Resolve for THIS page, then read the published field - the security rule traces `this.specRoots[0]` as a write path,
+    // and a local alias would lose that trace.
+    // Resolve only when the field does not already hold THIS page's folders or a caller's chosen ones: re-resolving over a caller's choice is
+    // what made a copy land somewhere other than where the page said.
+    const fieldIsChosen = Array.isArray(this.specRoots) && this.specRoots !== this.specRootsPublished;
+    if (!fieldIsChosen) await this.specRootsFor(this.activeConfig()); // else a caller already put this page's folders here
+    const roots = this.specRoots ?? [];
+    if (!roots[0]) throw new Error(this.specRefusal());
+    const root = this.specRoots[0]; // read from the field: the security rule traces this shape as a write path
     if (!root) throw new Error(this.specRefusal());
     const base = specCopyName(s.name);
     for (let i = 0; i < 20; i++) {
       const name = `${base}${i === 0 ? "" : i === 1 ? "-copy" : `-copy-${i}`}.yaml`;
       const file = `${root}/${name}`;
-      const existing = await Promise.all(this.specRoots.map((r) => readTextFile(`${r}/${name}`)));
+      const existing = await Promise.all(roots.map((r) => readTextFile(`${r}/${name}`)));
       if (existing.some((text) => text != null)) continue;
       // Create-only: herdr refuses if the file appeared meanwhile, and the next name is tried.
       op?.check(); // the name checks above awaited: the copy is only created under the settings it began with
@@ -2312,13 +2580,15 @@ export default class RigView extends View {
     if (!this.config?.person) { box.note = NO_PERSON; cx.notify(); return; }
     // A built-in rig spec that has a folder of its own is copied as that whole folder, so the copy can launch.
     if (folderCopyable(s)) { this.copyFolder(cx, s); return; }
-    if(this.config.daemonMachine){
+    const shown = this.specConfig(); // the connection this page shows decides the route
+    if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one."; cx.notify(); return; }
+    if(shown.daemonMachine){
       this.remoteSpecWrite(cx,s,{verb:"copy",name:s.name});return;
     }
     box.copying = true; box.note = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const op = gatedOperation(); // the library re-read below belongs to the config this copy began under
+        const op = this.writeOperation(shown); // the library re-read below belongs to the connection and config this copy began under
         const source = s.sourceType === "user_file" ? box.loaded ?? await this.specText(s, op) : await this.specText(s, op);
         // Agent refs relative to the original's folder are made absolute (text only); a copy that couldn't find its agents is never written.
         const prepared = copyableSpecText(source, s.sourcePath);
@@ -2326,16 +2596,18 @@ export default class RigView extends View {
         const text = prepared.text;
         const written = await this.writeSpecCopy(s, text, op);
         // Registered only at its resolved path inside the local spec folders: a link planted at that name is refused.
-        const file = await resolveInSpecRoots(written, this.specRoots, exec);
+        const roots = await this.specRootsFor(shown); // THIS acted-on connection's own folders
+        const file = await resolveInSpecRoots(written, roots, execFor(shown));
         if (!file) { box.note = this.specRefusal(); return; }
-        if (cliRefusal(this.config)) { box.note = cliRefusal(this.config); return; } // no home of its own: no CLI run, and the person is told
+        if (cliRefusal(shown)) { box.note = cliRefusal(shown); return; } // no home of its own: no CLI run, and the person is told
         op.check(); // the path resolution above awaited
-        const cmd = writeCommand(this.config, ["specs", "add", "--", file]);
+        const cmd = writeCommand(shown, ["specs", "add", "--", file]);
         if (!cmd) { box.note = NO_PERSON; return; }
-        const r = writeOutcome(await exec(cmd.command, cmd.args, { timeout: 180000 }));
+        const r = writeOutcome(await execFor(shown)(cmd.command, cmd.args, { timeout: 180000 }));
         if (!r.ok) { box.note = r.text; return; }
-        const daemonUrl = await this.resolveDaemonUrl();
-        if (daemonUrl) await op.fetch(`${daemonUrl}/api/specs/library/sync`, { method: "POST" }).catch(rethrowGate(null));
+        const daemonUrl = await this.resolveDaemonUrl(shown);
+        const copySynced = daemonUrl ? await this.syncLibrary(op, daemonUrl) : null;
+        if (copySynced?.refused) { box.note = "The copy was made, but OpenRig's settings changed before the library could be updated. Refresh the library to see it."; return; }
         let made = s.id, copy = null;
         try {
           const res = daemonUrl ? await op.fetch(`${daemonUrl}/api/specs/library`) : null;
@@ -2512,7 +2784,7 @@ export default class RigView extends View {
     if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running on this computer, so a built-in's folder can't be copied here.");
     const health = async (url) => { const r = await op.fetch(`${url}/healthz`); if (!r.ok) throw new Error("OpenRig isn't answering."); return JSON.parse(await r.text()); };
     const [here, there] = await Promise.all([health(status.daemonUrl), health(daemonUrl)]);
-    if (!here?.selfHostId || here.selfHostId !== there?.selfHostId)
+    if (!sameDaemon(here, there)) // the same host id isn't enough: a host.name-seeded id can be shared by two OpenRigs on this computer
       throw new Error("The OpenRig this page reads isn't this computer's own, so a copy made here would never be seen by it. Set up the machine first.");
     const helper = attachRelayPath(appHome(), MOD_IDS.view).replace(/rig-attach-relay\.cjs$/, "rig-spec-files.cjs");
     op.check();
@@ -2520,7 +2792,8 @@ export default class RigView extends View {
     op.check();
     let out; try { out = JSON.parse(r.stdout); } catch (_) { throw new Error(r.stderr || "The copy helper gave no answer."); }
     if (out.error) throw Object.assign(new Error(out.error), { code: out.code, folder: out.folder });
-    const file = await resolveInSpecRoots(out.path, this.specRoots, exec);
+    const roots = await this.specRootsFor(config); // the connection this copy began for
+    const file = await resolveInSpecRoots(out.path, roots, execFor(config));
     if (!file) throw new Error(this.specRefusal());
     const current = await readTextFile(file);
     if (current == null) throw new Error("The copied spec couldn't be read back.");
@@ -2537,14 +2810,17 @@ export default class RigView extends View {
   copyFolder(cx, s, consent = null) {
     const box = this.specBoxes?.[s.id];
     if (!box || box.copying || box.awaitingPermission) return;
-    const config = { ...this.config };
+    const shown = this.specConfig();
+    if (!shown) { box.note = "This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one."; cx.notify(); return; }
+    const refused = shown.daemonMachine ? cliRefusal(shown) : null; if (refused) { box.note = refused; cx.notify(); return; } // a box connection without its own home: HOME_NEEDED
+    const config = { ...shown };
     // The operation begins where the config is captured, synchronously: a settings change while the address is resolved (a CLI discovery on a default
     // install) must not pair this config's machine and home with the new address.
-    let op; try { op = gatedOperation(); } catch (error) { box.note = String(error?.message ?? error); cx.notify(); return; }
+    let op; try { op = this.writeOperation(config); } catch (error) { box.note = String(error?.message ?? error); cx.notify(); return; }
     box.copying = true; box.note = null; box.errors = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const daemonUrl = await this.resolveDaemonUrl();
+        const daemonUrl = await this.resolveDaemonUrl(this.specConfig());
         if (!daemonUrl) throw new Error("The daemon address isn't known yet.");
         op.check(); // the address resolved above is for the config that asked
         const host = this.folderHost(cx, config, daemonUrl, op);
@@ -2577,7 +2853,7 @@ export default class RigView extends View {
     (this.specAutoEdit ??= new Set()).add(copy.id);
     if (note) (this.specCopyNotes ??= Object.create(null))[copy.id] = note;
     else delete this.specCopyNotes?.[copy.id];
-    push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml" });
+    this.push({ section: "specs", id: copy.id, name: copy.name, specTab: "yaml" });
     this.read(cx, "/api/specs/library", true); run("rig.refresh");
   }
 
@@ -2590,23 +2866,28 @@ export default class RigView extends View {
       return;
     }
     if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`); return; }
-    const key=specDraftKey(found.entry.id,this.config),draft=(shared("rig.drafts")??{})[key];
+    const key=specDraftKey(found.entry.id,this.specConfig()),draft=(shared("rig.drafts")??{})[key];
     const retained=this.specDirty(this.specBoxes?.[found.entry.id]) || typeof draft==='string' || typeof draft?.text==='string';
     if(!retained)setDraft(key, { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
     this.showSpecCopy(cx, found.entry, retained ? null
       : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`);
   }
 
-  remoteSpecController(cx) {
+  remoteSpecController(cx, op = null) {
     const bridge=attachRelayPath(appHome(),MOD_IDS.view).replace(/rig-attach-relay\.cjs$/,"rig-spec-transport.cjs");
-    return new RemoteSpecs({exec,hc,machines,wait:waitWith(cx),appHome:appHome(),specBridgePath:bridge,
-      health:async url=>{const r=await fetch(`${url}/healthz`);if(!r.ok)throw Error("OpenRig isn't answering.");return JSON.parse(await r.text());},
+    // With the write's operation, every helper call first checks it: once the settings it began under are gone it refuses to START (each call otherwise takes the generation current at its own start).
+    const cfg=this.specConfig(); // the connection this page shows: its own gate scope for the helper calls
+    if(!cfg){const refuse=async()=>{throw Error(UNKNOWN_CONNECTION);};return{perform:refuse,hashText:refuse,checked:refuse};} // a removed connection: nothing runs, never another connection's
+    return new RemoteSpecs({exec:op?async(c,a,o)=>{op.check();return execFor(cfg)(c,a,o);}:execFor(cfg),hc:op?async(a,b)=>{op.check();return hcFor(cfg)(a,b);}:hcFor(cfg),machines,wait:waitWith(cx),appHome:appHome(),specBridgePath:bridge,
+      health:async url=>{const r=await this.writeOperation(cfg).fetch(`${url}/healthz`);if(!r.ok)throw Error("OpenRig isn't answering.");return JSON.parse(await r.text());},
       currentConfig:async()=>preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())),this.config),
+      // The connection the write began for, as the file says it NOW: another connection's own view; a removed one reads as none, so the write's identity check refuses.
+      connectionOf:base=>!cfg||cfg.connectionId===base?.connectionId||!(base?.connections??[]).length?base:((c=>c?connectionConfig(base,c):{})(base.connections.find(c=>c.id===cfg.connectionId))),
       writeText:writeTextFile,
-      readSpecConsent:async()=>consentOf(await readTextFile(`${appHome()}/openrig/spec-consent.json`),this.config?.connectionId??LEGACY_CONNECTION_ID),
+      readSpecConsent:async()=>consentOf(await readTextFile(`${appHome()}/openrig/spec-consent.json`),cfg?.connectionId??LEGACY_CONNECTION_ID),
       writeSpecConsent:async value=>{
         const path=`${appHome()}/openrig/spec-consent.json`,previous=await readTextFile(path);
-        return writeTextFile(path,consentText(previous,this.config?.connectionId??LEGACY_CONNECTION_ID,value).trimEnd(),previous??null);
+        return writeTextFile(path,consentText(previous,cfg?.connectionId??LEGACY_CONNECTION_ID,value).trimEnd(),previous??null);
       },
     });
   }
@@ -2614,11 +2895,14 @@ export default class RigView extends View {
   /** Remote targets go only to the pinned box helper; registration is HTTP-only. */
   remoteSpecWrite(cx,s,request,consent=null) {
     const box=this.specBoxes?.[s.id];if(!box||box.saving||box.copying||box.awaitingPermission)return;
-    const config={...this.config};box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
+    const shown=this.specConfig();
+    if(!shown){box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one. Unsaved text stays here.";cx.notify();return;}
+    const refused=cliRefusal(shown);if(refused){box.note=refused;cx.notify();return;} // a connection without its own OpenRig home: HOME_NEEDED, nothing sent
+    const config={...shown};box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
     cx.spawn(async cx=>{
       try{
-        const op=gatedOperation(); // the validation below is only good for the config this write began under
-        const daemonUrl=await this.resolveDaemonUrl();if(!daemonUrl)throw Error("The daemon address isn't known yet.");
+        const op=this.writeOperation(config); // the validation below is only good for the connection and config this write began under
+        const daemonUrl=await this.resolveDaemonUrl(this.specConfig());if(!daemonUrl)throw Error("The daemon address isn't known yet.");
         let content=request.content??await this.specText(s,op);
         if(request.verb==="copy"){
           const prepared=copyableSpecText(content,s.sourcePath);
@@ -2631,7 +2915,7 @@ export default class RigView extends View {
         let validation;try{validation=JSON.parse(await checked.text());}catch(e){validation=rethrowGate(undefined)(e);}
         if(!checked.ok||validation?.valid===false){box.errors=validation?.errors??[validation?.error??"Validation failed."];return;}
         op.check();
-        const result=await this.remoteSpecController(cx).perform(config,operation,consent);
+        const result=await this.remoteSpecController(cx,op).perform(config,operation,consent);
         if(result.needsConsent){
           if(this.specPermission)throw Error("Finish the open spec permission dialog first.");
           const token=`spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -2641,15 +2925,15 @@ export default class RigView extends View {
         }
         if(!result.ok)throw Error(result.reason??"The box did not confirm the write.");
         this.specConsentMachine=config.daemonMachine;
-        const synced=await op.fetch(`${daemonUrl}/api/specs/library/sync`,{method:"POST"}).catch(rethrowGate(null));
+        const synced=await this.syncLibrary(op,daemonUrl);
         if(request.verb==="save"){
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
-          box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
+          box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:synced?.refused?`Saved on ${config.daemonMachine}; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
           delete this.specCopyNotes?.[s.id];
-          const now=box.state.value();setDraft(specDraftKey(s.id,this.config),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
+          const now=box.state.value();setDraft(specDraftKey(s.id,this.specConfig()),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
           if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true);}
         }else{
-          if(!synced?.ok)throw Error(`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
+          if(!synced?.ok)throw Error(synced?.refused?`The copy was saved on ${config.daemonMachine}, but OpenRig's settings changed before the library could be updated. Refresh the library before copying again.`:`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
           const response=await op.fetch(`${daemonUrl}/api/specs/library`);if(!response.ok)throw Error("The copy was saved, but the library couldn't be read. Refresh before copying again.");
           const list=JSON.parse(await response.text()),copy=list.find(x=>x.sourceType==="user_file"&&x.sourcePath===result.path);
           if(!copy)throw Error("The copy was saved, but isn't indexed yet. Refresh before copying again.");
@@ -2657,7 +2941,7 @@ export default class RigView extends View {
           (this.specAutoEdit??=new Set()).add(copy.id);delete this.specBoxes[copy.id];
           const lacking=s.sourceType==="user_file"?null:siblingFileNote(siblingFileNames(content));
           if(lacking)(this.specCopyNotes??=Object.create(null))[copy.id]=lacking;
-          push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml"});
+          this.push({section:"specs",id:copy.id,name:copy.name,specTab:"yaml"});
         }
         this.read(cx,"/api/specs/library",true);run("rig.refresh");
       }catch(error){
@@ -2673,8 +2957,8 @@ export default class RigView extends View {
 
   /** "Launch rig from spec…": rig specs only, with or without a file (the menu and palette use the same rule). */
   launchButton(t, spec, id = "spec-launch") {
-    return this.button(t, id, "Launch rig from spec…", () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300,
-      props: { target: { kind: "spec", id: spec.id, conn: this.config?.connectionId, name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } }), { iconName: "rig-play" });
+    return this.button(t, id, "Launch rig from spec…", () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: LAUNCH_DIALOG_HEIGHT,
+      props: { target: { kind: "spec", id: spec.id, conn: this.shownConnId(), name: spec.name, sourcePath: spec.sourcePath ?? null, specKind: "rig" }, step: { action: "launch-spec" } } }), { iconName: "rig-play" });
   }
 
   scopes(t, cx, entry) {
@@ -2720,7 +3004,7 @@ export default class RigView extends View {
     const missions = scopes.data.missions ?? [];
     const sliceTarget = (m, s) => ({
       kind: "slice",
-      conn: this.config?.connectionId, // a scope belongs to the page's own connection (one in PR 1)
+      conn: this.shownConnId(), // a scope belongs to the connection this page shows
       mission: m.mission ?? m.id ?? m.name,
       slice: s.dirName ?? s.id ?? s.slug,
       name: s.displayName ?? s.dirName ?? s.id ?? s.slug,
@@ -2757,8 +3041,8 @@ export default class RigView extends View {
       if(got.loading&&got.data===undefined)return this.dim(t,'Reading workflows…');
       const resolved={...entry,project:project??entry.project};
       if(entry.workflow||this.activePageView==='workflows'){
-        const panel=new WorkflowPanel(this,{navigate:push,monoFamily:settings()?.font_family??'JetBrains Mono',ownerEntry:session=>{
-          const found=resolveAskerSeat(session,this.currentTopology(cx));if(!found.found)return null;
+        const panel=new WorkflowPanel(this,{navigate:entry=>this.push(entry),monoFamily:settings()?.font_family??'JetBrains Mono',ownerEntry:session=>{
+          const found=resolveAskerSeat(session,this.currentTopology(cx),entry.conn??null);if(!found.found)return null;
           const s=found.seat;return {section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,conn:s.conn,name:s.logicalId,session:s.session,pod:s.pod};
         },queueEntry:id=>validHealthQitemId(id)?{section:'system',subview:'health',healthQitem:id}:null,
         time:(value,exact=false)=>value==='INDETERMINATE'?'unknown':value==null?'not reported':this.time?this.time(value,{exact}):asOf(value).replace(/^as of /,'')});
@@ -2804,7 +3088,7 @@ export default class RigView extends View {
         .children(missionFiles.map(([name, filePath]) =>
           h_flex().id(`mission-file-${mKey}-${name}`).px(7).h(20).gap(4).items_center().rounded(5).cursor_pointer()
             .bg(t.raised).border_1().border_color(t.border).hover((x) => x.bg(t.hover))
-            .on_click((_e, cx) => { cx?.stop_propagation?.(); push(fileEntry(filePath, `${name} · ${mTitle}`)); })
+            .on_click((_e, cx) => { cx?.stop_propagation?.(); this.push(fileEntry(filePath, `${name} · ${mTitle}`)); })
             .child(svg(icon("file-text")).size(11).flex_none().text_color(t.muted))
             .child(div().text_size(11).text_color(t.foreground).child(name))
             .child(this.copyButton(t, filePath, `mission-file-${mKey}-${name}`, "path"))))
@@ -2839,7 +3123,7 @@ export default class RigView extends View {
         const followReason = capabilityDisableReason("follow", this.caps());
         const doFollow = (_e, cx) => {
           cx?.stop_propagation?.();
-          this.oneClick({ kind: "follow-target", conn: this.config?.connectionId, view: `slice:${s.id ?? sDir}`, name: sName }, "follow", `slice-follow-${sKey}`);
+          this.oneClick({ kind: "follow-target", conn: this.shownConnId(), view: `slice:${s.id ?? sDir}`, name: sName }, "follow", `slice-follow-${sKey}`);
         };
         return v_flex().id(`slices-${mi}-${si}`).when(sliceFocused, (el) => el.rounded(6).border_1().border_color(t.accent))
           .child(h_flex().id(`slice-row-${mKey}-${sKey}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((x) => x.bg(t.hover))
@@ -2858,7 +3142,7 @@ export default class RigView extends View {
             .when(!!s.proofContract?.length, (c) => c.child(v_flex().gap(4).child(div().text_size(11.5).text_color(t.dim).child("Proof contract")).child(checklist(s.proofContract))))
             .child(knownFiles.length
               ? h_flex().gap(6).items_center().flex_wrap().children(knownFiles.map(([name, filePath], fi) => {
-                  const openFile = (_e, cx) => { cx?.stop_propagation?.(); push(fileEntry(filePath, `${name} · ${sName}`)); };
+                  const openFile = (_e, cx) => { cx?.stop_propagation?.(); this.push(fileEntry(filePath, `${name} · ${sName}`)); };
                   const compatFileId = isFirstExpanded ? `file-${fi}-${name}` : `file-${sKey}-${fi}-${name}`;
                   return div().id(`slice-file-${sKey}-${name}`).on_click(openFile).child(
                     h_flex().id(compatFileId).px(8).h(24).gap(5).items_center().rounded(6).cursor_pointer()
@@ -2879,7 +3163,7 @@ export default class RigView extends View {
       return v_flex().id(`mission-card-${mKey}`).rounded(10).bg(t.background).border_1().border_color(missionFocused ? t.accent : t.border).p(12).gap(8)
         .child(h_flex().gap(8).items_center().flex_wrap()
           .child(div().id(`mission-open-${mKey}`).flex_1().text_size(12.5).font_semibold().text_color(t.accent).cursor_pointer()
-            .tooltip("Open mission").on_click(()=>push({section:"scopes",...(workflowProject?{project:workflowProject}:{}),mission:mTitle,missionTab:hasWorkflows?"workflows":"slices"})).child(mTitle))
+            .tooltip("Open mission").on_click(()=>this.push({section:"scopes",...(workflowProject?{project:workflowProject}:{}),mission:mTitle,missionTab:hasWorkflows?"workflows":"slices"})).child(mTitle))
           .child(this.copyButton(t, mKey, `mission-${mKey}`, "mission id"))
           .child(headerMeta))
         .when(!!m.error, (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(m.error)))
@@ -2899,7 +3183,7 @@ export default class RigView extends View {
     if (caps.probed === false) return this.dim(t, "Checking OpenRig's view-preview support…");
     const capReason = capabilityDisableReason("open-view", caps);
     if (capReason) return this.workerCapabilityNote(t, capReason);
-    const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app${caps.hostWorkerViews?"&viewportColumns=160":`&appHome=${encodeURIComponent(appHome())}`}`;
+    const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app${caps.hostWorkerViews||listAddedMachine(this.activeConfig())?"&viewportColumns=160":`&appHome=${encodeURIComponent(appHome())}`}`; // never this computer's app home to a list-added machine's daemon
     const preview = this.read(cx, fullPath);
     if (preview.status === 401 || /\b401\b/.test(String(preview.error ?? ""))) {
       return this.dim(t, TERMINAL_TOKEN_PROTECTED);
@@ -2909,16 +3193,17 @@ export default class RigView extends View {
     const normalized = normalizeTerminalPreview(preview.data?.composed, viewKey, sharedRigData(this.config, shared)?.topology ?? []);
     const opened = normalized.opened;
     const absent = normalized.absent;
+    const degraded = normalized.degraded;
     const pages = normalized.pages;
     const rigName = normalized.rigName;
-    const rigEntry = rigName ? (sharedRigData(this.config, shared)?.topology ?? []).find((r) => r.name === rigName || r.id === rigName) : null;
+    const rigEntry = rigName ? rigOfConnection(sharedRigData(this.config, shared)?.topology ?? [], rigName, this.activeConnId()) : null; // within the page's own connection
     const noAttachableReason = opened.length === 0
-      ? `No attachable seats (${absent.length} absent)`
+      ? `No attachable seats (${absent.length} absent${degraded.length ? `, ${degraded.length} degraded` : ""})`
       : null;
     const openReason = capReason ?? noAttachableReason;
     const doOpen = (_e, cx) => {
       cx?.stop_propagation?.();
-      this.oneClick({ kind: "open-view", view: viewKey, plan: preview.data?.planId, rig: rigName, rigId: rigEntry?.id ?? null, conn: rigEntry?.conn ?? this.config?.connectionId }, "open-view", `open-view-${viewKey}`);
+      this.oneClick({ kind: "open-view", view: viewKey, plan: preview.data?.planId, rig: rigName, rigId: rigEntry?.id ?? null, conn: rigEntry?.conn ?? this.activeConnId() }, "open-view", `open-view-${viewKey}`);
     };
     const doResume = (_e, cx) => {
       cx?.stop_propagation?.();
@@ -2929,7 +3214,7 @@ export default class RigView extends View {
         width: 460,
         height: 380,
         props: {
-          target: { kind: "rig", rig: rigName, rigId: rigEntry?.id ?? null, conn: rigEntry?.conn ?? this.config?.connectionId, lifecycle: rigEntry?.lifecycleState ?? rigEntry?.lifecycle ?? "stopped" },
+          target: { kind: "rig", rig: rigName, rigId: rigEntry?.id ?? null, conn: rigEntry?.conn ?? this.activeConnId(), lifecycle: rigEntry?.lifecycleState ?? rigEntry?.lifecycle ?? "stopped" },
           step: { action: "resume", confirm: true },
         },
       });
@@ -2940,7 +3225,7 @@ export default class RigView extends View {
     return v_flex().gap(8)
       .when(!!workerLine,el=>el.child(workerLine))
       .child(h_flex().gap(10).items_center().flex_wrap()
-        .child(this.dim(t, `${opened.length} attachable · ${absent.length} absent · ${pages.length} page${pages.length===1?"":"s"}`))
+        .child(this.dim(t, `${opened.length} attachable · ${absent.length} absent${degraded.length ? ` · ${degraded.length} degraded` : ""} · ${pages.length} page${pages.length===1?"":"s"}`))
         .child(div().flex_1())
         .when(opened.length === 0 && Boolean(rigName) && Boolean(normalized.rigStopped), (el) => el.child(
           this.button(t, `resume-terminal-rig-${rigName}`, "Rig is stopped · Resume…", doResume, { primary: true, small: true, iconName: "rig-play" }),
@@ -2956,6 +3241,15 @@ export default class RigView extends View {
           [["Seat"], ["Reason", 180]],
           absent.map((a) => ({ cells: [a.label ?? a.logicalId ?? a.seat ?? a.sessionName ?? "—", a.reason ?? "seat-not-running"] })),
           "No absent seats.",
+        ),
+      ])))
+      .when(degraded.length > 0, (el) => el.child(this.card(t, `Degraded seats (${degraded.length})`, [
+        this.table(
+          t,
+          `term-degraded-${viewKey}`,
+          [["Seat", 160], ["Reason"]],
+          degraded.map((seat) => ({ cells: [seat.label ?? seat.logicalId ?? seat.seat ?? seat.sessionName ?? "—", seat.reason ?? "OpenRig reported a degraded seat"] })),
+          "No degraded seats.",
         ),
       ])))
       .children(pages.map((page, i) => this.card(t, `Page ${i + 1}`, [this.table(t, `${pagePrefix}-${i}`, [["Seat"], ["Mode", 110]], page.map((p) => ({ cells: [p.label, p.readOnly ? "read-only" : "interactive"] })), "No panes in this page.")])));
@@ -3000,7 +3294,7 @@ export default class RigView extends View {
         return v_flex().id(`views-${i}`)
           .child(h_flex().id(`term-row-${r.view}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(toggleRow)
-            .on_mouse_down("right", () => this.menu({ kind: "terminal", conn: this.config?.connectionId, view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
+            .on_mouse_down("right", () => this.menu({ kind: "terminal", conn: this.shownConnId(), view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(r.name??"")).child(r.name))
             .child(this.copyButton(t, r.view, `view-id-${r.view}`, "view id"))
@@ -3012,7 +3306,7 @@ export default class RigView extends View {
   }
 
   currentTopology(cx) {
-    const fromShared = this.config?.connectionsRefused ? null : sharedRigData(this.config, shared)?.topology; // a refused list shows no rows another mod left behind
+    const fromShared = this.config?.configInvalid ? null : sharedRigData(this.config, shared)?.topology; // a refused list shows no rows another mod left behind
     if (Array.isArray(fromShared) && fromShared.length > 0) return fromShared;
     const summary = this.cache["/api/rigs/summary"]?.data ?? this.read(cx, "/api/rigs/summary", false, (sData) => {
       if (Array.isArray(sData)) {
@@ -3021,24 +3315,24 @@ export default class RigView extends View {
         }
       }
     }).data ?? [];
-    return (Array.isArray(summary) ? summary : []).filter((r) => r && !r.archivedAt).map((r) => rigModel(r, this.nodesOf(cx, r.id).data, [], this.config?.connectionId));
+    return (Array.isArray(summary) ? summary : []).filter((r) => r && !r.archivedAt).map((r) => rigModel(r, this.nodesOf(cx, r.id).data, [], this.activeConnId()));
   }
 
   openAskerSeat(cx, n) {
     const asker = n?.asker ?? (n?.logicalId && n?.rig ? `${n.logicalId}@${n.rig}` : null);
     const assistant=assistantForNeed({...n,asker},this.hostedMembers(cx));
-    if(assistant){const rig=this.currentTopology(cx).find(r=>r.name===assistant.rig&&r.conn===assistant.conn);push({section:'topology',kind:'assistant',session:assistant.seat,conn:assistant.conn,rig:assistant.rig,rigId:rig?.id,name:assistant.name});return;}
-    const resolved = resolveAskerSeat(asker, this.currentTopology(cx));
+    if(assistant){const rig=this.currentTopology(cx).find(r=>r.name===assistant.rig&&r.conn===assistant.conn);this.push({section:'topology',kind:'assistant',session:assistant.seat,conn:assistant.conn,rig:assistant.rig,rigId:rig?.id,name:assistant.name});return;}
+    const resolved = resolveAskerSeat(asker, this.currentTopology(cx), n?.conn ?? null); // the request's OWN connection: a name two OpenRigs share is never the first one's
     if (!resolved.found) {
       this.askerNotes[n.id] = resolved.message;
       cx?.notify?.();
       return;
     }
     delete this.askerNotes[n.id];
-    const config = this.config;
     cx.spawn(async (cx) => {
-      const res = await attachToSeat({ exec, run, hc, spaces, panes, terminals, layout, shared, setShared, wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.view) }, resolved.seat, config);
-      if (res && res.ok === false && res.reason) {
+      const res = await this.attachTarget(cx, resolved.seat);
+      if (res?.needsViewerRefresh) { this.reviewViewerReplace(res, resolved.seat); }
+      else if (res && res.ok === false && res.reason) {
         this.askerNotes[n.id] = res.reason;
       }
       cx.notify();
@@ -3184,7 +3478,7 @@ export default class RigView extends View {
         .child(div().text_size(12).font_semibold().text_color(t.foreground).child(digest.modeHeading ?? "Decided for you while away"))
         .children(digest.decisions.map((d, i) =>
           v_flex().id(`needs-away-decision-${i}`).rounded(6).bg(t.raised).p(8).gap(3).cursor_pointer()
-            .on_click(() => { if (d.qitemId) push({ section: "needs", id: `queue:${d.qitemId}`, name: d.summary ?? d.qitemId }); })
+            .on_click(() => { if (d.qitemId) this.push({ section: "needs", id: `queue:${d.qitemId}`, name: d.summary ?? d.qitemId }); })
             .child(h_flex().gap(8).items_center()
               .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.foreground).tooltip(String(d.summary ?? d.qitemId??"")).child(d.summary ?? d.qitemId))
               .child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(10.5).text_color(d.reversible ? t.muted : t.blocked).child(d.reversibilityLabel))
@@ -3242,7 +3536,7 @@ export default class RigView extends View {
       const n = items.find((x) => x.id === entry.id);
       if (!n) {
         if (isHealthAttention({ id: entry.id })) return this.dim(t, "Health findings are in System → Health.")
-          .on_click(() => push({ section: "system", subview: "health" }));
+          .on_click(() => this.push({ section: "system", subview: "health" }));
         const receipt = dismissals.receiptRows().find((r) => r.keys.some((key) => dismissals.records.find((v) => v.key === key)?.item.id === entry.id));
         if (receipt) return this.updateReceipt(t, receipt);
         const hidden = dismissals.hidden().find((r) => r.item.id === entry.id);
@@ -3363,7 +3657,7 @@ export default class RigView extends View {
   requestRows(t, cx, items, perspective) {
     const filter = this.filter?.toLowerCase();
     if (filter) items = items.filter(n => [n.summary, n.asker].some(s => String(s ?? "").toLowerCase().includes(filter)));
-    const toggle = (n) => { if (n.criticalHealth) { push({ section: "system", subview: "health" }); return; } this.selectedNeed = n.id; if (n.reply !== "none") this.replies[n.id] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
+    const toggle = (n) => { if (n.criticalHealth) { this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) }); return; } this.selectedNeed = n.id; if (n.reply !== "none") this.replies[n.id] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
     return v_flex().id("need-request-list").on_key_down((e, cx) => {
       if (!["up", "down", "enter"].includes(e.key)) return;
       cx.stop_propagation();
@@ -3400,7 +3694,7 @@ export default class RigView extends View {
     const started = Date.parse(n.healthFinding?.startedAt ?? "");
     const minutes = Number.isFinite(started) ? Math.max(0, Math.floor((Date.now() - started) / 60000)) : null;
     return h_flex().id(`critical-health-${n.id}`).px(8).h(34).gap(8).items_center().text_size(12.5).cursor_pointer().hover(el => el.bg(t.hover))
-      .on_click(() => push({ section: "system", subview: "health" }))
+      .on_click(() => this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) })) // the finding's own OpenRig (the Needs page lists every box)
       .child(div().w(12).text_color(t.blocked).child("◆"))
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary??"")).child(n.summary))
       .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip("health · critical").child("health · critical"))
@@ -3443,7 +3737,7 @@ export default class RigView extends View {
     const tierWord = tier === "escalation" ? "Escalation · stuck work" : tier === "alert" ? "Needs you now" : "Routine";
     const kind = resolve ? "Parked · needs your words" : qState.totalCount ? "Decision" : verb === "approve" ? "Approval" : "Question";
     const owner = resolve ? parkedWorkOwner(queueRow ?? n) : asker;
-    const resolved = resolveAskerSeat(owner, this.currentTopology(cx));
+    const resolved = resolveAskerSeat(owner, this.currentTopology(cx), n.conn ?? null);
     const logical = resolved.found ? resolved.seat.logicalId : String(owner ?? "the asking seat").split("@")[0].replace(/-/g, ".");
     const rig = resolved.found ? resolved.seat.rig : String(owner ?? "").split("@").slice(1).join("@");
     const at = n.at ?? queueRow?.tsUpdated, timestamp = Date.parse(at ?? ""), elapsed = Math.max(0, Date.now() - timestamp);
@@ -3556,7 +3850,7 @@ export default class RigView extends View {
           .children(evidenceFiles.map((file, i) => {
             const path = typeof file === "string" ? file : file.path ?? "";
             return h_flex().gap(6).child(div().id(`need-evidence-${id}-${i}`).flex_1().text_size(12).text_color(t.accent).cursor_pointer()
-              .on_click(() => push(fileEntry(path, typeof file === "object" ? file.label : path.split("/").pop()))).child(path))
+              .on_click(() => this.push(fileEntry(path, typeof file === "object" ? file.label : path.split("/").pop()))).child(path))
               .child(this.copyButton(t, path, `need-evidence-path-${id}-${i}`, "evidence path"));
           }))
           .child(v_flex().gap(4).child(h_flex().id(`need-recorded-toggle-${id}`).gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
@@ -3726,15 +4020,19 @@ export default class RigView extends View {
     box.busy = true;
     box.stepProgress = null;
     box.result = null;
+    // The answer goes to the OpenRig the request came from (its own `conn`, bound here, not to whatever the page shows by the time it is sent);
+    // a request without one is refused with two or more connections, never defaulted.
+    const target = targetConnection(this.config, { conn: adoptConnection(this.config, n?.conn) });
+    if (!target.ok) { box.busy = false; box.result = this.notSentResult(target.reason); cx.notify(); return; }
+    const config = target.config;
     cx.notify();
-    const config = this.config;
     cx.spawn(async (cx) => {
       let posted = false;
       try {
         // One operation: the address, the revision read and the POST belong to the config this decision began under. If the address changed while the
         // revision was read, nothing is POSTed to the old daemon.
-        const op = gatedOperation();
-        const daemonUrl = await this.resolveDaemonUrl();
+        const op = gatedOperation(config?.connectionId); // the decision's own connection
+        const daemonUrl = await this.resolveDaemonUrl(config);
         if (!daemonUrl) {
           box.busy = false;
           box.stepProgress = null;
@@ -3751,7 +4049,7 @@ export default class RigView extends View {
               const qd = await qr.json();
               if (qd && (typeof qd.decisionRevision === "number" || typeof qd.decisionRevision === "string")) {
                 latestRevision = qd.decisionRevision;
-                this.cache[`/api/queue/${encodeURIComponent(qid)}`] = { data: qd, status: qr.status, at: Date.now() };
+                this.cacheFor(config.connectionId)[`/api/queue/${encodeURIComponent(qid)}`] = { data: qd, status: qr.status, at: Date.now() };
               }
             }
           } catch (e) { rethrowGate(null)(e); /* a gate refusal stops the decision; other failures: expectedRevision is omitted in missionAction when decisionRevision is unavailable */ }
@@ -3982,7 +4280,9 @@ export default class RigView extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const op = gatedOperationOrRefusal(); // the address is resolved under this config and used under it
+        const refreshCfg = this.activeConfig();
+        if (!refreshCfg) { this.usageRefreshNote = { ok: false, text: "This page's OpenRig is no longer set up, so nothing was refreshed." }; return; }
+        const op = gatedOperationOrRefusal(refreshCfg.connectionId); // the page's own connection, never the followed one
         const daemonUrl = await this.resolveDaemonUrl();
         if (!daemonUrl) {
           this.usageRefreshNote = { ok: false, text: "The daemon address isn't known yet." };
@@ -4087,13 +4387,15 @@ export default class RigView extends View {
 
   runPeopleAction(cx, subargs, entityId = null) {
     if (this.peopleBusy) return;
-    const personReason = personDisableReason("people", this.config);
+    const config = this.activeConfig(); // the connection the page shows: its CLI, its home; none when it is no longer set up
+    if (!config) { this.peopleResult = { ok: false, text: UNKNOWN_CONNECTION }; return; } // never another connection's CLI
+    const personReason = personDisableReason("people", config);
     if (personReason) {
       this.peopleResult = { ok: false, text: personReason };
       cx.notify();
       return;
     }
-    const cmd = peopleCliCommand(this.config, subargs);
+    const cmd = peopleCliCommand(config, subargs);
     if (!cmd) {
       this.peopleResult = { ok: false, text: NO_PERSON };
       cx.notify();
@@ -4112,7 +4414,7 @@ export default class RigView extends View {
       let r;
       let rawRes = null;
       try {
-        rawRes = await exec(cmd.command, cmd.args, { timeout: 60000 });
+        rawRes = await execFor(config)(cmd.command, cmd.args, { timeout: 60000 });
         r = writeOutcome(rawRes);
       } catch (e) {
         r = { ok: false, text: String(e?.message ?? e) };
@@ -4378,7 +4680,7 @@ export default class RigView extends View {
       const failure = wait ?? (String(row?.qitemId ?? row?.id ?? "") !== qid ? this.dim(t, "Couldn't read queue item: OpenRig returned no matching row.") : null);
       const back = { ...entry }; delete back.healthQitem;
       return this.card(t, "Queue item", [
-        h_flex().child(this.button(t, "health-queue-back", "‹ Health", () => push(back), { small: true })),
+        h_flex().child(this.button(t, "health-queue-back", "‹ Health", () => this.push(back), { small: true })),
         ...(failure ? [failure] : [this.copyValue(t, qid, "health-queue-id", "queue item id"),
           this.plain(t, row?.summary ?? "No summary reported.", "health-queue-summary"),
           this.kv(t, [["State", row?.state ?? "not reported"], ["From", row?.sourceSession ?? "not reported"], ["To", row?.destinationSession ?? "not reported"]]),
@@ -4413,7 +4715,7 @@ export default class RigView extends View {
       : `No problems found.${counts.notes ? ` ${plural(counts.notes, "note")} available for reference.` : ""}`;
     return this.card(t, `Health · ${plural(counts.problems, "problem")} · ${plural(counts.notes, "note")}`, [
       ...(rig ? [h_flex().id("health-rig-filter").gap(6).items_center().cursor_pointer()
-        .on_click(() => push({ section: "system", subview: "health" }))
+        .on_click(() => this.push({ section: "system", subview: "health" }))
         .child(div().text_size(12).text_color(t.muted).child(rig.name))
         .child(svg(icon("x")).size(11).text_color(t.dim))] : []),
       this.plain(t, `${summary}${worstContextText ? ` · ${worstContextText}` : ""}${coverage ? ` · ${coverage}` : ""}`, "health-summary").text_color(t.muted),
@@ -4441,7 +4743,7 @@ export default class RigView extends View {
           .when(shown, el => el.child(v_flex().ml(24).gap(8)
             .child(this.plain(t, g.what, `health-what-${index}`))
             .child(h_flex().gap(6).items_center().flex_wrap().children(scopes.map((scope, i) => div().id(`health-scope-${index}-${i}`).text_size(12)
-              .text_color(scope.entry ? t.accent : t.muted).when(Boolean(scope.entry), el => el.cursor_pointer().on_click(() => push(scope.entry))).child(scope.label)))
+              .text_color(scope.entry ? t.accent : t.muted).when(Boolean(scope.entry), el => el.cursor_pointer().on_click(() => this.push(scope.entry))).child(scope.label)))
               .child(div().id(`health-freshness-${index}`).text_size(11.5).text_color(g.stale ? t.dim : t.muted).child(`· confidence ${confidence} · data ${healthAge(g.ageSeconds)}`)))
             .when(!g.cleared, el => el.child(this.plain(t, `What to do: ${g.todo}`, `health-todo-${index}`).text_color(t.muted)))
             .when(g.records[0].detector === "context.pressure" || !(g.records.length === 1 && g.records[0].scope?.type === "seat" && !healthQueueId(g.records[0])), el => el.child(v_flex().ml(8).pl(10).border_l(1).border_color(t.border).gap(4).children(g.records.map((r, i) => {
@@ -4451,7 +4753,7 @@ export default class RigView extends View {
               return h_flex().id(`health-item-${index}-${i}`).gap(8).items_center().flex_wrap()
                 .when(!g.cleared && r.detector === "context.pressure", el => el.child(svg(icon("rig-info")).size(11).text_color(tone)))
                 .child(div().text_size(12).text_color(qid || target.entry ? t.accent : t.muted)
-                  .when(Boolean(qid || target.entry), el => el.cursor_pointer().on_click(() => push(qid ? { ...entry, section: "system", subview: "health", healthQitem: qid } : target.entry))).child(subject))
+                  .when(Boolean(qid || target.entry), el => el.cursor_pointer().on_click(() => this.push(qid ? { ...entry, section: "system", subview: "health", healthQitem: qid } : target.entry))).child(subject))
                 .when(Boolean(count), el => el.child(div().text_size(11.5).text_color(t.muted).child(`${count} queue changes`)))
                 .when(!g.cleared && r.detector === "context.pressure", el => el.child(div().text_size(11.5).text_color(tone).child(`${healthContextPercentage(r)} context used · ${r.severity}`)))
                 .child(div().text_size(11).text_color(t.dim).child(time))
@@ -4486,9 +4788,12 @@ export default class RigView extends View {
     const seats = cost.data?.seats ?? [];
     const total = seats.reduce((sum, s) => sum + (typeof s.costUsd === "number" ? s.costUsd : 0), 0);
     const capDetail = capabilitiesSummaryDetail(this.caps());
-    const versionLine = sharedRigData(this.config, shared)?.versionLine || formatOpenRigVersionLine({
+    // The version of the OpenRig this page SHOWS: another connection's published line isn't this page's, so it falls back to the page's own /healthz.
+    const shownCfg = this.activeConfig(), published = sharedRigData(shownCfg, shared);
+    const own = (this.config?.connections ?? []).length > 1 ? published?.byConnection?.[shownCfg?.connectionId] : published; // several OpenRigs: only that connection's own entry, never the first's top-level line
+    const versionLine = own?.versionLine || formatOpenRigVersionLine({
       healthz: healthz.data,
-      cliVersion: sharedRigData(this.config, shared)?.cliVersion ?? null,
+      cliVersion: own?.cliVersion ?? null,
     });
     const open = shared("rig.open.page") ?? {};
     const focus = shared("rig.focus");
@@ -4522,6 +4827,7 @@ export default class RigView extends View {
     const sysRecentFocused = focus === "sys:recent";
     const activeSubview = entry.subview === "usage-hosts" ? "usage" : entry.subview === "overview" ? null : (entry.subview ?? null);
     const configCard = this.card(t, "Configuration", [
+      !this.activeConfig() ? div().id("config-not-set-up").text_size(12).text_color(t.muted).child("This page's connection isn't set up any more, so its settings aren't shown and nothing is sent from here. Open Configuration again from the sidebar.") : // never a removed connection's cached rows
       this.status(t, cx, "/api/config?view=browser", config) ?? (entry.category === "sources"
         ? this.table(t,"sys-config",[["Setting",260],["Value"],["Group",90],["Source",80]],configRows(config.data,{category:"sources"}).map(r=>({cells:[r.key,r.value,r.group,r.source]})))
         : v_flex().id("sys-config").gap(4).key_context('HerdrigSettings')
@@ -4540,9 +4846,17 @@ export default class RigView extends View {
         .when(!!this.config?.daemonMachine&&shared("rig.machineSetup")?.machine===this.config.daemonMachine
           &&shared("rig.machineSetup")?.origin===this.config.daemonUrl&&!!shared("rig.machineSetup")?.verifiedAt,
           el=>el.child(div().text_size(11).text_color(t.muted).child(machineSetupReceiptLabel(shared("rig.machineSetup"),this.uiTimezone))))
-        .child(div().id("system-choose-machine").text_color(t.accent).cursor_pointer().child(this.config?.daemonMachine?`Stop using ${this.config.daemonMachine}…`:"Choose machine…")
+        // The legacy one-connection actions (choose or stop using daemonMachine) are for the legacy config shape. A connections list adds and removes
+        // machines as connections: its own rows below with two or more, and Add a machine… with one.
+        .when(!this.config?.connectionsList,el=>el.child(div().id("system-choose-machine").text_color(t.accent).cursor_pointer().child(this.config?.daemonMachine?`Stop using ${this.config.daemonMachine}…`:"Choose machine…")
           .on_click(()=>{if(this.config?.daemonMachine)this.open({mod:MOD_IDS.menu,kind:"dialog",width:560,height:400,
-            props:{target:{kind:"machine"},step:{action:"stop-machine",machine:this.config.daemonMachine}}});else run("rig.choose-machine");})),
+            props:{target:{kind:"machine"},step:{action:"stop-machine",machine:this.config.daemonMachine}}});else run("rig.choose-machine");})))
+        .when(!!this.config?.connectionsList&&(this.config?.connections??[]).length<2,el=>el.child(div().id("system-add-machine").text_color(t.accent).cursor_pointer().child("Add a machine…")
+          .on_click(()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:680,props:{target:{kind:"machine"},step:{action:"add-machine"}}})))),
+      ...((this.config?.connections ?? []).length > 1 ? [connectionBlocks(t, { connections: this.config.connections, states: this.connectionStates(cx), consentText: this.connConsent ?? null,
+        mono: settings()?.font_family ?? "monospace", selected: this.connSelected ?? null, onSelect: (i, cx) => { this.connSelected = i; cx.notify(); }, handles: this.connectionHandles(cx),
+        onRemove: (c) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 520, height: 260, props: { target: { kind: "machine" }, step: { action: "remove-connection", id: c.id, machine: c.machine ?? null } } }),
+        onAdd: () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 600, height: 680, props: { target: { kind: "machine" }, step: { action: "add-machine" } } }) })] : []),
       this.kv(t, [
         ["Herdrig Version", `herdrig v${HERDRIG_VERSION}`],
         ["OpenRig Version", versionLine],
@@ -4631,9 +4945,9 @@ export default class RigView extends View {
     }
     if (entry.section === "specs" && entry.id) {
       const known = (this.cache["/api/specs/library"]?.data ?? []).find?.((s) => s.id === entry.id);
-      return { kind: "spec", conn: this.config?.connectionId, id: entry.id, name: entry.name, sourcePath: known?.sourcePath ?? null, specKind: known?.kind ?? null };
+      return { kind: "spec", conn: this.shownConnId(), id: entry.id, name: entry.name, sourcePath: known?.sourcePath ?? null, specKind: known?.kind ?? null };
     }
-    if (entry.section === "scopes" && entry.slice) return { kind: "slice", conn: this.config?.connectionId, mission: entry.mission, slice: entry.slice, name: entry.name, slicePath: this.slicePaths(cx, entry.project).get(entry.slice) ?? null };
+    if (entry.section === "scopes" && entry.slice) return { kind: "slice", conn: this.shownConnId(), mission: entry.mission, slice: entry.slice, name: entry.name, slicePath: this.slicePaths(cx, entry.project).get(entry.slice) ?? null };
     if (entry.section === "needs" && entry.id) return ((this.cache["/api/attention"]?.data?.items) ?? []).map(needTarget).find((n) => n.id === entry.id) ?? null;
     return null;
   }
@@ -4671,7 +4985,9 @@ export default class RigView extends View {
   }
 
   header(t, cx, stack, entry) {
-    const crumbs = compactLocationCrumbs(crumbsFor(entry), this.pageWidth ?? 960);
+    // With several OpenRigs the crumb names the box the page belongs to (Topology ▾ › hanamachi-box › demo); with one there is nothing to tell apart.
+    const base = crumbsFor(entry), several = (this.config?.connections ?? []).length > 1 && entry?.section !== "file" && base.length > 0;
+    const crumbs = compactLocationCrumbs(several ? [base[0], { text: connectionBoxLabel(this.config, this.activeConnId()), entry: null }, ...base.slice(1)] : base, this.pageWidth ?? 960);
     const target = this.targetFor(cx, entry), backTo = backTarget({ stack });
     const status = this.statusLine(t);
     const narrow = (this.pageWidth ?? 960) < 480;
@@ -4688,7 +5004,7 @@ export default class RigView extends View {
             .tooltip([String(c.text ?? ""), i === 0 ? "Sections (Alt+S)" : null].filter(Boolean).join("\n"))
             .when(i===0,el=>el.cursor_pointer().on_click(()=>this.sectionMenu()))
             .when(i>0&&!!c.ancestors,el=>el.cursor_pointer().on_click(()=>this.navigationMenu(c.ancestors.map(c=>({label:c.text,entry:c.entry})),"Location")))
-            .when(i>0&&!last&&!!c.entry,el=>el.cursor_pointer().on_click(()=>push(c.entry)))
+            .when(i>0&&!last&&!!c.entry,el=>el.cursor_pointer().on_click(()=>this.push(c.entry)))
             .child(`${c.text??""}${i===0?" ▾":""}`);
           return i?[svg(icon("chevron-right")).size(10).flex_none().text_color(t.dim),crumb]:[crumb];
         })))
@@ -4715,7 +5031,14 @@ export default class RigView extends View {
         .when(!!target&&!this.pageActions,el=>el.child(this.button(t,"rig-actions","⋯",()=>this.menu(target),{tooltip:"Page actions"}))))
       .when(!!status,el=>el.child(div().px(14).pb(6).child(status)));
   }
+  /** This tab's space: the one its props name (live, so it is found once Herdr has restored it), else the one it was last drawn in. */
+  tabSpace() {
+    if (!this.propsSpaceId) return this.ownSpace ?? null;
+    try { return (spaces?.() ?? []).find((s) => s?.id === this.propsSpaceId) ?? null; } catch (_) { return null; }
+  }
   render(cx) {
+    // A tab with no `space` prop (made by an earlier version) learns its space when drawn: only a shown tab is drawn, so the active space is its own.
+    if (!this.propsSpaceId) { try { const shown = (spaces?.() ?? []).find((s) => s?.active); if (shown) this.ownSpace = shown; } catch (_) {} }
     this.topologyStrip=null;
     this.wideGraph=false;
     this.pageHeading=null;
@@ -4742,15 +5065,17 @@ export default class RigView extends View {
     // The sidebar re-reads on every activity event: mark this page's copies of what it re-read stale, so a card never
     // lags it. Stale, not deleted: a deleted read draws the skeleton in place of the page until the fetch lands, which
     // collapsed the scroll to the top, dropped a focused text box and flashed the page on every event (the reported flash bug).
-    const at = sharedRigData(this.config, shared)?.at;
+    // With several OpenRigs, the shown connection's own refresh stamp: another connection's refresh must not re-read this page, and this one's must.
+    const published = sharedRigData(this.config, shared);
+    const at = (this.config?.connections?.length ?? 0) > 1 ? published?.byConnection?.[this.activeConnId()]?.at : published?.at;
     if (at && at !== this.dataAt) {
       this.dataAt = at;
       this.invalidateLiveReads();
     }
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
-    let entry = stack.at(-1) ?? (rawNav == null ? this.initialEntry : null);
-    const settingsScope=JSON.stringify([entry?.section,entry?.subview,entry?.category,entry?.settingKey,entry?.filter,this.config?.connectionId,this.config?.daemonUrl,this.config?.daemonMachine]);
+    let entry = this.shownEntry(); // this tab's own connection's page (the global top only when it is this tab's)
+    const settingsScope=JSON.stringify([entry?.section,entry?.subview,entry?.category,entry?.settingKey,entry?.filter,this.activeConfig()?.connectionId,this.activeConfig()?.daemonUrl,this.activeConfig()?.daemonMachine]);
     if(this.settingsScope!==settingsScope){if(this.configPanel)this.configPanel.selected=null;this.settingsScope=settingsScope;}
     const settingsShown=entry?.section==='system'&&(!entry.subview||['overview','config'].includes(entry.subview));
     const library=this.cache?.["/api/specs/library"]?.data??[];
@@ -4816,3 +5141,11 @@ export default class RigView extends View {
         : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(pageBodyLayout(this.pageWidth).padding).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!note, (el) => el.child(note)).child(body)));
   }
 }
+
+// The page's read cache is the shown connection's: `this.cache` keeps meaning "the cache of what is on screen" while each connection has its own
+// (one OpenRig's rig, queue and attention paths never answer another's). Assigning resets them all.
+Object.defineProperty(RigView.prototype, "cache", {
+  get() { return this.cacheFor(this.activeConnId()); },
+  set(value) { this.caches = {}; if (value && Object.keys(value).length) this.caches[this.activeConnId() ?? ""] = value; },
+  configurable: true,
+});
