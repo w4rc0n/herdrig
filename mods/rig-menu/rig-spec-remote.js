@@ -1,7 +1,7 @@
 // Spec permission is independent of Attach permission. Every operation checks the
 // configured machine and freshly resolved box roots, including after a dialog.
 import { RemoteMachine } from './rig-remote.js';
-import { specCopyName } from './rig-lib.js';
+import { specCopyName, sameDaemon } from './rig-lib.js';
 export const SPEC_SHA256 = '737eb9b9dbd16b5271eb67cdb36fdb4805ba25f890f9138e522d0f282731baa8';
 const jobs = new Map();
 const identity = r => [r.target ?? '', r.id ?? '', r.via ?? '', r.session ?? ''];
@@ -19,9 +19,17 @@ export class RemoteSpecs {
  // capability 'copy-folder' is its own grant: a save grant never satisfies it and it never satisfies a save.
  async checked(config, consent=null, capability='save') {
   const host=this.host,machine=config.daemonMachine;
-  const state=await new RemoteMachine(host).readIdentity(config);
-  if(!state.localHealth?.selfHostId || state.localHealth.selfHostId!==state.remoteHealth?.selfHostId)
-   throw Error('The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.');
+  // The helper reaches the machine's DEFAULT OpenRig; that is the one checked, against the OpenRig this page reads (its live /healthz) and, when the
+  // connection recorded one, its expected host id. A null expectedHostId (the legacy connection) is decided by the live check alone.
+  const state=await new RemoteMachine(host).readIdentity(config,{defaultHome:true});
+  const short=id=>`${String(id??'').slice(0,4)}…`,page=state.localHealth?.selfHostId,helper=state.remoteHealth?.selfHostId;
+  if(config.expectedHostId && page && config.expectedHostId!==page)
+   throw Error(`This spec wasn't saved: ${machine}'s connection now reaches a different OpenRig. It was set up for host ${short(config.expectedHostId)}, and its address now answers as host ${short(page)}. Nothing was written. Your edit is kept here.`);
+  if(!page || page!==helper)
+   throw Error(`This spec wasn't saved: ${machine} answers with a different OpenRig. The spec helper reached host ${short(helper)}, and this page belongs to host ${short(page)}. Nothing was written. Your edit is kept here.`);
+  // The same id can still be two OpenRigs on one box (a host.name-seeded id): the helper's daemon must be this page's daemon, by process too.
+  if(!sameDaemon(state.localHealth,state.remoteHealth))
+   throw Error(`This spec wasn't saved: ${machine} runs more than one OpenRig with the host id ${short(page)}, and the spec helper reached a different one than this page. Nothing was written. Your edit is kept here.`);
   const {info,record}=state;
   const shipped=await this.call(config,'inspect');
   if(shipped.sha256!==SPEC_SHA256)throw Error('The spec helper differs from this release. Reinstall the mod.');
@@ -42,8 +50,9 @@ export class RemoteSpecs {
   return{ok:true,...prepared};
  }
  async unchanged(config,record){
-  const current=await this.host.currentConfig();
-  if(current.daemonMachine!==config.daemonMachine || current.daemonUrl!==config.daemonUrl)
+  const read=await this.host.currentConfig(),current=this.host.connectionOf?this.host.connectionOf(read):read; // the write's own connection, as the file says it now
+  // The whole identity the write began under (machine, address, OpenRig home, connection, rig command), not only the machine and the address.
+  if(current.daemonMachine!==config.daemonMachine || current.daemonUrl!==config.daemonUrl || (current.openrigHome??null)!==(config.openrigHome??null) || (current.connectionId??null)!==(config.connectionId??null) || JSON.stringify(current.rig??null)!==JSON.stringify(config.rig??null))
    throw Error('The OpenRig connection changed. Nothing was written.');
   const fresh=await new RemoteMachine(this.host).ready(config.daemonMachine);
   if(JSON.stringify(identity(fresh))!==JSON.stringify(identity(record)))throw Error('The Herdr machine changed. Nothing was written.');

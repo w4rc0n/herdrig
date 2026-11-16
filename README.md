@@ -1,6 +1,6 @@
 # Herdrig
 
-Version: v0.4.7
+Version: v0.5.0
 
 **OpenRig Mod for Herdr**
 
@@ -11,6 +11,8 @@ Version: v0.4.7
 Herdrig puts [OpenRig](https://github.com/mvschwarz/openrig) inside the `herdr` window: your rigs, their seats and the
 decisions waiting for you, in a sidebar beside your own tabs. Select a row, then double-click or press Enter to open its page, and you can
 act from there (answer a request, message a seat, attach to it) without leaving Herdr.
+
+Inside Herdr, use Herdrig’s views. To open OpenRig’s own terminal view there, use `rig terminal open --window`.
 
 ## Features
 
@@ -50,6 +52,8 @@ act from there (answer a request, message a seat, attach to it) without leaving 
 - **Follows your space:** the sidebar folds outside OpenRig's spaces, keeping Needs you and search visible. Click its
   header to expand until you change spaces. Pages go to their rig's existing space or the **OpenRig** home, which
   also holds the TUI on OpenRig's selected machine. Personal spaces stay free of new Rig tabs. Existing tabs offer **Move** or **Keep here**.
+- **More than one OpenRig:** one sidebar for this computer's OpenRig and your Herdr machines'; see
+  [Using more than one OpenRig](#using-more-than-one-openrig).
 - **Works with or without OpenRig running:** when OpenRig is missing, stopped or unhealthy, the sidebar says so in
   plain words, with the fix (for example **Start OpenRig**). Controls your OpenRig version doesn't support are greyed
   out, each with its reason.
@@ -72,6 +76,8 @@ Herdr doesn't review mods: check what your agent runs and which keys it changes.
 ## Updating
 
 After updating, close every Attach tab you opened before the update, then Attach again. A tab that stays open keeps using the old helper until it is closed.
+v0.5.0 updates the Attach helper, so Herdr asks you once to approve it again on each configured Herdr machine. Local
+Attach doesn't ask.
 
 Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with the new
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
@@ -129,7 +135,7 @@ to the daemon. This version copies only the spec text OpenRig served.
 
 ## Worker views (OpenRig 0.7.12 and later)
 
-API/CLI compatibility smoke tested with OpenRig 0.7.13; native worker-view checks were run separately on 0.7.12.
+v0.5.0's native checks ran on OpenRig 0.7.14 and 0.7.16 with herdr-app 0.1.16 (on 0.7.16: install from the release package, an upgrade from 0.7.14, Attach and Needs on two machines). The API/CLI compatibility smoke ran on OpenRig 0.7.13, and native worker-view checks on 0.7.12.
 
 [The herdr-app provider](https://github.com/mvschwarz/openrig/pull/2744) opens worker
 views in the Herdr window on the **same machine as OpenRig**. Worker view, **Show in worker view**, and saved-view
@@ -158,14 +164,80 @@ Local and remote Seats tiles fit their panes when alone and yield sizing to Atta
 Sizing settles within about five seconds; a quicker Seats revisit can briefly resize Attach.
 Remote Seats use the verified relay on the configured machine; only each tile's own client flags change.
 
+**More than one OpenRig:** for an OpenRig added on another Herdr machine, worker views use Herdrig's worker pages
+where that OpenRig offers them, and never the provider (it would need this computer's app home, which means nothing
+on that machine). Otherwise its worker views say they aren't available from this computer yet, and nothing is sent.
+
 **Provider limits:** Follow and auto-prune for herdr-app, custom worker-view grids (`--grid`/`--replace`), and
 cell editing (`close --cell`) are not supported on upstream main yet. Those controls stay greyed out until OpenRig
 adds the required support. The provider release alone will not enable them; no release date is promised.
 
+## Using more than one OpenRig
+
+Herdrig can show several OpenRigs: one on this computer and one on each Herdr machine where you run OpenRig.
+
+**Adding a machine.** When you open a space on a Herdr machine that has no OpenRig connection yet, Herdrig looks
+there once. If OpenRig answers, the note under the sidebar header says "OpenRig also runs on `<machine>`. Show its
+rigs here too?" with **Add `<machine>`…** and **Not now**. This works with one OpenRig or several. If nothing
+answers, the note says the sidebar still shows your current OpenRig; **Find where OpenRig runs** looks again.
+**Not now** is remembered for that machine until you look again. You can also add one by hand: **Add a machine…**
+in the sidebar's **⋯** menu, or in **System › Connections**, lists your connected Herdr machines that have no
+connection yet.
+
+The **Add `<machine>`** screen shows how this computer reaches that machine's OpenRig:
+- **Address:** the local end of an SSH tunnel to that machine, prefilled with the next free loopback address and that
+  machine's OpenRig port (for example `http://127.0.0.2:7433`).
+- **The tunnel command** to run yourself, with **Copy**, for example
+  `ssh -N -L 127.0.0.2:7433:127.0.0.1:7433 <machine>`. Herdr never creates the tunnel.
+- **OpenRig home on this computer:** the folder `rig` on this computer uses for that machine's OpenRig (its
+  settings and sign-in). Each OpenRig needs its own.
+
+Start the tunnel, then press **Check**. Check confirms that the address reaches *that machine's* OpenRig. If it
+reaches nothing, a different OpenRig, or an address another connection already uses, it says so, and nothing is
+saved. **Save** turns on only after a passing Check of the address as typed, and it saves exactly that address.
+The first time you Attach (or open an Operator or rig space) on the new machine, Herdrig asks once for permission to
+install its helper there.
+
+With two or more OpenRigs, **System › Connections** lists each one with its state, its address, its host, whether its
+helper is approved, and its OpenRig home, plus **Add a machine…** at the end. **Remove…** asks first, then takes that
+OpenRig's rigs and requests out of the sidebar. Its spaces and tiles stay as they are, and nothing on that machine
+changes.
+
+Connections are saved in `<appHome>/openrig/config.json` as a `connections` list. Each entry has an `id`, the
+`machine` (empty for this computer), the `daemonUrl` this computer uses to reach it, and its `openrigHome`: a folder
+on this computer, never sent to the machine. A config with only `daemonUrl` and `daemonMachine` keeps working as one
+connection; nothing is rewritten.
+
+**What the sidebar shows.** One OpenRig at a time, named in the header. Requests waiting on the others show as
+**◆ N elsewhere**.
+
+**How it picks the OpenRig.** It follows your space:
+- in a space on a Herdr machine, that machine's OpenRig;
+- in this computer's spaces, this computer's OpenRig;
+- outside OpenRig's spaces, the one you used last.
+
+Open the picker from the header (or Alt+S) to look at another one; the choice holds until you change spaces.
+
+**Spaces.** Each rig has one space per machine, under that machine in Herdr's Spaces list, and each machine has its
+own **OpenRig** home space. Actions, pages, settings, specs, health and worker views act for the OpenRig the row or
+page came from, and each Rig tab keeps to its own OpenRig's pages.
+
+**Limits.**
+- One OpenRig per Herdr machine you add. Herdrig reaches each added machine's default OpenRig. With two OpenRigs added
+  on the same machine, commands for them there say "Two OpenRigs on <machine> need a home for each; this version
+  supports one per machine." and nothing is sent.
+- Adding a second OpenRig for a machine that already has one is refused ("`<machine>` already has a connection.").
+- OpenRig's own herdr-app provider still opens worker views only on its own machine. Herdrig's worker pages,
+  Attach and Seats grids work on each machine.
+- If a machine's OpenRig address changes, Herdrig asks once before it treats that machine's existing rig spaces as its
+  own.
+- **Copy & edit** of a built-in spec that has its own folder (such as `starter`) doesn't work on this computer while
+  more than one OpenRig is added: it is refused and nothing is changed. The changelog's Known issues show how to copy
+  one by hand with `rig`.
+
 ## Known limitations
 
-- A Herdr change to keep the active space in view has merged: [herdrdev/herdr-app#977](https://github.com/herdrdev/herdr-app/pull/977).
-  This does not claim that the change is in your installed Herdr release.
+- Herdr-app [v0.1.16](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.16) includes [#977](https://github.com/herdrdev/herdr-app/pull/977), which keeps the active space in view. Update Herdr if you are using an older version.
 - **Provider worker views need one machine.** OpenRig's own provider must reach a Herdr window on its machine.
   Herdrig's configured-machine worker pages, Attach and Seats grids use separate paths.
 - **With upstream OpenRig's own `herdr-app` provider** serving the window, the four mods work with less chrome: no

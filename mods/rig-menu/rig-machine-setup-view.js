@@ -102,7 +102,9 @@ export class MachineSetupPanel {
           .child(div().child("✓ OpenRig answers there"))
           .child(div().child(`✓ Same OpenRig as your tunnel · host ${c.selfHostId}`)))
         .child(div().font_semibold().child("This saves on this computer"))
-        .child(div().text_color(t.muted).child(this.review.alreadyConfigured?"daemonMachine: already set in openrig/config.json":`daemonMachine = ${c.machine} in openrig/config.json`))
+        .child(div().text_color(t.muted).child(this.config?.connectionsList
+          ? `Connection ${c.machine} ${this.review.alreadyConfigured ? "is already set" : "will be saved"} in openrig/config.json`
+          : this.review.alreadyConfigured?"daemonMachine: already set in openrig/config.json":`daemonMachine = ${c.machine} in openrig/config.json`))
         .child(div().font_semibold().child(`This installs on ${c.machine}`))
         .child(this.value("File","rig-attach-relay.cjs (the Attach helper)"))
         .child(this.value("Folder",c.folder,{copy:true})).child(this.value("Account",`${c.user} on ${c.target}`))

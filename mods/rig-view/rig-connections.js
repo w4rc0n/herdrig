@@ -1,5 +1,5 @@
 // A connection is one OpenRig daemon this mod talks to: { id, machine, daemonUrl, token, expectedHostId, openrigHome }.
-// Its identity is (machine, hostId); the URL is only the transport. v0.5.0 PR 1 threads this object through with a list of ONE built
+// Its identity is (machine, hostId); the URL is only the transport. A config without a connections list is a list of ONE built
 // from the legacy `daemonUrl` / `daemonMachine` keys, so nothing is rewritten and nothing changes for a single-daemon setup.
 // Pure functions: nothing here reads a file, sends a request or touches Herdr.
 
@@ -12,14 +12,15 @@ const HOST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 export const NO_CONNECTION = "This needs to know which OpenRig it is for, and it didn't say. Nothing was sent.";
 export const UNKNOWN_CONNECTION = "That OpenRig connection isn't set up any more. Nothing was sent.";
 export const HOME_NEEDED = "This OpenRig needs its own OpenRig home in its connection settings, and none is set. Nothing was sent.";
-/** Whether a `connections` list is read at all. False in v0.4.5: there is no setter and no config key for it (v0.5.0 removes this switch). Tests of the
- *  multi-connection code read lists through `parseConfig(text, { connectionsList: true })`, or against a staged copy with this constant patched. */
-export const CONNECTIONS_LIST_SUPPORTED = false;
-/** v0.4.5 reads one OpenRig connection: a hand-written `connections` list is refused outright (v0.5.0 lifts this). Said as one plain line. */
-export const CONNECTIONS_LIST_REFUSED = "This herdrig reads one OpenRig connection. A connections list arrives in v0.5.0; remove it to continue.";
+/** A `connections` list that has no usable entry (empty, not a list, or every entry invalid) is an INVALID config: no connection opens and nothing is sent. It is never read as the
+ *  legacy keys (a typo must not send to the legacy daemon). Said as one plain line. */
+export const CONFIG_LIST_INVALID = "The connections list in config.json has no usable entry, so nothing was sent. Fix the list or remove it.";
+/** A listed entry that is not used, named so the person can fix it. `n` is its 1-based place in the list. */
+export const connectionNote = (n, why) => `Connection ${n} isn't used: ${why}.`;
 export const EXPLICIT_ADDRESS_NEEDED = "With more than one OpenRig, each needs its own address. Nothing was sent.";
 
 const text = (value) => (typeof value === "string" && value !== "" ? value : null);
+const LOOPBACK_ADDRESS = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i;
 const url = (value) => (typeof value === "string" && /^https?:\/\/[^\s]+$/.test(value) ? value.replace(/\/+$/, "") : null);
 
 /** One connection from a raw record; null when it can't be one. `token` is reserved and always null: the mod sends no token today
@@ -34,21 +35,26 @@ export function normalizeConnection(raw, fallbackId = null) {
   return { id, machine, daemonUrl: url(raw.daemonUrl), token: null, expectedHostId: hostId, openrigHome: text(raw.openrigHome) };
 }
 
-/** The connections a raw config.json describes: its `connections` array when it has a valid one, else the legacy keys as a list of
- *  one. Duplicate or invalid entries are dropped (never repaired). Returns { connections, legacy }. */
+/** The connections a raw config.json describes: its `connections` array when it has a usable one, else (only when there is NO `connections` key) the legacy keys as a list of
+ *  one. An entry that is invalid, or whose id repeats an earlier one, is not used and is NAMED (`notes`), never silently repaired. A list with no usable entry is `invalid`: no
+ *  connection (a typo never falls back to the legacy daemon). Returns { connections, legacy, notes, invalid }. */
 export function connectionsOf(raw) {
-  if (raw && typeof raw === "object" && Array.isArray(raw.connections)) {
-    const seen = new Set(), list = [];
-    for (const entry of raw.connections) {
-      const conn = normalizeConnection(entry);
-      if (conn && !seen.has(conn.id)) { seen.add(conn.id); list.push(conn); }
-    }
-    if (list.length) return { connections: list, legacy: false };
+  const present = raw && typeof raw === "object" && raw.connections !== undefined && raw.connections !== null;
+  if (present) {
+    const notes = [], seen = new Set(), list = [];
+    if (!Array.isArray(raw.connections)) return { connections: [], legacy: false, notes, invalid: CONFIG_LIST_INVALID };
+    raw.connections.forEach((entry, index) => {
+      const conn = normalizeConnection(entry), n = index + 1;
+      if (!conn) notes.push(connectionNote(n, "it needs an id (letters, digits, dots or dashes), and an address or a machine"));
+      else if (seen.has(conn.id)) notes.push(connectionNote(n, `the id ${conn.id} is already used by an earlier entry`));
+      else { seen.add(conn.id); list.push(conn); }
+    });
+    return list.length ? { connections: list, legacy: false, notes, invalid: null } : { connections: [], legacy: false, notes, invalid: CONFIG_LIST_INVALID };
   }
   const machine = raw && typeof raw === "object" ? raw.daemonMachine : undefined;
   const conn = normalizeConnection({ id: LEGACY_CONNECTION_ID, machine, daemonUrl: raw?.daemonUrl, openrigHome: raw?.openrigHome }, LEGACY_CONNECTION_ID)
     ?? { id: LEGACY_CONNECTION_ID, machine: null, daemonUrl: url(raw?.daemonUrl), token: null, expectedHostId: null, openrigHome: text(raw?.openrigHome) };
-  return { connections: [conn], legacy: true };
+  return { connections: [conn], legacy: true, notes: [], invalid: null };
 }
 
 /** The config one connection's code sees: the shared settings (person, rig argv, ...) with this connection's address, machine and
@@ -57,11 +63,32 @@ export function connectionConfig(base, conn) {
   const out = { ...(base ?? {}), connectionId: conn.id };
   // Address, machine and home are this connection's own: nothing of another connection's may remain, or a command would run
   // against the wrong daemon or authenticate from the wrong home. What the CLI found for another connection is not this one's.
-  for (const key of ["daemonUrl", "daemonMachine", "openrigHome", "daemonUrlSource", "daemonState", "daemonMessage"]) delete out[key];
+  for (const key of ["daemonUrl", "daemonMachine", "openrigHome", "expectedHostId", "daemonUrlSource", "daemonState", "daemonMessage"]) delete out[key];
   if (conn.daemonUrl) out.daemonUrl = conn.daemonUrl;
   if (conn.machine) out.daemonMachine = conn.machine;
   if (conn.openrigHome) out.openrigHome = conn.openrigHome;
+  if (conn.expectedHostId) out.expectedHostId = conn.expectedHostId; // the host id this connection recorded: a write checks its address still answers as it
   return out;
+}
+
+/** What a person calls a connection's box: its Herdr machine, else "this computer". Two connections that share a label (two OpenRigs on one machine) are told apart by their id. An id that is not listed
+ *  (a removed connection) is never "this computer": it is named by its id as no longer set up. */
+export function connectionBoxLabel(config, id) {
+  const list = Array.isArray(config?.connections) ? config.connections : [];
+  const name = (c) => c?.machine || "this computer";
+  const one = list.find((c) => c.id === id);
+  if (!one) return `${id ?? "an OpenRig"} (no longer set up)`;
+  return list.filter((c) => name(c) === name(one)).length > 1 ? `${name(one)} (${one.id})` : name(one);
+}
+
+/** The config of ONE listed connection, as a config that lists several describes it: the config itself when it is that connection's, `connectionConfig` of the listed entry for another, null when the
+ *  id is not listed (a closed connection: nothing may be resolved for it, by name or otherwise). */
+export function configOfConnection(config, id) {
+  if (!config) return null;
+  const own = config.connectionId ?? LEGACY_CONNECTION_ID;
+  if (id === undefined || id === null || id === own) return config;
+  const listed = (config.connections ?? []).find((c) => c.id === id);
+  return listed ? connectionConfig(config, listed) : null;
 }
 
 /** Whether a config names its daemon in writing (as `cliEnv` decides): a URL the CLI found or a default is not. */
@@ -130,12 +157,134 @@ export function consentText(previousText, id, record) {
  *  connection configured it can only be that one, so it reads as that one; with several it stays unnamed and is refused when acted on. */
 export const adoptConnection = (config, id) => (typeof id === "string" && id !== "" ? id : (config?.connections ?? []).length === 1 ? config.connections[0].id : undefined);
 
-/** Stored state that PR 1 keeps flat (v0.4.x shapes, read as the legacy connection's) until PR 2 makes it per connection together with the
- *  grouping. Only the legacy connection may write it: a second connection writing here would overwrite the first's values. */
-export const FLAT_STATE_KEYS = Object.freeze(["rig.data", "rig.order", "rig.open.sidebar", "rig.open.page"]);
-export const FLAT_STORE_LEGACY_ONLY = "Only the first OpenRig keeps its state here for now; this one can't write it yet. Nothing was changed.";
-export function assertFlatStoreWriter(key, connectionId) {
-  if (FLAT_STATE_KEYS.includes(key) && connectionId !== undefined && connectionId !== null && connectionId !== LEGACY_CONNECTION_ID) throw new Error(FLAT_STORE_LEGACY_ONLY);
+
+/** A row or group key made specific to one connection, so two OpenRigs never share a fold, order or selection key. The legacy connection's
+ *  keys are the old ones (stored state stays found). */
+/** A `rig.<command>` for a target of `config`'s connection. herdr delivers a mod command as its NAME only (its args are dropped), so with several connections the
+ *  connection goes in the name, `rig.<command>:<conn>|<target>`; the sidebar reads it back only for one of its own connections. One connection: `rig.<command>:<target>`. */
+export const commandFor = (command, config, target) => `${command}:${(config?.connections?.length ?? 0) > 1 && config?.connectionId ? `${config.connectionId}|` : ""}${target}`;
+/** The forwarded operator Attach for `config`'s connection: `rig.operator:<conn>` with several connections (the sidebar opens that OpenRig's operator), `rig.operator` with one. */
+export const operatorCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.operator:${config.connectionId}` : "rig.operator");
+export const qualifyKey = (conn, key) => (conn && conn !== LEGACY_CONNECTION_ID ? `${conn}|${key}` : key);
+
+/** Said when a name the person typed (or a bare name a row carried) is on more than one OpenRig: it is refused, never picked. */
+export const AMBIGUOUS_NAME = "That name is on more than one OpenRig. Pick it in the sidebar, which names the machine. Nothing was sent.";
+const connsOf = (list) => new Set(list.map((r) => r?.conn ?? "")).size;
+/** A row is on a connection unless it names another (a row without one comes from a single-OpenRig setup, where there is only one). */
+const onConn = (row, conn) => !conn || !row?.conn || row.conn === conn;
+
+/** The rig a reference means in the merged list of every connection's rigs: { rig } (undefined when there is none) or { ambiguous: true }.
+ *  An id is exact (with its connection when given) and, with several OpenRigs, never falls back to a name; a name that is on more than one
+ *  OpenRig is ambiguous (the same `demo` and `kernel` exist on every one). With one OpenRig this is the plain id-or-name lookup. */
+export function pickRig(rigs, { rigId, conn, name } = {}) {
+  const list = Array.isArray(rigs) ? rigs : [];
+  if (rigId) {
+    const hit = list.find((r) => r.id === rigId && onConn(r, conn));
+    if (hit || connsOf(list) > 1) return { rig: hit };
+  }
+  if (!name) return { rig: undefined };
+  const hits = list.filter((r) => r.name === name && onConn(r, conn));
+  return connsOf(hits) > 1 ? { ambiguous: true } : { rig: hits[0] };
 }
-/** `setShared` that refuses a flat-state key for any connection but the legacy one. `connectionOf()` is the writer's connection id. */
-export const guardFlatStore = (setShared, connectionOf) => (key, value) => { assertFlatStoreWriter(key, connectionOf()); return setShared(key, value); };
+
+/** The seat a predicate means across the merged list: { rig, seat }, {} when none, or { ambiguous: true } when it matches on more than one
+ *  OpenRig (`dev-one@demo` exists on each). `conn` limits it to one connection (a shown row's own). */
+export function pickSeat(rigs, match, { conn } = {}) {
+  const hits = [];
+  for (const rig of Array.isArray(rigs) ? rigs : []) {
+    if (!onConn(rig, conn)) continue;
+    for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) if (match(seat, rig)) hits.push({ rig, seat });
+  }
+  return connsOf(hits.map((h) => h.rig)) > 1 ? { ambiguous: true } : (hits[0] ?? {});
+}
+
+const MACHINE_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
+/** The refusal for a connection's OpenRig home (a clean absolute folder path on THIS computer), or null when it is fine. */
+export const openrigHomeProblem = (value) => (typeof value === "string" && /^\/[^\x00-\x1f\x7f]*[^/\x00-\x1f\x7f]$/.test(value) && !value.split("/").some((part) => part === "." || part === "..")
+  ? null : "This connection needs its OpenRig home: an absolute folder path, such as /srv/openrig-home.");
+
+/** Adds a new connection for a machine the setup gate has already checked, as a compare-and-swap write
+ *  against config.json -- the same `host.readConfig()` / `host.writeConfig(text, previous)` convention
+ *  rig-machine-setup.js's approval flow already uses, so a config edited elsewhere between the read and this
+ *  write is refused rather than silently overwritten. `before` is the exact text `host.readConfig()` returned
+ *  right before this call (the setup gate's own CAS recheck happens first; this is the write-time CAS, belt
+ *  and suspenders). The legacy `daemonUrl`/`daemonMachine` keys, if present, are left exactly as they are
+ *  (§1: nothing is rewritten) -- only a `connections` key is added or appended to. `expectedHostId` is taken
+ *  EXACTLY as given (the setup gate's own checked identity), never re-derived here. */
+export async function addMachineConnection(host, before, { machine, daemonUrl, expectedHostId, openrigHome, legacyDaemonUrl } = {}) {
+  if (typeof machine !== "string" || !MACHINE_NAME.test(machine)) throw new Error("A valid machine name is required.");
+  const cleanUrl = url(daemonUrl);
+  if (!cleanUrl) throw new Error("A valid daemon address is required.");
+  if (typeof expectedHostId !== "string" || !HOST_ID.test(expectedHostId)) throw new Error("A checked host id is required.");
+  // With more than one connection each entry needs its OWN OpenRig home as well as its address: without it the CLI would
+  // authenticate from another daemon's home, so every command for this connection refuses (HOME_NEEDED). Saving one
+  // without it would write a connection that cannot be used.
+  const homeProblem = openrigHomeProblem(openrigHome);
+  if (homeProblem) throw new Error(homeProblem);
+  let raw;
+  try { raw = before === null || before === undefined ? {} : JSON.parse(before); }
+  catch { throw new Error("openrig/config.json is not valid JSON."); }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("openrig/config.json must contain an object.");
+  const { connections: found, invalid, legacy } = connectionsOf(raw);
+  if (invalid) throw new Error(CONFIG_LIST_INVALID);
+  let connections = found;
+  // A one-connection (legacy-shaped) file may name no address: the CLI finds it, as it always did. With several connections each command must name its own
+  // daemon, so the list that keeps this connection working has to write the address it uses now (the loopback one the caller read from the live config);
+  // the legacy root keys themselves stay as they are. Without such an address the connection would be left unusable, so nothing is saved.
+  if (legacy && !found[0].daemonUrl) {
+    const live = url(legacyDaemonUrl);
+    if (!live || !LOOPBACK_ADDRESS.test(live)) throw new Error("This computer's OpenRig address isn't known, so adding a machine would leave it without one. Nothing was saved.");
+    connections = [{ ...found[0], daemonUrl: live }, ...found.slice(1)];
+  }
+  if (connections.some((c) => c.machine === machine)) throw new Error(`${machine} already has a connection.`);
+  let id;
+  do { id = `conn-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`; } while (connections.some((c) => c.id === id));
+  const next = { id, machine, daemonUrl: cleanUrl, token: null, expectedHostId, openrigHome: text(openrigHome) };
+  const nextRaw = { ...raw, connections: [...connections, next] };
+  await host.writeConfig(JSON.stringify(nextRaw, null, 2) + "\n", before);
+  return next;
+}
+
+/** The next loopback address no connection already uses, as the setup screen's prefilled tunnel address:
+ *  `http://127.0.0.N:<port>` with N from 2 up, where N is not the host of any existing connection (127.0.0.1, the primary's usual address, is never offered because the search starts at 2; the port is only the box's own,
+ *  from its rig status; two tunnels never share a host here, so they never share an address either). null when none is free. */
+export function nextTunnelAddress(connections, port) {
+  const p = Number(port);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) return null;
+  const taken = new Set();
+  for (const c of Array.isArray(connections) ? connections : []) {
+    const m = /^https?:\/\/(127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d+)?\/?$/i.exec(String(c?.daemonUrl ?? ""));
+    if (m) taken.add(m[1]);
+  }
+  for (let n = 2; n <= 254; n++) if (!taken.has(`127.0.0.${n}`)) return `http://127.0.0.${n}:${p}`;
+  return null;
+}
+
+/** The command the person copies to make the tunnel (herdrig never creates or guesses one). The destination is the Herdr machine's own
+ *  target from Herdr's list when it is a plain `user@host` shape, else the machine name; both are checked for a shell-safe shape, so the
+ *  text is safe to paste. Returns null when the address is not a loopback `http://127.x.y.z:<port>` or a name is unsafe. */
+export function tunnelCommand(address, boxPort, machine, target = null) {
+  const m = /^http:\/\/(127\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$/.exec(String(address ?? ""));
+  const bp = Number(boxPort), lp = m ? Number(m[2]) : NaN;
+  const ok = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
+  if (!m || !ok(bp) || !ok(lp) || m[1].split(".").some((part) => Number(part) > 255)) return null;
+  const safe = (v) => typeof v === "string" && /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/.test(v);
+  const destination = safe(target) ? target : machine;
+  if (!safe(destination)) return null;
+  return `ssh -N -L ${m[1]}:${lp}:127.0.0.1:${bp} ${destination}`;
+}
+
+/** Removes one connection from the list as a compare-and-swap write against config.json (the same readConfig/writeConfig(text, previous)
+ *  convention as adding one). Only the entry with that id goes: every other entry, the legacy keys and every other key stay exactly as they are,
+ *  and nothing on the machine, no tunnel and no space or tile is touched by it. A list always keeps at least one OpenRig. */
+export async function removeConnection(host, before, id) {
+  let raw;
+  try { raw = JSON.parse(before ?? ""); } catch { throw new Error("openrig/config.json is not valid JSON."); }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.connections)) throw new Error("This OpenRig has no connections list to remove from. Nothing was changed.");
+  const index = raw.connections.findIndex((c) => c && typeof c === "object" && c.id === id);
+  if (index < 0) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
+  if (raw.connections.length < 2) throw new Error("A connections list keeps at least one OpenRig, so this one was not removed.");
+  const nextRaw = { ...raw, connections: raw.connections.filter((_, i) => i !== index) };
+  await host.writeConfig(JSON.stringify(nextRaw, null, 2) + "\n", before);
+  return { removed: id };
+}

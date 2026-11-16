@@ -139,16 +139,25 @@ function tmuxFailureMessage(session) {
 const DEFAULT_POLL_INTERVAL_MS = 4000;
 const MAX_POLL_INTERVAL_MS = 60000;
 const DEFAULT_POLL_FETCH_TIMEOUT_MS = 5000;
+/** The lowest base interval a seat may ask for: a seat-supplied 1 ms would poll back to back. A status dot never needs
+ *  more than 4 polls a second, and the 4 s default sits well above this, so no ordinary value is changed. */
+const MIN_POLL_INTERVAL_MS = 250;
+/** Consecutive failed or timed-out polls before the relay drops the seat's dot (OSC 7501 `clear`) instead of freezing on its last
+ *  state (one failure can be a blip; three in a row, with the backoff between them, is OpenRig not answering). Not `error`:
+ *  herdr counts error as blocked, so every tile would show "Needs you" with a toast. We don't know the seat's state, and the
+ *  sidebar already says OpenRig isn't answering. */
+const NOT_ANSWERING_AFTER = 3;
 const POLL_JITTER_RATIO = 0.2;
 /** The next poll interval: double `current` (capped at `max`) after a slow or failed answer, else back to `base`. Pure. */
 function nextPollInterval(current, backOff, base = DEFAULT_POLL_INTERVAL_MS, max = MAX_POLL_INTERVAL_MS) {
   return backOff ? Math.min(current * 2, max) : base;
 }
-/** A configured base poll interval, clamped to `max`: a seat-supplied value above the cap (or one so large it would
- *  wrap a 32-bit timer into firing almost immediately) must not bypass the backoff cap it's meant to respect. Pure. */
-function resolveBaseIntervalMs(raw, fallback = DEFAULT_POLL_INTERVAL_MS, max = MAX_POLL_INTERVAL_MS) {
+/** A configured base poll interval, clamped to [`min`, `max`]: a seat-supplied value above the cap (or one so large it
+ *  would wrap a 32-bit timer into firing almost immediately) must not bypass the backoff cap it's meant to respect, and
+ *  one below the floor must not poll back to back. Pure. */
+function resolveBaseIntervalMs(raw, fallback = DEFAULT_POLL_INTERVAL_MS, max = MAX_POLL_INTERVAL_MS, min = MIN_POLL_INTERVAL_MS) {
   const n = Number(raw);
-  return Math.min(n > 0 ? n : fallback, max);
+  return Math.max(min, Math.min(n > 0 ? n : fallback, max));
 }
 /** `ms` randomized by +/- `ratio` (default the module's own jitter ratio), so several relays whose intervals started
  *  out equal drift apart over time instead of staying in lockstep. `random` is injectable for exact tests. */
@@ -206,7 +215,7 @@ function main(payloadArg) {
     lastSeq = seq;
     try { process.stdout.write(seq); } catch (_) {}
   };
-  const emit = (st, kind) => {
+  const emit = (st, kind, message) => {
     if (!st) return;
     if (st === "clear") return write("\x1b]7501;state=clear\x07");
     const parts = [`state=${st}`];
@@ -215,6 +224,7 @@ function main(payloadArg) {
     if (app) parts.push(`app=${app}`);
     const title = cleanB64(cfg.titleB64);
     if (title) parts.push(`title=${title}`);
+    if (message) parts.push(`msg=${Buffer.from(message, "utf8").toString("base64")}`);
     write(`\x1b]7501;${parts.join(":")}\x07`);
   };
   emit(["working", "blocked", "idle", "done", "clear"].includes(cfg.initialState) ? cfg.initialState : "idle");
@@ -250,7 +260,7 @@ function main(payloadArg) {
   };
   const baseIntervalMs = resolveBaseIntervalMs(cfg.pollIntervalMs);
   const fetchTimeoutMs = Number(cfg.pollFetchTimeoutMs) > 0 ? Number(cfg.pollFetchTimeoutMs) : DEFAULT_POLL_FETCH_TIMEOUT_MS;
-  let pollInFlight = false, currentPollInterval = baseIntervalMs, pollTimer = null, stopped = false;
+  let pollInFlight = false, currentPollInterval = baseIntervalMs, pollTimer = null, stopped = false, failedPolls = 0;
   const reschedulePoll = (ms) => {
     clearInterval(pollTimer);
     pollTimer = setInterval(poll, jitteredPollInterval(ms));
@@ -263,6 +273,10 @@ function main(payloadArg) {
     const startedAt = Date.now();
     try {
       const nodes = await fetchNodes(fetchTimeoutMs);
+      // Cleanup may have run while this fetch was pending: its clear is the relay's last word, so nothing follows it.
+      if (stopped) return;
+      const wasNotAnswering = failedPolls >= NOT_ANSWERING_AFTER;
+      failedPolls = 0;
       // A slow answer (over half the timeout) means the daemon is still struggling even though it didn't fail
       // outright; back off the same as a failure so this relay doesn't keep leaning on a daemon that's barely coping.
       if (Date.now() - startedAt > fetchTimeoutMs / 2) backOff = true;
@@ -274,10 +288,13 @@ function main(payloadArg) {
           if (mapped.clearAfter) {
             if (lastSeq !== "done:clear") { emit(mapped.state, mapped.kind); emit("clear"); lastSeq = "done:clear"; }
           } else emit(mapped.state, mapped.kind);
-        }
+        } else if (wasNotAnswering) emit("clear"); // answering again, but the seat isn't listed: drop the stale error
       }
     } catch (_) {
+      if (stopped) return;
       backOff = true;
+      failedPolls += 1;
+      if (failedPolls === NOT_ANSWERING_AFTER) emit("clear");
     } finally {
       pollInFlight = false;
     }
@@ -408,5 +425,5 @@ async function gridMain(payload) {
   child.on("error", (e) => park(`Rig grid: tmux did not start (${e.message})\n${tmuxFailureMessage(cfg.session)}`));
   child.on("exit", (code) => park(code ? tmuxFailureMessage(cfg.session) : `The viewer for ${cfg.session} ended. Its tmux session may have stopped.`));
 }
-module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage, decodeRelayPayload, MAX_PAYLOAD_BYTES, gridMain, viewerArgs, ignoreSizeArgs, sizingClients, sizingChange, SIZING_INTERVAL_MS, nextPollInterval, resolveBaseIntervalMs, jitteredPollInterval, DEFAULT_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS, DEFAULT_POLL_FETCH_TIMEOUT_MS, POLL_JITTER_RATIO };
+module.exports = { SESSION_RE, validSession, validServerArgs, tmuxArgv, mapNode, termFor, localServerArgs, relayDaemonUrl, tmuxFailureMessage, decodeRelayPayload, MAX_PAYLOAD_BYTES, gridMain, viewerArgs, ignoreSizeArgs, sizingClients, sizingChange, SIZING_INTERVAL_MS, nextPollInterval, resolveBaseIntervalMs, jitteredPollInterval, DEFAULT_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS, MIN_POLL_INTERVAL_MS, NOT_ANSWERING_AFTER, DEFAULT_POLL_FETCH_TIMEOUT_MS, POLL_JITTER_RATIO };
 if (require.main === module) main(process.argv[2]);

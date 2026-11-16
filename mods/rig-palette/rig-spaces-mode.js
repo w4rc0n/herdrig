@@ -46,7 +46,7 @@ export function detectMode(tree) {
   let herdr = 0, full = 0, only = 0, personal = 0;
   // Only the blocks herdrig itself generates count as a herdrig mode. A person's own `only` block has an id we never write, so
   // it is THEIR block: it must not make the layout "both", because a request for "herdr" would then short-circuit on "already
-  // shows" while System still reported Both (CodeRabbit 4566227823, found natively). It is counted separately so a refusal can
+  // shows" while System still reported Both (found natively). It is counted separately so a refusal can
   // say plainly what is left. personal does not enter the mode expression: a person's block is not a mode of ours.
   walk(tree, (n) => {
     if (modOf(n) === HERDR_MOD) herdr++;
@@ -108,7 +108,7 @@ export function planMode(tree, target) {
     added++;
     changed.push(id);
   }
-  // CodeRabbit 4566227823: a transition may report success only when the result really IS the requested mode. A block we cannot
+  // A transition may report success only when the result really IS the requested mode. A block we cannot
   // manage (a person's own `only` block, say) can leave the layout short of the target, and claiming success then would tell the
   // person their layout changed when it did not. Say plainly what is left instead.
   const after = detectMode(next);
@@ -153,7 +153,7 @@ export function namedOurMods(tree) {
  *  goes with them. Returns { ok: true, tree, spaces, rigBlocks } or null when the layout names none of ours. */
 export function uninstallPlan(tree) {
   // Which containers held something BEFORE we touched anything: a container that was already empty is the person's structure and
-  // must survive, while one we empty ourselves should go (CodeRabbit 4566227713).
+  // must survive, while one we empty ourselves should go.
   const wasPopulated = new Set();
   walk(tree, (node) => { if (Array.isArray(node?.children) && node.children.length > 0 && typeof node.id === "string") wasPopulated.add(node.id); });
   const back = switchBack(tree);
@@ -177,7 +177,7 @@ export function uninstallPlan(tree) {
     });
   };
   if (back?.ok) pruneEmptied(next, true);
-  // CodeRabbit 4560854971: switchBack puts back the blocks it can trace (a full block, or the one whose id we generated). A
+  // switchBack puts back the blocks it can trace (a full block, or the one whose id we generated). A
   // `rig-spaces` block it cannot trace — a Rig-spaces-only block a person copied, or one an older build wrote — would survive and
   // still name a mod that is being removed, so herdr would fall back to its own layout. Convert EVERY remaining one to Herdr's
   // Spaces list; personal blocks of other mods are untouched.

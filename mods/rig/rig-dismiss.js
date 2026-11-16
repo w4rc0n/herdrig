@@ -28,7 +28,7 @@ export function liveDismissalItems(requested, liveItems, records = []) {
   });
 }
 
-/** Herdr mods have cx.timer, not browser AbortSignal/setTimeout. Bound both fetch and JSON body reading.
+/** Herdr provides URL, but no AbortSignal; use cx.timer to bound fetch and JSON body reading.
  * A timed-out POST may have committed; stop waiting, keep it local/uncertain, and never retry automatically.
  */
 export function boundedDismissalRequest(request, after, timeoutMs = 15000) {
