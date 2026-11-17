@@ -8,8 +8,8 @@ Only the latest release line gets security fixes. Fixes ship as a new release; t
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.4.x   | :white_check_mark: |
-| < 0.4   | :x:                |
+| 0.5.x   | :white_check_mark: |
+| < 0.5   | :x:                |
 
 Versions before 0.3.0 have known, fixed vulnerabilities (see [Past security fixes](#past-security-fixes)). If you are on one, update first.
 
