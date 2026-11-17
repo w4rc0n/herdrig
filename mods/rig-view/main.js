@@ -21,7 +21,7 @@ import { formatAbsoluteTime, timezoneValue } from './rig-time.js';
 // Needs-You: a request row expands in place to the request's words and a reply box (Answer or
 // Resolve, Ctrl+Enter); the item page shows the same. Drafts are rig-menu's (`shared("rig.drafts")`, draftKey).
 import { View, div, svg } from "gpui-kit";
-import { sharedLoopbackDaemonUrl, sharedRigData, stampRows, rowsIdentityOf } from "./rig-lib.js";
+import { sharedLoopbackDaemonUrl, sharedRigData, stampRows, rowsIdentityOf, RIG_DATA_STAMP } from "./rig-lib.js";
 import { relativeTimeText, specRealpathAvailable, sameDaemon, listAddedMachine } from "./rig-lib.js";
 
 import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, healthScopeTarget, healthQueueId, healthAge, validHealthQitemId, healthContextPercentage, classifyHealth, mergeHealthHistory } from "./rig-health.js";
@@ -47,7 +47,7 @@ let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 import { MOD_IDS, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKEN_PROTECTED, NETWORK_UNCONFIRMED_MESSAGE, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, formatOpenRigVersionLine, personDisableReason, seatStatus, statusLook, needTarget, iconsAt, fileLanguage, fileEntry, transcriptPath, openOrFocusTui, labelledTui,
   configRows, crumbsFor, navPush, navBack, navKey, layoutHasMod, startOneClick, writeCommand, cliRefusal, writeOutcome, peopleCliCommand, needDetailLines, needRecordedLines, draftKey, unsafeSpecWritePath, simpleHash, stripSecondaryEnterNewline,
-  STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, worstTone,
+  STATUS_MS, ERROR_STATUS_MS, hostOf, rigModel, statusCounts, rigFoldOpen, podFoldOpen, foldChoice, rigKey, podKey, orderRigs, seatClickTarget, seatTerminalIndex, worstTone,
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
@@ -81,6 +81,10 @@ const ASSETS = `mods/${MOD_IDS.view}`;
 const icon = iconsAt(ASSETS);
 
 const STACK = "rig-work", PAGE = "rig-page";
+// herdr gives a mod's render a fixed time budget; a Needs list draws one page of rows at a time, so its render stays the same size at any count.
+const NEEDS_PAGE_ROWS = 50;
+/** How long the page reuses its copy of rig.data while the publish stamp stays the same (rawRigData). */
+const RIG_DATA_KEEP_MS = 5_000;
 const CONFIG = () => `${appHome()}/openrig/config.json`;
 
 const nav = () => shared("rig.nav") ?? { stack: [] };
@@ -146,13 +150,24 @@ const usd = (v) => typeof v === "number" ? `$${v.toFixed(2)}` : "—";
 
 import {rigSpecLibraryPath, LAUNCH_DIALOG_HEIGHT} from "./rig-lib.js";
 import {StatusMotion} from "./rig-status-motion.js";
+/** How long a read may go unanswered before the page asks again. The mod runtime has no request timeout, so a lost answer (a tunnel gone half-open,
+ *  a daemon stopped mid-request) would otherwise hold that path on skeletons for the life of the tab. Asking again does not give up on the older
+ *  read: whichever answer comes back first is shown (a slow but live daemon still settles), and only an answer older than the one shown is dropped. */
+const READ_LOST_MS = 30_000;
+/** The connection id of a page that names no OpenRig while several are set up: it matches none, so nothing is read or sent for it. */
+const NO_PAGE_CONNECTION = "no-page-connection";
 export default class RigView extends View {
   // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
   get config() { return this._config; }
   set config(value) { this._config = value; observeConfig(value); }
   /** Every overlay this instance opens is stamped with ITS OWN config (its rows were read under it), never the latest instance's. */
   open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config, spec?.props?.target?.conn))); }
-  menu(target) { return this.open({ mod: MOD_IDS.menu, kind: "popup", width: 280, height: 320, props: { target } }); }
+  /** A menu opened from this page acts for the page's own OpenRig (with several): a row that names its own box keeps it. */
+  menu(target) {
+    const own = (this.config?.connections ?? []).length > 1 ? this.activeConnId() : null;
+    const stamped = target?.conn || !own || own === NO_PAGE_CONNECTION ? target : { ...target, conn: own };
+    return this.open({ mod: MOD_IDS.menu, kind: "popup", width: 280, height: 320, props: { target: stamped } });
+  }
   oneClick(target, action, actionKey = null) { return startOneClick({ shared, setShared, run, layout, openOverlay: (spec) => this.open(spec) }, target, action, actionKey); }
   palette(initial) { this.configPanel?.clearSelection();return this.open({ mod: MOD_IDS.palette, kind: "dialog", width: 560, height: 360, props: { initial } }); }
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
@@ -368,10 +383,10 @@ export default class RigView extends View {
   }
   caps() {
     if ((this.config?.connections ?? []).length > 1) {
-      const own = shared("rig.data")?.byConnection?.[this.activeConnId()]?.capabilities;
-      return currentCapabilities(this.activeConfig()?.capabilities ?? own ?? {}, terminals?.() ?? [], own ?? {herdrAppAvailable:null});
+      const own = this.rawRigData()?.byConnection?.[this.activeConnId()]?.capabilities;
+      return currentCapabilities(this.activeConfig()?.capabilities ?? own ?? {}, this.hostLists().terminals, own ?? {herdrAppAvailable:null});
     }
-    return currentCapabilities(this.config?.capabilities ?? shared, terminals?.() ?? [], shared("rig.capabilities"));
+    return currentCapabilities(this.config?.capabilities ?? shared, this.hostLists().terminals, shared("rig.capabilities"));
   }
 
   /** Open or switch to the active space's TUI. The Rig sidebar does it (`rig.tui`), as the menu does: it outlives
@@ -423,7 +438,7 @@ export default class RigView extends View {
   }
 
   sectionMenu() {
-    const published=sharedRigData(this.config, shared);
+    const published=this.rigData();
     const data = ((this.config?.connections?.length??0)>1?published?.byConnection?.[this.activeConnId()]:published) ?? {}, topology = data.topology ?? [];
     const items = data.attentionItems ?? this.cache?.["/api/attention"]?.data?.items ?? [];
     const health=data.health?.records??this.cache?.["/api/health"]?.data?.records;
@@ -433,7 +448,7 @@ export default class RigView extends View {
   }
 
   objectTabs(t, entry, spec, {prefix="page",active=this.activePageView}={}) {
-    const data=sharedRigData(this.config, shared)??{};
+    const data=this.rigData()??{};
     const counts=this.pageNeedsCounts??{requests:needsRequestCount(data.topology,data.attentionItems),updates:(data.attentionItems??[]).filter(isUpdateNeed).length};
     const options = pageViewOptions(entry, spec, {...counts,...this.workflowCounts});
     if (!options.length) return null;
@@ -525,8 +540,11 @@ export default class RigView extends View {
   activeConnId() {
     const entry = this.shownEntry();
     let id = entry?.conn;
-    if (!id && entry?.section === "needs" && entry.id) id = (shared("rig.data")?.attentionItems ?? []).find((i) => i?.id === entry.id)?.conn;
-    return adoptConnection(this.config, id) ?? this.config?.connectionId ?? null;
+    if (!id && entry?.section === "needs" && entry.id) id = (this.rawRigData()?.attentionItems ?? []).find((i) => i?.id === entry.id)?.conn;
+    const adopted = adoptConnection(this.config, id);
+    // Several OpenRigs and a page that names none: it belongs to no box, so it reads and sends nothing (the System page lists them all and needs none).
+    if (!adopted && entry && (this.config?.connections ?? []).length > 1 && entry.section !== "system" && entry.section !== "file") return NO_PAGE_CONNECTION;
+    return adopted ?? this.config?.connectionId ?? null;
   }
   /** The config for the shown connection: this page's own for the first, that connection's own address and home for another, null when it is
    *  not set up any more (nothing is read or sent: never the first connection's). */
@@ -630,7 +648,7 @@ export default class RigView extends View {
     if (this.config.configInvalid) { this.lastDaemonMessage = this.config.configInvalid; return null; } // a refused list has no address, from anywhere
     if (this.config.daemonUrl) return this.config.daemonUrl;
     // Another mod's shared state may name the daemon only when it's on this machine (loopback).
-    const fromShared = sharedLoopbackDaemonUrl(this.config, shared("rig.data"));
+    const fromShared = sharedLoopbackDaemonUrl(this.config, this.rawRigData());
     if (fromShared) {
       const nextCfg = { ...this.config, daemonUrl: fromShared, daemonUrlSource: this.config.daemonUrlSource ?? "cli" };
       delete nextCfg.daemonMessage;
@@ -660,18 +678,24 @@ export default class RigView extends View {
     const conn = as ? as.connectionId : this.activeConnId(), cache = this.cacheFor(conn), cfg = as ?? this.activeConfig();
     this.reading?.add(path);
     const hit = cache[path];
-    if ((!hit || force || hit.stale) && cfg && !hit?.loading) {
-      const sharedAt = sharedRigData(cfg, shared)?.at;
+    const lost = Boolean(hit?.loading) && Number.isFinite(hit.startedAt) && Date.now() - hit.startedAt > READ_LOST_MS;
+    if ((!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost)) {
+      const sharedAt = sharedRigData(cfg, this.sharedOnce)?.at;
       // The read belongs to the daemon and connection it started against: a late answer, after the configuration moved, is dropped.
       const epoch = this.cacheEpoch ?? 0;
-      cache[path] = { ...(hit ?? {}), stale: false, loading: true };
+      // Each read of a path is numbered. Any outstanding read's answer settles a loading entry; once an answer is shown, an older one is dropped.
+      const seq = (hit?.seq ?? 0) + 1;
+      const older = () => Number.isFinite(cache[path]?.shownSeq) && seq < cache[path].shownSeq;
+      cache[path] = { ...(hit ?? {}), stale: false, loading: true, startedAt: Date.now(), seq };
       const finish = (outcome) => {
         const pending = cache[path];
+        if (older()) return;
         cache[path] = {
           ...settleRead(pending, outcome),
           sharedAt: outcome.ok ? sharedAt : pending?.sharedAt,
           // Consume invalidation when starting, not when finishing: another update may arrive mid-read.
           ...(pending?.stale ? { stale: true } : {}),
+          seq: Math.max(pending?.seq ?? seq, seq), shownSeq: seq,
         };
         if (outcome.ok && typeof outcome.data?.qitemId === "string" && path.startsWith("/api/queue/")) {
           const row = outcome.data, at = cache[path].at;
@@ -693,7 +717,7 @@ export default class RigView extends View {
           }
           const r = await op.fetch(`${daemonUrl}${path}`);
           const body = await r.text();
-          if (epoch !== (this.cacheEpoch ?? 0)) return;
+          if (epoch !== (this.cacheEpoch ?? 0) || older()) return; // the config moved, or a newer answer is already shown
           let data = null; try { data = stampConnection(JSON.parse(body), cfg?.connectionId); } catch (_) { data = body; }
           // onData runs here, after the await: outside render, so it may create view state (an EditorState).
           if (r.ok && onData) onData(data);
@@ -708,8 +732,12 @@ export default class RigView extends View {
     // still "loading".)
     const result = cache[path] ?? (this.config && !cfg ? { error: UNKNOWN_CONNECTION, status: 0 } : { loading: true });
     if (path.startsWith("/api/attention") && result.data?.items) {
-      const health = this.read(cx, "/api/health");
-      return { ...result, data: { ...result.data, items: filterAttentionHealth(result.data.items, health.error ? [] : health.data?.records ?? []) } };
+      const health = this.read(cx, "/api/health"), records = health.error ? null : health.data?.records ?? null;
+      // The same filtered list until the items or the health records are read again: pages key their own per-read work on it.
+      const memo = (this.healthFiltered ??= new WeakMap()), hit = memo.get(result.data.items);
+      const items = hit && hit.records === records ? hit.items : filterAttentionHealth(result.data.items, records ?? []);
+      if (!hit || hit.items !== items) memo.set(result.data.items, { records, items });
+      return { ...result, data: { ...result.data, items } };
     }
     return result;
   }
@@ -926,11 +954,77 @@ export default class RigView extends View {
       .child(div().id("rig-close").cursor_pointer().on_click(() => closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)));
   }
 
+  /** herdr's lists a seat row needs (worker views, the shown view, panes, terminals and their index). Native herdr copies each list into the mod
+   *  on every call, and a page draws a chip per seat: within one render they are read once; outside a render (a click) they are read now. */
+  hostLists() {
+    const read = () => {
+      const pn = panes?.() ?? [], tm = terminals?.() ?? [];
+      return { strip: stripProps(), activeView: activeRigViewId(), panes: pn, terminals: tm, index: seatTerminalIndex(pn, tm) };
+    };
+    const memo = this.renderMemo;
+    return memo ? (memo.hostLists ??= read()) : read();
+  }
+  /** Where a click on this seat goes (seatClickTarget over hostLists). */
+  seatTarget(session, conn) {
+    const h = this.hostLists();
+    return seatClickTarget(h.strip, h.activeView, session, h.panes, h.terminals, seatOrigin(this.config, conn ?? this.activeConnId()),
+      seatSharedOf(this.config, this.sharedOnce)?.(session) === true, h.index);
+  }
+  /** shared("rig.data"): every connection's rigs, seats and attention, copied whole on each read. The page keeps the copy it read and reads it
+   *  again when the sidebar's publish stamp (RIG_DATA_STAMP) changes, or once the copy is RIG_DATA_KEEP_MS old (a writer that sets rig.data
+   *  without a stamp is still seen), so most renders read only the small stamp. Within one render the stamp is read once; with no stamp (no
+   *  sidebar publishes one), every read is current. The kept copy is shared, so nothing may change it in place. */
+  rawRigData() {
+    const memo = this.renderMemo;
+    if (memo && "rigData" in memo) return memo.rigData;
+    const stamp = shared(RIG_DATA_STAMP), kept = this.rigDataKept, now = Date.now();
+    const reuse = stamp !== undefined && kept?.stamp === stamp && now - kept.at < RIG_DATA_KEEP_MS;
+    const value = reuse ? kept.value : shared("rig.data");
+    this.rigDataKept = stamp === undefined ? null : reuse ? kept : { stamp, value, at: now };
+    if (memo) memo.rigData = value;
+    return value;
+  }
+  /** `shared` with rig.data through the once-per-render read; for helpers that take a shared function. */
+  get sharedOnce() { return (key) => key === "rig.data" ? this.rawRigData() : shared(key); }
+  /** rig.data as published under this page's settings (sharedRigData), through the same once-per-render read. */
+  rigData() { return sharedRigData(this.config, this.sharedOnce); }
+
   // ---- sections --------------------------------------------------------------------------------------------------
+  /** The attention items a Topology page counts with (a connected assistant's requests left out: terminalAttention), their targets and a
+   *  seat's first request, made once per read of the items and roster. A draw asks for them in every rig block, pod and seat, and the list
+   *  holds every update (hundreds with a busy OpenRig); herdr's mod runtime is an interpreter, where redoing that each render is costly. */
+  pageAttention(raw, roster) {
+    const list = Array.isArray(raw) ? raw : [];
+    const memo = (this.attentionMemo ??= new WeakMap()), hit = memo.get(list);
+    if (hit && hit.roster === roster) return hit;
+    const made = { roster, items: terminalAttention(list, roster), targetList: null, firstBySession: null, firstBySeat: null };
+    made.targets = () => (made.targetList ??= made.items.map(needTarget));
+    /** The first request (not an update) for this seat, in list order: by its session, or by its rig and logical id. */
+    made.seatNeed = (session, rigName, logicalId) => {
+      if (!made.firstBySession) {
+        // Built in locals and kept only when complete: a throw while building leaves nothing half-made for the next render to trust.
+        const bySession = new Map(), bySeat = new Map();
+        made.targets().forEach((it, i) => {
+          if (it.update) return;
+          if (!bySession.has(it.session)) bySession.set(it.session, i);
+          const byLogical = bySeat.get(it.rig) ?? new Map();
+          if (!byLogical.has(it.logicalId)) byLogical.set(it.logicalId, i);
+          bySeat.set(it.rig, byLogical);
+        });
+        made.firstBySeat = bySeat; made.firstBySession = bySession;
+      }
+      const a = made.firstBySession.get(session), b = made.firstBySeat.get(rigName)?.get(logicalId);
+      const i = a === undefined ? b : b === undefined ? a : Math.min(a, b);
+      return i === undefined ? undefined : made.targetList[i];
+    };
+    memo.set(list, made);
+    return made;
+  }
+
   hostedMembers(cx){
     const config=this.activeConfig(); // the shown connection's roster: each OpenRig has its own
     if(!config?.connectionId||!config.daemonUrl)return null;
-    const rig=sharedRigData(this.config, shared), supplied=rig?.byConnection?.[config.connectionId]?.hostedMembers??rig?.hostedMembers;
+    const rig=this.rigData(), supplied=rig?.byConnection?.[config.connectionId]?.hostedMembers??rig?.hostedMembers;
     if(supplied?.conn===config.connectionId&&supplied.origin===config.daemonUrl)return supplied;
     const cache=this.cacheFor(config.connectionId),key=`/api/queue/hosted-members:${config.connectionId}`,cached=cache[key];
     if((!cached||cached.stale)&&!cached?.loading&&typeof cx?.spawn==='function'){
@@ -979,7 +1073,7 @@ export default class RigView extends View {
     if (entry.kind === "pod") return this.podCard(t, cx, entry);
     const summary = this.read(cx, "/api/rigs/summary");
     const att = this.read(cx, "/api/attention");
-    const attentionItems = terminalAttention(att.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [],this.hostedMembers(cx));
+    const attentionItems = this.pageAttention(att.data?.items ?? this.rigData()?.attention?.items ?? [],this.hostedMembers(cx)).items;
     // One rig (`Topology › factory`): the same block, alone. It reads its own seats at once.
     if (entry.kind === "rig" && entry.rigId) {
       const one = (summary.data ?? []).find((r) => r.id === entry.rigId) ?? { id: entry.rigId, name: entry.name };
@@ -1136,7 +1230,7 @@ export default class RigView extends View {
     const podSeats = model.seats.filter((s) => s.pod === podName);
     const nativeSeats = this.read(cx, `/api/native-seats?rig=${encodeURIComponent(entry.rig)}`).data?.seats ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
-    const attentionItems = terminalAttention(this.read(cx,"/api/attention").data?.items ?? [],this.hostedMembers(cx)).map(needTarget);
+    const pageAttention = this.pageAttention(this.read(cx,"/api/attention").data?.items ?? [],this.hostedMembers(cx)), attentionItems = pageAttention.targets();
     const counts = computePulseCounts([{rig:rigObj,...model,countSeats:podSeats}],attentionItems);
     return v_flex().id(`pod-page-${entry.rigId ?? entry.rig}-${podName}`).gap(12)
       .child(this.title(t, `Pod ${podName} · ${entry.rig}`))
@@ -1148,7 +1242,7 @@ export default class RigView extends View {
       .child(this.card(t, "Seats", podSeats.length
         ? podSeats.map((s) => {
             const ns = nativeBySession.get(s.session);
-            const seatNeed = attentionItems.find((it) => !it.update && (it.session === s.session || (it.rig === entry.rig && it.logicalId === s.logicalId)));
+            const seatNeed = pageAttention.seatNeed(s.session, entry.rig, s.logicalId);
             return this.seatChip(t, rigObj, s, model.lifecycle, { nativeSeat: ns, seatNeed });
           })
         : [this.dim(t, `No seats in pod ${podName}.`)]));
@@ -1225,13 +1319,13 @@ export default class RigView extends View {
    *  OpenRigs (every one has a kernel rig, and seats can share names), so a lookup by name reads this connection's own entry. One connection:
    *  the publication itself, as before. */
   pageRigData() {
-    const published = sharedRigData(this.config, shared);
+    const published = this.rigData();
     return (this.config?.connections ?? []).length > 1 ? published?.byConnection?.[this.activeConnId()] : published;
   }
   /** A rig's nodes: this page's read, else what the sidebar already holds (so a block isn't empty while its own read lands). */
   nodesOf(cx, rigId) {
     const got = this.read(cx, `/api/rigs/${encodeURIComponent(rigId)}/nodes`);
-    const snapshot = sharedRigData(this.config, shared);
+    const snapshot = this.rigData();
     const nodes = snapshot?.nodesByRig?.[rigId];
     return nodes !== undefined && (got.data === undefined || got.sharedAt !== snapshot.at)
       ? { ...got, data: nodes } : got;
@@ -1392,7 +1486,7 @@ export default class RigView extends View {
       .when(!showBody, (el) => el.child(more()));
     const body = [];
     if (showBody) {
-      const followed = (stripProps()?.views ?? []).find((v) => v.following?.target === `rig:${rig.name}`);
+      const followed = (this.hostLists().strip?.views ?? []).find((v) => v.following?.target === `rig:${rig.name}`);
       const on = this.hostWorkerEntry(`rig:${rig.name}`, rig.conn ? configOfConnection(this.config, rig.conn) : this.config)?.following??!!followed?.following?.enabled;
       const caps = this.caps();
       const workerReason = capabilityDisableReason("open-view", caps);
@@ -1575,7 +1669,7 @@ export default class RigView extends View {
       ?? this.cache["/api/native-seats"]?.data?.seats
       ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
-    const attentionItems = terminalAttention(this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? [],this.hostedMembers(cx)).map(needTarget);
+    const pageAttention = this.pageAttention(this.cache["/api/attention"]?.data?.items ?? this.rigData()?.attention?.items ?? [],this.hostedMembers(cx)), attentionItems = pageAttention.targets();
     const hosts = [...new Set(model.seats.map((s) => s.host ?? "local"))];
     const sourceSeats = preserveHidden ? model.seats : seats;
     const groups = hosts.length > 1 ? hosts.map((h) => [h, sourceSeats.filter((s) => (s.host ?? "local") === h)]).filter(([, list]) => list.length) : [[null, sourceSeats]];
@@ -1622,7 +1716,7 @@ export default class RigView extends View {
           .when(!podSeats.length && preserveHidden, el => el.child(div().text_size(12).text_color(t.dim).child(`${all.length === 1 ? "The seat is" : `All ${all.length} seats`} hidden by the filter`)))
           .child(v_flex().gap(2).children(podSeats.map((s) => {
             const ns = nativeBySession.get(s.session);
-            const seatNeed = attentionItems.find((it) => !it.update && (it.session === s.session || (it.rig === rig.name && it.logicalId === s.logicalId)));
+            const seatNeed = pageAttention.seatNeed(s.session, rig.name, s.logicalId);
             return this.seatChip(t, rig, s, lifecycle, { nativeSeat: ns, seatNeed });
           })));
       });
@@ -1637,7 +1731,7 @@ export default class RigView extends View {
     const rowStatus = seatNeed ? "needs_input" : s.status;
     if (!s.terminal) { const seat = this.nowSeat(s); this.nowSeats?.set(seat.key, seat); }
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
-    const click = seatClickTarget(stripProps(), activeRigViewId(), s.session, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, s.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(s.session) === true);
+    const click = this.seatTarget(s.session, s.conn);
     const seatTarget = {
       kind: "seat",
       rig: rig.name,
@@ -1827,7 +1921,7 @@ export default class RigView extends View {
     const activityWords = seatActivityWords(n,Date.now(),this.uiTimezone);
 
     const attGot = this.read(cx, "/api/attention");
-    const allNeeds = (attGot.data?.items ?? sharedRigData(this.config, shared)?.attention?.items ?? []).map(needTarget);
+    const allNeeds = this.pageAttention(attGot.data?.items ?? this.rigData()?.attention?.items ?? [], null).targets(); // every item (no roster filter here, as before)
     const seatNeeds = allNeeds.filter((it) => !it.update && (it.session === n.canonicalSessionName || (it.rig === entry.rig && it.logicalId === entry.name)));
 
     const podName = n.pod ?? n.podNamespace ?? "default";
@@ -1850,7 +1944,7 @@ export default class RigView extends View {
       attachable: !stoppedSeat,
     };
     const dialog = (step, height) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
-    const live = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, n.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(n.canonicalSessionName) === true);
+    const live = this.seatTarget(n.canonicalSessionName, n.conn);
     const seatViewReason = capabilityDisableReason("open-seat", this.caps());
     const attachReason = stoppedSeat ? "Stopped: seat has no running session to attach" : null;
     const sendReason = personDisableReason("send", this.config);
@@ -1870,7 +1964,7 @@ export default class RigView extends View {
     // OpenRig's herdr provider (seatViewReason), like Open terminal beside it.
     const focusReason = live.kind === "focus" || live.kind === "select-then-focus" ? null : seatViewReason;
     const doFocusPane = () => {
-      const hit = seatClickTarget(stripProps(), activeRigViewId(), n.canonicalSessionName, panes?.() ?? [], terminals?.() ?? [], seatOrigin(this.config, n.conn ?? this.activeConnId()), seatSharedOf(this.config, shared)?.(n.canonicalSessionName) === true);
+      const hit = this.seatTarget(n.canonicalSessionName, n.conn);
       if (hit.kind === "focus") {
         if (hit.stack && hit.child) run("layout.select", { stack: hit.stack, child: hit.child });
         if (hit.tab) run("tab.select", { id: hit.tab });
@@ -1883,7 +1977,7 @@ export default class RigView extends View {
         run("pane.focus", { terminal: hit.terminal });
         return;
       }
-      if (hit.kind === "ambiguous") { notify({ title: "Focus pane", body: SEAT_NAME_SHARED, level: "warning" }); return; }
+      if (hit.kind === "ambiguous") { notify({ title: "Focus pane", body: hit.reason ?? SEAT_NAME_SHARED, level: "warning" }); return; }
       this.oneClick(target, "open-seat", "seat-focus-pane");
     };
 
@@ -2162,7 +2256,7 @@ export default class RigView extends View {
   /** Running rigs that use a spec: a rig spec's rigs by name, an agent spec's by the seats that resolve to it. */
   runningRigsOf(cx, s) {
     const rigs = (this.read(cx, "/api/rigs/summary").data ?? []).filter((r) => !r.archivedAt && (r.lifecycleState ?? r.lifecycle) === "running");
-    const nodes = sharedRigData(this.config, shared)?.nodesByRig ?? {};
+    const nodes = this.rigData()?.nodesByRig ?? {};
     return rigs.filter((r) => [r.name, r.specName, r.spec].includes(s.name) || (nodes[r.id] ?? []).some((n) => n.resolvedSpecName === s.name));
   }
 
@@ -3353,7 +3447,7 @@ export default class RigView extends View {
     const degraded = normalized.degraded;
     const pages = normalized.pages;
     const rigName = normalized.rigName;
-    const rigEntry = rigName ? rigOfConnection(sharedRigData(this.config, shared)?.topology ?? [], rigName, this.activeConnId()) : null; // within the page's own connection
+    const rigEntry = rigName ? rigOfConnection(this.rigData()?.topology ?? [], rigName, this.activeConnId()) : null; // within the page's own connection
     const noAttachableReason = opened.length === 0
       ? `No attachable seats (${absent.length} absent${degraded.length ? `, ${degraded.length} degraded` : ""})`
       : null;
@@ -3463,7 +3557,7 @@ export default class RigView extends View {
   }
 
   currentTopology(cx) {
-    const fromShared = this.config?.configInvalid ? null : sharedRigData(this.config, shared)?.topology; // a refused list shows no rows another mod left behind
+    const fromShared = this.config?.configInvalid ? null : this.rigData()?.topology; // a refused list shows no rows another mod left behind
     if (Array.isArray(fromShared) && fromShared.length > 0) return fromShared;
     const summary = this.cache["/api/rigs/summary"]?.data ?? this.read(cx, "/api/rigs/summary", false, (sData) => {
       if (Array.isArray(sData)) {
@@ -3667,8 +3761,13 @@ export default class RigView extends View {
     }
     const wait = this.status(t, cx, attPath, att);
     if (wait) return wait;
-    const rawItems = enrichAttentionItems(att.data?.items ?? [], agg.data);
-    const allItems = rawItems.map((raw) => {
+    // Every item as a target, made again only when the items, their aggregate or a cached queue row they merge from is read again (the
+    // queue rows cached are the requests opened, a few): not every update on every render.
+    const queueRows = Object.keys(this.cache).filter((k) => k.startsWith("/api/queue/")).sort().map((k) => this.cache[k]?.data);
+    const targetsHit = this.needsTargetsMemo;
+    const sameRead = targetsHit && targetsHit.items === att.data?.items && targetsHit.agg === agg.data && targetsHit.queueRows.length === queueRows.length
+      && targetsHit.queueRows.every((row, i) => row === queueRows[i]);
+    const allItems = sameRead ? targetsHit.allItems : enrichAttentionItems(att.data?.items ?? [], agg.data).map((raw) => {
       const qid = raw?.answer?.qitemId ?? (String(raw?.id ?? "").startsWith("queue:") ? String(raw.id).slice(6) : null);
       const cachedQueue = qid ? this.cache[`/api/queue/${encodeURIComponent(qid)}`]?.data : null;
       const merged = cachedQueue && typeof cachedQueue === "object" && !cachedQueue.error
@@ -3684,9 +3783,13 @@ export default class RigView extends View {
         : raw;
       return needTarget(merged);
     });
-    const dismissals = this.updateModel();
-    const items = dismissals.visible(allItems);
-    this.visibleUpdates = items.filter(dismissible);
+    if (!sameRead) this.needsTargetsMemo = { items: att.data?.items, agg: agg.data, queueRows, allItems, visible: null };
+    const dismissals = this.updateModel(), recordsKey = dismissals.records.map((r) => `${r.restored ? 1 : 0}${r.key}`).join("\n");
+    const kept = this.needsTargetsMemo;
+    if (kept.visible?.recordsKey !== recordsKey) kept.visible = { recordsKey, items: dismissals.visible(allItems) };
+    const items = kept.visible.items;
+    this.visibleUpdates = []; // the Updates rows drawn on the shown page (needRows sets them): Delete acts only on one of those
+    this.drawnNeedKeys = new Set(); // likewise the requests drawn, by their key (their OpenRig and id; requestRows sets them)
     const whoseRow = this.whoseQueueRow(t, cx, att.data?.perspective, entry.id ? items.find((x) => x.id === entry.id) : null);
     if (entry.id) {
       // One item (sidebar or toast click): the full Decision Card, here; no menu or dialog between.
@@ -3756,6 +3859,23 @@ export default class RigView extends View {
       .child(this.dim(t, `Read ${relativeTimeText(att.data.readAt)}. Viewing is not approval.`).id("needs-read-time").tooltip(this.time(att.data.readAt,{exact:true})));
   }
 
+  /** One page of a Needs list: its rows, their offset in the whole list, and the pager line (null when everything fits on one page). The page is
+   *  kept per OpenRig and list, and a list that shrank shows its last page. */
+  needsListPage(t, cx, listKey, list) {
+    const pages = Math.max(1, Math.ceil(list.length / NEEDS_PAGE_ROWS)), key = `${this.activeConnId() ?? ""}:${listKey}`;
+    const pageNo = Math.min(Math.max(0, (this.needsPages ??= {})[key] ?? 0), pages - 1), offset = pageNo * NEEDS_PAGE_ROWS;
+    const rows = list.slice(offset, offset + NEEDS_PAGE_ROWS);
+    if (pages === 1) return { rows, offset, pager: null };
+    // A page change drops the selection: a key (Delete, Up/Down, Enter) must never act on a row that is no longer on screen.
+    const go = (to) => (_e, cx) => { cx?.stop_propagation?.(); this.needsPages[key] = to; this.selectedUpdate = null; this.selectedNeed = undefined; this.selectedNeedId = undefined; cx?.notify?.(); };
+    const link = (id, label, to) => to < 0 || to >= pages ? div().text_size(12).text_color(t.dim).child(label)
+      : div().id(id).text_size(12).text_color(t.accent).cursor_pointer().on_click(go(to)).child(label);
+    const pager = h_flex().id(`${listKey}-pager`).px(8).h(28).gap(12).items_center()
+      .child(div().flex_1().text_size(12).text_color(t.muted).child(`${offset + 1}–${offset + rows.length} of ${list.length}`))
+      .child(link(`${listKey}-page-previous`, "Previous", pageNo - 1)).child(link(`${listKey}-page-next`, "Next", pageNo + 1));
+    return { rows, offset, pager };
+  }
+
   /** Needs-You rows: a click opens the Decision Card in place (`shared("rig.open.page")`, `needs:<id>`, so the palette and the
    *  sidebar agree); right-click is the menu. A palette filter narrows them, as it does a table. */
   needRows(t, cx, idPrefix, list, perspective = null) {
@@ -3764,6 +3884,8 @@ export default class RigView extends View {
     if (f) list = list.filter((n) => [n.summary, n.urgency, n.asker, n.scope, n.tier].some((c) => String(c ?? "").toLowerCase().includes(f)));
     const open = shared("rig.open.page") ?? {};
     const focusNeed = shared("rig.focusNeed");
+    const { rows, offset, pager } = this.needsListPage(t, cx, idPrefix, list);
+    if (idPrefix === "updates") this.visibleUpdates = rows.filter((n) => !n.receipt && dismissible(n));
     const toggle = (n) => {
       this.selectedUpdate = dismissible(n) ? n : null;
       const now = shared("rig.open.page") ?? {}, next = !now[`needs:${n.id}`];
@@ -3774,7 +3896,8 @@ export default class RigView extends View {
     return v_flex()
       .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().w(12)).child(div().flex_1().child("What")).child(div().w(140).flex_none().child("Answer")).child(div().w(150).flex_none().child("Since")))
-      .children(list.length ? list.map((n, i) => {
+      .children(list.length ? rows.map((n, at) => {
+        const i = offset + at;
         if (n.receipt) return this.updateReceipt(t, n.receipt);
         if (dismissible(n)) n = { ...n, dismissalPosition: i };
         const shown = !!open[`needs:${n.id}`];
@@ -3810,7 +3933,8 @@ export default class RigView extends View {
             .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); }))
             .child(div().w(150).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).tooltip(this.time(n.at,{exact:true})).child(relativeTimeText(n.at))))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(n.dismissed ? this.dim(t, n.dismissalNote ?? "Hidden here only.") : this.needBody(t, cx, n, perspective))));
-      }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")]);
+      }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")])
+      .when(!!pager, (el) => el.child(pager));
   }
 
   /** A request opened in place or on its own item page: renders the full Decision Card. */
@@ -3818,14 +3942,19 @@ export default class RigView extends View {
     const filter = this.filter?.toLowerCase();
     if (filter) items = items.filter(n => [n.summary, n.asker].some(s => String(s ?? "").toLowerCase().includes(filter)));
     const toggle = (n) => { if (n.criticalHealth) { this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) }); return; } this.selectedNeed = this.replyKey(n); this.selectedNeedId = n.id; if (n.reply !== "none") this.replies[this.replyKey(n)] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
+    const open = shared("rig.open.page") ?? {};
+    const { rows, offset, pager } = this.needsListPage(t, cx, "needs", items);
+    this.drawnNeedKeys = new Set(rows.map((n) => this.replyKey(n))); // the requests on screen: a card key acts only on one of them (routeNeedKey)
     return v_flex().id("need-request-list").on_key_down((e, cx) => {
       if (!["up", "down", "enter"].includes(e.key)) return;
       cx.stop_propagation();
-      let i = items.findIndex(n => this.replyKey(n) === this.selectedNeed);
-      if (e.key === "enter") { if (i >= 0) toggle(items[i]); }
-      else { i = Math.max(0, Math.min(items.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = items[i] ? this.replyKey(items[i]) : undefined; this.selectedNeedId = items[i]?.id; }
+      // Up, Down and Enter move over the shown page's rows only; Previous / Next change the page.
+      let i = rows.findIndex(n => this.replyKey(n) === this.selectedNeed);
+      if (e.key === "enter") { if (i >= 0) toggle(rows[i]); }
+      else { i = Math.max(0, Math.min(rows.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = rows[i] ? this.replyKey(rows[i]) : undefined; this.selectedNeedId = rows[i]?.id; }
       cx.notify();
-    }).children(items.length ? items.map((n, i) => {
+    }).children(items.length ? rows.map((n, at) => {
+      const i = offset + at;
       if (n.criticalHealth) return this.healthNeedsLine(t, n);
       // A blank summary needs the same body the expanded card uses; fetch it only for these rows.
       const queue = n.summaryIsFallback && !n.body && n.qitemId ? this.read(cx, `/api/queue/${encodeURIComponent(n.qitemId)}`).data : null;
@@ -3833,7 +3962,7 @@ export default class RigView extends View {
       const assistant=assistantForNeed(n,this.hostedMembers(cx));
       const owner = n.reply === "resolve" || n.answer?.verb === "resolve" ? parkedWorkOwner(n) : assistant?assistantOwner(assistant):n.asker ?? n.sourceSession;
       const age = Date.parse(n.at ?? ""), mins = Number.isFinite(age) ? Math.max(0, Math.floor((Date.now() - age) / 60000)) : null;
-      const shown = Boolean((shared("rig.open.page") ?? {})[`needs:${n.id}`]);
+      const shown = Boolean(open[`needs:${n.id}`]);
       return v_flex().min_w(0).child(h_flex().id(`needs-${i}`).px(8).h(34).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
         .when(this.selectedNeed === this.replyKey(n), el => el.bg(t.selection ?? t.raised))
         .on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
@@ -3843,7 +3972,8 @@ export default class RigView extends View {
         .child(div().text_size(11).text_color(t.dim).tooltip(this.time(n.at,{exact:true})).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
         .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); })))
         .when(shown, el => el.child(this.decisionCard(t, cx, n, { perspective })));
-    }) : [this.dim(t, filter ? "No matching requests." : "No pending Needs-You requests.")]);
+    }) : [this.dim(t, filter ? "No matching requests." : "No pending Needs-You requests.")])
+      .when(!!pager, (el) => el.child(pager));
   }
 
   needBody(t, cx, n, perspective = null) {
@@ -3882,6 +4012,7 @@ export default class RigView extends View {
     if (!id || (!entry.id && !(shared("rig.open.page") ?? {})[`needs:${id}`])) return false;
     // The card's box is the request's on its own OpenRig: the page's request, else the row selected in the list (with its connection).
     const boxKey = entry.id ? this.replyKey(entry) : this.selectedNeed && id === this.selectedNeedId ? this.selectedNeed : this.replyKey({ id });
+    if (!entry.id && !this.drawnNeedKeys?.has(boxKey)) return false; // an open card on another page, or another tab, isn't on screen: its keys don't reach it
     const key = this.replies[boxKey]?.cardKey;
     if (!key) return false;
     key(e, cx); return true;
@@ -4871,8 +5002,8 @@ export default class RigView extends View {
     // the existing health cache/refresh, only on System → Health, never a timer.
     const history = entry.subview === "health" ? this.read(cx, "/api/health?status=cleared") : null;
     const allRecords = mergeHealthHistory(data.records, history?.error ? null : history?.data);
-    const rigs = this.read(cx, "/api/rigs/summary").data ?? sharedRigData(this.config, shared)?.topology ?? [];
-    const nodes = { ...(sharedRigData(this.config, shared)?.nodesByRig ?? {}) };
+    const rigs = this.read(cx, "/api/rigs/summary").data ?? this.rigData()?.topology ?? [];
+    const nodes = { ...(this.rigData()?.nodesByRig ?? {}) };
     for (const id of new Set(allRecords.map(r => r.scope?.rigId).filter(Boolean))) nodes[id] = this.nodesOf(cx, id).data ?? nodes[id] ?? [];
     const rig = entry.healthRigId ? rigs.find(r => r.id === entry.healthRigId) ?? { id: entry.healthRigId, name: entry.healthRigName ?? entry.healthRigId } : null;
     const records = rig ? healthForRig(allRecords, rig, nodes[rig.id] ?? [], true, true) : allRecords;
@@ -4962,7 +5093,7 @@ export default class RigView extends View {
     const total = seats.reduce((sum, s) => sum + (typeof s.costUsd === "number" ? s.costUsd : 0), 0);
     const capDetail = capabilitiesSummaryDetail(this.caps());
     // The version of the OpenRig this page SHOWS: another connection's published line isn't this page's, so it falls back to the page's own /healthz.
-    const shownCfg = this.activeConfig(), published = sharedRigData(shownCfg, shared);
+    const shownCfg = this.activeConfig(), published = sharedRigData(shownCfg, this.sharedOnce);
     const own = (this.config?.connections ?? []).length > 1 ? published?.byConnection?.[shownCfg?.connectionId] : published; // several OpenRigs: only that connection's own entry, never the first's top-level line
     const versionLine = own?.versionLine || formatOpenRigVersionLine({
       healthz: healthz.data,
@@ -5210,6 +5341,11 @@ export default class RigView extends View {
     try { return (spaces?.() ?? []).find((s) => s?.id === this.propsSpaceId) ?? null; } catch (_) { return null; }
   }
   render(cx) {
+    // Values read once per render (see rawRigData); cleared after it, so nothing outside a render sees a stale one.
+    this.renderMemo = {};
+    try { return this.renderPage(cx); } finally { this.renderMemo = null; }
+  }
+  renderPage(cx) {
     // A tab with no `space` prop (made by an earlier version) learns its space when drawn: only a shown tab is drawn, so the active space is its own.
     if (!this.propsSpaceId) { try { const shown = (spaces?.() ?? []).find((s) => s?.active); if (shown) this.ownSpace = shown; } catch (_) {} }
     this.topologyStrip=null;
@@ -5239,7 +5375,7 @@ export default class RigView extends View {
     // lags it. Stale, not deleted: a deleted read draws the skeleton in place of the page until the fetch lands, which
     // collapsed the scroll to the top, dropped a focused text box and flashed the page on every event (the reported flash bug).
     // With several OpenRigs, the shown connection's own refresh stamp: another connection's refresh must not re-read this page, and this one's must.
-    const published = sharedRigData(this.config, shared);
+    const published = this.rigData();
     const at = (this.config?.connections?.length ?? 0) > 1 ? published?.byConnection?.[this.activeConnId()]?.at : published?.at;
     if (at && at !== this.dataAt) {
       this.dataAt = at;
@@ -5265,11 +5401,12 @@ export default class RigView extends View {
     this.filter = entry?.filter ?? null;
     this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,navKey(entry)]),cx,{
       reducedMotion:this.config?.reducedMotion===true,
-      attention: this.cache["/api/attention"]?.data?.items ?? sharedRigData(this.config, shared)?.attentionItems,
+      attention: this.cache["/api/attention"]?.data?.items ?? this.rigData()?.attentionItems,
     });
     let body;
     if (!this.config) body = this.dim(t, "Reading OpenRig's settings…");
     else if (!entry) body = this.dim(t, "Nothing open. Pick a rig, seat, spec or slice in the Rig sidebar.");
+    else if (this.activeConnId() === NO_PAGE_CONNECTION) body = this.dim(t, "This page names no OpenRig, and several are set up, so nothing is shown or sent for it. Open it again from a row in the Rig sidebar.");
     else if (entry.section === "file") body = this.fileView(t, cx, entry);
     else if (entry.section === "topology") body = this.topology(t, cx, entry);
     else if (entry.section === "specs") body = this.specs(t, cx, entry);

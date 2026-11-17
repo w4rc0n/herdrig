@@ -1,6 +1,10 @@
 # Herdrig
 
-Version: v0.5.0
+Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible branches of a rig's live topology,
+specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
+its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
+
+Version: v0.5.1
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
@@ -20,14 +24,10 @@ release's folders, one at a time. Replace only those named folders; never use `-
 Restart herdr-app after all five are copied. Folds and settings are kept outside those folders.
 Check the `Version:` line in the README you copied, or **Herdrig Version** in System.
 
-Herdrig brings OpenRig into the `herdr` window: a sidebar with six collapsible branches of a rig's live topology,
-specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
-its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
-
-The sidebar folds to a 30 px header in personal spaces, keeping Needs you and search. Click the header, press Enter
-while it has focus, or choose **OpenRig: show sidebar here** to expand until the space changes. Its previous pixel
-or weighted height is restored; tree folds and scroll position are untouched. Give the rig block its own layout id
-for automatic resizing. Without one it draws only the header and explains the fallback.
+The sidebar keeps its size and contents on every space: clicking another space never folds it. It folds only when
+the person folds Herdr's own OpenRig block, and that fold stays across space switches and restarts. Tree folds are
+kept per OpenRig connection. A block an earlier version left folded to its 30 px header gets its saved height back
+once, on the first start after updating.
 Pages for a rig use its existing rig space; when none exists they use the local **OpenRig** home. Cross-rig pages
 stay in the current OpenRig space, or go home from personal spaces. The TUI always goes home, on the configured
 Herdr machine when one is selected and locally otherwise. The first home terminal is a labelled TUI; its recorded
@@ -407,8 +407,8 @@ list reads only a Herdr shared key (`herdrig.spaces`) that the Rig sidebar fills
 OpenRig. The copy is pinned to a Herdr commit (shown on the row); Herdr's later changes to its own list reach it with a herdrig
 release.
 
-**Fitting it into the layout.** All four mods have `"place": "none"` (Herdr only auto-docks a newly seen mod when
-`place` is not `"none"`, and never into a shipped layout). After copying the four folders into `<appHome>/mods/`,
+**Fitting it into the layout.** All five mods have `"place": "none"` (Herdr only auto-docks a newly seen mod when
+`place` is not `"none"`, and never into a shipped layout). After copying the five folders into `<appHome>/mods/`,
 the installing agent fits the sidebar into the person's layout in one step (`AGENTS.md` step 3):
 1. Tell the person before changing their layout.
 2. If the person is on **Herdr (`main`)** (check `herdr-app status`), clone it
@@ -516,7 +516,7 @@ What tripped this build up, and what a fresh build would get wrong:
   and the provider then fails **every** view with `herdr_app_mods` — it does not degrade, and it does not repair
   itself, because the refusal happens before any write. A *missing* folder is different: that one is reinstalled on
   the next open, so deleting is not a shortcut either — it just breaks a different daemon later.
-- **On a window served by upstream OpenRig's `herdr-app` provider, these four mods still work — with less chrome.**
+- **On a window served by upstream OpenRig's `herdr-app` provider, these mods still work — with less chrome.**
   That provider ships a minimal `rig-cell-header` whose props carry `{ title, detail, ended }` and no `views` or
   `seat`. The sidebar reads both optionally, so nothing throws: you get the tree, the Page, the palette and the maps
   with no cell-level seat identity, no follow countdown and no per-view row. Features that need the native-tab
@@ -526,7 +526,7 @@ What tripped this build up, and what a fresh build would get wrong:
   you already use — nothing else is taken.
 - **`place` is `"none"`, so the layout must reference `{ "mod": "rig" }`.** Herdr never auto-docks a `"place": "none"`
   mod or modifies a shipped layout on folder discovery. Tell the person before changing their layout; if they are on
-  `main`, `layout.clone` it to their own and insert a block with `"id": "openrig-sidebar"`, `"content": { "mod": "rig" }` (`"size": { "weight": 2 }` or a pixel
+  `main`, `layout.clone` it to their own and insert a block with `"id": "rig-sidebar"`, `"content": { "mod": "rig" }` (`"size": { "weight": 2 }` or a pixel
   height) as the first child of `sidebar-lists` (otherwise ask the person).
 - **The sidebar wants 260 px of width, and the rail keys off column `id: "sidebar"`.** Below 160 px wide the column with
   `id: "sidebar"` becomes a rail; between 160 and 260 the tree is cramped rather than broken. Keep `id: "sidebar"` if you

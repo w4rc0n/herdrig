@@ -16,6 +16,9 @@ const needs = (seat) => !excluded(seat) && ["needs_input", "attention_required",
 const helperStatus = (child) => ["blocked", "error", "needs_input"].includes(child.status) ? "needs" : child.status === "working" ? "working" : "idle";
 function helpersOf(seat, terminals) {
   const known = seat.native?.children ?? [];
+  // Helper rows start from the seat's own children or its native address: a seat with neither (any seat not on herdr-core) has none,
+  // and the map of every terminal below would be built for nothing, once per seat and render.
+  if (!known.length && !seat.native?.address) return [];
   const all = new Map(known.map((c) => [c.address, c]));
   for (const t of terminals) all.set(t.address, { ...(all.get(t.address) ?? {}), ...t });
   const seen = new Set(), rows = [];

@@ -1,10 +1,10 @@
-import { needTarget, missionAction, isUpdateNeed, isHealthAttention, filterAttentionHealth } from "./rig-lib.js";
+import { needTarget, needSummary, missionAction, isUpdateNeed, isHealthAttention, filterAttentionHealth } from "./rig-lib.js";
 
 export const UNDO_MS = 10000;
 const RETAIN_MS = 30 * 86400000;
 export const dismissible = (item) => !!item?.id && !isHealthAttention(item) && isUpdateNeed(item) && !item.native
   && !item.answer?.verb && !["answer", "resolve", "native"].includes(item.reply);
-export const updateKey = (item) => JSON.stringify([item.id, needTarget(item).summary]);
+export const updateKey = (item) => JSON.stringify([item.id, needSummary(item)]); // the target's summary, without making the whole target
 export const dismissalScope = (config) => JSON.stringify([config?.daemonUrl ?? "", config?.person ?? ""]);
 const localNote = "Hidden here only; other OpenRig clients may still show it.";
 

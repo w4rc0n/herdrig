@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.1
+
+Fixes for v0.5.0.
+
+- **The Rig sidebar and the Rig page cope much better with hundreds of requests or updates (see Known issues).** v0.5.0 could show "This view could not be re-rendered" for an OpenRig with a few hundred updates nobody had dismissed, for example on a machine added with Add a machine. The sidebar shows the first 20 requests, updates and dismissed updates. A "N more requests" or "N more updates" row opens that OpenRig's Needs page on the matching tab. The Needs page shows 50 at a time, with Previous and Next; its keys act only on the rows of the page shown, and changing page clears the selection. The Topology pages stay fast too.
+- **The Rig page no longer goes blank ("This view could not be rendered: interrupted") when Herdr lists many terminals,** for example from several machines. Each seat used to search every terminal and pane on every draw; now they are looked up once per draw.
+- **The Rig sidebar no longer freezes when Herdr lists many terminals** and the focused terminal isn't a seat's. Finding the focused seat searched every terminal and pane for each seat on every draw; now they are looked up once per draw.
+- **The Rig sidebar no longer sticks with hundreds of open updates on another OpenRig.** Every draw of that OpenRig's view went through all of its requests and updates again, although it shows 20; it now does that once each time OpenRig is read.
+- **The Rig sidebar no longer sticks with Topology open and hundreds of Herdr terminals.** It now reads Herdr's terminal lists once per draw and looks for helper terminals only for seats that have them. The sidebar lists show 20 rows each; the "N more" row opens the full list.
+- **An Attach on another machine always says why it failed.** After one "OpenRig isn't answering" notice for a machine, later failed Attaches there showed nothing until Herdr restarted; now each one shows its notice, and a success there resets it.
+- **The Rig page no longer copies all of OpenRig's data on every draw.** It reads it again only when the sidebar publishes new data, so pages stay quick with several hundred updates.
+- **In the sidebar, Dismiss all says how many it dismisses** ("Dismiss all 300"), on the Updates header and in its right-click menu. It still dismisses every update, not only the ones shown.
+- **With a machine pinned in the sidebar, a page you open from a row or its menu shows that machine's OpenRig,** not this computer's.
+- **With several OpenRigs, a page that doesn't say which OpenRig it belongs to shows nothing and sends nothing.** It says "This page names no OpenRig, and several are set up" instead of quietly showing the first one. System and file pages aren't affected. Open the page again from a row in the Rig sidebar.
+- **The summary notification for new requests opens the Needs page of the OpenRig it came from.**
+- **When two OpenRigs share a seat name, an older Attach tab that does not say which OpenRig it belongs to is no longer reused or focused by mistake;** herdrig asks you to close it, then Attach again.
+- **Clicking another space no longer folds the OpenRig sidebar.** It keeps its size and its open and closed sections on every space, and folds only when you fold its block yourself; that fold stays when you switch spaces or restart. If an earlier version left it folded to its header, it opens to its previous height once after updating.
+- **A Rig page no longer stays on loading placeholders after an answer from OpenRig is lost,** for example when a connection drops mid-request. After 30 seconds it asks again, and whichever answer comes back first is shown; an older answer arriving after a newer one is ignored.
+- **Herdrig has a logo.** The README now opens with it, in a light and a dark version, and the full kit is in `assets/logo` (SVG and PNG sizes, with its attribution).
+- **RECIPE.md:** the sidebar block id is `rig-sidebar` (one place said `openrig-sidebar`, which the sidebar never finds), and "Fitting it into the layout" now names all five mods.
+
+### Known issues
+
+- With several hundred updates, changing page can rarely show the could-not-be-re-rendered banner for a few seconds. It clears by itself.
+- With several OpenRigs, an update you dismiss while the sidebar shows another OpenRig can still be listed there, or come back after a moment. Your dismissal is kept. A fix is planned for the next release.
+- On a slow or busy remote machine, Attach to a seat there can take minutes without a message. A fix is planned for the next release.
+- Under heavy load, Attach can show "Open the Rig sidebar to attach" even though the sidebar is open. Folding the sidebar's Topology section makes this less likely; otherwise Attach again once load drops. A fix is planned for the next release.
+
 ## v0.5.0
 
 ### Updating from v0.4.7

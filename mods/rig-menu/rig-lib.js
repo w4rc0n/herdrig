@@ -945,7 +945,6 @@ export const LOCAL_COMMANDS = [
   { line: "pulse", hint: "Focus the pulse status strip on Topology" },
   { line: "expand-all", hint: "Expand all branches in the OpenRig sidebar tree" },
   { line: "collapse-all", hint: "Collapse branches in the OpenRig sidebar tree (keeps Needs visible)" },
-  { line: "show-sidebar-here", hint: "OpenRig: show sidebar here" },
   { line: "change-model", hint: "Switch a seat's harness, model, or effort via the lead (change-model <seat>)" },
   { line: "people", hint: "People, quiet hours, and modes on System" },
   { line: "spaces-list", hint: "Choose Herdr's, herdrig's or both Spaces lists (System → Layout)" },
@@ -1021,6 +1020,14 @@ export function sharedLoopbackDaemonUrl(config, published) {
 /** What other mods published in the shared `rig.data` (rows, nodes, needs, versions), as a reader may RENDER or SUGGEST it. A refused connections list
  *  has none: whatever a sidebar published before the list was added is stale, and the sidebar replaces it only when its own refresh runs. Every
  *  reader of the shared rows goes through this (`undefined` reads like a sidebar that has published nothing). */
+/** `rig.data` (every connection's rigs, seats, roster and attention) is large, and native herdr copies a shared value into a mod on every read.
+ *  The sidebar, its only writer, publishes it through `publishRigData`: the data, then a new `rig.dataStamp`. A reader that keeps a copy may
+ *  reuse it while the stamp is the same (the data is written first, so a new stamp never comes with old data). */
+export const RIG_DATA_STAMP = "rig.dataStamp";
+export function publishRigData(setSharedFn, value) {
+  setSharedFn("rig.data", value);
+  setSharedFn(RIG_DATA_STAMP, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
+}
 export function sharedRigData(config, shared) {
   // No config yet (a mod's first moments, before it has read config.json) cannot rule a refused list out, so it reads nothing either.
   if (!config || config.configInvalid) return undefined;
@@ -2783,21 +2790,45 @@ export function cellsForSeat(stripProps, session) {
   return out;
 }
 
-/** Resolve a seat's live pane target in an open worker view or attached/native seat tab, or `{ kind: "card" }` when none is open. */
-export function seatClickTarget(stripProps, shownChild, session, panes = [], terminals = [], origin = undefined, shared = false) {
+/** herdr's panes and terminals indexed once, for a page that resolves many seats in one draw (`seatClickTarget`'s `index`): each pane by its
+ *  terminal (the first, as `find` gives), and each terminal (with its position in the list) under every label a seat can be found by. A seat
+ *  then looks at its few candidates instead of every terminal and every pane. */
+export function seatTerminalIndex(panes = [], terminals = []) {
+  const pn = Array.isArray(panes) ? panes : [], tm = Array.isArray(terminals) ? terminals : [];
+  const paneByTerminal = new Map(), byLabel = new Map();
+  for (const p of pn) if (p?.terminal && !paneByTerminal.has(p.terminal)) paneByTerminal.set(p.terminal, p);
+  const add = (key, entry) => { const list = byLabel.get(key); if (list) list.push(entry); else byLabel.set(key, [entry]); };
+  tm.forEach((t, at) => {
+    const l = t?.labels; if (!l) return;
+    if (l["herdr-openrig.role"] === "attach" && l["herdr-openrig.attach"]) add(`attach:${l["herdr-openrig.attach"]}`, { t, at });
+    if (l["openrig.role"] === "seat") {
+      if (l["openrig.session"]) add(`seat:${l["openrig.session"]}`, { t, at });
+      if (l["openrig.seat"] && l["openrig.seat"] !== l["openrig.session"]) add(`seat:${l["openrig.seat"]}`, { t, at });
+    }
+  });
+  return { panes: pn, terminals: tm, paneByTerminal, byLabel };
+}
+
+/** Resolve a seat's live pane target in an open worker view or attached/native seat tab, or `{ kind: "card" }` when none is open. With `index`
+ *  (seatTerminalIndex of the same panes and terminals) only the terminals a seat can match are checked, in their list order: the same answer. */
+export function seatClickTarget(stripProps, shownChild, session, panes = [], terminals = [], origin = undefined, shared = false, index = null) {
   const cells = cellsForSeat(stripProps, session);
   const pn = Array.isArray(panes) ? panes : (Array.isArray(panes?.panes) ? panes.panes : []);
   const tm = Array.isArray(terminals) ? terminals : (Array.isArray(panes?.terminals) ? panes.terminals : []);
+  const paneOf = index ? (address) => index.paneByTerminal.get(address) : (address) => pn.find((p) => p?.terminal === address);
   const sess = String(session ?? "").trim();
   const atIdx = sess.lastIndexOf("@");
   const logicalId = atIdx > 0 ? sess.slice(0, atIdx).replace(/-/g, ".") : sess;
   const rig = atIdx > 0 ? sess.slice(atIdx + 1) : "";
   for (const c of cells) {
-    const paneHit = pn.find((p) => p?.terminal === c.terminal);
+    const paneHit = paneOf(c.terminal);
     if (paneHit?.tab) c.tab = paneHit.tab;
   }
-  let ambiguous = false;
-  for (const t of tm) {
+  let ambiguousReason = null;
+  // Every terminal that can match carries one of these labels (the checks below decide); without an index, every terminal is checked.
+  const candidates = index ? [...new Map([`attach:${sess}`, `seat:${sess}`, `seat:${logicalId}`].flatMap((key) => index.byLabel.get(key) ?? []).map((e) => [e.at, e.t])).entries()]
+    .sort((a, b) => a[0] - b[0]).map(([, t]) => t) : tm;
+  for (const t of candidates) {
     if (!t?.address || (t.state !== undefined && t.state !== "live" && t.state !== "running")) continue;
     if (!sameOrigin(t, origin)) continue;
     const isAttach = t.labels?.["herdr-openrig.role"] === "attach" && t.labels?.["herdr-openrig.attach"] === sess;
@@ -2807,10 +2838,12 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
       (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig))
     );
     if (!isAttach && !isNativeSeat) continue;
-    // A native-namespace terminal is never focused (rule Y: nothing on it names this daemon); with a shared name it still says so.
-    if (isNativeSeat && !isAttach) { if (shared && origin !== undefined) ambiguous = true; continue; }
+    // A native-namespace terminal is never focused (rule Y: nothing on it names this daemon); an unlabeled attach terminal
+    // with a shared name on several OpenRigs cannot be tied to this box either.
+    if (isNativeSeat && !isAttach) { if (shared && origin !== undefined) ambiguousReason ??= SEAT_NAME_SHARED; continue; }
+    if (isAttach && !t.labels?.["herdr-openrig.origin"] && shared && origin !== undefined && origin !== null) { ambiguousReason = ATTACH_TAB_UNLABELED; continue; }
     if (cells.some((c) => c.terminal === t.address)) continue;
-    const paneHit = pn.find((p) => p?.terminal === t.address);
+    const paneHit = paneOf(t.address);
     const tab = paneHit?.tab ?? t.labels?.["herdr.tab"] ?? null;
     if (tab || paneHit) {
       cells.push({ view: tab ?? t.address, ...(tab ? { tab } : {}), terminal: t.address });
@@ -2819,7 +2852,7 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
   const here = cells.find((c) => c.view === shownChild || (c.tab && c.tab === shownChild));
   if (here) return { kind: "focus", terminal: here.terminal };
   if (cells[0]) return { kind: "select-then-focus", view: cells[0].view, ...(cells[0].tab ? { tab: cells[0].tab } : {}), terminal: cells[0].terminal };
-  return ambiguous ? { kind: "ambiguous" } : { kind: "card" };
+  return ambiguousReason ? { kind: "ambiguous", reason: ambiguousReason } : { kind: "card" };
 }
 export const seatPaneTarget = seatClickTarget;
 
@@ -3108,6 +3141,11 @@ export function enrichAttentionItems(attentionItems = [], aggregateData = null, 
   });
 }
 
+/** A Needs-You item's one-line summary, as its target (`needTarget`) carries it: the summary, else the title, else the id. */
+export function needSummary(item) {
+  return singleLineText(item?.summary) || singleLineText(item?.title) || String(item?.id ?? "");
+}
+
 /**
  * A Needs-You item (`/api/attention` items) as a menu/card target:
  * replies and decisions go through `POST /api/mission-control/action` (`missionAction`).
@@ -3150,7 +3188,7 @@ export function needTarget(item) {
     humanAnswers: item?.humanAnswers ?? null,
     tags: Array.isArray(item?.tags) ? item.tags : [],
     ownerNotificationLevel: item?.ownerNotificationLevel ?? null,
-    summary: singleLineText(item?.summary) || singleLineText(item?.title) || id,
+    summary: needSummary(item),
     summaryIsFallback: item?.summaryIsFallback === true || !(singleLineText(item?.summary) || singleLineText(item?.title)),
     body: item?.body ?? item?.bodyPreview ?? "",
     urgency: item?.urgency ?? null,
@@ -4725,12 +4763,25 @@ export function computePulseCounts(models, attentionItems = []) {
   return { working, blocked, needs, idle, unreported };
 }
 
+/** The requests among a list of attention items (updates dropped). A Topology draw asks this for every seat and every pulse bucket with the same
+ *  list, which holds every update too: it is worked out once per list. */
+const actionableNeedsCache = new WeakMap();
+function actionableNeedsOf(attentionItems) {
+  if (!Array.isArray(attentionItems)) return [];
+  let hit = actionableNeedsCache.get(attentionItems);
+  if (!hit || hit.length !== attentionItems.length) {
+    hit = { length: attentionItems.length, needs: attentionItems.filter((i) => i && !i.update && i.kind !== "update") };
+    actionableNeedsCache.set(attentionItems, hit);
+  }
+  return hit.needs;
+}
+
 /** Buckets partition seats; unreported activity is separate from known idle and stopped states. */
 export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], _allSeats = []) {
   if (!pulseFilter) return true;
   // Neutral lifecycle states have a home in Idle; their individual row marks stay unchanged.
   if (["detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
-  const actionableNeeds = (Array.isArray(attentionItems) ? attentionItems : []).filter((i) => i && !i.update && i.kind !== "update");
+  const actionableNeeds = actionableNeedsOf(attentionItems);
   const rigName = rig?.name ?? rig?.id ?? "";
   // A live terminal can own a human request even when its activity word is idle. Keep counts aligned with its row.
   if(seat.terminal||seat.status==="terminal"){
@@ -6120,26 +6171,41 @@ export function buildAttachRelayArgv(config, seat = {}, relayPath = null) {
   return [nodeBin, relayPath, payload];
 }
 
-/** With several OpenRigs a seat NAME is not unique: an attach terminal that names another OpenRig's address is not this seat's. `origin`
- * is undefined with one connection (nothing is filtered) and a value that matches no terminal for a connection that isn't listed. */
-const sameOrigin = (terminal, origin) => {
+/** With several OpenRigs a seat NAME is not unique: an attach terminal that names another OpenRig's address is not this seat's, and when
+ * the seat name is shared across OpenRigs an unlabeled terminal cannot be tied to this box either. `origin` is undefined with one connection
+ * (nothing is filtered) and a value that matches no terminal for a connection that isn't listed. */
+const sameOrigin = (terminal, origin, shared = false) => {
   if (origin === undefined || origin === null) return true;
   const label = terminal?.labels?.["herdr-openrig.origin"];
-  return !label || (rigOrigin(label) !== null && rigOrigin(label) === rigOrigin(origin));
+  if (!label) return !shared;
+  return rigOrigin(label) !== null && rigOrigin(label) === rigOrigin(origin);
 };
 export const SEAT_NAME_SHARED = "This seat name exists on more than one OpenRig; open it from its box.";
+export const ATTACH_TAB_UNLABELED = "An older Attach tab for this seat does not say which OpenRig it belongs to. Close that tab, then Attach again.";
 /** Whether `session` is held by seats of more than one CONNECTION in a merged topology (rigs carry `conn`). */
 export function seatNameShared(topology, session) {
   const conns = new Set();
   for (const rig of topology ?? []) for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) if (seat.session === session) conns.add(rig.conn ?? null);
   return conns.size > 1;
 }
-/** A native-placement seat terminal for `session` exists, can't be tied to this box (no origin label) and the name is shared: the caller refuses with SEAT_NAME_SHARED. */
-export function nativeSeatAmbiguous(terminals, session, meta = {}) {
-  if (!meta?.shared || meta.origin === undefined) return false;
+/** Why a terminal for a shared `session` cannot be tied to this box (no origin label): `ATTACH_TAB_UNLABELED` when an unlabeled Attach tab blocks it,
+ *  `SEAT_NAME_SHARED` when only a native-placement seat terminal matches, or `null` when nothing ambiguous is open. */
+function ambiguousSeatReason(terminals, session, meta = {}) {
+  if (!meta?.shared || meta.origin === undefined || meta.origin === null) return null;
   const sess = String(session ?? "").trim(), at = sess.lastIndexOf("@"), logicalId = at > 0 ? sess.slice(0, at).replace(/-/g, ".") : sess, rig = at > 0 ? sess.slice(at + 1) : "";
-  return (Array.isArray(terminals) ? terminals : []).some((t) => t?.address && (t.state === undefined || t.state === "live" || t.state === "running") && t.labels?.["openrig.role"] === "seat"
-    && (t.labels?.["openrig.session"] === sess || t.labels?.["openrig.seat"] === sess || (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig))));
+  let nativeHit = false;
+  for (const t of Array.isArray(terminals) ? terminals : []) {
+    if (!t?.address || (t.state !== undefined && t.state !== "live" && t.state !== "running")) continue;
+    if (t.labels?.["herdr-openrig.role"] === "attach" && t.labels?.["herdr-openrig.attach"] === sess && !t.labels?.["herdr-openrig.origin"]) return ATTACH_TAB_UNLABELED;
+    if (t.labels?.["openrig.role"] === "seat"
+      && (t.labels?.["openrig.session"] === sess || t.labels?.["openrig.seat"] === sess || (t.labels?.["openrig.seat"] === logicalId && (!rig || !t.labels?.["openrig.rig"] || t.labels?.["openrig.rig"] === rig)))) {
+      nativeHit = true;
+    }
+  }
+  return nativeHit ? SEAT_NAME_SHARED : null;
+}
+export function nativeSeatAmbiguous(terminals, session, meta = {}) {
+  return Boolean(ambiguousSeatReason(terminals, session, meta));
 }
 /** `session => boolean`: whether the name is held by more than one OpenRig. Only with several connections (undefined with one: nothing changes). */
 export function seatSharedOf(config, sharedFn) {
@@ -6155,8 +6221,10 @@ export function seatOrigin(config, conn) {
 
 /**
  * Find an already-open Attach tab or native `herdr` seat terminal for `seatSession` in the active space (or across spaces).
+ * With `index` (seatTerminalIndex of the same panes and terminals) only the terminals carrying this seat's attach label are
+ * checked, in list order, with the same checks: the same answer, for a caller that looks up many seats in one draw.
  */
-export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", panes = [], seatMeta = {}) {
+export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", panes = [], seatMeta = {}, index = null) {
   const session = String(seatSession ?? "").trim();
   if (!session) return null;
   const atIdx = session.lastIndexOf("@");
@@ -6167,10 +6235,10 @@ export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", 
   const pn = Array.isArray(panes) ? panes : [];
   const activeSpace = sp.find((s) => s?.active) ?? sp[0] ?? null;
   const activeTabs = new Set((activeSpace?.tabs ?? []).filter((t) => !t?.settled).map((t) => t?.id).filter(Boolean));
-  const origin = seatMeta?.origin;
-  const candidates = tm.filter((t) => {
+  const origin = seatMeta?.origin, shared = Boolean(seatMeta?.shared);
+  const candidates = (index ? (index.byLabel.get(`attach:${session}`) ?? []).map((e) => e.t) : tm).filter((t) => {
     if (!t?.address || (t.state !== undefined && t.state !== "live" && t.state !== "running")) return false;
-    if (!sameOrigin(t, origin)) return false;
+    if (!sameOrigin(t, origin, shared)) return false;
     const isAttach = t.labels?.["herdr-openrig.role"] === "attach" && t.labels?.["herdr-openrig.attach"] === session;
     // Only OUR herdr-openrig.* labels count (rule Y, every caller: Attach reuse focuses the hit, needs-view's silent flag is set by it). A terminal labelled only in OpenRig's native namespace (openrig.role=seat,
     // openrig.seat, ...) carries nothing that names this daemon, and a same-named rig on another OpenRig has the same seat names, so it is never "this seat's terminal". Native seats are not released (v0.5.0: by openrig.node).
@@ -6178,7 +6246,7 @@ export function findAttachedSeat(terminals = [], spaces = [], seatSession = "", 
   });
   if (!candidates.length) return null;
   const resolveTab = (t) => {
-    const paneHit = pn.find((p) => p?.terminal === t.address);
+    const paneHit = index ? index.paneByTerminal.get(t.address) : pn.find((p) => p?.terminal === t.address);
     return paneHit?.tab ?? t.labels?.["herdr.tab"] ?? null;
   };
   const inActiveSpace = candidates.find((t) => {
@@ -6355,7 +6423,8 @@ async function attachSeatOnce(host, seat, config, options) {
     return { ok: true, reused: true, ...existing };
   };
   const meta = { logicalId, rig: rigName, ...(typeof host.seatShared === "function" ? { origin: effectiveDaemonUrl ?? "unknown:", shared: host.seatShared(session) === true } : {}) };
-  if (nativeSeatAmbiguous(tm, session, meta)) return { ok: false, reason: SEAT_NAME_SHARED }; // a native seat can't be tied to its box and the name is on several: open nothing
+  const initialAmbiguous = ambiguousSeatReason(tm, session, meta);
+  if (initialAmbiguous) return { ok: false, reason: initialAmbiguous }; // an unlabeled terminal can't be tied to its box when the name is shared: open nothing
   const existing = findAttachedSeat(tm, sp, session, pn, meta);
   if (existing) {
     const staleViewer = staleViewerOf(existing, currentViewerArgv);
@@ -6400,7 +6469,10 @@ async function attachSeatOnce(host, seat, config, options) {
   } catch (e) {
     return { ok: false, disabled: true, reason: String(e?.message ?? e) };
   }
-  const appeared = findAttachedSeat(live("terminals"), live("spaces"), session, live("panes"), { logicalId, rig: rigName });
+  const liveMeta = typeof host.seatShared === "function" ? { ...meta, origin: effectiveDaemonUrl } : meta;
+  const liveAmbiguous = ambiguousSeatReason(live("terminals"), session, liveMeta);
+  if (liveAmbiguous) return { ok: false, reason: liveAmbiguous };
+  const appeared = findAttachedSeat(live("terminals"), live("spaces"), session, live("panes"), liveMeta);
   if (appeared) {
     const staleViewer = staleViewerOf(appeared, argv);
     if (staleViewer) {
