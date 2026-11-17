@@ -912,7 +912,7 @@ export default class RigMenu extends View {
           run("pane.focus", { terminal: hit.terminal });
           return;
         }
-        if (hit.kind === "ambiguous") { notify({ title: "Focus pane", body: SEAT_NAME_SHARED, level: "warning" }); return; }
+        if (hit.kind === "ambiguous") { notify({ title: "Focus pane", body: hit.reason ?? SEAT_NAME_SHARED, level: "warning" }); return; }
         oneClick(target, "open-seat");
       }, live.kind === "focus" || live.kind === "select-then-focus" ? null : "open-seat");
       item("rig-view", "Open terminal", () => oneClick(target, "open-seat"), "open-seat");
@@ -1070,7 +1070,7 @@ export default class RigMenu extends View {
       if (target.reply !== "none") item("rig-reply", "Reply…", () => dialog(target, { input: true, placeholder: "Your answer, in your own words", action: "reply", multiLine: true }, 290), target.reply === "answer" ? "reply-answer" : "reply");
       item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: target.summary }));
     }
-    if (target.kind === "updates-group") item("check", "Dismiss all updates", () =>
+    if (target.kind === "updates-group") item("check", `Dismiss all ${(target.items ?? []).length} update${(target.items ?? []).length === 1 ? "" : "s"}`, () =>
       requestDismissal({ shared, setShared, run, scope: this.config ? dismissalScope(this.config) : undefined }, "dismiss", target.items ?? []));
     if (target.kind === "open-view") item("rig-view", `Open ${target.view}`, () => oneClick(target, "open-view"), "open-view", true);
     // Sidebar rows that are places: each opens its page; a saved or rig view also opens in herdr.

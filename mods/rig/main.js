@@ -25,7 +25,7 @@ import { resolveAskerSeat,relativeTimeText } from './rig-lib.js';
 import { timezoneValue } from './rig-time.js';
 import { healthCounts } from "./rig-health.js";
 
-import { filterAttentionHealth } from "./rig-lib.js";
+import { publishRigData, filterAttentionHealth, isUpdateNeed } from "./rig-lib.js";
 import { h_flex, v_flex, ScrollHandle } from "gpui-base";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { appHome, readTextFile, writeTextFile, props, theme, run as rawRun, exec as rawExec, layout, focused, openOverlay as rawOpenOverlay, closeOverlay, setShared as rawSetShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc as rawHc, commands, machines } from "herdr";
@@ -50,7 +50,7 @@ import {workerViewDetails} from "./rig-worker-views.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { RigSpaces, RebuildConfirmations, rigSpaceRelocation } from "./rig-spaces.js";
 import { sameConnectionConfig, acceptRigOpen, migrateRigTabs, replaceMigrationTab, moveMigrationPages, migrationReportNow, needsTabMigration, migrationSourceMatches, migrationChoice, migrationChoices } from "./rig-routing.js";
-import { openRigSpaceContext, SidebarSpaceFold, rigOrigin } from "./rig-space-context.js";
+import { openRigSpaceContext, rigOrigin } from "./rig-space-context.js";
 import { publishGraphActivity } from "./rig-graph-state.js";
 import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest, requestDismissal, dismissible } from "./rig-dismiss.js";
 import { NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
@@ -72,7 +72,7 @@ import {
   parseSidebarState, serializeSidebarState, treeKeyNav, rigViewsBranch, attachToSeat, isLoopbackDaemonUrl, formatSeatContextPct, isSeatContextWarning,
   tierOf, sortNeedsByTier, enrichAttentionItems, quietModeHeaderChip, whoseQueueSummary, statusMark, statusMarkElement, pageRevealOpen,
   attachRelayPath, isValidSessionName, sessionNameRefusal,
-  findAttachedSeat, seatOrigin, seatNameShared, newRigOverlay, rigSpaceMarks } from "./rig-lib.js";
+  findAttachedSeat, seatTerminalIndex, seatOrigin, seatNameShared, newRigOverlay, rigSpaceMarks } from "./rig-lib.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.sidebar` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.sidebar}`;
@@ -83,6 +83,8 @@ const STACK = "rig-work", PAGE = "rig-page";
 /** The tree's geometry: one indent step per level, and a 12 px cell before every name, holding the
  *  chevron when the row expands and empty on a leaf, so names line up at each depth. */
 const TREE_STEP = 12;
+/** The most rows a sidebar list of requests or updates draws; the rest are behind one row that opens the Needs page. */
+const SIDEBAR_ROW_CAP = 20;
 const treeIndent = (depth) => 8 + depth * TREE_STEP;
 const leafCell = () => div().w(12).flex_none();
 
@@ -207,7 +209,7 @@ export default class RigSidebar extends View {
           if (request) this.routeRequest(cx, request);
         }
         else if (cmdName === "palette") run("mod.open", { name: MOD_IDS.palette });
-        else if (cmdName === "show-sidebar-here") { this.spaceFold?.expand(spaces().find(s => s.active)?.id); cx.notify(); }
+        else if (cmdName === "show-sidebar-here") this.showSidebarHere(cx);
         else if (cmdName === "focus-sidebar") this.focusSidebar(cx);
         else if (cmdName.startsWith("move-row:")) {
           const parts = cmdName.slice("move-row:".length).split(":");
@@ -224,7 +226,7 @@ export default class RigSidebar extends View {
         else if (cmdName === "start-daemon" || cmdName === "rig.start-daemon") this.startDaemon(cx);
         else if (cmdName === "open-page" || cmdName === "rig.open-page" || cmdName === "open") {
           const fallbackEntry = this.viewState("rig.sel")?.entry ?? shared("rig.nav")?.stack?.at(-1) ?? { section: "topology" };
-          openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, fallbackEntry);
+          openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, this.entryOf(fallbackEntry)); // the shown box's page, never the first connection's
         }
         else if (cmdName.startsWith("update-action:")) this.updateAction(cx, cmdName.slice(14));
         else if (cmdName === "refresh") { this.forceCapabilityProbe = true; cx.spawn(async (cx) => { await this.reloadConfig(cx); await this.refreshFeeds(cx); }); }
@@ -301,8 +303,16 @@ export default class RigSidebar extends View {
 
   primaryStateId() { return this.primary.config?.connectionId ?? this.primary.id ?? LEGACY_CONNECTION_ID; }
   sidebarConnection() { return this.viewFeed?.id ?? this.follow?.shownId ?? this.primaryStateId(); }
-  viewState(key,conn=this.sidebarConnection()) { return readSidebarView(shared,key,conn,this.primaryStateId()); }
+  // Within a render each view field is read once (rig.sidebar.views is copied whole on every read); a write drops what was read.
+  viewState(key,conn=this.sidebarConnection()) {
+    const memo=this.renderMemo,id=`${key}\u0000${conn}`;
+    if(memo?.views?.has(id))return memo.views.get(id);
+    const value=readSidebarView(shared,key,conn,this.primaryStateId());
+    if(memo)(memo.views??=new Map()).set(id,value);
+    return value;
+  }
   setViewState(key,value,conn=this.sidebarConnection()) {
+    if(this.renderMemo)this.renderMemo.views=null;
     if(key==='rig.sel'&&value?.entry?.conn)conn=value.entry.conn;
     if(conn!==this.primaryStateId()&&!(this.primary.config?.connections??[]).some(c=>c.id===conn))return false;
     const changed=writeSidebarView({shared,setShared},key,value,conn,this.primaryStateId());
@@ -338,10 +348,9 @@ export default class RigSidebar extends View {
       try {
         const saved = JSON.parse(raw);
         const spaceState = { homeSpace: saved.homeSpace, homeSpaces:saved.homeSpaces, machineDeclined:saved.machineDeclined,machineSearchDeclined:saved.machineSearchDeclined,machineAddDeclined:saved.machineAddDeclined,
-          sidebarSize: saved.sidebarSize, tabMigration: saved.tabMigration,workerViews:saved.workerViews };
+          sidebarSize: saved.sidebarSize, autoFoldRetired: saved.autoFoldRetired, tabMigration: saved.tabMigration,workerViews:saved.workerViews };
         setShared("rig.spaceState", { ...spaceState, ...(shared("rig.spaceState") ?? {}) });
         setShared("rig.workerViews",shared("rig.spaceState")?.workerViews??{});
-        if (this.spaceFold && !this.spaceFold.savedSize) this.spaceFold.savedSize = spaceState.sidebarSize;
       } catch (_) {}
       try { this.dismissalOrigins = JSON.parse(raw).dismissedUpdates ?? {}; } catch (_) {}
       if (parsed.topologyView && !shared("rig.topology.view")) setShared("rig.topology.view", parsed.topologyView);
@@ -416,7 +425,7 @@ export default class RigSidebar extends View {
     if (changed) {
       this.data = null; this.live = false; this.lists = {};
       this.healthz = null; this.cliVersion = null; // the old daemon's health and version are not the new one's; a failed read of the new one leaves them unknown (routeHost's selfHostId too)
-      setShared("rig.data", { topology: [], live: false, error: null, config: this.config });
+      publishRigData(setShared, { topology: [], live: false, error: null, config: this.config });
       cx.notify();
     }
     if (reconnect || rigChanged) this.forceCapabilityProbe = true;
@@ -516,7 +525,7 @@ export default class RigSidebar extends View {
       if (!current()) { notify({ title: "Open operator", body: CONNECTION_CHANGED_DURING, level: "warning" }); cx.notify(); return; }
       if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.openOperator(cx, approval, conn), feed);
       else if (res?.needsViewerRefresh) this.reviewViewerReplace(res, opSeat, { operator: true, name: "Operator" });
-      else this.notifyResult("Open operator", res);
+      else this.notifyResult("Open operator", res, true, { machine: config?.daemonMachine });
       cx.notify();
     });
   }
@@ -595,7 +604,7 @@ export default class RigSidebar extends View {
       if (!current()) { notify({ title: `Attach ${session}`, body: CONNECTION_CHANGED_DURING, level: "warning" }); cx.notify(); return; }
       if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.attachSeatBySession(cx, session, approval, conn), feed); // the approved retry is for the same OpenRig
       else if (res?.needsViewerRefresh) this.reviewViewerReplace(res, seat);
-      else this.notifyResult(`Attach ${seat.logicalId ?? session}`, res);
+      else this.notifyResult(`Attach ${seat.logicalId ?? session}`, res, true, { machine: config.daemonMachine });
       cx.notify();
     });
   }
@@ -675,9 +684,22 @@ export default class RigSidebar extends View {
     }
   }
 
-  showSidebarHere(cx) {
-    this.spaceFold?.expand(spaces().find(s => s.active)?.id);
-    cx.notify();
+  /** The sidebar shows on every space (it folds only when the person folds Herdr's block). The command stays so an existing key binding still
+   *  resolves; it just redraws. */
+  showSidebarHere(cx) { cx.notify(); }
+  /** Once: an area an earlier version folded to its 30 px header on a non-rig space gets its saved size back. Herdr keeps a block's size in its
+   *  layout, so without this an upgrade on a personal space would stay folded. Recorded in state.json, so a fold the person makes later is kept. */
+  retireAutoFold(block) {
+    if (this.autoFoldChecked) return;
+    const state = shared("rig.spaceState");
+    if (!state) return; // state.json not read yet (or none: nothing was ever folded)
+    // Not in the layout yet: look again on a later render. A block with no id is decided now: an earlier version could not fold it.
+    if (!block) return;
+    this.autoFoldChecked = true;
+    if (state.autoFoldRetired) return;
+    const saved = state.sidebarSize, size = saved && Number.isFinite(saved.px) && saved.px > 0 ? { px: saved.px } : saved && Number.isFinite(saved.weight) && saved.weight > 0 ? { weight: saved.weight } : null;
+    if (block?.id && block.size?.px === 30 && size && size.px !== 30) run("layout.resize", { id: block.id, ...size });
+    this.saveSpaceState({ autoFoldRetired: true }).catch(() => {});
   }
 
   showMachineOffer(cx) {
@@ -881,47 +903,6 @@ export default class RigSidebar extends View {
     return report;
   }
 
-  foldedHeader(t) {
-    const stateConn=this.sidebarConnection();
-    const needs = needsRequestCount(this.data?.topology, this.data?.attentionItems);
-    // Follow mode (2+ connections): the folded header names the followed box and keeps the count of needs on other boxes so a need elsewhere is never missed. The count
-    // shows at every width; the name gives way below 260 px (the Choose machine chip's width rule) and moves into the count's tooltip; "· pinned" is for 260 px or wider.
-    const shown = this.viewFeed, label = shown?.config?.daemonMachine ?? "this computer", elsewhere = shown ? this.elsewhereNeeds(shown) : 0;
-    const wide = (find(layout(), n => n.id === "sidebar")?.size?.px ?? Infinity) >= 260;
-    return h_flex().id("rig-folded-header").h(30).px(10).gap(6).items_center().justify_between().flex_none()
-      .hover(s => s.bg(t.hover)).tooltip("Not a rig space · click to show it here")
-      .on_click((_e, cx) => this.showSidebarHere(cx))
-      .on_key_down((e, cx) => { if (String(e.key ?? e.keystroke ?? "").toLowerCase() === "enter") this.showSidebarHere(cx); })
-      .child(h_flex().gap(6).items_center().when(!!shown, el => el.min_w(0)) // the name truncates first, so the search icon is never pushed out
-        .child(div().text_color(t.muted).child("›"))
-        .child(div().text_size(12).font_medium().text_color(t.muted).child("OpenRig"))
-        .when(!!shown && (wide || elsewhere === 0), el => el.child(div().id("rig-folded-box").min_w(0).truncate().text_size(12).text_color(t.dim).tooltip(label).child(`· ${label}`)))
-        .when(!!shown && wide && Boolean(this.follow?.pinned), el => el.child(div().id("rig-folded-pinned").flex_none().text_size(10.5).text_color(t.dim).child("· pinned")))
-        .when(!!shown && elsewhere > 0, el => el.child(div().id("rig-folded-elsewhere").flex_none().text_size(10.5).text_color(t.dim).cursor_pointer()
-          .tooltip(wide ? "Needs on your other OpenRigs" : `Showing ${label}`)
-          .on_click((_e, cx) => { cx.stop_propagation(); const follow = this.follow; if (follow) { follow.pickerOpen = true; follow.pickerIndex = Math.max(0, this.feeds.indexOf(shown)); } this.showSidebarHere(cx); }) // shows the sidebar here, with the picker open
-          .child(h_flex().gap(3).items_center()
-            .child(div().id("rig-folded-elsewhere-sep").child("·")) // its own separator at every width: "OpenRig · <box> · ◆ N elsewhere", and "OpenRig · ◆ N elsewhere" once the name gives way below 260 px
-            .child(div().id("rig-folded-elsewhere-mark").text_color(t.blocked).child(`◆ ${elsewhere}`)) // the need mark in the needs colour, as on the picker's rows
-            .child(div().child("elsewhere")))))
-        .when(!!this.machineChoiceAvailable&&(find(layout(),n=>n.id==="sidebar")?.size?.px??Infinity)>=260,el=>el.child(
-          div().id("rig-choose-machine-hint").px(5).h(18).rounded(4).border_1().border_color(t.border).text_size(10.5).text_color(t.muted)
-            .when(!!this.machineHintHandle,node=>node.track_focus(this.machineHintHandle).tab_stop(true).tab_index(0))
-            .tooltip(this.daemonMachineOffer?`OpenRig runs on ${this.daemonMachineOffer.machine}. Choose where its spaces open.`:"Choose where OpenRig's spaces open.")
-            .on_click((_e,cx)=>{cx.stop_propagation();this.showMachineOffer(cx);})
-            .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();this.showMachineOffer(cx);}})
-            .child("Choose machine")))
-        .when(needs > 0, el => el.child(h_flex().id("rig-folded-needs").px(5).h(18).gap(4).rounded(4).items_center()
-          .bg(`${t.blocked}26`).text_color(t.blocked).hover(s => s.bg(t.hover))
-          .on_click((_e, cx) => { cx.stop_propagation(); this.revealPriorityNeeds(cx,stateConn); })
-          .child(div().size(6).rounded(3).bg(t.blocked))
-          .child(div().text_size(10.5).font_semibold().child(String(needs))))))
-      .child(div().id("rig-folded-search").size(20).flex().items_center().justify_center().text_color(t.dim)
-        .tooltip("Search rigs, seats, commands").hover(s => s.bg(t.hover).text_color(t.foreground))
-        .on_click((_e, cx) => { cx.stop_propagation(); run("mod.open", { name: MOD_IDS.palette }); })
-        .child(svg(icon("search")).size(12)));
-  }
-
   routeRequest(cx, request, consent = null) {
     request = { ...request, conn: request.conn ?? request.entry?.conn ?? request.seat?.conn };
     // A forwarded route: command in the init window: there is no config to open anything for yet.
@@ -956,7 +937,7 @@ export default class RigSidebar extends View {
         if (!current()) { this.notifyResult(request.kind === "attach" ? "Attach" : "OpenRig", { ok: false, reason: CONNECTION_CHANGED_DURING }); return; }
         if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.routeRequest(cx, request, approval), feed);
         else if (result.needsViewerRefresh) this.reviewViewerReplace(result, selected.seat ?? request.seat ?? {}, selected.options ?? {});
-        else this.notifyResult(request.kind === "attach" ? "Attach" : "OpenRig", result);
+        else this.notifyResult(request.kind === "attach" ? "Attach" : "OpenRig", result, true, { machine: config?.daemonMachine });
       } catch (error) {
         this.notifyResult("OpenRig", { ok: false, reason: String(error?.message ?? error) });
       } finally { cx.notify(); }
@@ -1087,7 +1068,7 @@ export default class RigSidebar extends View {
         changedRows:(result.changed??[]).map(session=>({name:this.gridSeatName(rig,session),reason:result.changedReasons?.[session]??"it changed"})),
         failed:(result.failed??[]).map(session=>this.gridSeatName(rig,session))};
       else if (result.recovery) this.reviewRigRebuild(rig, {...result,worker:continueWorker});
-      else this.notifyResult(`${rig.name} space`, result);
+      else this.notifyResult(`${rig.name} space`, result, true, { machine: config.daemonMachine });
       if(result.ok&&continueWorker)await this.hostWorkerAction(cx,continueWorker.id,continueWorker.target,continueWorker.action);
       cx.notify();
     });
@@ -1096,15 +1077,17 @@ export default class RigSidebar extends View {
   /** What the list says while a rig's grid builds (the machine as Herdr names it). */
   openingLine(rig) { const machine = this.feedOf(rig?.conn).config?.daemonMachine; return machine ? `Opening ${rig.name} on ${machine}…` : `Opening ${rig.name}…`; }
 
-  notifyResult(title, result, changed = true) {
+  /** A result as a toast. A machine notice (a Herdr machine that lost its connection, an OpenRig not answering there) is shown once per machine
+   *  for the BACKGROUND space sync; an action the person took (Attach, an open, a worker view) always shows its failure, the notice included.
+   *  A success clears the notice of the result's own machine (`machine`: its connection's), not the first connection's. */
+  notifyResult(title, result, changed = true, { background = false, machine = null } = {}) {
     this.machineNotices ??= new Map();
-    if (result.ok && !result.closed) this.machineNotices.delete(this.config?.daemonMachine);
+    if (result.ok && !result.closed && machine) this.machineNotices.delete(machine);
     if (result.machineNotice) {
-      const { machine, body } = result.machineNotice;
-      if (!this.machineNotices.has(machine)) {
-        this.machineNotices.set(machine, body);
-        notify({ title: machine, body, level: "warning" });
-      }
+      const { machine: noticeMachine, body } = result.machineNotice;
+      const shown = this.machineNotices.has(noticeMachine);
+      if (!shown) this.machineNotices.set(noticeMachine, body);
+      if (!shown || !background) notify({ title: noticeMachine, body, level: "warning" });
     } else if (changed && (!result.ok || result.empty)) {
       notify({ title, body: result.reason ?? "No running seats in this rig.", level: "warning" });
     }
@@ -1128,7 +1111,7 @@ export default class RigSidebar extends View {
           const statuses = shared("rig.spaceStatus") ?? {};
           // A background skip means "nothing to update here". It must not wipe the card of a failed explicit open.
           if ((result.skipped || result.closed) && statuses[rig.id] && !statuses[rig.id].ok && !statuses[rig.id].skipped) continue;
-          this.notifyResult(`${rig.name} space`, result, statuses[rig.id]?.reason !== result.reason);
+          this.notifyResult(`${rig.name} space`, result, statuses[rig.id]?.reason !== result.reason, { background: true, machine: config?.daemonMachine });
           setShared("rig.spaceStatus", { ...statuses, [rig.id]: result });
         }
       } finally {
@@ -1149,7 +1132,7 @@ export default class RigSidebar extends View {
       const result = await this.spaceController(cx, null, feed).sync(rig, config, { explicit: true, closeAll: true });
       if (!current()) return;
       setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
-      this.notifyResult(`${rig.name} space`, result);
+      this.notifyResult(`${rig.name} space`, result, true, { machine: config.daemonMachine });
       cx.notify();
     });
   }
@@ -1346,7 +1329,7 @@ export default class RigSidebar extends View {
       if(result.unconfirmedSpace&&rig)setShared("rig.spaceStatus",{...(shared("rig.spaceStatus")??{}),[rig.id]:result});
       const words=result.ok?(result.reason??`Worker view open here: ${result.pages?.length??0} pages.`):result.reason;
       setShared("rig.status",{id,ok:result.ok,busy:false,text:words,at:Date.now()});
-      this.notifyResult("Worker view",result);
+      this.notifyResult("Worker view",result,true,{machine:config.daemonMachine});
     }
     cx.notify();return result;
     }finally{
@@ -1483,7 +1466,6 @@ export default class RigSidebar extends View {
   async close() {
     this.closed = true;
     this.cancelTreeReveal();
-    this.cancelScrollClamp?.cancel?.();
     for (const handle of this.listScrolls?.values() ?? []) handle?.release?.();
     this.workerViews?.dispose();
     this.statusMotion.close();
@@ -1521,7 +1503,7 @@ export default class RigSidebar extends View {
     setShared("rig.dismissedUpdates", { ...model.saved(), receipts: model.receiptRows(), origin: model.origin, scope: model.scope });
     if (this.data) {
       this.data.attention = needsRequestCount(this.data.topology, this.data.attentionItems);
-      setShared("rig.data", { ...(shared("rig.data") ?? {}), attention: this.data.attention });
+      publishRigData(setShared, { ...(shared("rig.data") ?? {}), attention: this.data.attention });
     }
   }
 
@@ -1568,7 +1550,7 @@ export default class RigSidebar extends View {
   refuseInvalidConfig(cx) {
     for (const feed of this.feeds) { try { feed.sock?.close(); } catch (_) {} feed.sock = null; feed.data = null; feed.live = false; feed.error = null; feed.sidebarState = null; if (feed !== this.primary) { feed.closed = true; const wake = feed.wake; feed.wake = null; wake?.(); } }
     this.feedList.splice(1);
-    setShared("rig.data", { topology: [], live: false, error: this.config.configInvalid, config: this.config });
+    publishRigData(setShared, { topology: [], live: false, error: this.config.configInvalid, config: this.config });
     cx.notify();
   }
 
@@ -1790,7 +1772,7 @@ export default class RigSidebar extends View {
 
   /** Publishes `rig.data`: the primary feed's state, with the merged rows of every connection that answers when there are several. */
   publishData(cx, feed = this.primary) {
-    setShared("rig.data", {
+    publishRigData(setShared, {
       ...(this.data ?? {}),
       live: feed.live,
       error: feed.error,
@@ -2005,7 +1987,7 @@ export default class RigSidebar extends View {
   /** A toast action of `feed` that names it, in the command name herdr delivers (see `commandTarget`) and in the args. */
   toastAction(action, feed) {
     if (!action?.args) return action;
-    const named = /^rig\.open-(seat|need):./.test(action.name ?? "") ? action.name.replace(":", `:${feed.id}|`) : action.name;
+    const named = /^rig\.open-(seat|need):/.test(action.name ?? "") ? action.name.replace(":", `:${feed.id}|`) : action.name;
     return { ...action, name: named, args: { ...action.args, conn: feed.id } };
   }
 
@@ -2016,9 +1998,10 @@ export default class RigSidebar extends View {
    *  first feed keeps the original `rig.notifiedNeeds` key; another connection's is that key qualified by its id. A toast names the machine and its action names the connection. */
   notifyNeeds(feed, topology, attentionItems, sources, quietChip) {
     const stateKey = feed === this.primary ? "rig.notifiedNeeds" : qualifyKey(feed.id, "rig.notifiedNeeds");
+    const lists = this.hostLists();
     const { toasts, nextState } = diffPriorityNotifications(topology, attentionItems, feed.prioritySeeded ? shared(stateKey) : null, {
       quiet: Boolean(quietChip), needsVisible: isNeedsVisible({ nav: shared("rig.nav"), activeChild: shownChild() }), notificationsEnabled: (shared("rig.settings")?.notifications ?? true) !== false, sources,
-      focusedSession: this.focusedSeat(topology), terminals: terminals(), spaces: spaces(), config: this.config,
+      focusedSession: this.focusedSeat(topology, lists), terminals: lists.terminals, spaces: lists.spaces, config: this.config,
     });
     feed.prioritySeeded = true;
     setShared(stateKey, nextState);
@@ -2112,7 +2095,7 @@ export default class RigSidebar extends View {
       kind: "popup",
       width: 280,
       height: height + (hasCustomOrder ? 28 : 0) + (reorder ? 56 : 0),
-      props: { target: { ...target, hasCustomOrder, ...(reorder ? { reorder: { ...reorder, key: rowKey } } : {}) } },
+      props: { target: { ...target, ...(target?.conn || this.feeds.length < 2 || !this.shownConnId() ? {} : { conn: this.shownConnId() }), hasCustomOrder, ...(reorder ? { reorder: { ...reorder, key: rowKey } } : {}) } },
     });
   }
 
@@ -2146,13 +2129,45 @@ export default class RigSidebar extends View {
 
   /** Clicking a seat row in the sidebar opens the seat page (`rig-view`) and selects the node. */
   seatClick(rig, seat, pod = null) {
-    const attached = findAttachedSeat(terminals(), spaces(), seat.session, panes(), { logicalId: seat.logicalId, rig: rig.name, origin: seatOrigin(this.config, rig.conn), shared: this.seatShared()?.(seat.session) === true });
+    const h = this.hostLists();
+    const attached = findAttachedSeat(h.terminals, h.spaces, seat.session, h.panes, { logicalId: seat.logicalId, rig: rig.name, origin: seatOrigin(this.config, rig.conn), shared: this.seatShared()?.(seat.session) === true }, h.index);
     if (attached) { run("terminal.peek", { terminal: attached.terminal }); return; }
     this.openPage(
       { section: "topology", kind: "seat", rig: rig.name, rigId: rig.id, conn: rig.conn, name: seat.logicalId, session: seat.session, ...(pod ? { pod } : {}) },
       `seat:${seat.session}`,
     );
   }
+
+  /** herdr's terminals, spaces and panes, with the terminal index (seatTerminalIndex). Native herdr copies each list into the mod on every
+   *  call, and finding the focused seat looks at every seat: within one render they are read once; outside a render (a click, a feed's
+   *  notification) they are read now, once per call. */
+  hostLists() {
+    const read = () => { const tm = terminals?.() ?? [], pn = panes?.() ?? []; return { terminals: tm, spaces: spaces?.() ?? [], panes: pn, index: seatTerminalIndex(pn, tm) }; };
+    const memo = this.renderMemo;
+    return memo ? (memo.hostLists ??= read()) : read();
+  }
+
+  /** A value made from `deps` (compared by identity) and kept until one of them is replaced. A feed's arrays are replaced on each refresh, never
+   *  changed in place, so the per-render work over every update (hundreds with a busy OpenRig) is done again only when its inputs are new. */
+  memoBy(key, deps, make) {
+    const memo = (this.derivedMemo ??= new Map()), hit = memo.get(key);
+    if (hit && hit.deps.length === deps.length && hit.deps.every((d, i) => d === deps[i])) return hit.value;
+    const value = make();
+    memo.set(key, { deps, value });
+    return value;
+  }
+
+  /** needsRequestCount for a feed's items and topology, counted once per read of them (a render asks for it in several places). */
+  requestCountOf(topology, items) {
+    if (!Array.isArray(items)) return needsRequestCount(topology, items);
+    const memo = (this.requestCounts ??= new WeakMap()), hit = memo.get(items);
+    if (hit && hit.topology === topology) return hit.count;
+    const count = needsRequestCount(topology, items);
+    memo.set(items, { topology, count });
+    return count;
+  }
+  /** The dismissal records as one comparable value: the records change in place, so a memo over visible items compares this too. */
+  dismissalRecordsKey(model) { return model ? model.records.map((r) => `${r.restored ? 1 : 0}${r.key}`).join("\n") : null; }
 
   /** `session => boolean` over the merged topology of every connection; undefined with one. */
   seatShared() { return this.feeds.length > 1 ? (session) => seatNameShared(this.data?.topology, session) : undefined; }
@@ -2163,22 +2178,35 @@ export default class RigSidebar extends View {
   }
 
   /** The seat being looked at, `{ session, conn }`: the same session name on another OpenRig is a different seat (its toast and Done stay its own). */
-  focusedSeat(topology = this.data?.topology ?? []) {
+  focusedSeat(topology = this.data?.topology ?? [], lists = null) {
     const entry = shared("rig.nav")?.stack?.at(-1);
     if (shownChild() === PAGE && entry?.kind === "seat") return entry.session ? { session: entry.session, conn: entry.conn ?? null } : null;
     const focus = focused();
-    const pane = panes().find((p) => p.id === focus?.pane || p.focused);
+    // herdr's lists once for every seat (hostLists, or the caller's own read of them), and each seat a lookup in their index.
+    const h = lists ?? this.hostLists(), nameShared = this.seatShared();
+    const pane = h.panes.find((p) => p.id === focus?.pane || p.focused);
     if (!pane?.terminal) return null;
     for (const rig of topology) for (const pod of rig.pods) for (const seat of pod.seats) {
-      const attached = findAttachedSeat(terminals(), spaces(), seat.session, panes(), { logicalId: seat.logicalId, rig: rig.name, origin: seatOrigin(this.config, rig.conn), shared: this.seatShared()?.(seat.session) === true });
+      const attached = findAttachedSeat(h.terminals, h.spaces, seat.session, h.panes, { logicalId: seat.logicalId, rig: rig.name, origin: seatOrigin(this.config, rig.conn), shared: nameShared?.(seat.session) === true }, h.index);
       if (attached?.terminal === pane.terminal) return { session: seat.session, conn: rig.conn ?? null };
     }
     return null;
   }
 
+  /** How many requests and updates the drawn box shows after dismissals (null without a dismissal model), once per read and dismissal change. */
+  visibleNeedsCount() {
+    const model = this.dismissalModel();
+    if (!model) return null;
+    const items = this.data?.attentionItems ?? [];
+    return this.memoBy("needs:visible-count", [items, model, this.dismissalRecordsKey(model)], () => model.visible(items).length);
+  }
+
   priorityRows() {
-    return this.needsTracker?.update(this.data?.topology ?? [], this.data?.attentionItems ?? [], {
-      focusedSession: this.focusedSeat(), terminals: terminals(), config: this.config,
+    // The tracker skips updates (isUpdateNeed): it is handed the requests alone, sorted out once per read instead of on every render.
+    const items = this.data?.attentionItems ?? [];
+    const asks = this.memoBy("needs:asks", [items], () => items.filter((ask) => !isUpdateNeed(ask)));
+    return this.needsTracker?.update(this.data?.topology ?? [], asks, {
+      focusedSession: this.focusedSeat(), terminals: this.hostLists().terminals, config: this.config,
     }) ?? [];
   }
 
@@ -2193,7 +2221,7 @@ export default class RigSidebar extends View {
     if (this.sidebarState?.id === "S4" && !this.data?.topology?.some((r) => r.name !== "kernel")) return this.topologyRows(t, cx);
     const registered=[];
     const elements=priorityElements({ div, svg, h_flex }, t, rows, {
-      requestCount: needsRequestCount(this.data?.topology, this.data?.attentionItems),
+      requestCount: this.requestCountOf(this.data?.topology, this.data?.attentionItems),
       askOwner:ask=>{if(ask?.reply==='resolve'||ask?.answer?.verb==='resolve')return ask.waiting?.owner??ask.destinationSession??null;const member=assistantForNeed(ask,this.rosterOf(ask?.conn));return member?assistantOwner(member):null;},
       folds: this.viewState("rig.open.sidebar") ?? {}, selected: this.viewState("rig.sel")?.key, iconOf: icon,
       register: (row) => {this.visibleTreeRows.push(row);registered.push(row);},
@@ -2232,7 +2260,6 @@ export default class RigSidebar extends View {
   }
 
   revealPriorityNeeds(cx,conn=this.sidebarConnection()) {
-    this.spaceFold?.expand(spaces().find(s=>s.active)?.id);
     if (narrow()) {
       run("layout.resize", { id: "sidebar", px: Math.max(160, Number(shared("sidebar.width")) || 268) });
       setShared("sidebar.collapsed", false);
@@ -2252,7 +2279,7 @@ export default class RigSidebar extends View {
     const compact = (this.headerWidth ?? 268) < 220 || Boolean(this.viewFeed && this.compactFollowHeader());
     const showTitle = !(this.activeSpaceContext?.rigs?.length && (this.headerWidth ?? 268) < 340);
     const key = paletteKey(keys(), window()?.platform);
-    const needs = needsRequestCount(this.data?.topology, this.data?.attentionItems);
+    const needs = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
     const showOperatorIcon = Boolean(this.sidebarState?.id === "S4");
     const remoteOperator = Boolean(this.config?.daemonUrl && !isLoopbackDaemonUrl(this.config.daemonUrl));
     const iconButton = (id, name, onClick, label = null) => h_flex().id(id).flex_none().px(compact ? 2 : 4).h(20).gap(3).rounded(4).items_center().text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -2425,8 +2452,12 @@ export default class RigSidebar extends View {
     siblingIds = null,
     showElsewhere = true,
   } = {}) {
-    const sel = this.viewState("rig.sel");
-    const nav = shared("rig.nav");
+    // Read once per render, not once per row: every row of a draw sees the same selection and navigation, and each read is a
+    // native shared() call that converts the stored value (a sidebar with many rows ran past the render budget).
+    const memo = this.renderMemo;
+    if (memo && !memo.selRead) { memo.sel = this.viewState("rig.sel"); memo.nav = shared("rig.nav"); memo.selRead = true; }
+    const sel = memo ? memo.sel : this.viewState("rig.sel");
+    const nav = memo ? memo.nav : shared("rig.nav");
     const isSelected = Boolean(
       sel && (sel.key === rowKey || (entry && sel.entry && navKey(sel.entry) === navKey(entry) && sel.key === rowKey))
     );
@@ -2457,7 +2488,10 @@ export default class RigSidebar extends View {
 
     if (groupKey && itemId && Array.isArray(siblingIds) && siblingIds.length > 1) {
       this.reorderRows ??= new Map();
-      this.reorderRows.set(rowKey, { groupKey, itemId: String(itemId), siblingIds: siblingIds.map(String) });
+      // A group's rows share one sibling list: its string form is made once per render, not once per row (that was quadratic in the group's size).
+      let ids = memo?.siblingStrings.get(siblingIds);
+      if (!ids) { ids = siblingIds.map(String); memo?.siblingStrings.set(siblingIds, ids); }
+      this.reorderRows.set(rowKey, { groupKey, itemId: String(itemId), siblingIds: ids });
       out = out.when(isSelected, row => row.child(div().id(`reorder-${rowKey}`).size(18).flex_none().text_size(12).text_color(t.dim).cursor_pointer().tooltip("Move this row")
         .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.cancelDrag(cx); })
         .on_click((_e, cx) => { cx.stop_propagation(); this.menu({ kind: "sidebar-row", rowKind: entry?.kind ?? "row", name: entry?.name ?? itemId }, 320, rowKey); }).child("⋯")));
@@ -2911,7 +2945,7 @@ export default class RigSidebar extends View {
     }
     const result = feed.lists[path] ?? { loading: true };
     return path.startsWith("/api/attention") && result.data?.items ? { ...result, data: { ...result.data,
-      items: filterAttentionHealth(result.data.items, feed.data?.attentionHealth ?? []) } } : result;
+      items: this.memoBy(`attention:${feed.id ?? ""}:${path}`, [result.data.items, feed.data?.attentionHealth], () => filterAttentionHealth(result.data.items, feed.data?.attentionHealth ?? [])) } } : result;
   }
 
   treeLeafRow(t, { id, rowKey, label, detail = "", tooltip = null, entry = null, onClick = null, onRight = null, indent = treeIndent(1), parentKey = null, groupKey = null, itemId = null, siblingIds = null, textColor = null } = {}) {
@@ -2950,6 +2984,14 @@ export default class RigSidebar extends View {
     requestDismissal({ shared, setShared, run, scope: dismissalScope(this.config) }, action, value);
   }
 
+  /** The row that stands for the rows a capped sidebar list doesn't draw: it opens that OpenRig's Needs page on the list's own tab, which lists them all. */
+  moreNeedsRow(t, cx, { id, label, conn, parentKey, tab }) {
+    const entry = { section: "needs", needsTab: tab, ...(conn ? { conn } : {}) }, rowKey = `more:${id}`;
+    this.visibleTreeRows.push({ key: rowKey, expandable: false, parentKey, entry });
+    return this.scrollRow(h_flex().id(id).pl(treeIndent(1)).pr(8).h(24).gap(6).items_center().cursor_pointer().hover(s => s.bg(t.hover))
+      .on_click(() => { this.openPage(entry, rowKey); cx.notify(); })
+      .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.accent).child(label)), rowKey);
+  }
   sidebarUpdates(t, cx, updates) {
     const stateConn=this.sidebarConnection();
     const model = this.dismissalModel(), hidden = model?.hidden() ?? [], receipts = model?.receiptRows() ?? [];
@@ -2969,10 +3011,11 @@ export default class RigSidebar extends View {
       .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
       .child(div().flex_1().text_size(11.5).text_color(t.muted).child("Updates"));
     if (updates.length && hovered(key)) head.child(div().id("sidebar-dismiss-all").text_size(11).text_color(t.dim)
-      .hover(s => s.text_color(t.foreground)).cursor_pointer().on_click(action("dismiss", updates)).child("Dismiss all"));
+      .hover(s => s.text_color(t.foreground)).cursor_pointer().on_click(action("dismiss", updates)).child(`Dismiss all ${updates.length}`)); // every update, drawn or not: the count says so
     else head.child(div().text_size(11).text_color(t.dim).child(String(updates.length)));
     const out = [this.scrollRow(head,key)];
     if (!expanded) return out;
+    const updateIds = updates.map(item => item.id); // the group's sibling list, made once for every row
     const row = (n, record, position) => {
       const rowKey = record ? `dismissed:${record.key}` : `need:${n.id}`;
       const entry = { section: "needs", id: n.id, name: n.summary, ...(n.conn ? { conn: n.conn } : {}) };
@@ -2993,19 +3036,27 @@ export default class RigSidebar extends View {
         el.child(div().text_size(10.5).text_color(t.dim).child(mins < 1 ? "<1m" : `${mins}m`));
       }
       return this.decorateRow(t, el, { rowKey, entry, groupKey: record ? null : "needs:items",
-        itemId: n.id, siblingIds: updates.map(item => item.id), showElsewhere: !hovered(rowKey) });
+        itemId: n.id, siblingIds: updateIds, showElsewhere: !hovered(rowKey) });
     };
     // Receipts retain the dismissed row's position, including when the last update goes away.
-    const rows = updates.map((n, index) => row(n, null, index));
+    // A connection added later can bring hundreds of updates nobody dismissed: draw the first ones (newest, in the sidebar's own order) and one
+    // row that opens the Needs page for the rest. Drawing them all ran past herdr's render budget.
+    const rows = updates.slice(0, SIDEBAR_ROW_CAP).map((n, index) => row(n, null, index));
     for (const receipt of receipts) rows.splice(Math.min(receipt.position, rows.length), 0,
       h_flex().id(`sidebar-receipt-${receipt.id}`).pl(treeIndent(1)).pr(8).h(24).gap(4).items_center().text_size(11.5)
         .child(div().truncate().text_color(t.muted).tooltip(String((receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`)??"")).child(receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`))
         .child(div().id(`sidebar-undo-${receipt.id}`).text_color(t.accent).cursor_pointer().on_click(action("undo", receipt.id)).child("Undo")));
     out.push(...rows);
+    if (updates.length > SIDEBAR_ROW_CAP) out.push(this.moreNeedsRow(t, cx, { id: "sidebar-updates-more", parentKey: key, tab: "updates", conn: updates[0]?.conn ?? null,
+      label: `${updates.length - SIDEBAR_ROW_CAP} more update${updates.length - SIDEBAR_ROW_CAP === 1 ? "" : "s"}` }));
     if (hidden.length) {
       out.push(div().id("sidebar-show-dismissed").pl(treeIndent(1)).h(24).text_size(11).text_color(t.dim).cursor_pointer()
         .on_click(action("show")).child(`${model.show ? "Hide" : "Show"} dismissed (${hidden.length})`));
-      if (model.show) out.push(...hidden.map(record => row(record.item, record)));
+      if (model.show) {
+        out.push(...hidden.slice(0, SIDEBAR_ROW_CAP).map(record => row(record.item, record)));
+        if (hidden.length > SIDEBAR_ROW_CAP) out.push(div().id("sidebar-dismissed-more").pl(treeIndent(1)).h(24).text_size(11).text_color(t.dim)
+          .child(`${hidden.length - SIDEBAR_ROW_CAP} more dismissed, not shown here`));
+      }
     }
     return out;
   }
@@ -3318,14 +3369,21 @@ export default class RigSidebar extends View {
       if (whoseLine?.headline) {
         out.push(div().id("sidebar-needs-whose").px(18).py(2).text_size(10.5).text_color(t.dim).child(whoseLine.headline));
       }
-      const enrichedById = new Map((this.data?.attentionItems ?? []).filter((x) => x?.id).map((x) => [x.id, x]));
-      const mergedItems = (d.items ?? []).map((it) => {
-        const match = enrichedById.get(it.id);
-        return needTarget(match ? { ...it, ...match } : it);
+      // Every request and update as a target, without the dismissed ones, sorted: made again only when the items, the enriched items or the
+      // dismissals change (the records change in place, so their keys and restored marks are part of what is compared).
+      const model = this.dismissalModel(), records = this.dismissalRecordsKey(model);
+      const rawItems = this.memoBy(`needs:${rowFeed?.id ?? ""}`, [d.items, this.data?.attentionItems, model, records], () => {
+        const enrichedById = new Map((this.data?.attentionItems ?? []).filter((x) => x?.id).map((x) => [x.id, x]));
+        const mergedItems = (d.items ?? []).map((it) => {
+          const match = enrichedById.get(it.id);
+          return needTarget(match ? { ...it, ...match } : it);
+        });
+        return sortNeedsByTier(model?.visible(mergedItems) ?? mergedItems);
       });
-      const rawItems = sortNeedsByTier(this.dismissalModel()?.visible(mergedItems) ?? mergedItems);
       const orderedNeeds = orderSiblings(rawItems, "needs:items", orderMap, (n) => n.id);
       const needIds = orderedNeeds.map((n) => n.id);
+      const requestCount = orderedNeeds.filter((n) => !n.update && !n.criticalHealth).length;
+      let drawnRequests = 0;
       for (const n of orderedNeeds) {
         if (n.criticalHealth) {
           const entry = { section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) };
@@ -3334,6 +3392,8 @@ export default class RigSidebar extends View {
           continue;
         }
         if (n.update) continue;
+        if (drawnRequests >= SIDEBAR_ROW_CAP) continue; // the rest are behind the "more requests" row
+        drawnRequests++;
         const entry = { section: "needs", id: n.id, name: n.summary, ...(n.conn ? { conn: n.conn } : {}) };
         const tier = n.tier ?? tierOf(n);
         const rowId = `need-${n.id}`;
@@ -3357,6 +3417,8 @@ export default class RigSidebar extends View {
           continue;
         }
       }
+      if (requestCount > SIDEBAR_ROW_CAP) out.push(this.moreNeedsRow(t, cx, { id: "sidebar-requests-more", parentKey: parentBranchKey, tab: "requests",
+        conn: orderedNeeds.find((n) => !n.update)?.conn ?? null, label: `${requestCount - SIDEBAR_ROW_CAP} more request${requestCount - SIDEBAR_ROW_CAP === 1 ? "" : "s"}` }));
       out.push(...this.sidebarUpdates(t, cx, orderedNeeds.filter((n) => n.update)));
       if (!orderedNeeds.length && !this.dismissalModel()?.hidden().length) {
         out.push(div().px(18).py(4).text_size(12).text_color(t.dim).child("No pending Needs-You requests."));
@@ -3395,7 +3457,7 @@ export default class RigSidebar extends View {
       const defaultOpen = section === "topology"
         ? true
         : section === "needs"
-          ? Boolean((this.dismissalModel()?.visible(this.data?.attentionItems ?? []).length ?? this.data?.attention ?? 0) > 0)
+          ? Boolean((this.visibleNeedsCount() ?? this.data?.attention ?? 0) > 0)
           : false;
       const openBranch = branchFoldOpen(folds, bKey, defaultOpen);
 
@@ -3414,7 +3476,7 @@ export default class RigSidebar extends View {
           out.push(...(this.viewState("rig.topology.view") === "rig" ? this.topologyRows(t, cx) : this.priorityView(t, cx)));
         }
       } else if (section === "needs") {
-        const needsCount = needsRequestCount(this.data?.topology, this.data?.attentionItems);
+        const needsCount = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
         const quietChip = this.data?.quietModeChip ?? null;
         const quietChipEl = quietChip?.label
           ? h_flex().id("rig-quiet-mode-chip").px(5).h(18).gap(4).rounded(4).items_center().cursor_pointer()
@@ -3503,41 +3565,19 @@ export default class RigSidebar extends View {
     if(!this.listScroll)return;
     this.keyRevealPending=true;this.renderRevealKey=null;
     this.cancelSidebarReveal=revealAfterKey(cx,this.listScroll,()=>{
-      if(this.closed||this.listWasFolded||!this.keyRevealPending)return -1;
+      if(this.closed||!this.keyRevealPending)return -1;
       this.keyRevealPending=false;
       return this.scrollRowIndices?.get(this.viewState("rig.sel")?.key)??-1;
     },this);
   }
 
   scrollChildren(content) {
-    this.scrollRowIndices=new Map();this.scrollRowHeights??=new Map();
-    const tokens=content.map((el,i)=>{
+    this.scrollRowIndices=new Map();
+    return content.map((el,i)=>{
       const key=this.scrollRowKeys?.get(el);
       if(key)this.scrollRowIndices.set(key,i);
-      return key?`key:${key}`:`notice:${i}`;
+      return div().id(`rig-scroll-row-${encodeURIComponent(key?`key:${key}`:`notice:${i}`)}`).flex_none().w_full().child(el);
     });
-    this.scrollRowTokens=tokens;
-    const live=new Set(tokens);
-    for(const key of this.scrollRowHeights.keys())if(!live.has(key))this.scrollRowHeights.delete(key);
-    return content.map((el,i)=>div().id(`rig-scroll-row-${encodeURIComponent(tokens[i])}`).flex_none().w_full()
-      .on_size_change((size,cx)=>{
-        if(!this.scrollRowTokens?.includes(tokens[i]))return;
-        this.scrollRowHeights.set(tokens[i],size.height);
-        this.measureScrollContent(cx);
-      }).child(el));
-  }
-
-  measureScrollContent(cx) {
-    if(!this.scrollRowTokens?.every(key=>this.scrollRowHeights.has(key)))return;
-    const height=this.scrollRowTokens.reduce((sum,key)=>sum+this.scrollRowHeights.get(key),0);
-    this.listContentHeight=height;
-    if(!this.scrollClampReady)return;
-    const previous=this.pendingScrollClamp;this.pendingScrollClamp=null;
-    // A rare shrink while folded can strand the retained offset. No public offset setter exists.
-    if(Number.isFinite(previous)&&height<previous){
-      this.cancelTreeReveal();this.listScroll?.release?.();this.listScroll=ScrollHandle.new();
-      this.listScrollVersion=(this.listScrollVersion??0)+1;cx.notify();
-    }
   }
 
   handleTreeKeyDown(e, cx) {
@@ -3594,7 +3634,7 @@ export default class RigSidebar extends View {
   rail(t) {
     const stateConn=this.sidebarConnection();
     const rows = this.priorityRows();
-    const needs = needsRequestCount(this.data?.topology, this.data?.attentionItems);
+    const needs = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
     return v_flex().size_full().items_center().py(6).gap(8).bg(t.chrome)
       .child(div().id("rig-rail-needs").size(22).rounded(6).flex().items_center().justify_center().text_size(10.5).font_bold()
         .bg(needs ? t.blocked + "26" : "#00000000").text_color(needs ? t.blocked : t.dim)
@@ -3611,6 +3651,10 @@ export default class RigSidebar extends View {
   /** The sidebar draws ONE connection (follow mode, v0.5.0 PR 2b): everything it reads while drawing (`config`, `data`, `error`, `lists`, ...) is the followed feed's. With one connection
    *  nothing is swapped and the draw is what it always was. Clicks run later, outside the draw, and read the sidebar's own (first) connection as before. */
   render(cx) {
+    // One read of herdr's lists for the whole render, the follow rule's included.
+    this.renderMemo = { selRead: false, sel: undefined, nav: undefined, siblingStrings: new WeakMap() };
+    // Everything after the memo opens is inside one try: whatever throws (the follow rule, a publish), the memo and the drawn feed are cleared.
+    try {
     const shown = this.followFeed(cx);
     // The scroll handle of the drawn box exists already (made with its feed, never here: Herdr refuses native allocation while a view renders). `scrollShown` stays the box drawn last, so a resize
     // outside the draw replaces that box's handle.
@@ -3619,7 +3663,8 @@ export default class RigSidebar extends View {
     // Other mods (the palette) open a section page on the box this sidebar follows: published when it changes, and only with several connections.
     const followedId = shown?.id ?? null;
     if (followedId !== (this.publishedFollowed ?? null)) { this.publishedFollowed = followedId; setShared("rig.followed", followedId); }
-    try { return this.renderShown(cx); } finally { this.viewFeed = null; }
+    return this.renderShown(cx);
+    } finally { this.viewFeed = null; this.renderMemo = null; }
   }
 
   /** Which feed the sidebar shows now, or null with one connection. See rig-follow.js for the rule; a change of box is applied after 150 ms so a fast run through spaces draws once. */
@@ -3629,7 +3674,7 @@ export default class RigSidebar extends View {
     if (feeds.length < 2) {
       // One connection has no follow mode (nothing to switch between), but a shown space on a machine with NO connection still gets the offer to add it:
       // the same rule as with several (a plain machine other than the one this connection is for; a Local space says nothing).
-      const focus = focused(), space = focus ? spaces().find((sp) => sp.id === focus.space) : undefined, machine = spaceMachine(space);
+      const focus = focused(), space = focus ? this.hostLists().spaces.find((sp) => sp.id === focus.space) : undefined, machine = spaceMachine(space);
       follow.hint = feeds.length === 1 && machine !== undefined && machine !== null && machine !== (feeds[0].config?.daemonMachine ?? null) ? machine : null;
       return null;
     }
@@ -3649,8 +3694,9 @@ export default class RigSidebar extends View {
   /** What the follow rule reads: the connections (config order), the shown space (null focus: none) and the origins its rigs were made with. */
   followInputs() {
     const connections = this.feeds.map((f) => ({ id: f.id, machine: f.config?.daemonMachine ?? null, daemonUrl: f.config?.daemonUrl ?? null }));
-    const focus = focused(), space = focus ? spaces().find((sp) => sp.id === focus.space) : undefined;
-    const links = space ? openRigSpaceContext(spaces(), terminals(), panes(), shared("rig.spaceState") ?? {}, MOD_IDS.view).find((c) => c.id === space.id)?.rigLinks ?? [] : [];
+    const focus = focused(), h = this.hostLists(), space = focus ? h.spaces.find((sp) => sp.id === focus.space) : undefined;
+    // The shown space's own context (each space's is worked out from its own terminals and tabs alone), not every space's.
+    const links = space ? openRigSpaceContext([space], h.terminals, h.panes, shared("rig.spaceState") ?? {}, MOD_IDS.view)[0]?.rigLinks ?? [] : [];
     return { connections, space, links };
   }
 
@@ -3695,7 +3741,7 @@ export default class RigSidebar extends View {
   }
 
   /** The needs on the OTHER connections that answer (a box that does not answer contributes nothing: the picker says so). */
-  elsewhereNeeds(shown) { return this.feeds.filter((f) => f !== shown && f.data && !f.error).reduce((n, f) => n + needsRequestCount(f.data.topology, f.data.attentionItems), 0); }
+  elsewhereNeeds(shown) { return this.feeds.filter((f) => f !== shown && f.data && !f.error).reduce((n, f) => n + this.requestCountOf(f.data.topology, f.data.attentionItems), 0); }
 
   /** The picker: one row per connection (a state dot, its machine, its needs, a check on the shown one), in config order. */
   followPicker(t) {
@@ -3704,7 +3750,7 @@ export default class RigSidebar extends View {
     return v_flex().id("rig-follow-menu").mx(8).mb(4).p(4).gap(1).rounded(6).bg(t.raised).border_1().border_color(t.border)
       .children(this.feeds.map((feed, index) => {
         const answering = Boolean(feed.data) && !feed.error, label = feed.config?.daemonMachine ?? "this computer";
-        const needs = answering ? needsRequestCount(feed.data.topology, feed.data.attentionItems) : 0;
+        const needs = answering ? this.requestCountOf(feed.data.topology, feed.data.attentionItems) : 0;
         return h_flex().id(`rig-follow-pick-${feed.id}`).px(6).h(24).gap(6).items_center().rounded(4).cursor_pointer().hover((s) => s.bg(t.hover))
           .when(follow.pickerIndex === index, (el) => el.bg(t.hover))
           .on_click((_e, cx) => { cx.stop_propagation(); this.followPick(feed.id, cx); })
@@ -3721,72 +3767,42 @@ export default class RigSidebar extends View {
     const t = theme();
     this.observeDaemonMachines(cx);
     this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,this.viewState("rig.topology.view"),narrow()]),cx,{attention:this.data?.attentionItems,reducedMotion:this.config?.reducedMotion===true});
-    this.spaceFold ??= new SidebarSpaceFold(shared("rig.spaceState")?.sidebarSize);
-    const active = spaces().find(s => s.active);
-    const context = openRigSpaceContext(spaces(), terminals(), panes(), shared("rig.spaceState") ?? {}, MOD_IDS.view)
+    const lists = this.hostLists(); // herdr's lists once for this render (hostLists)
+    const active = lists.spaces.find(s => s.active);
+    const context = openRigSpaceContext(lists.spaces, lists.terminals, lists.panes, shared("rig.spaceState") ?? {}, MOD_IDS.view)
       .find(c => c.id === active?.id);
     this.activeSpaceContext = context;
     // herdrig's Spaces list marks rig spaces from this: published only when it changes.
     // Each connection marks its own spaces (a space on a machine belongs to that machine's connection); with one connection this is the original call.
-    const markWorld = { spaces: spaces(), terminals: terminals(), panes: panes(), state: shared("rig.spaceState") ?? {} };
+    const markWorld = { spaces: lists.spaces, terminals: lists.terminals, panes: lists.panes, state: shared("rig.spaceState") ?? {} };
     const marks = JSON.stringify(this.feeds.length > 1
       ? Object.assign({}, ...this.feeds.filter((f) => f.config && f.data && !f.error).map((f) => rigSpaceMarks({ ...markWorld, topology: f.data.topology ?? [], config: f.config, hostId: f.healthz?.selfHostId })))
       : rigSpaceMarks({ ...markWorld, topology: this.data?.topology ?? [], config: this.config ?? {}, hostId: this.healthz?.selfHostId }));
     if (marks !== this.publishedMarks) { this.publishedMarks = marks; setShared("herdrig.spaces", JSON.parse(marks)); }
     const block = find(layout(), n => n.content?.mod === MOD_IDS.sidebar);
-    let foldCx = cx;
-    const folded = this.spaceFold.observe(context, block, {
-      after: (ms, fn) => foldCx.timer.after(ms, nextCx => { foldCx = nextCx ?? foldCx; fn(); }), run,
-      save: size => cx.timer.after(0, nextCx => (nextCx ?? cx).spawn(async () => {
-        try { await this.saveSpaceState({ sidebarSize: size }); }
-        catch (error) { notify({ title: "OpenRig", body: `Could not save sidebar size: ${error?.message ?? error}`, level: "warning" }); }
-      })),
-      warn: body => notify({ title: "OpenRig", body, level: "warning" }), notify: () => foldCx.notify(),
-    });
-    if (folded || narrow()) {this.reorderRows = new Map();this.cancelTreeReveal();this.cancelScrollClamp?.cancel?.();this.scrollClampReady=false;}
-    if (folded && narrow()) {
-      let root=v_flex().id("rig-sidebar-folded").size_full().bg(t.chrome)
-        .on_mouse_down("left",()=>this.focusHandle?.focus?.())
-        .on_key_down((event,cx)=>{if(String(event?.key??"").toLowerCase()==="enter")this.showSidebarHere(cx);});
-      root=root.child(h_flex().id("rig-folded-rail").h(30).gap(3).items_center().justify_center()
-        .tooltip("Not a rig space · click to show it here").on_click((_e,cx)=>this.showSidebarHere(cx))
-        .child(svg(icon("rig-popout")).size(14).text_color(t.dim))
-        .when(this.priorityRows().some(r=>r.rank===4),el=>el.child(div().size(5).rounded(3).bg(t.blocked))));
-      if(this.focusHandle) root=root.track_focus(this.focusHandle);
-      return root;
-    }
+    // The OpenRig area keeps its size on every space: it folds only when the person folds Herdr's own block. An area an earlier version folded
+    // to its header on a non-rig space is given its size back once.
+    this.retireAutoFold(block);
+    if (narrow()) {this.reorderRows = new Map();this.cancelTreeReveal();}
     if (narrow()) return this.rail(t);
-    const state = folded?null:this.states(t);
-    if(folded&&!this.listWasFolded)this.foldedContentHeight=this.listContentHeight;
-    if(!folded&&this.listWasFolded){
-      this.pendingScrollClamp=this.foldedContentHeight;this.scrollClampReady=false;
-      // Retain measurements: unchanged keyed rows need not emit another size event on return.
-      // Keep the render context's implicit owner: explicitly reading this view here re-enters its native update.
-      this.cancelScrollClamp=cx.timer.after(16,next=>{if(this.closed||this.listWasFolded)return;this.scrollClampReady=true;this.measureScrollContent(next);});
-    }
-    this.listWasFolded=folded;
-    const content=folded?[]:this.listRows(t,cx,state);
-    const scrollChildren=folded?[div().h(this.listContentHeight??0).flex_none()]:this.scrollChildren(content);
+    const state = this.states(t);
+    const content=this.listRows(t,cx,state);
+    const scrollChildren=this.scrollChildren(content);
     if(this.keyRevealPending&&this.renderRevealKey!==this.viewState("rig.sel")?.key){
       const index=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key);
       if(Number.isInteger(index)){this.listScroll?.scroll_to_item(index);this.renderRevealKey=this.viewState("rig.sel")?.key;}
     }
-    const listId="rig-list"+(this.listScrollVersion?`-resize-${this.listScrollVersion}`:"");
     let root = v_flex().id("rig-sidebar-root").size_full().bg(t.chrome).text_color(t.foreground)
       .on_mouse_up("left", (_e, ctx) => this.cancelDrag(ctx))
       .on_mouse_down("left", () => {this.cancelTreeReveal();this.focusHandle?.focus?.();})
-      .on_key_down((e, cx) => {
-        if(folded){if(String(e?.key??"").toLowerCase()==="enter")this.showSidebarHere(cx);}
-        else this.handleTreeKeyDown(e,cx);
-      });
+      .on_key_down((e, cx) => this.handleTreeKeyDown(e,cx));
     if (this.focusHandle) root = root.track_focus(this.focusHandle);
     return root
-      .child(folded?this.foldedHeader(t):this.header(t))
-      .when(!folded && Boolean(this.followPicker(t)), (el) => el.child(this.followPicker(t)))
-      .child(div().h(folded?0:1).bg(t.border).mx(8))
-      .child(v_flex().id(listId).flex_1().overflow_y_scrollbar().py(4)
+      .child(this.header(t))
+      .when(Boolean(this.followPicker(t)), (el) => el.child(this.followPicker(t)))
+      .child(div().h(1).bg(t.border).mx(8))
+      .child(v_flex().id("rig-list").flex_1().overflow_y_scrollbar().py(4)
         .when(!!this.listScroll,el=>el.track_scroll(this.listScroll))
-        .when(folded,el=>el.h(0).min_h(0).flex_none().py(0))
         .on_size_change((_size,cx)=>{if(this.keyRevealPending){const index=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key);if(Number.isInteger(index))this.listScroll?.scroll_to_item(index);cx.notify();}})
         .children(scrollChildren));
   }

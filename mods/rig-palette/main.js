@@ -235,7 +235,6 @@ export default class RigPalette extends View {
     }
     // The TUI's refresh re-reads its own view; here the sidebar re-reads (the page follows it).
     if (verb === "refresh" && !arg) { run("rig.refresh"); this.dismiss(); return true; }
-    if (verb === "show-sidebar-here" && !arg) { run("rig.show-sidebar-here"); this.dismiss(); return true; }
     if ((verb === "open-page" || verb === ":open-page") && !arg) {
       const acting = this.acting(); // the box the sidebar follows: its own selection, never the first box's
       if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return true; }

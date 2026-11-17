@@ -8,7 +8,8 @@ export class StatusMotion {
   begin(scope,cx,{attention,ready=Array.isArray(attention),reducedMotion=false}={}){
     if(scope!==this.scope){this.reset();this.scope=scope;}
     this.cx=cx;this.reducedMotion=reducedMotion;if(reducedMotion)this.pulses.clear();this.freshNeeds=new Set();
-    this.needs=(attention??[]).filter(n=>needsToastFor(n)&&!["done","closed","canceled"].includes(n.state)).map(needTarget);
+    // The same list until the sidebar has new items (a refresh replaces the array): not every update again on every render.
+    if(attention!==this.needsOf||!this.needsOfSet){this.needs=(attention??[]).filter(n=>needsToastFor(n)&&!["done","closed","canceled"].includes(n.state)).map(needTarget);this.needsOf=attention;this.needsOfSet=true;}
     if(ready){
       const ids=new Set(this.needs.map(n=>n.id));
       if(this.seeded)for(const id of ids)if(!this.knownNeeds.has(id))this.freshNeeds.add(id);

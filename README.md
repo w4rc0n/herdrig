@@ -1,6 +1,13 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/herdrig-logo-dark.svg">
+    <img src="assets/logo/herdrig-logo-light.svg" alt="Herdrig" width="420">
+  </picture>
+</p>
+
 # Herdrig
 
-Version: v0.5.0
+Version: v0.5.1
 
 **OpenRig Mod for Herdr**
 
