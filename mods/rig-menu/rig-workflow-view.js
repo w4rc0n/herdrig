@@ -7,9 +7,11 @@ const icon=iconsAt('mods/rig-view');
 export class WorkflowPanel {
   constructor(page,{navigate,ownerEntry,queueEntry,time,monoFamily='JetBrains Mono'}={}){this.page=page;this.navigate=navigate;this.ownerEntry=ownerEntry;this.queueEntry=queueEntry;this.time=time;this.monoFamily=monoFamily;}
   muted(t,text){return div().text_size(11.5).text_color(t.dim).child(text);}
-  link(t,id,label,entry){return div().id(id).text_size(12).text_color(entry?t.accent:t.dim)
-    .when(!!entry,el=>el.cursor_pointer().tab_stop(true).on_click(()=>this.navigate(entry))
-      .on_key_down((e,cx)=>{if(e.key==='enter'){cx.stop_propagation();this.navigate(entry);}})).child(label);}
+  // A link with somewhere to go is the page's keyboard link (its own focus handle, so Tab reaches it and Enter or Space opens it); one with
+  // nowhere to go is dim text.
+  link(t,id,label,entry){
+    if(entry&&this.page?.inlineLink)return this.page.inlineLink(t,this.cx,id,label,()=>this.navigate(entry));
+    return div().id(id).text_size(12).text_color(entry?t.accent:t.dim).when(!!entry,el=>el.cursor_pointer().on_click(()=>this.navigate(entry))).child(label);}
   owner(t,id,session){return typeof session==='string'&&session.trim()?this.link(t,id,workflowWord(session),session==='INDETERMINATE'?null:this.ownerEntry(session)):div();}
   fields(t,rows){return v_flex().gap(4).children(rows.map(([label,value,mono])=>h_flex().gap(8).items_start().flex_wrap()
     .child(div().min_w(90).text_size(11.5).text_color(t.dim).child(label))
@@ -18,7 +20,8 @@ export class WorkflowPanel {
     .child(div().flex_1().min_w(0).font_family(this.monoFamily).text_size(11.5).child(workflowWord(text)))
     .when(typeof text==='string'&&text!=='INDETERMINATE',el=>el.child(this.page.copyButton(t,text,id,'suggested command'))));}
   entry(context,wf,packet){return workflowEntry(context,wf,packet);}
-  render(t,cx,entry,model){
+  render(t,cx,entry,model){this.cx=cx; // the links make their focus handles through it
+
     const context={project:entry.project??model.project,mission:entry.mission??model.mission};
     if(!model.supported)return this.muted(t,"This OpenRig doesn't serve workflow views.");
     const wf=model.instances.find(w=>w.id===entry.workflow);

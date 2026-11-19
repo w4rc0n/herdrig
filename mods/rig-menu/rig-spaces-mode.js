@@ -15,7 +15,7 @@ export const ONLY_ID = "rig-spaces-only";
 /** The layouts herdr ships. It rewrites them at every start and takes no structure change to them. */
 export const SHIPPED_LAYOUTS = Object.freeze(["main", "terminals", "win98"]);
 /** The herdr-app commit our copy of herdr's list was taken from (the drift test pins the same). */
-export const BASE_HERDR = "3d76790";
+export const BASE_HERDR = "034f8b8";
 
 export const MODES = Object.freeze(["herdr", "herdrig", "both"]);
 export const MODE_LABEL = Object.freeze({ herdr: "Herdr's", herdrig: "herdrig's", both: "Both" });

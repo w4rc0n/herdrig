@@ -1,7 +1,7 @@
 // The person's configured Herdr machine is the only remote authority. Daemon data never selects it.
-import { isLoopbackDaemonUrl, parseDaemonStatusJson, differentDaemons, localDaemonOrigin } from "./rig-lib.js";
+import { isLoopbackDaemonUrl, parseDaemonStatusJson, differentDaemons } from "./rig-lib.js";
 import { gateConfigGeneration } from "./rig-gate.js";
-import { addMachineConnection, connectionsOf } from "./rig-connections.js";
+import { localDaemonOrigin, addressKey, addMachineConnection, connectionsOf, openrigHomeProblem, isCodeError, CONFIG_NOT_JSON, parseExecTimeout, describeExecTimeout, logExecError, plainExecError } from "./rig-connections.js";
 // v0.4.7: the relay's content changed (the poll-storm fix: an in-flight guard, a fetch timeout, backoff and jitter);
 // the person re-approves the new hook/hash once on update, as every relay change requires.
 export const RELAY_SHA256 = "285a54561125c00964e607ce379bbbd5e7988dcdd768b61bd2daa9f9522f15ad";
@@ -9,22 +9,28 @@ const MACHINE = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 // Attach and every rig space create separate callers. Serialize the whole preparation across them;
 // each queued caller still rechecks its own config, consent, profile and bytes instead of sharing readiness.
 const preparations = new Map();
+// The longest one preparation holds the queue for the next caller. A slow or stuck job (a busy machine answers each remote
+// call in 0.3-0.7 s, and a preparation makes about 45) never keeps every later Attach and space open waiting behind it.
+export const PREPARE_HOLD_MS = 60000;
 // Metadata is read with fixed executable/argv calls; no shell or remotely evaluated source.
 export const goodHome = (s) => typeof s === "string" && s.startsWith("/") && s !== "/" && !/[\x00-\x1f\x7f]/.test(s) && s.split("/").slice(1).every((p) => p && p !== "." && p !== "..");
+// The helper on a machine is not the copy herdrig installed (hash or path differs): said the same wherever it is found.
+const HELPER_NOT_OURS = (at) => `herdrig's helper on ${at} isn't the copy it installed, so nothing was started. Attach again to reinstall it.`;
 const line = (value) => String(value ?? "").replace(/\r?\n$/, "");
-export async function inspectRemote(run, expectedHome = null) {
+export async function inspectRemote(run, expectedHome = null, machine = null) {
+  const at = machine ?? "the machine";
   const output = async (cmd, args) => {
     const result = await run(cmd, args);
-    if (result?.code !== 0) throw new Error(result?.stderr || `Remote ${cmd} failed.`);
+    if (result?.code !== 0) throw new Error(result?.stderr || `A check on ${at} didn't work (${cmd} failed). Nothing was started.`);
     return line(result.stdout);
   };
   const test = async (flag, file) => {
     const result = await run("test", [flag, file]);
-    if (result?.code !== 0 && result?.code !== 1) throw new Error(result?.stderr || "Remote path check failed.");
+    if (result?.code !== 0 && result?.code !== 1) throw new Error(result?.stderr || `herdrig couldn't check its folder on ${at}. Nothing was started.`);
     return result.code === 0;
   };
   const home = await output("printenv", ["HOME"]);
-  if (!goodHome(home) || (expectedHome !== null && home !== expectedHome)) throw new Error("Invalid or changed remote home.");
+  if (!goodHome(home) || (expectedHome !== null && home !== expectedHome)) throw new Error(`${at}'s home folder isn't the one herdrig set up, so nothing was started. If the account changed, approve ${at} again.`);
   if (await output("readlink", ["-f", "--", home]) !== home || !await test("-d", home)) throw new Error("Refused symlinked or invalid remote home.");
   let current = home, sha256 = null;
   const parts = [".local", "share", "herdr-openrig", "rig-attach-relay.cjs"];
@@ -36,28 +42,31 @@ export async function inspectRemote(run, expectedHome = null) {
       if (await output("readlink", ["-f", "--", current]) !== current) throw new Error("Refused symlinked relay path.");
       if (i === parts.length - 1) {
         const hash = await output("sha256sum", ["--", current]);
-        if (!/^[a-f0-9]{64} [ *]/.test(hash)) throw new Error("Invalid remote relay hash.");
+        if (!/^[a-f0-9]{64} [ *]/.test(hash)) throw new Error(HELPER_NOT_OURS(at));
         sha256 = hash.slice(0, 64);
       }
     }
   }
   return { home, path: current, sha256 };
 }
-export async function remoteMetadata(run) {
-  const info = await inspectRemote(run);
+export async function remoteMetadata(run, machine = null) {
+  const at = machine ?? "the machine";
+  const info = await inspectRemote(run, null, machine);
   const read = async (cmd, args) => {
     const r = await run(cmd, args);
-    if (r?.code !== 0) throw new Error(r?.stderr || `Remote ${cmd} failed.`);
+    if (r?.code !== 0) throw new Error(r?.stderr || `A check on ${at} didn't work (${cmd} failed). Nothing was started.`);
     return line(r.stdout);
   };
   const node = await read("which", ["node"]), user = await read("id", ["-un"]), searchPath = await read("printenv", ["PATH"]);
-  if (!goodHome(node) || !user || /[\x00-\x1f\x7f]/.test(user) || !searchPath || /[\x00-\x1f\x7f]/.test(searchPath)) throw new Error("Invalid remote executable or account metadata.");
+  if (!goodHome(node) || !user || /[\x00-\x1f\x7f]/.test(user) || !searchPath || /[\x00-\x1f\x7f]/.test(searchPath)) throw new Error(`herdrig couldn't find Node or the user account on ${at}, so nothing was started. Check that Node is installed there.`);
   return { ...info, node, user, searchPath };
 }
 const callList = (host, key) => typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? [];
-const parse = (result, operation) => {
-  if (result?.code !== 0) throw new Error(`${operation}: ${result?.stderr || "command failed"}`);
-  try { return JSON.parse(result.stdout); } catch { throw new Error(`${operation}: invalid response.`); }
+// `what` is the thing that was being done, in words ("list Herdr's machines"): what happened, then what it said, never a function name.
+const firstLineOf = (text) => String(text ?? "").split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
+const parse = (result, what) => {
+  if (result?.code !== 0) { const said = firstLineOf(result?.stderr); throw new Error(`Couldn't ${what} (${said ? `it said: ${said}` : "it gave no reason"}).`); }
+  try { return JSON.parse(result.stdout); } catch { throw new Error(`Couldn't ${what}: the answer couldn't be read.`); }
 };
 // The setup gate's reads (rig status --json, healthz) are small, fixed-shape JSON; a 64KB cap is a sanity bound,
 // not a real limit on either response. Over the cap REFUSES outright rather than truncating and parsing what's
@@ -66,7 +75,7 @@ const JSON_READ_CAP = 65536;
 // The native mod runtime has no Buffer (rig-space-context.js says so): the size of a text in UTF-8 bytes, counted by hand.
 export const utf8Length = (text) => { let n = 0; for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); if (c < 0x80) n += 1; else if (c < 0x800) n += 2; else if (c >= 0xd800 && c <= 0xdbff) { n += 4; i++; } else n += 3; } return n; };
 const boundedParse = (result, operation, maxBytes = JSON_READ_CAP) => {
-  if (result?.code === 0 && typeof result.stdout === "string" && utf8Length(result.stdout) > maxBytes) throw new Error(`${operation}: the response was too large to read safely.`);
+  if (result?.code === 0 && typeof result.stdout === "string" && utf8Length(result.stdout) > maxBytes) throw new Error(`Couldn't ${operation}: the answer was too large to read safely.`);
   return parse(result, operation);
 };
 export const machineLocalId = (id, machine) => machine && String(id).startsWith(`${machine}/`) ? String(id).slice(machine.length + 1) : id;
@@ -82,9 +91,19 @@ const machineStateWords = (state, name) => {
   }
 };
 const machineFix = (state, name) => `hc machine ${state === "needs_update" ? "update" : "login"} ${name}`;
-export function remoteFailure(error, machine) {
+export function remoteFailure(error, machine, { attach = false } = {}) {
   const reason = String(error?.message ?? error);
   if (error?.machineNotice) return { ok: false, reason, machineNotice: error.machineNotice };
+  const timeout = parseExecTimeout(error);
+  if (timeout) {
+    logExecError(error);
+    return {
+      ok: false,
+      retryable: true,
+      execTimeout: { seconds: timeout.seconds, machine: timeout.machine ?? machine ?? null },
+      reason: describeExecTimeout(error, { machine, kind: attach ? "attach" : "remote" }),
+    };
+  }
   // The machine can still say connected while an in-flight call loses its core. Give all callers
   // the same notice during that transition, preserving integrity and other actionable errors.
   if (typeof machine === "string" && MACHINE.test(machine)
@@ -93,7 +112,7 @@ export function remoteFailure(error, machine) {
       reason: `${machine} lost its connection. Run hc machine login ${machine}, then retry. No local terminal was started.`,
       machineNotice: { machine, body: `Run hc machine login ${machine}. ${machine} lost its connection.` } };
   }
-  return { ok: false, reason };
+  return { ok: false, reason: plainExecError(error, { machine, kind: attach ? "attach" : "remote" }) };
 }
 export function machineProblem(record, name) {
   if (!record) return `Herdr machine ${name} is not configured. Add it in Herdr's Add machine first.`;
@@ -102,11 +121,28 @@ export function machineProblem(record, name) {
   return null;
 }
 
+/** A connection over Herdr's connection (herdr://<machine>/<hostId>) for this connection's own machine: the host id it recorded, else null. */
+export function herdrIdentityOf(config){
+  const m=/^herdr:\/\/([a-z0-9][a-z0-9._-]{0,31})\/([A-Za-z0-9._:-]{1,128})$/.exec(String(config?.daemonUrl??""));
+  if(!m||m[1]!==config?.daemonMachine)return null;
+  if(config.expectedHostId&&config.expectedHostId!==m[2])return null; // the record and the address disagree: not this connection's identity
+  return {machine:m[1],hostId:m[2]};
+}
+const shortHostId=(id)=>`${String(id??"").slice(0,4)}…`;
+/** The sentence for a machine whose OpenRig isn't the one this connection is for. */
+function identityMismatch(config,local,remote){
+  if(local?.recorded)return `${config.daemonMachine} now answers as another OpenRig (host ${shortHostId(remote?.selfHostId)}) than this connection was set up for (host ${shortHostId(local.selfHostId)}), so nothing was started. Switch back to the tunnel, or set this connection up again.`;
+  return "The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.";
+}
+
 export class RemoteMachine {
   constructor(host) { this.host = host; }
+  /** Names what the preparation is doing now (an Attach that takes long says it), and stops it once its caller gave up. */
+  step(words) { this.stopIfCancelled(); this.host.onStep?.(words); }
+  stopIfCancelled() { if (this.host.cancelled?.()) throw Object.assign(new Error("Stopped: the request took too long. Nothing was started."), { cancelled: true }); }
   async ready(name) {
     if (typeof name !== "string" || !MACHINE.test(name)) throw new Error("daemonMachine must name a Herdr machine (letters, digits, dot, underscore or hyphen; at most 32 characters).");
-    const body = parse(await this.host.hc(["machine", "ls", "--json"]), "Read Herdr machines");
+    const body = parse(await this.host.hc(["machine", "ls", "--json"]), "list Herdr's machines");
     const rows = Array.isArray(body) ? body : body.machines;
     const record = rows?.find((m) => m.name === name);
     const reason = machineProblem(record, name);
@@ -125,37 +161,63 @@ export class RemoteMachine {
   }
   prepare(config, options = {}) {
     const machine = config.daemonMachine;
-    const job = (preparations.get(machine) ?? Promise.resolve()).catch(() => {}).then(() => this.prepareExclusive(config, options));
-    preparations.set(machine, job);
-    return job.finally(() => { if (preparations.get(machine) === job) preparations.delete(machine); });
+    const before = preparations.get(machine);
+    if (before) this.host.onStep?.(`waiting for another check of ${machine} to finish`);
+    const waitBefore = before
+      ? (this.host.waitQueue ? this.host.waitQueue(() => before.settled) : before.settled)
+      : Promise.resolve();
+    const job = waitBefore.then(() => this.prepareExclusive(config, options));
+    let prevRef = before, rawRelease;
+    const released = new Promise((r) => { rawRelease = r; });
+    const unregister = this.host.registerBarrier?.(rawRelease);
+    const cleanup = () => { prevRef = null; unregister?.(); };
+    const release = () => { const p = prevRef; cleanup(); p?.release?.(); rawRelease(); };
+    const baseSettled = Promise.race([job.catch(() => {}), released]).finally(cleanup);
+    // The next caller waits for this job, or PREPARE_HOLD_MS at most (ownerless when available so a gone view still releases the queue).
+    const holdTimer = this.host.deadline ?? this.host.wait;
+    const entry = { settled: holdTimer ? Promise.race([baseSettled, holdTimer(PREPARE_HOLD_MS)]) : baseSettled, release };
+    preparations.set(machine, entry);
+    return job.finally(() => { if (preparations.get(machine) === entry) preparations.delete(machine); });
   }
   /** Read-only identity check shared by detection and home TUI opens. No relay installation or consent writes. */
   async readIdentity(config, { defaultHome = false } = {}) {
-    const host=this.host,machine=config.daemonMachine,record=await this.ready(machine);
-    if(!config.daemonUrl||!isLoopbackDaemonUrl(config.daemonUrl))throw new Error("Remote seats need the configured OpenRig loopback tunnel URL.");
-    const remoteExec=(cmd,args)=>host.exec(cmd,args,{on:machine,timeout:15000});
-    const info=await remoteMetadata(remoteExec);
+    const host=this.host,machine=config.daemonMachine;
+    this.step(`checking ${machine} in Herdr`);
+    const record=await this.ready(machine);
+    // Over Herdr's connection there is no tunnel to compare with: the OpenRig this connection is for is the host id it recorded when it switched
+    // (after the tunnel and the helper named the same one), and the machine's own OpenRig must answer as that host below.
+    const recorded=herdrIdentityOf(config);
+    if(!recorded&&(!config.daemonUrl||!isLoopbackDaemonUrl(config.daemonUrl)))throw new Error(`Seats on ${machine} need the tunnel address in this connection's settings (http://127.0.0.x:port). Nothing was started.`);
+    const remoteExec=(cmd,args)=>{this.stopIfCancelled();return host.exec(cmd,args,{on:machine,timeout:15000});};
+    this.step(`reading ${machine}'s account and helper`);
+    const info=await remoteMetadata(remoteExec,machine);
     // The machine's DEFAULT OpenRig, always: a connection's `openrigHome` is a folder on THIS computer (the local CLI's OPENRIG_HOME), never sent to a
     // machine. v0.5.0 supports one OpenRig per added machine; two on one machine would need a home on the machine itself.
     // `defaultHome` (the spec helper's caller) is kept for its callers and means the same now.
     void defaultHome;
+    this.step(`checking OpenRig on ${machine}`);
     const statusResult=await remoteExec("env",["-i",`HOME=${info.home}`,`PATH=${info.searchPath}`,"rig","status","--json"]);
-    parse(statusResult,`Read OpenRig status on ${machine}`);
+    parse(statusResult,`read OpenRig's status on ${machine}`);
     const status=parseDaemonStatusJson(statusResult.stdout);
     if(!status.reachable||!status.daemonUrl||!isLoopbackDaemonUrl(status.daemonUrl))throw new Error(`OpenRig is not reachable on ${machine}. Check rig status on that machine.`);
-    const localHealth=await host.health(config.daemonUrl);
+    const localHealth=recorded?{selfHostId:recorded.hostId,recorded:true}:await host.health(config.daemonUrl);
     const remoteHealthResult=await remoteExec("curl",["--disable","--noproxy","*","--fail","--silent","--show-error","--max-time","5","--max-redirs","0",`${status.daemonUrl}/healthz`]);
     if(remoteHealthResult?.code!==0)throw Object.assign(new Error(`OpenRig isn't answering on ${machine}. Check rig status on that machine and the daemon tunnel, then retry. No local terminal was started.`),
       {machineNotice:{machine,body:`Check rig status on ${machine}. OpenRig isn't answering on ${machine}.`}});
-    const remoteHealth=parse(remoteHealthResult,`Check OpenRig on ${machine}`);
+    const remoteHealth=parse(remoteHealthResult,`check OpenRig on ${machine}`);
     const current=await this.ready(machine);
     if(JSON.stringify([current.target,current.id,current.via,current.session])!==JSON.stringify([record.target,record.id,record.via,record.session]))throw new Error("The Herdr machine changed during preparation. Retry and review it again.");
     return {record,info,status,localHealth,remoteHealth,remoteExec};
   }
+  /** The configured machine's account, home, PATH and node, read with fixed utilities there (no OpenRig involved). */
+  async machineInfo(config) {
+    const machine=config.daemonMachine;
+    return remoteMetadata((cmd,args)=>this.host.exec(cmd,args,{on:machine,timeout:15000}));
+  }
   async home(config) {
     try {
       const {record,info,status,localHealth,remoteHealth}=await this.readIdentity(config);
-      if(!localHealth?.selfHostId||localHealth.selfHostId!==remoteHealth.selfHostId)throw new Error("The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.");
+      if(!localHealth?.selfHostId||localHealth.selfHostId!==remoteHealth.selfHostId)throw new Error(identityMismatch(config,localHealth,remoteHealth));
       if(differentDaemons(localHealth,remoteHealth))throw new Error(`The tunnel and selected Herdr machine reach two different OpenRigs that share host ID ${localHealth.selfHostId}. Check daemonMachine and the tunnel destination.`); // a host.name-seeded id can be shared on one machine
       return {ok:true,machine:config.daemonMachine,profileId:record.id??record.name,home:info.home,searchPath:info.searchPath,daemonUrl:status.daemonUrl,selfHostId:localHealth.selfHostId,...(localHealth.selfHostIdSource?{selfHostIdSource:localHealth.selfHostIdSource}:{})};
     }catch(error){return remoteFailure(error,config.daemonMachine);}
@@ -166,11 +228,12 @@ export class RemoteMachine {
     try {
       const host=this.host,machine=config.daemonMachine;
       const {record,info,status,localHealth,remoteHealth,remoteExec}=await this.readIdentity(config);
-      if(!localHealth?.selfHostId||localHealth.selfHostId!==remoteHealth.selfHostId)throw new Error("The tunnel and selected Herdr machine do not report the same OpenRig host ID. Check daemonMachine and the tunnel destination.");
+      if(!localHealth?.selfHostId||localHealth.selfHostId!==remoteHealth.selfHostId)throw new Error(identityMismatch(config,localHealth,remoteHealth));
       if(differentDaemons(localHealth,remoteHealth))throw new Error(`The tunnel and selected Herdr machine reach two different OpenRigs that share host ID ${localHealth.selfHostId}. Check daemonMachine and the tunnel destination.`); // a host.name-seeded id can be shared on one machine
+      this.step(`checking the helper for ${machine}`);
       const localNode = config.rig?.[0]?.match(/(?:^|\/)node$/) ? config.rig[0] : "node";
       const fileHelper = host.relayPath.replace(/rig-attach-relay\.cjs$/, "rig-remote-files.cjs");
-      const shipped = parse(await host.exec(localNode, [fileHelper, "inspect"]), "Verify shipped relay");
+      const shipped = parse(await host.exec(localNode, [fileHelper, "inspect"]), "check herdrig's helper before it is installed");
       if (shipped.sha256 !== RELAY_SHA256) throw new Error("The relay hash does not match this release. Reinstall the mod.");
       const identity = { machine, target: record.target ?? "", id: record.id ?? "", via: record.via ?? "", session: record.session ?? "", home: info.home, daemonUrl: config.daemonUrl, selfHostId: localHealth.selfHostId };
       const key = JSON.stringify({ ...identity, sha256: RELAY_SHA256 });
@@ -186,19 +249,34 @@ export class RemoteMachine {
       // Re-read availability after the asynchronous identity and consent checks, immediately before writes.
       const current = await this.ready(machine);
       if (JSON.stringify([current.target, current.id, current.via, current.session]) !== JSON.stringify([record.target, record.id, record.via, record.session])) throw new Error("The Herdr machine changed during preparation. Retry and review it again.");
-      if (install && info.sha256 !== RELAY_SHA256) {
+      const installed = Boolean(install && info.sha256 !== RELAY_SHA256);
+      if (installed) {
         onProgress?.("install");
-        const written = parse(await host.exec(localNode, [fileHelper, "install", machine, info.home]), `Install relay on ${machine}`);
-        if (written.path !== info.path) throw new Error("Remote relay write returned an unexpected path.");
+        const written = parse(await host.exec(localNode, [fileHelper, "install", machine, info.home]), `install herdrig's helper on ${machine}`);
+        if (written.path !== info.path) throw new Error(`herdrig couldn't install its helper on ${machine} where it expected. Nothing was started.`);
       }
-      // Also covers unchanged relays and install:false. Never return a stale initial hash as readiness.
+      // Also covers unchanged relays and install:false. When nothing was installed, readIdentity already walked every
+      // path segment; re-checking canonical readlink -f, regular-file type and live SHA-256 catches any post-read change
+      // without repeating the 20-call directory walk.
       const verify = async () => {
-        const verified = await inspectRemote(remoteExec, info.home);
-        if (verified.path !== info.path || verified.sha256 !== RELAY_SHA256) throw new Error("Remote relay verification failed. No terminal was started.");
+        if (installed) {
+          const verified = await inspectRemote(remoteExec, info.home, machine);
+          if (verified.path !== info.path || verified.sha256 !== RELAY_SHA256) throw new Error(HELPER_NOT_OURS(machine));
+          return;
+        }
+        if (info.sha256 !== RELAY_SHA256) throw new Error(HELPER_NOT_OURS(machine));
+        const canon = await host.exec("readlink", ["-f", "--", info.path], { on: machine, timeout: 15000 });
+        const regular = await host.exec("test", ["-f", info.path], { on: machine, timeout: 15000 });
+        const hashed = await host.exec("sha256sum", ["--", info.path], { on: machine, timeout: 15000 });
+        if (canon?.code !== 0 || line(canon.stdout) !== info.path || regular?.code !== 0 || hashed?.code !== 0
+          || !/^[a-f0-9]{64} [ *]/.test(line(hashed.stdout)) || line(hashed.stdout).slice(0, 64) !== RELAY_SHA256) {
+          throw new Error(HELPER_NOT_OURS(machine));
+        }
       };
       onProgress?.("verify");await verify();
       if (consent && stored?.key !== key) { await host.writeConsent({ key }); await verify(); }
-      return { ok: true, machine, node: info.node, relayPath: info.path, daemonUrl: status.daemonUrl, selfHostId: localHealth.selfHostId };
+      return { ok: true, machine, node: info.node, relayPath: info.path, daemonUrl: status.daemonUrl, selfHostId: localHealth.selfHostId,
+        machineIdentity: JSON.stringify([record.target ?? "", record.id ?? "", record.via ?? "", record.session ?? ""]) };
     } catch (e) { return remoteFailure(e, config.daemonMachine); }
   }
 }
@@ -206,7 +284,7 @@ export class RemoteMachine {
 /** A read-only offer, never an implicit routing decision. Only connected persistent profiles are probed. */
 export async function detectDaemonMachine(host,config) {
   if(config?.daemonMachine||!config?.daemonUrl||!isLoopbackDaemonUrl(config.daemonUrl))return null;
-  const body=parse(await host.hc(["machine","ls","--json"]),"Read Herdr machines");
+  const body=parse(await host.hc(["machine","ls","--json"]),"list Herdr's machines");
   const rows=Array.isArray(body)?body:body.machines,matches=[];
   for(const record of rows??[]){
     if(record.temporary!==false||record.state!=="connected"||!MACHINE.test(record.name??""))continue;
@@ -223,21 +301,31 @@ export async function detectDaemonMachine(host,config) {
  *  is no local connection yet to check it against. `machineName` must be the caller's own already-filtered Herdr
  *  machine-list entry (connected, persistent) -- never a name read back from daemon or discovery output -- so this
  *  never probes a machine the person did not already have connected in Herdr. */
-export async function detectMachineOpenRig(host, machineName) {
+async function readMachineOpenRig(host, machineName) {
   if (typeof machineName !== "string" || !MACHINE.test(machineName)) return null;
   try {
     const remoteExec = (cmd, args) => host.exec(cmd, args, { on: machineName, timeout: 15000 });
-    const info = await remoteMetadata(remoteExec);
+    const info = await remoteMetadata(remoteExec, machineName);
     const statusResult = await remoteExec("env", ["-i", `HOME=${info.home}`, `PATH=${info.searchPath}`, "rig", "status", "--json"]);
-    boundedParse(statusResult, `Read OpenRig status on ${machineName}`);
+    const rawStatus = boundedParse(statusResult, `read OpenRig's status on ${machineName}`);
     const status = parseDaemonStatusJson(statusResult.stdout);
     if (!status.reachable || !status.daemonUrl || !isLoopbackDaemonUrl(status.daemonUrl)) return null;
     const healthResult = await remoteExec("curl", ["--disable", "--noproxy", "*", "--fail", "--silent", "--show-error", "--max-time", "5", "--max-redirs", "0", `${status.daemonUrl}/healthz`]);
-    const health = boundedParse(healthResult, `Check OpenRig on ${machineName}`);
+    const health = boundedParse(healthResult, `check OpenRig on ${machineName}`);
     if (typeof health?.selfHostId !== "string" || !health.selfHostId) return null;
     const portMatch = String(status.daemonUrl).match(/^https?:\/\/[^/:?#]+:(\d{1,5})(?:[/?#]|$)/i), port = portMatch ? portMatch[1] : null; // no `URL`: the Herdr mod runtime has none
-    return { machine: machineName, daemonUrl: status.daemonUrl, selfHostId: health.selfHostId, port };
-  } catch (_) { return null; }
+    const workspaceRoot = goodHome(rawStatus?.workspaceRoot?.value) ? rawStatus.workspaceRoot.value : null;
+    return {
+      found: { machine: machineName, daemonUrl: status.daemonUrl, selfHostId: health.selfHostId, port },
+      paths: { home: info.home, workspaceRoot },
+    };
+  } catch (e) { if (isCodeError(e)) throw e; return null; } // what the machine does is "nothing found"; herdrig's own error is raised
+}
+
+export async function detectMachineOpenRig(host, machineName) {
+  if (typeof machineName !== "string" || !MACHINE.test(machineName)) return null;
+  const details = await readMachineOpenRig(host, machineName);
+  return details ? details.found : null;
 }
 
 /** The offer for ONE machine, called once per connected machine that has no connection (never in a loop, never from daemon data):
@@ -248,9 +336,9 @@ export async function offerForMachine(host, machineName) {
   if (typeof machineName !== "string" || !MACHINE.test(machineName)) return null;
   let record;
   try {
-    const body = boundedParse(await host.hc(["machine", "ls", "--json"]), "Read Herdr machines");
+    const body = boundedParse(await host.hc(["machine", "ls", "--json"]), "list Herdr's machines");
     record = (Array.isArray(body) ? body : body.machines)?.find((m) => m?.name === machineName);
-  } catch (_) { return null; }
+  } catch (e) { if (isCodeError(e)) throw e; return null; }
   if (!record || record.temporary !== false || record.state !== "connected") return null;
   return { machine: machineName, target: record.target ?? null, session: record.session ?? null, found: await detectMachineOpenRig(host, machineName) };
 }
@@ -258,7 +346,7 @@ export async function offerForMachine(host, machineName) {
 /** The machines "Add a machine…" may offer: those Herdr lists as persistent and connected, with a name of the safe shape, that have no connection yet
  *  (`taken` is the machine names already used). Read from Herdr's own list only; each carries the {target, session} the gate pins. */
 export async function listAddableMachines(host, taken = []) {
-  const body = boundedParse(await host.hc(["machine", "ls", "--json"]), "Read Herdr machines");
+  const body = boundedParse(await host.hc(["machine", "ls", "--json"]), "list Herdr's machines");
   const rows = Array.isArray(body) ? body : body?.machines;
   if (!Array.isArray(rows)) return [];
   const used = new Set(taken.filter((n) => typeof n === "string"));
@@ -269,22 +357,13 @@ export async function listAddableMachines(host, taken = []) {
 /** The Herdr machine record the setup gate pins at open: name plus `target` and `session` when present, read only
  *  from Herdr's own machine list (`hc machine ls --json`), never from config or daemon data. */
 async function herdrMachineRecord(host, machineName) {
-  const body = boundedParse(await host.hc(["machine", "ls", "--json"]), "Read Herdr machines");
+  const body = boundedParse(await host.hc(["machine", "ls", "--json"]), "list Herdr's machines");
   const rows = Array.isArray(body) ? body : body.machines;
   const record = rows?.find((m) => m?.name === machineName);
   return record ? { target: record.target ?? null, session: record.session ?? null } : null;
 }
 const sameMachineRecord = (a, b) => Boolean(a && b) && a.target === b.target && a.session === b.session;
 
-// One key per loopback ADDRESS, so spellings of it compare equal: localhost, 127.0.0.1, [::1] and 0.0.0.0 with the same
-// scheme and port are one address; any other loopback (127.0.0.4) stays its own.
-const addressKey = (value) => {
-  const origin = localDaemonOrigin(value) ?? String(value);
-  const m = /^(https?):\/\/(\[[^\]]+\]|[^:/]+)(?::(\d+))?$/i.exec(origin);
-  if (!m) return origin;
-  const host = m[2].toLowerCase(), alias = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(host);
-  return `${m[1].toLowerCase()}|${alias ? "loopback" : host}|${m[3] ?? (m[1].toLowerCase() === "https" ? "443" : "80")}`;
-};
 /** The only commands the add-a-machine screen and the sidebar's offer run ON a machine that has no connection yet (so no gate scope can name it): the fixed,
  *  read-only checks of `detectMachineOpenRig` and nothing else. Each argument list must be exactly one of those shapes, and the machine must be the one it
  *  was made for; anything else is refused before it reaches Herdr. Used in place of a connection's gated exec, which refuses another machine by design. */
@@ -303,9 +382,22 @@ export function machineProbeExec(rawExec, machine) {
       || (command === "test" && a.length === 2 && ["-d", "-e", "-f", "-L"].includes(a[0]) && PROBE_PATH.test(a[1]))
       || (command === "sha256sum" && a.length === 2 && a[0] === "--" && PROBE_PATH.test(a[1]))
       || (command === "env" && a.length === 6 && a[0] === "-i" && /^HOME=/.test(a[1]) && PROBE_VALUE.test(a[1]) && /^PATH=/.test(a[2]) && PROBE_VALUE.test(a[2]) && sameList(a.slice(3), ["rig", "status", "--json"]))
-      || (command === "curl" && a.length === PROBE_CURL.length + 1 && sameList(a.slice(0, PROBE_CURL.length), PROBE_CURL) && localDaemonOrigin(a.at(-1).slice(0, -"/healthz".length)) === a.at(-1).slice(0, -"/healthz".length));
+      || (command === "curl" && a.length === PROBE_CURL.length + 1 && sameList(a.slice(0, PROBE_CURL.length), PROBE_CURL) && typeof a.at(-1) === "string" && a.at(-1).endsWith("/healthz") && localDaemonOrigin(a.at(-1).slice(0, -"/healthz".length)) === a.at(-1).slice(0, -"/healthz".length));
     if (!allowed) throw new Error("This screen only runs its fixed read-only checks on a machine.");
     return rawExec(command, [...a], { on: machine, timeout: 15000 });
+  };
+}
+
+/** Fixed local directory-existence check for Add a machine's OpenRig home warning: runs only `test -d <folder>` on this
+ *  computer (never on a machine) after `openrigHomeProblem` accepts the path shape. Returns true, false, or null if unknown. */
+export function localDirectoryProbe(execFn) {
+  if (typeof execFn !== "function") throw new Error("localDirectoryProbe needs an exec function.");
+  return async (folder) => {
+    if (openrigHomeProblem(folder)) return null;
+    try {
+      const result = await execFn("test", ["-d", folder], { timeout: 5000 });
+      return result?.code === 0 ? true : result?.code === 1 ? false : null;
+    } catch (_) { return null; }
   };
 }
 
@@ -348,6 +440,24 @@ export function loopbackHealthFetch(rawFetch, after, timeoutMs = 5000) {
   };
 }
 
+/** The OpenRigs this computer already has, for one question: is an address one of them. The connections the file lists (a one-connection file is one), plus every
+ *  address the caller's LIVE (CLI-enriched) config knows: a primary whose address the CLI found (a default install, no daemonUrl in the file) is not in the file,
+ *  but it is still an OpenRig a new one must not be mistaken for. Used by Check (before any request) and by Save (the guard that cannot be skipped). */
+function connectionsInUse(before, liveConfig) {
+  let raw = {};
+  try { raw = before ? JSON.parse(before) : {}; } catch (_) { throw new Error(CONFIG_NOT_JSON); }
+  const existing = [...connectionsOf(raw).connections];
+  // A connection switched to Herdr's connection still owns the tunnel address it kept for switching back: that address is in use too.
+  for (const c of [...existing]) if (typeof c?.retainedDaemonUrl === "string" && c.retainedDaemonUrl) existing.push({ id: c.id ?? null, daemonUrl: c.retainedDaemonUrl, expectedHostId: null });
+  if (liveConfig && typeof liveConfig === "object") {
+    const live = [liveConfig.daemonUrl, ...(Array.isArray(liveConfig.connections) ? liveConfig.connections.map((c) => c?.daemonUrl) : [])];
+    for (const daemonUrl of live) if (typeof daemonUrl === "string" && daemonUrl && !existing.some((c) => c.daemonUrl === daemonUrl)) existing.push({ id: null, daemonUrl, expectedHostId: null });
+  }
+  return existing;
+}
+const ADDRESS_IN_USE = "That address is already used by another OpenRig connection. Use a different tunnel address.";
+// Loopback spellings of one address are one address (localhost, 127.0.0.1, [::1], 0.0.0.0 with the same scheme and port; 127.0.0.4 stays distinct). Over-matching only refuses, the safe direction.
+const addressInUse = (existing, address) => { const key = addressKey(address); return existing.some((c) => c.daemonUrl && addressKey(c.daemonUrl) === key); };
 /** The interactive setup screen: one gate per open screen. It exposes exactly one
  *  operation -- `checkIdentity()`, `detectMachineOpenRig`'s own fixed call sequence and nothing else, no generic
  *  exec/fetch/hc passthrough -- against ONE machine name captured once at open from the person's own pick in
@@ -367,17 +477,22 @@ export function machineSetupGate(host, machineName, picked = null) {
   // `picked` is the {target, session} of the Herdr list row the person chose. With it, the record is pinned AT PICK
   // TIME and compared from the very first call; without it, the first call pins it (a machine removed and re-added
   // between the pick and the first check would then be pinned silently).
-  let expired = false, record = picked ? { target: picked.target ?? null, session: picked.session ?? null } : null, lastChecked = null, tunnel = null;
-  const recheck = async () => {
+  let expired = false, record = picked ? { target: picked.target ?? null, session: picked.session ?? null } : null, lastChecked = null, lastPaths = null, tunnel = null;
+  const checkLive = () => {
     if (expired) throw new Error("This setup check has expired. Reopen the machine setup screen.");
     if (gateConfigGeneration() !== generation) throw new Error("OpenRig's settings changed while this was open. Reopen it and check again.");
+  };
+  const recheck = async () => {
+    checkLive();
     const current = await herdrMachineRecord(host, machineName);
+    checkLive();
     if (!current) throw new Error(`${machineName} is no longer in Herdr's machine list. Reopen the setup screen.`);
     if (record === null) record = current;
     else if (!sameMachineRecord(record, current)) throw new Error(`${machineName} was removed and re-added in Herdr while this was open. Reopen it and check again.`);
   };
-  // The gate's one local operation: a plain GET of <origin>/healthz (no bearer, redirect manual, the 64KB refusal), through
-  // host.setupFetch only. Used for the person's tunnel and, read-only, for an existing connection's id (never a send of anything).
+  // The gate's one local operation: a plain GET of <origin>/healthz (no bearer, the 64KB refusal; loopbackHealthFetch ignores caller
+  // options since Herdr's runtime rejects `redirect`, and refuses redirects by checking `response.url`), through host.setupFetch only.
+  // Used for the person's tunnel and, read-only, for an existing connection's id (never a send of anything).
   const readHealthz = async (origin) => {
     const nothing = () => new Error(`Nothing answers at ${origin.replace(/^https?:\/\//, "")}. Start the tunnel (the command below), then check again.`);
     let text;
@@ -397,21 +512,29 @@ export function machineSetupGate(host, machineName, picked = null) {
      *  loopback address, meaningful only on the box (the remote curl); it is never a local address and is never saved. */
     async checkIdentity() {
       await recheck();
-      const result = await detectMachineOpenRig(host, machineName);
+      const details = await readMachineOpenRig(host, machineName);
       await recheck();
-      lastChecked = result;
+      lastChecked = details ? details.found : null;
+      lastPaths = details ? details.paths : null;
       tunnel = null; // a new box-side check invalidates an earlier tunnel check
-      return result;
+      return lastChecked;
     },
+    /** The checked remote home and workspaceRoot from the last successful `checkIdentity()`, or null. */
+    machinePaths() { return lastPaths ? { ...lastPaths } : null; },
     /** This computer's side ([Check]): reads /healthz THROUGH the tunnel address the person gave and
      *  requires its selfHostId to equal the machine's own. This gate's one extra fixed operation: a plain GET of
-     *  `<address>/healthz` (no bearer, redirect: manual, the same 64KB refusal), through `host.setupFetch`, and only
-     *  to a loopback address. Returns the checked {address, selfHostId}; throws the two refusal lines the screen shows. */
-    async checkTunnel(address) {
+     *  `<address>/healthz` (no bearer, redirects refused via `loopbackHealthFetch`'s final-address check, the same 64KB refusal), through `host.setupFetch`, and only
+     *  to a loopback address. Returns the checked {address, selfHostId}; throws the refusal lines the screen shows (an address already in use among them). */
+    async checkTunnel(address, { liveConfig } = {}) {
       if (!lastChecked) throw new Error("Check the machine before checking the tunnel.");
       const origin = localDaemonOrigin(address);
       if (!origin) throw new Error("The tunnel address must be a loopback address on this computer, such as http://127.0.0.1:7434.");
       if (typeof host.setupFetch !== "function") throw new Error("Herdr cannot check the tunnel from here.");
+      // An address one of this computer's OpenRigs already uses is said here, before any request, so a tick is never shown for what Save will refuse.
+      // A file that cannot be read or parsed is not this check's to judge: Save refuses it with its own line.
+      let before = null; try { before = typeof host.readConfig === "function" ? (await host.readConfig()) ?? null : null; } catch (_) { before = null; }
+      let used = []; try { used = connectionsInUse(before, liveConfig); } catch (_) { used = []; }
+      if (addressInUse(used, origin)) throw new Error(ADDRESS_IN_USE);
       await recheck();
       const health = await readHealthz(origin);
       await recheck();
@@ -433,19 +556,9 @@ export function machineSetupGate(host, machineName, picked = null) {
       if (!lastChecked || !tunnel) throw new Error("Check the machine and its tunnel before adding it.");
       // Required, so a caller that forgets it fails CLOSED: without the live (CLI-enriched) config a primary the CLI found is invisible here.
       if (!liveConfig || typeof liveConfig !== "object" || Array.isArray(liveConfig)) throw new Error("Saving needs this computer's live OpenRig settings, and none were given. Nothing was saved.");
-      let raw = {};
-      try { raw = before ? JSON.parse(before) : {}; } catch (_) { throw new Error("openrig/config.json is not valid JSON."); }
-      const existing = [...connectionsOf(raw).connections];
-      // The caller's LIVE config (CLI-enriched): a primary whose address the CLI found (a default install, no daemonUrl in the file)
-      // is not in `before`, but it is still an OpenRig this one must not be mistaken for. Its address and live id are compared too.
-      {
-        const live = [liveConfig.daemonUrl, ...(Array.isArray(liveConfig.connections) ? liveConfig.connections.map((c) => c?.daemonUrl) : [])];
-        for (const daemonUrl of live) if (typeof daemonUrl === "string" && daemonUrl && !existing.some((c) => c.daemonUrl === daemonUrl)) existing.push({ id: null, daemonUrl, expectedHostId: null });
-      }
-      // The address: loopback spellings of one address are one address (localhost, 127.0.0.1, [::1], 0.0.0.0 with the same
-      // scheme and port; 127.0.0.4 stays distinct). Over-matching only refuses, the safe direction.
-      const key = addressKey(tunnel.address);
-      for (const c of existing) if (c.daemonUrl && addressKey(c.daemonUrl) === key) throw new Error("That address is already used by another OpenRig connection. Use a different tunnel address.");
+      // The live config's addresses (a CLI-found primary) are compared too, and so is its live id further down.
+      const existing = connectionsInUse(before, liveConfig);
+      if (addressInUse(existing, tunnel.address)) throw new Error(ADDRESS_IN_USE);
       // The tunnel must still be what [Check] saw: re-read it right before the write (a tunnel re-pointed between [Check] and [Add]).
       const again = await readHealthz(tunnel.address);
       if (again?.selfHostId !== tunnel.selfHostId) throw new Error(`That address now reaches a different OpenRig${typeof again?.selfHostId === "string" ? ` (host ${again.selfHostId})` : ""}. Check the tunnel again.`);

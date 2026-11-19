@@ -15,14 +15,26 @@ async function headers(socket){
     return{status,head,initial:bytes};
   }
 }
-export async function openRigEventStream(connect,url,onSocket=()=>{}){
+// An OpenRig over Herdr's connection (herdr://<machine>/<hostId>) has no socket to open: `herdrSocket(url)` gives the transport's long-poll
+// socket, which answers like the stream below (an event-stream head, then SSE), so the reader after this is the same.
+export async function openRigEventStream(connect,url,onSocket=()=>{},herdrSocket=null){
+  if(url.protocol==="herdr:"){
+    if(!herdrSocket)throw new Error("This view can't read OpenRig's events over Herdr's connection.");
+    const socket=herdrSocket(url);onSocket(socket);
+    try{
+      await socket.write("GET /api/events HTTP/1.1\r\nAccept: text/event-stream\r\n\r\n");
+      const response=await headers(socket);
+      if(response.status!==200)throw new Error(`OpenRig's live updates stopped (error ${response.status}). The sidebar keeps what it last read and tries again.`);
+      return{socket,path:"herdr",initial:response.initial};
+    }catch(error){try{socket.close();}catch{}throw error;}
+  }
   for(const path of PATHS){
     const socket=await connect(url.hostname,Number(url.port||80));onSocket(socket);
     try{
       await socket.write(`GET ${path} HTTP/1.1\r\nHost: ${url.host}\r\nAccept: text/event-stream\r\n\r\n`);
       const response=await headers(socket);
       if(response.status===404&&path===PATHS[0]){socket.close();continue;}
-      if(response.status!==200)throw new Error(`OpenRig event stream returned HTTP ${response.status}.`);
+      if(response.status!==200)throw new Error(`OpenRig's live updates stopped (error ${response.status}). The sidebar keeps what it last read and tries again.`);
       if(!/^content-type:\s*text\/event-stream(?:[;\s]|$)/im.test(response.head))throw new Error("OpenRig event response is not an event stream.");
       return{socket,path,initial:response.initial};
     }catch(error){try{socket.close();}catch{}throw error;}

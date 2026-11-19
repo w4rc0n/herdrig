@@ -1,6 +1,6 @@
 import { div, svg } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input, Select, Popup } from "gpui-base";
-import { configRows, iconsAt } from "./rig-lib.js";
+import { configRows, iconsAt, requestFailed } from "./rig-lib.js";
 import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-editor.js";
 import { configDefinition, validateConfigValue,configPairPlan,CONFIG_TERMINAL_KEYS } from "./rig-config-schema.js";
 import { configWriteError, writeDaemonConfig, readDaemonConfig,configOperationRequest,CONFIG_SAVE_TIMEOUT,configRejectedSaveResidual,configWriteState,waitForConfigWrites,beginConfigReconcile,finishConfigReconcile,failConfigReconcile,configReconcileResult,closeConfigWrites } from "./rig-config-write.js";
@@ -53,7 +53,7 @@ export class ConfigPanel {
       // The page now shows another connection (or this one's address changed). An open edit is NOT dropped: its typed values are frozen
       // as a draft the person can copy, nothing is sent, and the panel rebinds to the new connection.
       const row=this.model?.row,touched=row?Object.keys(row.touched??{}).filter(k=>row.values?.[k]!==row.initial?.[k]):[];
-      if(this.boundIdentity!==undefined&&row&&touched.length)this.frozenDraft={from:this.daemonNameOf(this.boundIdentity),values:touched.map(k=>[k,row.values[k]])};
+      if(this.boundIdentity!==undefined&&row&&touched.length){this.frozenDraft={from:this.daemonNameOf(this.boundIdentity),values:touched.map(k=>[k,row.values[k]])};this.keyboardLatches?.delete("config-connection-draft-dismiss");}
       this.releaseInputs(); this.selected=null;this.model = new ConfigEditor(identity); this.boundOrigin = origin;this.boundIdentity=identity;this.nextKey=null;
     }
     this.model.observe(browser);
@@ -127,7 +127,7 @@ export class ConfigPanel {
   }
   async refresh(origin,request=fetch,model=this.model,identity=this.identity()) {
     const response = await request(`${origin.replace(/\/$/, "")}/api/config?view=browser`);
-    if (!response.ok) throw new Error(`GET configuration → ${response.status}`);
+    if (!response.ok) throw new Error(requestFailed("its settings", response.status));
     const data = await response.json();
     return this.applyRefresh(data,origin,model,identity);
   }
@@ -417,7 +417,10 @@ export class ConfigPanel {
         .child(div().text_size(12).text_color(t.muted).child(`Your edit for ${d.from} wasn't saved: ${d.values.map(([k,v])=>`${k} = ${v}`).join(", ")}. Copy it, then set it again where you want it.`))
         .child(h_flex().gap(8).items_center()
           .child(h_flex().id("config-connection-draft-copy").gap(4).items_center().child(this.page.copyButton(t,text,"config-connection-draft","my text")).child(div().text_size(12).text_color(t.muted).child("Copy my text")))
-          .child(div().id("config-connection-draft-dismiss").text_size(12).text_color(t.muted).cursor_pointer().on_click((_e,ctx)=>{this.frozenDraft=null;ctx.notify();}).child("Dismiss"))));
+          .child(this.focusControl(t,cx,"config-connection-draft-dismiss",
+            div().id("config-connection-draft-dismiss").px(6).py(2).rounded(4).text_size(12).text_color(t.muted).cursor_pointer().hover(s=>s.bg(t.hover))
+              .on_click((_e,ctx)=>{this.keyboardLatches?.delete("config-connection-draft-dismiss");this.frozenDraft=null;ctx.notify();}).child("Dismiss"),
+            (_e,ctx)=>{this.frozenDraft=null;ctx.notify();}))))
     }
     if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(m.errorTone==='working'?t.working:t.blocked).child(m.error));
     if(this.reconciledModel===m){

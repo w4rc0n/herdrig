@@ -35,7 +35,10 @@ export function entryWithPageView(entry, view, {preserveScope=false}={}) {
   else if(kind==='workflow')next.workflowTab=view;
   else if(kind==='mission')next.missionTab=view;
   else if(kind==="seat")next.seatTab=view;
-  else if(kind==="needs")next.needsTab=view;
+  else if(kind==="needs"){
+    next.needsTab=view;
+    if(!preserveScope)delete next.showDismissed;
+  }
   else if(kind==="spec")next.specTab=view;
   else if(kind==="system"){
     next.subview=view; // Explicit Overview must beat a remembered Health tab.

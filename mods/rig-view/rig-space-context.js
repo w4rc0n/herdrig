@@ -10,13 +10,46 @@ const qualifiedSpace = terminal => {
 };
 
 // HTTP origins keep their scheme and port. Only the three loopback host spellings are aliases.
-export function rigOrigin(value) {
+// An OpenRig over Herdr's connection is herdr://<machine>/<selfHostId>: its own origin, never equal to an http one by spelling.
+const HERDR_ORIGIN=/^herdr:\/\/([a-z0-9][a-z0-9._-]{0,31})\/([A-Za-z0-9._:-]{1,128})\/?$/;
+// A connection switched between its tunnel and Herdr's connection keeps the address it left (retainedDaemonUrl). Its seats and spaces may be
+// labelled with that origin, so that EXACT origin counts as the current one, and Attach reuse and one rig == one space keep working on either
+// road. The map is rebuilt from the config's own records whenever a mod reads its config (syncRetainedOrigins), so removing the connection or
+// editing it drops the alias. It's written only by the switch, after the tunnel's own /healthz named the host id the helper reached; a kept
+// herdr:// address counts only while it names the connection's own machine and recorded host id. Only the exact origin is aliased (another
+// loopback spelling is another OpenRig, such as this computer's own on 127.0.0.1), and never one another listed connection uses now.
+let retained=new Map();
+/** Rebuilds the switched connections' old-origin aliases from `config` (its connections list). Call wherever a mod takes a new config. */
+export function syncRetainedOrigins(config){
+  const list=Array.isArray(config?.connections)?config.connections:[],next=new Map();
+  const herdrOf=(value)=>{const m=HERDR_ORIGIN.exec(String(value??""));return m?`herdr://${m[1]}/${m[2]}`:null;};
+  const originOf=(value)=>herdrOf(value)??httpOrigin(value);
+  for(const c of list){
+    const to=herdrOf(c?.daemonUrl),from=httpOrigin(c?.retainedDaemonUrl);
+    let pair=to&&from?[from,to]:null;
+    // Switched back: the tunnel is current and the herdr:// address it left is kept. It names this machine and this connection's recorded host.
+    const back=HERDR_ORIGIN.exec(String(c?.retainedDaemonUrl??"")),tunnel=httpOrigin(c?.daemonUrl);
+    if(!pair&&back&&tunnel&&back[1]===c?.machine&&back[2]===c?.expectedHostId)pair=[`herdr://${back[1]}/${back[2]}`,tunnel];
+    if(!pair)continue;
+    if(list.some(o=>o!==c&&originOf(o?.daemonUrl)===pair[0]))continue; // that address is another live connection's: never aliased away
+    next.set(pair[0],pair[1]);
+  }
+  retained=next;
+}
+export function forgetRetainedOrigins(){retained=new Map();}
+function httpOrigin(value){
   const match=/^(https?):\/\/(localhost|127\.0\.0\.1|\[::1\]|[a-z0-9._-]+)(?::([0-9]+))?\/?$/i.exec(String(value??""));
   if(!match)return null;
   const scheme=match[1].toLowerCase(),rawHost=match[2].toLowerCase(),host=["localhost","[::1]"].includes(rawHost)?"127.0.0.1":rawHost;
   const port=match[3]===undefined?null:Number(match[3]);
   if(port!==null&&(!Number.isInteger(port)||port<1||port>65535))return null;
   return `${scheme}://${host}${port!==null&&port!==(scheme==="https"?443:80)?":"+port:""}`;
+}
+export function rigOrigin(value) {
+  const herdr=HERDR_ORIGIN.exec(String(value??""));
+  if(herdr){const origin=`herdr://${herdr[1]}/${herdr[2]}`;return retained.get(origin)??origin;}
+  const origin=httpOrigin(value);
+  return origin===null?null:retained.get(origin)??origin;
 }
 const get=(host,key)=>(typeof host[key]==="function"?host[key]():host[key])??[];
 // On a configured Herdr machine the daemon is that machine's OpenRig, reached through a tunnel whose local address can be spelled
@@ -72,12 +105,30 @@ const nameSet=names=>new Set((Array.isArray(names)?names:[names]).filter(Boolean
 const rigLabel=labels=>labels["herdr-openrig.rig"]||labels["openrig.rig"];
 /** The daemon's host id as it may be written in a label (letters, digits and . _ : - only). */
 export const hostLabelValue=hostId=>typeof hostId==="string"&&/^[A-Za-z0-9._:-]{1,128}$/.test(hostId)?hostId:null;
-const rigTerminals=(host,space,rigNames)=>get(host,"terminals").filter(t=>qualifiedSpace(t)===space.id&&rigNames.has(rigLabel(t.labels??{})));
+function indexRigTerminalsBySpace(terminals,rigNames,machine=undefined){
+  const bySpace=new Map(),prefix=machine?`${machine}/`:null;
+  for(const terminal of terminals){
+    const a=String(terminal?.address??terminal?.terminal??"");
+    if(machine!==undefined&&(prefix?!a.startsWith(prefix):a.includes("/")))continue;
+    const labels=terminal?.labels??{};
+    if(!rigNames.has(rigLabel(labels)))continue;
+    const rawSpace=labels["herdr.space"];
+    if(!rawSpace)continue;
+    const spId=a.includes("/")&&!rawSpace.includes("/")?`${a.slice(0,a.indexOf("/"))}/${rawSpace}`:rawSpace;
+    let bucket=bySpace.get(spId);
+    if(!bucket){bucket=[];bySpace.set(spId,bucket);}
+    bucket.push({terminal,labels});
+  }
+  return bySpace;
+}
+const rigTerminalsFrom=(terminals,space,rigNames)=>indexRigTerminalsBySpace(terminals,rigNames).get(space.id)?.map(e=>e.terminal)??[];
+const rigTerminals=(host,space,rigNames)=>rigTerminalsFrom(get(host,"terminals"),space,rigNames);
 
 /** Classify every relevant terminal, including unstamped ones. A stamp is evidence, never authentication. */
-export function classifyRigSpace(host,config,names,space,liveId){
+export function classifyRigSpace(host,config,names,space,liveId,terminalsList=null){
   const expected=rigOrigin(config?.daemonUrl),own=hostLabelValue(liveId);
-  const terminals=rigTerminals(host,space,nameSet(names)).map(terminal=>{
+  const source=terminalsList??get(host,"terminals");
+  const terminals=rigTerminalsFrom(source,space,nameSet(names)).map(terminal=>{
     const labels=terminal.labels??{},origin=labels["herdr-openrig.origin"],stamp=hostLabelValue(labels["herdr-openrig.host"]);
     const kind=origin&&sameDaemonOrigin(origin,expected,config?.daemonMachine)?"ours"
       :!origin&&labels["herdr-openrig.rig"]?"ours-legacy"
@@ -151,8 +202,9 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
   const machine=config?.daemonMachine||null,expected=rigOrigin(config?.daemonUrl),rigNames=nameSet(names);
   const pinnedId=value=>{const conn=value?.connections?.find(c=>c.id===value.connectionId);return conn?conn.expectedHostId:value?.expectedHostId;};
   const expectedHostId=pinnedId(config);
-  const candidates=get(host,"spaces").filter(space=>(space.machine??(String(space.id).includes("/")?space.id.split("/")[0]:null))===machine
-    &&rigTerminals(host,space,rigNames).some(t=>t.labels?.["herdr-openrig.origin"]&&!sameDaemonOrigin(t.labels["herdr-openrig.origin"],expected,machine)));
+  const initialSpaces=get(host,"spaces"),initialBySpace=indexRigTerminalsBySpace(get(host,"terminals"),rigNames,machine);
+  const candidates=initialSpaces.filter(space=>(space.machine??(String(space.id).includes("/")?space.id.split("/")[0]:null))===machine
+    &&(initialBySpace.get(space.id)??[]).some(({labels:l})=>l["herdr-openrig.origin"]&&!sameDaemonOrigin(l["herdr-openrig.origin"],expected,machine)));
   if(!candidates.length)return {ok:true,space:null};
   const generation=host.gateToken?.()??gateGeneration(config?.connectionId);
   const current=()=>{
@@ -162,7 +214,7 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
     return generationCurrent
       &&(!host.currentConfig||live&&!live.configInvalid&&gateSameConfig(config,live)&&rigOrigin(live.daemonUrl)===expected&&pinnedId(live)===expectedHostId);
   };
-  const oldOrigins=[...new Set(candidates.flatMap(space=>rigTerminals(host,space,rigNames).map(t=>t.labels?.["herdr-openrig.origin"]).filter(Boolean)))];
+  const oldOrigins=[...new Set(candidates.flatMap(space=>(initialBySpace.get(space.id)??[]).map(({labels:l})=>l["herdr-openrig.origin"]).filter(Boolean)))];
   const refuse=reason=>({ok:false,unconfirmedSpace:true,reason:`Herdr cannot tell whether the existing space made with ${oldOrigins.join(", ")} belongs to ${config.daemonUrl}. ${reason} ${unconfirmedSpaceNextSteps(candidates[0].name??[...rigNames].at(-1)??"the rig")}`});
   if(!current())return refuse("OpenRig's connection changed. No space was adopted.");
   let identity;
@@ -175,7 +227,8 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
   const liveId=hostLabelValue(identity?.selfHostId);
   if(!liveId||identity?.ok===false)return refuse("OpenRig did not confirm its live host identity. No space was adopted.");
   if(expectedHostId&&expectedHostId!==liveId)return refuse("OpenRig's live host identity does not match the expected host. Nothing was opened or relabelled.");
-  const decisions=candidates.map(space=>({space,...classifyRigSpace(host,config,names,space,liveId)}));
+  const liveTerminals=get(host,"terminals");
+  const decisions=candidates.map(space=>({space,...classifyRigSpace(host,config,names,space,liveId,liveTerminals)}));
   const excluded=new Set(decisions.filter(d=>d.kind==="theirs").map(d=>d.space.id));
   const scoped={...host,selfHostId:()=>liveId,
     spaces:()=>get(host,"spaces").filter(s=>!excluded.has(s.id)),
@@ -187,7 +240,7 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
   if(selected.length>1)return refuse("More than one existing space matches this OpenRig's host identity. No space was adopted.");
   if(!selected.length)return {ok:true,space:null,hostId:liveId,host:scoped};
   const decision=selected[0];
-  const snapshot=JSON.stringify(classifyRigSpace(host,config,names,decision.space,liveId));
+  const snapshot=JSON.stringify({kind:decision.kind,terminals:decision.terminals});
   const key=JSON.stringify([config?.connectionId??null,decision.space.id]);
   const automatic=identity.selfHostIdSource==="generated"||sessionVouch(decision.terminals,options);
   const binding=JSON.stringify([gateIdentity(config),expectedHostId,generation,liveId,identity.selfHostIdSource,automatic,snapshot]);
@@ -307,21 +360,22 @@ async function relabelRigSpaceOrigin(host,config,decision,current){
  *     seat session, and every such session is one the configured daemon lists for this rig. Those terminals attach to tmux ON that machine,
  *     where a session name is one per tmux server and only the OpenRig that manages it lists it; a host-local daemon's space lives on Local
  *     and fails the machine check before this runs. */
-function vouched(host,space,rigNames,{sessions=null,hostId=null,servers=null}={}){
-  const terminals=rigTerminals(host,space,rigNames);
-  const stamps=terminals.map(t=>t.labels?.["herdr-openrig.host"]).filter(value=>value!==undefined&&value!==null&&value!=="");
+function vouched(host,space,rigNames,{sessions=null,hostId=null,servers=null,terminals:terminalsList=null}={}){
+  const terminals=terminalsList?rigTerminalsFrom(terminalsList,space,rigNames):rigTerminals(host,space,rigNames);
+  const terminalLabels=terminals.map(t=>({terminal:t,labels:t.labels??{}}));
+  const stamps=terminalLabels.map(x=>x.labels["herdr-openrig.host"]).filter(value=>value!==undefined&&value!==null&&value!=="");
   if(stamps.length){
     const own=hostLabelValue(hostId);
     if(!own)return "unknown";
     return stamps.every(stamp=>stamp===own)?"same":"other";
   }
   const listed=new Set(Array.isArray(sessions)?sessions:sessions instanceof Set?[...sessions]:[]);
-  const seats=terminals.map(t=>t.labels?.["herdr-openrig.seat"]).filter(Boolean);
+  const seats=terminalLabels.map(x=>x.labels["herdr-openrig.seat"]).filter(Boolean);
   if(!(seats.length>0&&seats.every(session=>listed.has(session))))return "unknown";
   // When both sides say which tmux server the seat is on, they must say the same one. A deliberate exclusion remains: two daemons on one
   // machine sharing an identical tmux socket and identical session names cannot be told apart without the host stamp.
-  for(const terminal of terminals){
-    const session=terminal.labels?.["herdr-openrig.seat"],wanted=servers instanceof Map?servers.get(session):undefined,actual=viewerServerFlags(terminal.labels);
+  for(const {labels} of terminalLabels){
+    const session=labels["herdr-openrig.seat"],wanted=servers instanceof Map?servers.get(session):undefined,actual=viewerServerFlags(labels);
     if(session&&wanted&&actual&&JSON.stringify(wanted)!==JSON.stringify(actual))return "unknown";
   }
   return "same";
@@ -331,20 +385,25 @@ export const vouchedSpace=vouched;
 /** A rig space whose only content is the Rig page (its seat and Attach tabs were closed): no terminal is left to carry a label, and a mod pane carries none, so nothing durable names the rig.
  *  It is recognised by OUR creation signature plus the rig's name, never by a name alone: the id starts `sp-openrig-` (and is not the OpenRig home space), the space has no terminal at
  *  all, exactly one tab and that tab holds only a Rig page. */
-function pageOnlyRigSpace(host,context,rigNames){
+function pageOnlyRigSpace(host,context,rigNames,lists=null){
   const {space}=context,id=String(space.id),local=id.includes("/")?id.slice(id.indexOf("/")+1):id;
   if(context.home||!local.startsWith("sp-openrig-")||local.startsWith("sp-openrig-home-")||!rigNames.has(space.name))return false;
   if((space.tabs??[]).length!==1)return false;
-  if(get(host,"terminals").some(t=>qualifiedSpace(t)===space.id))return false;
-  const tabs=new Set(space.tabs.map(t=>t.id)),inSpace=get(host,"panes").filter(p=>tabs.has(p.tab));
+  const terminals=lists?.terminals??get(host,"terminals"),panes=lists?.panes??get(host,"panes");
+  if(terminals.some(t=>qualifiedSpace(t)===space.id))return false;
+  const tabs=new Set(space.tabs.map(t=>t.id)),inSpace=panes.filter(p=>tabs.has(p.tab));
   return inSpace.length>0&&inSpace.every(p=>!p.terminal&&p.mod==="rig-view");
 }
 function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,servers=null,strictOrigin=false}={}){
   const expected=rigOrigin(config?.daemonUrl);if(!expected)return {space:null,unconfirmed:null};
   const rigNames=nameSet(names),machine=config?.daemonMachine||null;
   const state=host.routeState?.()??host.shared?.("rig.spaceState")??{};
-  const onMachine=openRigSpaceContext(get(host,"spaces"),get(host,"terminals"),get(host,"panes"),state)
-    .filter(context=>(context.space.machine??(context.id.includes("/")?context.id.split("/")[0]:null))===machine);
+  const spacesOnMachine=get(host,"spaces").filter(sp=>(sp.machine??(String(sp.id??"").includes("/")?String(sp.id).split("/")[0]:null))===machine);
+  if(!spacesOnMachine.length)return {space:null,unconfirmed:null};
+  const prefix=machine?`${machine}/`:null;
+  const terminals=get(host,"terminals").filter(t=>{const a=String(t?.address??t?.terminal??"");return prefix?a.startsWith(prefix):!a.includes("/");});
+  const panes=get(host,"panes");
+  const onMachine=openRigSpaceContext(spacesOnMachine,terminals,panes,state);
   const links=context=>markedOnly?context.markedRigLinks:context.rigLinks;
   // strictOrigin (every path that adopts, marks or builds into a space): a rig terminal with an origin must carry THIS daemon's. One WITHOUT an origin counts only when it carries OUR rig label
   // (herdr-openrig.rig: a space an older herdrig wrote before the origin label existed, which markRigSpace never gave one); a terminal labelled only in OpenRig's native namespace
@@ -364,7 +423,7 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   // A rig space made with an origin that is not this daemon's (and no terminal of ours in it) is either CONFIRMED to be another OpenRig's (its host stamp is another daemon's: the open builds its own space beside it) or
   // CANNOT BE TOLD (no stamp, or a stamp we cannot compare: it may be this daemon at a new address): the open asks and writes nothing (RC9e), the same way it asks for a space it cannot vouch for.
   if(strictOrigin&&!markedOnly){
-    const undecided=onMachine.filter(foreign).map(context=>({context,verdict:vouched(host,context.space,rigNames,{sessions,hostId,servers})})).find(item=>item.verdict!=="other");
+    const undecided=onMachine.filter(foreign).map(context=>({context,verdict:vouched(host,context.space,rigNames,{sessions,hostId,servers,terminals})})).find(item=>item.verdict!=="other");
     if(undecided){
       const link=links(undecided.context).find(item=>rigNames.has(item.rig)&&item.origin&&!sameOrigin(item.origin,expected,machine));
       return {space:null,unconfirmed:{space:undecided.context.space,origin:link?.origin??null,foreign:true}};
@@ -373,7 +432,7 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   // The last resort for the open that may adopt (not background activation): the rig's page-only space. One candidate is adopted; several are asked about, never guessed.
   const pageOnly=()=>{
     if(markedOnly)return {space:null,unconfirmed:null};
-    const found=onMachine.filter(context=>pageOnlyRigSpace(host,context,rigNames));
+    const found=onMachine.filter(context=>pageOnlyRigSpace(host,context,rigNames,{terminals,panes}));
     // A page-only space names no daemon (a mod pane carries no label): with two OpenRig connections on this machine
     // it may be the other one's, so it is never silently adopted here. But when a candidate DOES exist, say so as an
     // unconfirmed candidate rather than returning nothing: a caller that asks the person cannot build a second space
@@ -386,7 +445,7 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   };
   if(!machine)return pageOnly();
   const loose=onMachine.filter(context=>!foreign(context)&&links(context).some(link=>rigNames.has(link.rig)&&counts(link,machine)))
-    .map(context=>({context,verdict:vouched(host,context.space,rigNames,{sessions,hostId,servers})}));
+    .map(context=>({context,verdict:vouched(host,context.space,rigNames,{sessions,hostId,servers,terminals})}));
   const same=loose.filter(item=>item.verdict==="same").map(item=>item.context);
   if(same.length)return {space:(same.find(context=>context.space.active)??same[0]).space,unconfirmed:null};
   const unknown=loose.find(item=>item.verdict==="unknown")?.context;
@@ -402,7 +461,10 @@ export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl,other=null
 export function topologyRig(host,refs,config){
   // The sidebar's rows vouch only for the daemon they were read from: the same gate as every other reader of `rig.data` (a refused list or no config reads nothing; other settings' rows are not used).
   const published=host.topology?null:host.shared?.("rig.data");
-  const topology=host.topology?.()??(config&&!config.configInvalid&&publishedUnder(config,published)?published?.topology:null)??[];
+  const conn=config?.connectionId??null,multi=(config?.connections?.length??0)>1;
+  const ownPublished=conn&&published?.byConnection?.[conn]?.topology?published.byConnection[conn].topology:published?.topology;
+  const raw=host.topology?.()??(config&&!config.configInvalid&&publishedUnder(config,published)?ownPublished:null)??[];
+  const topology=conn?raw.filter(rig=>rig?.conn?rig.conn===conn:!multi):raw;
   const wanted=(refs??[]).filter(Boolean);
   return topology.find(rig=>wanted.some(ref=>rig.id===ref||rig.name===ref))??null;
 }
@@ -462,10 +524,11 @@ export async function markRigSpace(host,config,names,space,{sessions=null,hostId
   const expected=rigOrigin(config?.daemonUrl),rigNames=nameSet(names);
   if(!space||!expected)return;
   const machine=config?.daemonMachine||null,configured=String(config.daemonUrl).replace(/\/$/,"");
-  const adopted=machine?vouched(host,space,rigNames,{sessions,hostId,servers})==="same":false,stamp=hostLabelValue(hostId);
-  for(const terminal of get(host,"terminals")){
-    const labels=terminal.labels??{};
-    if(qualifiedSpace(terminal)!==space.id||!rigNames.has(labels["herdr-openrig.rig"]??labels["openrig.rig"]))continue;
+  const spaceRigEntries=indexRigTerminalsBySpace(get(host,"terminals"),rigNames,machine).get(space.id)??[];
+  if(!spaceRigEntries.length)return;
+  const spaceTerminals=spaceRigEntries.map(e=>e.terminal);
+  const adopted=machine?vouched(host,space,rigNames,{sessions,hostId,servers,terminals:spaceTerminals})==="same":false,stamp=hostLabelValue(hostId);
+  for(const {terminal,labels} of spaceRigEntries){
     // Backstop: a terminal with no origin is stamped only when it carries OUR rig label; OpenRig's native seats (openrig.* labels alone) are never ours to stamp.
     if(!labels["herdr-openrig.origin"]&&!labels["herdr-openrig.rig"])continue;
     const exact=sameOrigin(labels["herdr-openrig.origin"],expected);
@@ -486,18 +549,41 @@ export async function markRigSpace(host,config,names,space,{sessions=null,hostId
 }
 
 export function openRigSpaceContext(spaces = [], terminals = [], panes = [], state = {}, viewMod = "rig-view") {
+  const termsBySpace = new Map();
+  for (const terminal of terminals) {
+    const labels = terminal?.labels ?? {};
+    const rawSpace = labels["herdr.space"];
+    if (!rawSpace) continue;
+    const address = String(terminal?.address ?? terminal?.terminal ?? "");
+    const spId = address.includes("/") && !rawSpace.includes("/") ? `${address.slice(0, address.indexOf("/"))}/${rawSpace}` : rawSpace;
+    let bucket = termsBySpace.get(spId);
+    if (!bucket) { bucket = []; termsBySpace.set(spId, bucket); }
+    bucket.push({ terminal, labels });
+  }
+  const panesByTab = new Map();
+  for (const p of panes) {
+    let bucket = panesByTab.get(p?.tab);
+    if (!bucket) { bucket = []; panesByTab.set(p?.tab, bucket); }
+    bucket.push(p);
+  }
+  const homeSpaceSet = new Set(Object.values(state.homeSpaces ?? {}));
   return spaces.map(space => {
-    const terms = terminals.filter(t => qualifiedSpace(t) === space.id);
-    const tabs = new Set((space.tabs ?? []).map(t => t.id));
-    const pages = panes.filter(p => p.mod === viewMod && tabs.has(p.tab));
+    const termEntries = termsBySpace.get(space.id) ?? [];
+    const spacePanes = [];
+    for (const tb of space.tabs ?? []) {
+      const bucket = panesByTab.get(tb.id);
+      if (bucket) spacePanes.push(...bucket);
+    }
+    const pages = spacePanes.filter(p => p.mod === viewMod);
+    const liveTerminalsInSpace = new Set(spacePanes.map(p => p.terminal).filter(Boolean));
     const rigs = new Set();
     const rigLinks = [];
     const markedRigLinks = [];
     let rigOwned = false;
-    for (const terminal of terms) {
-      const labels = terminal.labels ?? {};
-      const own = ownsRigSpace(labels);
-      if (own) {
+    let homeMarked = false;
+    const tuis = [];
+    for (const { terminal, labels } of termEntries) {
+      if (ownsRigSpace(labels)) {
         rigOwned = true;
         const rig = labels["herdr-openrig.rig"] || labels["openrig.rig"];
         if (rig) {
@@ -505,11 +591,10 @@ export function openRigSpaceContext(spaces = [], terminals = [], panes = [], sta
           if(labels["herdr-openrig.space"]==="1")markedRigLinks.push(link);
         }
       }
+      if (labels["herdr-openrig.home"] === "1" && liveTerminalsInSpace.has(terminal.address)) homeMarked = true;
+      if (labels["herdr-openrig.role"] === "tui" && liveTerminalsInSpace.has(terminal.address)) tuis.push(terminal);
     }
-    const currentTerminal = t => panes.some(p=>p.terminal===t.address&&tabs.has(p.tab));
-    const home = state.homeSpace === space.id || Object.values(state.homeSpaces??{}).includes(space.id)
-      || terms.some(t => t.labels?.["herdr-openrig.home"] === "1"&&currentTerminal(t));
-    const tuis = terms.filter(t => t.labels?.["herdr-openrig.role"] === "tui"&&currentTerminal(t));
+    const home = state.homeSpace === space.id || homeSpaceSet.has(space.id) || homeMarked;
     const legacy = !home && !rigOwned && (pages.length > 0 || tuis.length > 0);
     return { space, id: space.id, owned: Boolean(home || rigOwned || legacy), home, rigs: home ? [] : [...rigs], rigLinks, markedRigLinks, pages, tuis, legacy };
   });

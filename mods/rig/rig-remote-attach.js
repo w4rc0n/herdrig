@@ -1,9 +1,12 @@
 import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, rigSeatServers, layoutHasMod, MOD_IDS, relayIdentity } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
 import { commandFor, operatorCommandFor } from "./rig-connections.js";
+import { gatedOperationOrRefusal } from "./rig-gate.js";
 import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, topologyRig, rigSessions, markRigSpace, rigOrigin, hostLabelValue, prepareRigSpaceAdoption } from "./rig-space-context.js";
 
 const list = (host, key) => (typeof host[key] === "function" ? host[key]() ?? [] : host[key] ?? []);
+// A caller that gave up (its deadline passed) gets nothing started, focused or replaced afterwards.
+const stopIfCancelled = (host) => { if (host.cancelled?.()) throw new Error("Stopped: the request took too long. Nothing was started."); };
 
 // Called only for an explicitly configured daemonMachine. Every failure is terminal: never a local fallback.
 export async function attachRemoteSeat(host, seat, config, options = {}) {
@@ -17,9 +20,17 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     }
     return { ok: false, reason: "Open the Rig sidebar to confirm and use the configured Herdr machine. No local terminal was started." };
   }
+  // ONE operation for the whole flow, as the local Attach has: the preparations, the space marking and the stop of an older viewer all belong to the settings this Attach began
+  // under. Per-send checks judge each send alone, and the origin check needs two connections, so with one an edit of the machine or address mid-flow went unseen and the
+  // viewer started on the old machine. `changed()` is the last look before an act (null with no operation: the gate refuses every gated send itself).
+  const op = gatedOperationOrRefusal(config?.connectionId);
+  const changed = () => { if (op.since < 0) return null; try { op.check(); return null; } catch (error) { return { ok: false, disabled: true, reason: String(error?.message ?? error) }; } };
+  const asAttachFailure = (res) => res?.execTimeout && typeof res.reason === "string"
+    ? { ...res, reason: res.reason.replace(/^Stopped:/, "Attach stopped:") }
+    : res;
   try {
     const remote = await host.prepareRemote(config);
-    if (!remote.ok) return remote;
+    if (!remote.ok) return asAttachFailure(remote);
     if (seat.host && seat.host !== "local" && seat.host !== remote.selfHostId) throw new Error("This seat belongs to a different OpenRig host. No terminal was started.");
     const adoptionNames=[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)],adoptionRig=topologyRig(host,adoptionNames,config);
     const adoption=await prepareRigSpaceAdoption(host,config,adoptionNames,{sessions:rigSessions(adoptionRig),servers:rigSeatServers(adoptionRig)});
@@ -37,9 +48,12 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
       && rigOrigin(t.labels?.["herdr-openrig.origin"]) === rigOrigin(origin) && t.labels?.["herdr-openrig.role"] === "attach"
       && relayIdentity(t.argv) === relayIdentity(argv) && (!t.state || ["running", "live"].includes(t.state)));
     const reuse = async (existing) => {
+      stopIfCancelled(host);
       const tab = qualified(existing.labels["herdr.tab"]);
       const destination=resolveRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)],{strictOrigin:true});
       if(destination?.tabs?.some(item=>item.id===tab))await markRigSpace(host,config,[seat.rig,seat.rigId,session.slice(session.lastIndexOf("@")+1)],destination);
+      stopIfCancelled(host);
+      const movedBeforeFocus = changed(); if (movedBeforeFocus) return movedBeforeFocus; // the marking above awaited
       host.run("space.select", { id: qualified(existing.labels["herdr.space"]) });
       host.run("tab.select", { id: tab }); host.run("pane.focus", { terminal: existing.address });
       return { ok: true, reused: true, terminal: existing.address, tab };
@@ -90,8 +104,10 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     const spaceId = space?.id ?? qualified(`sp-openrig-${nonce}`), tab = qualified(`tb-attach-${nonce}`);
     // Preparation revalidates the profile, identity and relay bytes immediately before launching.
     const checked = await host.prepareRemote(config);
-    if (!checked.ok) return checked;
+    if (!checked.ok) return asAttachFailure(checked);
     if (JSON.stringify(checked) !== JSON.stringify(remote)) throw new Error("The remote machine changed during Attach. Retry.");
+    const movedAfterPrepare = changed(); if (movedAfterPrepare) return movedAfterPrepare; // the preparation just awaited: the settings it ran under may be gone
+    stopIfCancelled(host);
     const appeared = existingViewer();
     if (appeared) return await reuse(appeared);
     // The last look before the fresh start: with the person's approval the remembered stale viewer is stopped now, never
@@ -99,12 +115,15 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     // Once the person's click has stopped the old viewer and closed its tab, a failure in the fresh
     // start must say so — the generic line reads as if nothing happened. Single source: this flag is set only here.
     let replaced = false;
+    stopIfCancelled(host); // before the old viewer is stopped, too
     if (pendingReplace) {
       const stillStale = staleChangedViewer();
       if (stillStale) {
+        const movedBeforeStop = changed(); if (movedBeforeStop) return movedBeforeStop; // nothing is stopped for settings that are gone
         // No `--on`: herdr-core routes terminal-addressed verbs by the address's `machine/` prefix (remote.rs ON_A_TERMINAL),
         // so the kill reaches the right core without a cross-machine verb (security rule S32: only run, exec and the relay's
         // file write go to another machine explicitly). A refused or failed kill closes nothing and starts nothing.
+        host.onStep?.("replacing the old viewer");
         const killed = await host.hc(["kill", "--", pendingReplace.terminal]);
         if (killed && killed.code !== undefined && killed.code !== 0) throw new Error("The older viewer could not be stopped, so nothing was changed.");
         // A kill of the relay often closes the seat's tab with it: close it only while it is still there, or herdr
@@ -117,6 +136,10 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     const afterReplace = (reason) => replaced
       ? `The older viewer was stopped and its tab closed for this Attach, and the new one could not be confirmed. ${reason} Open Attach again.`
       : reason;
+    // Nothing awaits between this check and the start: a caller that gave up during the replace above gets no viewer, and is told the old one was stopped.
+    if (host.cancelled?.()) throw new Error(afterReplace("Stopped: the request took too long. Nothing more was started."));
+    const movedBeforeStart = changed(); if (movedBeforeStart) return { ...movedBeforeStart, reason: afterReplace(movedBeforeStart.reason) }; // the last look: no await between it and the start
+    host.onStep?.("starting the viewer");
     const started = await host.hc(["run", "--on", machine, "--bg", "--json", "--no-parent", "--no-notify",
       "--label", `herdr.space=${local(spaceId)}`, "--label", `herdr.tab=${local(tab)}`,
       "--label", "herdr-openrig.space=1", "--label", `herdr-openrig.rig=${rig}`,
@@ -135,5 +158,5 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     host.run("tab.rename", { id: tab, name: options.name ?? (isOperator ? "Operator" : seat.logicalId ?? session) });
     host.run("space.select", { id: spaceId }); host.run("tab.select", { id: tab }); host.run("pane.focus", { terminal: address });
     return { ok: true, terminal: address, tab };
-  } catch (e) { return remoteFailure(e, config.daemonMachine); }
+  } catch (e) { return remoteFailure(e, config.daemonMachine, { attach: true }); }
 }

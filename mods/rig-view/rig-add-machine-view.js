@@ -1,24 +1,25 @@
 import {div,svg} from "gpui-kit";
 import {v_flex,h_flex,InputState,Input} from "gpui-base";
 import {machineSetupGate,listAddableMachines} from "./rig-remote.js";
-import {connectionsOf,nextTunnelAddress,tunnelCommand,openrigHomeProblem} from "./rig-connections.js";
+import {connectionsOf,nextTunnelAddress,tunnelCommand,openrigHomeProblem,openrigHomeWarning,formatHostId,plainExecError} from "./rig-connections.js";
 
 // The "add a machine" dialog. One gate per open dialog; it is expired on save, on cancel and when the dialog goes away.
 // Phases: checking (the box side) -> ready (the tunnel section) -> tunnel (reading it) -> verified -> saving -> done; "nothing" when no OpenRig answers there.
 // Keys: Enter in either field runs Check and never Save; Save needs a tick for the current address and a valid home; Esc leaves like Cancel; Tab wraps in the dialog.
 // A short id reads as itself; only a long one is cut (the full id stays in the tooltip).
-const shortHost=id=>{const text=String(id??"");return text.length>16?`${text.slice(0,4)}…`:text;};
+const shortHost=formatHostId;
 export class AddMachinePanel {
   constructor(host,machine,picked,{liveConfig,done,cancel,mono="monospace",copyIcon,cancelHandle,primaryHandle,copyHandles={}}={}){
     this.host=host;this.machine=machine;this.picked=picked??null;this.liveConfig=liveConfig;this.done=done;this.cancel=cancel;
     this.mono=mono;this.copyIcon=copyIcon;this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;this.copyHandles=copyHandles;
     this.phase="checking";this.error=null;this.tunnelError=null;this.verified=null;this.homeTouched=false;this.focusedField=null;
+    this.homeCheckedPath=null;this.homeExists=null;this.homeProbeTask=null;this.homeProbeGen=0;
     this.gate=machineSetupGate(host,machine,picked);
     this.addressInput=InputState.new({value:"",placeholder:"http://127.0.0.2:7433"});
     this.homeInput=InputState.new({value:"",placeholder:"/path/to/this/connection's/openrig-home"});
     // Editing the address means what was checked is no longer what would be saved; editing either field re-draws the command and Save.
     this.addressInput.on("change",(_e,cx)=>{if(this.verified){this.verified=null;if(this.phase==="verified")this.phase="ready";}this.tunnelError=null;cx.notify();});
-    this.homeInput.on("change",(_e,cx)=>cx.notify());
+    this.homeInput.on("change",(_e,cx)=>{this.homeProbeGen++;this.homeCheckedPath=null;this.homeExists=null;this.probeHome(cx);cx.notify();});
     for(const state of [this.addressInput,this.homeInput]){
       state.on("focus",()=>{this.focusedField=state;});
       state.on("blur",()=>{if(this.focusedField===state)this.focusedField=null;});
@@ -31,6 +32,37 @@ export class AddMachinePanel {
     cx.timer?.after?.(0,next=>{state.focus?.();if(select)state.set_selected_range?.({start:0,end:String(state.value()??"").length});next.notify?.();});
   }
   homeText(){return String(this.homeInput.value()??"").trim();}
+  homeWarning(){
+    const text=this.homeText();
+    if(openrigHomeProblem(text))return null;
+    const paths=this.gate.machinePaths?.()??null;
+    const exists=this.homeCheckedPath===text?this.homeExists:null;
+    return openrigHomeWarning(text,{
+      machine:this.machine,exists,
+      localHome:this.host.localHome?.()??null,
+      machineHome:paths?.home??null,workspaceRoot:paths?.workspaceRoot??null,
+      machineFolders:this.host.machineFolders?.(this.machine)??[],
+    });
+  }
+  probeHome(cx){
+    if(this.homeProbeTask)return this.homeProbeTask;
+    if(typeof this.host.localFolderExists!=="function"||openrigHomeProblem(this.homeText())||this.gate.expired())return Promise.resolve();
+    const run=async nextCx=>{
+      try{
+        while(!this.gate.expired()){
+          const target=this.homeText(),gen=this.homeProbeGen;
+          if(openrigHomeProblem(target)){this.homeCheckedPath=null;this.homeExists=null;break;}
+          if(this.homeCheckedPath===target&&this.homeExists!==null)break;
+          let exists=null;
+          try{exists=await this.host.localFolderExists(target);}catch(_){exists=null;}
+          if(this.gate.expired())return;
+          if(this.homeProbeGen===gen&&this.homeText()===target){this.homeCheckedPath=target;this.homeExists=exists;nextCx?.notify?.();break;}
+        }
+      }finally{this.homeProbeTask=null;}
+    };
+    this.homeProbeTask=cx?.spawn?Promise.resolve(cx.spawn(run)):run(cx);
+    return this.homeProbeTask;
+  }
   /** The box side, then the suggested tunnel: the next unused loopback with the box's own port, and the command to make it. */
   async check(cx){
     if(this.busy)return;
@@ -41,26 +73,36 @@ export class AddMachinePanel {
       let existing=[];
       try{existing=connectionsOf(JSON.parse(await this.host.readConfig()??"{}")).connections;}catch(_){}
       const live=this.liveConfig?.();
-      const taken=[...existing,...(live?.daemonUrl?[{daemonUrl:live.daemonUrl}]:[])];
+      // A switched connection's kept tunnel address is taken too: suggesting it would put two connections on one address after a switch back.
+      const taken=[...existing,...existing.filter(c=>c?.retainedDaemonUrl).map(c=>({daemonUrl:c.retainedDaemonUrl})),...(live?.daemonUrl?[{daemonUrl:live.daemonUrl}]:[])];
       const address=nextTunnelAddress(taken,found.port);
       this.suggested=address;
       // What the person typed stays: a second check (after a refusal or an expired screen) never overwrites the field.
       if(!String(this.addressInput.value()??"").trim())this.addressInput.set_value?.(address??"");
       this.boxPort=found.port;this.found=found;this.phase="ready";
+      this.probeHome(cx);
       this.focusField(this.addressInput,cx,{select:true});
-    }catch(error){this.phase="error";this.error=String(error?.message??error);}
+    }catch(error){this.phase="error";this.error=plainExecError(error,{machine:this.machine,kind:"remote"});}
     cx.notify();
   }
   /** [Check]: reads /healthz through the address the person gave and compares the host id with the machine's. */
   checkTunnel(cx){
     if(this.busy||!["ready","verified"].includes(this.phase))return;
-    this.busy=true;this.phase="tunnel";this.tunnelError=null;this.verified=null;this.homeTouched=true;cx.notify();
+    const checkedAddress=String(this.addressInput.value()??"").trim();
+    this.busy=true;this.phase="tunnel";this.tunnelError=null;this.verified=null;this.homeTouched=true;this.homeProbeGen++;this.homeCheckedPath=null;this.homeExists=null;cx.notify();
     cx.spawn(async cx=>{
+      const homeCheck=this.probeHome(cx);
       try{
-        const verified=await this.gate.checkTunnel(String(this.addressInput.value()??"").trim());
+        const verified=await this.gate.checkTunnel(checkedAddress,{liveConfig:this.liveConfig?.()??undefined});
+        await homeCheck;
+        if(String(this.addressInput.value()??"").trim()!==checkedAddress){this.phase="ready";return;}
         this.verified=verified;this.phase="verified";
-        if(openrigHomeProblem(this.homeText()))this.focusField(this.homeInput,cx);
-      }catch(error){this.phase="ready";this.tunnelError=String(error?.message??error);this.focusField(this.addressInput,cx);}
+        if(openrigHomeProblem(this.homeText())||this.homeWarning())this.focusField(this.homeInput,cx);
+      }catch(error){
+        await homeCheck;
+        this.phase="ready";
+        if(String(this.addressInput.value()??"").trim()===checkedAddress){this.tunnelError=String(error?.message??error);this.focusField(this.addressInput,cx);}
+      }
       finally{this.busy=false;cx.notify();}
     });
   }
@@ -95,7 +137,7 @@ export class AddMachinePanel {
   render(t,cx){
     this.theme=t;
     const ready=["ready","tunnel","verified","saving"].includes(this.phase),done=this.phase==="done";
-    const addressText=String(this.addressInput.value()??"").trim(),homeProblem=openrigHomeProblem(this.homeText());
+    const addressText=String(this.addressInput.value()??"").trim(),homeProblem=openrigHomeProblem(this.homeText()),homeWarning=this.homeWarning();
     const command=ready?tunnelCommand(addressText,this.boxPort,this.machine,this.picked?.target):null;
     const canSave=this.phase==="verified"&&!homeProblem,retry=this.phase==="nothing"||this.phase==="error";
     // Tab wraps inside the dialog: past the last enabled control it returns to the Address field (or Cancel before the tunnel section exists).
@@ -140,6 +182,7 @@ export class AddMachinePanel {
         .child(Input.new(this.homeInput).id("add-machine-home"))
         .child(div().text_color(t.muted).text_size(11).child(`The folder rig on this computer uses for ${this.machine}'s OpenRig: its settings and sign-in. Each OpenRig needs its own.`))
         .when(this.homeTouched&&!!homeProblem&&!done,el=>el.child(div().id("add-machine-home-error").text_color(t.blocked).child(`✗ ${homeProblem}`)))
+        .when(!homeProblem&&!!homeWarning&&!done,el=>el.child(div().id("add-machine-home-warning").text_color(t.working).child(`⚠ ${homeWarning}`)))
         .child(this.button("add-machine-check","Check",cx=>this.checkTunnel(cx),{disabled:this.busy||done}));
     }
     if(this.phase==="saving")body=body.child(div().id("add-machine-progress").text_color(t.muted).child("Saving…"));
@@ -159,17 +202,23 @@ export class AddMachinePanel {
 
 /** "Add a machine…" by hand: the person picks one of Herdr's connected machines that has no connection yet, then the same screen as the offer
  *  runs for it. With none left it says so and offers only Close. Nothing is run on any machine until one is picked. */
+/** The handle when it can still be used (is_focused() on a released one throws), else null. */
+const liveFocus=h=>{if(!h)return null;try{h.is_focused?.();return h;}catch(_){return null;}};
 export class AddMachineChooser {
   constructor(host,{liveConfig,makePanel,cancel,cancelHandle,primaryHandle}={}){
     this.host=host;this.liveConfig=liveConfig;this.makePanel=makePanel;this.cancel=cancel;this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
     this.phase="loading";this.rows=[];this.error=null;this.panel=null;
   }
-  expire(){this.expired=true;this.panel?.expire?.();}
+  expire(){this.expired=true;this.panel?.expire?.();for(const handle of this.rowHandles??[])handle?.release?.();this.rowHandles=[];}
   async load(cx){
     try{
       const live=this.liveConfig?.()??{},taken=[live.daemonMachine,...(live.connections??[]).map(c=>c?.machine)];
       this.rows=await listAddableMachines(this.host,taken);this.phase="choose";
-    }catch(error){this.phase="error";this.error=String(error?.message??error);}
+      // Each row's focus handle is made by the next draw (rowHandlesFor), never in this continuation: a handle made after an await belongs to
+      // whichever view drained the promise jobs. Without one Tab can't reach the row and its keys never arrive.
+      for(const handle of this.rowHandles??[])handle?.release?.();
+      this.rowHandles=[];
+    }catch(error){this.phase="error";this.error=plainExecError(error,{machine:this.machine,kind:"remote"});}
     cx.notify();
   }
   async choose(row,cx){
@@ -177,9 +226,22 @@ export class AddMachineChooser {
     this.panel=this.makePanel(row.name,{target:row.target,session:row.session});
     cx.notify();await this.panel.check(cx);
   }
+  /** From a draw (the view's own call): one timer that makes a focus handle per machine row (never in the draw itself, which Herdr refuses). */
+  rowHandlesFor(cx){
+    const rows=this.rows;
+    if(this.expired||this.rowHandlesPending||!rows.length||!cx?.timer?.after||(this.rowHandles?.length===rows.length&&this.rowHandles.every(h=>liveFocus(h))))return;
+    this.rowHandlesPending=true;
+    cx.timer.after(0,next=>{
+      this.rowHandlesPending=false;
+      if(this.expired||this.rows!==rows||!next?.focus_handle)return;
+      this.rowHandles=rows.map((_,i)=>liveFocus(this.rowHandles?.[i])??next.focus_handle());
+      next.notify?.();
+    });
+  }
   render(t,cx){
     if(this.panel)return this.panel.render(t,cx);
     this.theme=t;
+    if(this.phase==="choose")this.rowHandlesFor(cx);
     const root=v_flex().id("add-machine-choose").size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
       .on_key_down((event,cx)=>{if(event.key==="escape"){cx.stop_propagation();this.expire();this.cancel?.(cx);}})
       .child(div().text_size(15).font_semibold().child("Add a machine"));
@@ -189,7 +251,8 @@ export class AddMachineChooser {
     else if(!this.rows.length)body=body.child(div().id("add-machine-none").child("Every connected Herdr machine already has a connection."));
     else{
       body=body.child(div().text_color(t.muted).child("Machine"));
-      for(const row of this.rows)body=body.child(div().id(`add-machine-pick-${row.name}`).role("button").tab_stop(true).px(8).py(5).rounded(5).bg(t.raised).cursor_pointer()
+      for(const [i,row] of this.rows.entries())body=body.child(div().id(`add-machine-pick-${row.name}`).role("button").tab_stop(true).px(8).py(5).rounded(5).bg(t.raised).cursor_pointer()
+        .when(!!this.rowHandles?.[i],el=>el.track_focus(this.rowHandles[i]))
         .focus(el=>el.border_1().border_color(t.accent))
         .on_click((_e,cx)=>cx.spawn(cx=>this.choose(row,cx)))
         .on_key_down((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}}).child(row.name));

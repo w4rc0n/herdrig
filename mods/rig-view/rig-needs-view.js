@@ -74,7 +74,7 @@ export class NeedsTracker {
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
       const owner = seatOf(ask, session) ?? seatOf(ask, resolveAskerSeat(session, topology.filter((r) => sameConn(ask, r))).seat?.session);
       if (owner && !excluded(owner.seat)) owner.asks.push(ask);
-      else rows.push({ key: `ask:${ask.id}`, kind: "ask", ask, seat: owner?.seat, rig: owner?.rig, name: requestHeadline(ask), helpers: [], asks: [ask] });
+      else rows.push({ key: qualifyKey(ask.conn, `ask:${ask.id}`), kind: "ask", ask, seat: owner?.seat, rig: owner?.rig, name: requestHeadline(ask), helpers: [], asks: [ask] });
     }
     for (const row of rows) {
       if (row.kind === "ask") {

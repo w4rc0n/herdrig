@@ -1,11 +1,40 @@
+import { LEGACY_CONNECTION_ID } from "./rig-connections.js";
 import { needTarget, needSummary, missionAction, isUpdateNeed, isHealthAttention, filterAttentionHealth } from "./rig-lib.js";
 
 export const UNDO_MS = 10000;
 const RETAIN_MS = 30 * 86400000;
+const itemConn = (item) => (typeof item?.conn === "string" && item.conn !== "" ? item.conn : null);
 export const dismissible = (item) => !!item?.id && !isHealthAttention(item) && isUpdateNeed(item) && !item.native
   && !item.answer?.verb && !["answer", "resolve", "native"].includes(item.reply);
-export const updateKey = (item) => JSON.stringify([item.id, needSummary(item)]); // the target's summary, without making the whole target
-export const dismissalScope = (config) => JSON.stringify([config?.daemonUrl ?? "", config?.person ?? ""]);
+export const legacyUpdateKey = (item) => JSON.stringify([item?.id, needSummary(item)]);
+export const updateKey = (item) => JSON.stringify([itemConn(item), item?.id, needSummary(item)]); // the target's summary, without making the whole target
+export const legacyDismissalScope = (config) => JSON.stringify([config?.daemonUrl ?? "", config?.person ?? ""]);
+export const dismissalScope = (config) => JSON.stringify([
+  config?.connectionId || LEGACY_CONNECTION_ID,
+  config?.daemonUrl ?? "",
+  config?.person ?? "",
+]);
+
+/** Saved dismissals for one connection's config, falling back to the pre-connection scope when unambiguous. */
+export function savedDismissalsFor(origins, config) {
+  if (!origins || typeof origins !== "object") return undefined;
+  const connId = config?.connectionId || LEGACY_CONNECTION_ID;
+  const scope = dismissalScope(config);
+  if (Object.hasOwn(origins, scope)) {
+    const found = origins[scope];
+    return found && typeof found === "object" ? { ...found, connectionId: connId } : found;
+  }
+  const list = Array.isArray(config?.connections) ? config.connections : [];
+  const url = config?.daemonUrl ?? "";
+  const canFallback = list.length <= 1
+    || ((connId === LEGACY_CONNECTION_ID || connId === list[0]?.id)
+      && list.filter((c) => (c?.id === connId ? url : (c?.daemonUrl ?? "")) === url).length <= 1);
+  if (!canFallback) return undefined;
+  const legacy = legacyDismissalScope(config);
+  if (!Object.hasOwn(origins, legacy)) return undefined;
+  const found = origins[legacy];
+  return found && typeof found === "object" ? { ...found, connectionId: connId } : found;
+}
 const localNote = "Hidden here only; other OpenRig clients may still show it.";
 
 export function dismissalRecipient(config, perspective) {
@@ -21,11 +50,35 @@ export function dismissalRecipient(config, perspective) {
 export function liveDismissalItems(requested, liveItems, records = []) {
   return requested.flatMap((item) => {
     if (!dismissible(item)) return [];
-    const live = liveItems.find((i) => dismissible(i) && updateKey(i) === updateKey(item));
-    const restored = records.find((r) => r.restored && r.status === "closed" && r.key === updateKey(item));
+    const conn = itemConn(item), key = updateKey(item);
+    const live = liveItems.find((i) => dismissible(i) && itemConn(i) === conn && updateKey(i) === key);
+    const restored = records.find((r) => r.restored && r.status === "closed" && itemConn(r.item) === conn && r.key === key);
     const actual = live ?? restored?.item;
     return actual ? [{ ...actual, dismissalPosition: item.dismissalPosition }] : [];
   });
+}
+
+function migrateDismissalRecord(r, ownerConn, now) {
+  if (!r || !r.item || !(dismissible(r.item) || isHealthAttention(r.item)) || typeof r.key !== "string") return null;
+  if (!Number.isFinite(r.at) || (r.missingSince && now - r.missingSince >= RETAIN_MS)) return null;
+  const currentKey = updateKey(r.item);
+  const legacyKey = legacyUpdateKey(r.item);
+  if (r.key !== currentKey && r.key !== legacyKey) return null;
+  const conn = itemConn(r.item);
+  let item = r.item;
+  if (ownerConn) {
+    if (conn !== null && conn !== ownerConn) return null;
+    if (conn !== ownerConn) item = { ...r.item, conn: ownerConn };
+  }
+  const key = updateKey(item);
+  const sending = r.status === "sending";
+  return {
+    ...r,
+    item,
+    key,
+    status: sending ? "local" : r.status,
+    note: sending ? "Hidden here; the previous close was not confirmed. Check OpenRig before retrying." : r.note,
+  };
 }
 
 /** Herdr provides URL, but no AbortSignal; use cx.timer to bound fetch and JSON body reading.
@@ -40,25 +93,34 @@ export function boundedDismissalRequest(request, after, timeoutMs = 15000) {
   });
 }
 
-/** Local presentation state only. The sidebar owns commits, including after the Needs page closes. */
+let lastRevision = 0;
+/** Local presentation state only. The sidebar owns commits, including after the Needs page closes. `revision` is new whenever a record changes
+ *  (and for every new model), so the sidebar can tell a changed list from an unchanged one without reading every record each second. Records are
+ *  changed only by the methods below. */
 export class DismissedUpdates {
-  constructor(saved = {}, now = Date.now()) {
-    this.show = saved.show === true;
-    this.records = (Array.isArray(saved.records) ? saved.records : []).filter((r) =>
-      r && (dismissible(r.item) || isHealthAttention(r.item)) && typeof r.key === "string" && r.key === updateKey(r.item)
-      && Number.isFinite(r.at) && (!r.missingSince || now - r.missingSince < RETAIN_MS))
-      .map((r) => ({ ...r, status: r.status === "sending" ? "local" : r.status,
-        note: r.status === "sending" ? "Hidden here; the previous close was not confirmed. Check OpenRig before retrying." : r.note }));
+  constructor(saved = {}, now = Date.now(), options = {}) {
+    const ownerConn = typeof options?.connectionId === "string" && options.connectionId
+      ? options.connectionId
+      : (typeof saved?.connectionId === "string" && saved.connectionId ? saved.connectionId : null);
+    this.show = saved?.show === true;
+    this.records = (Array.isArray(saved?.records) ? saved.records : [])
+      .map((r) => migrateDismissalRecord(r, ownerConn, now))
+      .filter(Boolean);
     this.receipts = [];
+    this.revision = ++lastRevision;
   }
+  changed() { this.revision = ++lastRevision; }
   saved() { return { show: this.show, records: this.records }; }
   observe(items, now = Date.now()) {
     const keys = new Set(items.filter(dismissible).map(updateKey));
+    let changed = false;
     for (const r of this.records) {
-      if (keys.has(r.key)) delete r.missingSince;
-      else r.missingSince ??= now;
+      if (keys.has(r.key)) { if ("missingSince" in r) { delete r.missingSince; changed = true; } }
+      else if (r.missingSince == null) { r.missingSince = now; changed = true; }
     }
-    this.records = this.records.filter((r) => !r.missingSince || now - r.missingSince < RETAIN_MS);
+    const kept = this.records.filter((r) => !r.missingSince || now - r.missingSince < RETAIN_MS);
+    if (kept.length !== this.records.length) { this.records = kept; changed = true; }
+    if (changed) this.changed();
   }
   dismiss(items, now = Date.now()) {
     const added = [];
@@ -71,6 +133,7 @@ export class DismissedUpdates {
       this.records.push({ key, item, at: now, due: now + UNDO_MS, status: "pending", restored: false });
       added.push(key);
     }
+    if (added.length) this.changed();
     if (added.length) this.receipts.push({ id: `${now}:${this.receipts.length}`, keys: added, at: now, position: items[0]?.dismissalPosition ?? 0,
       summary: added.length === 1 ? items.find((i) => updateKey(i) === added[0])?.summary : null });
     return added;
@@ -85,11 +148,18 @@ export class DismissedUpdates {
       else r.restored = true;
     }
     this.receipts = this.receipts.filter((r) => r !== receipt);
+    this.changed();
   }
-  restore(key) { const r = this.records.find((v) => v.key === key); if (r && r.status !== "sending") r.restored = true; }
+  restore(key) { const r = this.records.find((v) => v.key === key); if (r && r.status !== "sending" && !r.restored) { r.restored = true; this.changed(); } }
+  /** The items without the dismissed ones, plus restored records no item stands for any more. Each item's key is made once and the records'
+   *  keys are read once: with every record compared against every item's freshly made key, 600 updates and 300 dismissals took about a second
+   *  in QuickJS on the first render after a refresh. */
   visible(items) {
-    return filterAttentionHealth(items.filter((i) => !dismissible(i) || !this.records.some((r) => r.key === updateKey(i) && !r.restored))
-      .concat(this.records.filter((r) => r.restored && !items.some((i) => updateKey(i) === r.key)).map((r) => r.item)));
+    const hidden = new Set(), restored = [];
+    for (const r of this.records) { if (r.restored) restored.push(r); else hidden.add(r.key); }
+    const keys = items.map((i) => updateKey(i)), present = new Set(keys);
+    return filterAttentionHealth(items.filter((i, n) => !dismissible(i) || !hidden.has(keys[n]))
+      .concat(restored.filter((r) => !present.has(r.key)).map((r) => r.item)));
   }
   hidden() { return this.records.filter((r) => !r.restored && !isHealthAttention(r.item)).sort((a, b) => b.at - a.at); }
   receiptRows(now = Date.now()) { return this.receipts.filter((r) => now - r.at < UNDO_MS && r.keys.some(key => this.records.some(v => v.key === key && !isHealthAttention(v.item)))); }
@@ -98,11 +168,11 @@ export class DismissedUpdates {
     for (const r of this.records) {
       if (isHealthAttention(r.item) || r.status !== "pending" || r.restored || r.due > now) continue;
       // Persist before sending. A restart after an uncertain response never resends a close automatically.
-      r.status = "sending"; await persist();
+      r.status = "sending"; this.changed(); await persist();
       let result;
       try { result = await commit(r.item); }
       catch (_) { result = { status: "local", note: "Hidden here; the close was not confirmed. Check OpenRig before retrying." }; }
-      Object.assign(r, result); await persist();
+      Object.assign(r, result); this.changed(); await persist();
     }
   }
 }
@@ -116,7 +186,8 @@ export function dismissalSnapshot(sharedState) {
 /** Public HTTP only. No daemon-selected actor, route, verb, host, or authentication source. */
 export async function commitDismissal(config, item, request, { attentionItems = [], person = null } = {}) {
   if (!dismissible(item) || !/^queue-update:qitem-[A-Za-z0-9-]+$/.test(item.id)) return { status: "local", note: localNote };
-  const live = attentionItems.find((i) => dismissible(i) && updateKey(i) === updateKey(item));
+  const conn = itemConn(item), key = updateKey(item);
+  const live = attentionItems.find((i) => dismissible(i) && itemConn(i) === conn && updateKey(i) === key);
   if (!live) return { status: "local", note: "Hidden here only; this update is no longer in the live Needs list." };
   const qitemId = item.id.slice("queue-update:".length);
   const got = await request({ path: `/api/queue/${encodeURIComponent(qitemId)}`, method: "GET" });

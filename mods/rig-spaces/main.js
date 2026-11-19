@@ -1,5 +1,5 @@
 // herdrig: a copy of herdr-app's defaults/mods/spaces/main.js (Apache-2.0; mod/LICENSES/herdr-app-Apache-2.0.txt). // herdrig hook
-// herdrig: pinned to herdr-app 3d76790. Every line marked "herdrig hook" is ours; the rest is herdr's file, unchanged. // herdrig hook
+// herdrig: pinned to herdr-app 034f8b8. Every line marked "herdrig hook" is ours; the rest is herdr's file, unchanged. // herdrig hook
 // Workspace spaces: stable colored avatars, worktrees under their checkout,
 // grouped by machine when more than one is known. After a space's name, the repo
 // its first terminal is in now, only where unusual: branch, ahead/behind. Agent state lives in the agents list, not here. Click to
@@ -84,9 +84,13 @@ export default class Spaces extends View {
     this.scroll = ScrollHandle.new(); // the list's position: the active space is brought into view through it
     this.activeAt = -1; // the active space's place among the list's children (headers and rows), -1 when not drawn
     this.machines = [];
-    this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
-    for (const state of Object.values(this.reconnecting)) state.busy = false;
-    this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    try {
+      this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
+      if (!this.reconnecting || typeof this.reconnecting !== "object" || Array.isArray(this.reconnecting)) this.reconnecting = {};
+      for (const state of Object.values(this.reconnecting)) state.busy = false;
+    } catch { this.reconnecting = {}; }
+    this.reconnecting = rig.reconnecting(this.reconnecting); // herdrig hook
+    try { this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]")); } catch { this.folded = new Set(); }
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // Refresh only when the refs could have changed (see `due`).
@@ -164,9 +168,11 @@ export default class Spaces extends View {
   }
 
   reconnect(machine, cx) {
+    if (!rig.canReconnect(machine, this.reconnecting, cx)) return; // herdrig hook
     const name = machine.name;
     if (this.reconnecting[name]?.busy) return;
     const state = this.reconnecting[name] ??= { machine, removed: false };
+    rig.persistReconnecting(state); // herdrig hook
     state.busy = true;
     state.error = null;
     localStorage.setItem("machines.reconnecting", JSON.stringify(this.reconnecting));
@@ -239,8 +245,10 @@ export default class Spaces extends View {
       );
       if (r.code !== 0 || common.code !== 0) {
         // Only git's own "no" is remembered as no repo; anything else is asked again.
-        if (!/not a git repository/i.test(r.code !== 0 ? r.stderr : common.stderr)) this.unsure.add(key);
-        this.git[key] = null;
+        if (!/not a git repository/i.test(r.code !== 0 ? r.stderr : common.stderr)) {
+          this.unsure.add(key);
+          this.git[key] ??= null;
+        } else this.git[key] = null;
         return;
       }
       // The repo's own .git folder names it; a worktree's top differs from it.
