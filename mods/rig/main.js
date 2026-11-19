@@ -14,18 +14,18 @@
 //   `<appHome>/openrig/state.json`.
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
-import { stampConnection, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, NO_CONNECTION } from "./rig-connections.js";
+import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, NO_CONNECTION, formatHostId, plainExecError } from "./rig-connections.js";
 import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
 import {SYSTEM_PAGE_VIEWS} from './rig-page-nav.js';
 import { View, div, svg } from "gpui-kit";
-import { effectiveScopeProject } from './rig-project.js';
+import { effectiveScopeProject, readScopeProject } from './rig-project.js';
 import { workflowPath,workflowView,workflowEntry,workflowWord } from './rig-workflow.js';
-import { resolveAskerSeat,relativeTimeText } from './rig-lib.js';
+import { resolveAskerSeat,relativeTimeText,requestFailed,requestWhat,focusTarget,releaseFocusTargets,liveFocus } from './rig-lib.js';
 import { timezoneValue } from './rig-time.js';
 import { healthCounts } from "./rig-health.js";
 
-import { publishRigData, filterAttentionHealth, isUpdateNeed } from "./rig-lib.js";
+import { publishRigData, filterAttentionHealth, isUpdateNeed, saveStateFile, stateSaveFailure, stateSaveReason } from "./rig-lib.js";
 import { h_flex, v_flex, ScrollHandle } from "gpui-base";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { appHome, readTextFile, writeTextFile, props, theme, run as rawRun, exec as rawExec, layout, focused, openOverlay as rawOpenOverlay, closeOverlay, setShared as rawSetShared, shared, nextCommand, notify, playSound, settings, watchFolder, keys, window, spaces, panes, terminals, hc as rawHc, commands, machines } from "herdr";
@@ -44,16 +44,17 @@ const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.
 
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
-import { RemoteMachine, detectDaemonMachine, offerForMachine, machineProbeExec } from "./rig-remote.js";
+import { RemoteMachine, detectDaemonMachine, offerForMachine, machineProbeExec, herdrIdentityOf } from "./rig-remote.js";
 import { HostWorkerViews } from "./rig-worker-controller.js";
 import {workerViewDetails} from "./rig-worker-views.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { RigSpaces, RebuildConfirmations, rigSpaceRelocation } from "./rig-spaces.js";
-import { sameConnectionConfig, acceptRigOpen, migrateRigTabs, replaceMigrationTab, moveMigrationPages, migrationReportNow, needsTabMigration, migrationSourceMatches, migrationChoice, migrationChoices } from "./rig-routing.js";
-import { openRigSpaceContext, rigOrigin } from "./rig-space-context.js";
+import { sameConnectionConfig, acceptRigOpen, receiversWithBeat, migrateRigTabs, replaceMigrationTab, moveMigrationPages, migrationReportNow, needsTabMigration, migrationSourceMatches, migrationChoice, migrationChoices, clearInterruptedRouteJob, activeInPlaceOpen, inPlaceSpaceRefusal } from "./rig-routing.js";
+import { openRigSpaceContext, rigOrigin, syncRetainedOrigins } from "./rig-space-context.js";
 import { publishGraphActivity } from "./rig-graph-state.js";
-import { DismissedUpdates, commitDismissal, dismissalScope, dismissalRecipient, liveDismissalItems, boundedDismissalRequest, requestDismissal, dismissible } from "./rig-dismiss.js";
-import { NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
+import { DismissedUpdates, commitDismissal, dismissalScope, savedDismissalsFor, dismissalRecipient, liveDismissalItems, boundedDismissalRequest, requestDismissal, dismissible } from "./rig-dismiss.js";
+import { PRIORITY_GROUPS, NeedsTracker, priorityElements, diffPriorityNotifications, needsMark } from "./rig-needs-view.js";
+import { buildStickyScrollLayout, clampScrollTop, computeStickyTopology, nextScrollTopAfterReveal, revealTargetForSelection, stickySignature } from "./rig-sticky-topology.js";
 import rawNet from "net";
 const net = { connect: (host, port) => gatedConnect((h, p) => rawNet.connect(h, p), host, port) };
 const netFor = (config) => (host, port) => gatedConnect((h, p) => rawNet.connect(h, p), host, port, config?.connectionId);
@@ -63,8 +64,8 @@ import {
   buildTopology, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
   asOf, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, requestHeadline,
-  readCommand, writeCommand, writeOutcome, actionArgs, actionTitle, doneWords, startOneClick, ONE_CLICK, PROVIDER_HOME_ACTIONS, providerHomeRefusal, appHomeArgsRefusal, listAddedMachine, RIG_SECTIONS, SECTION_TITLES, CONFIG_CATEGORIES,
-  navPush, navBack, navKey,
+  readCommand, writeCommand, writeOutcome, actionArgs, actionTitle, doneWords, startOneClick, qualifyBusyKey, oneClickBusyKey, ONE_CLICK, PROVIDER_HOME_ACTIONS, providerHomeRefusal, appHomeArgsRefusal, listAddedMachine, RIG_SECTIONS, SECTION_TITLES, CONFIG_CATEGORIES,
+  navPush, navBack, backTarget, navKey,
   probeCapabilities, currentCapabilities, connectionCapabilities, capabilityDisableReason, herdrAppAvailability, isNeedsVisible, openNeed, worstHealthChip,
   isRigStopped, expandAllTopology, collapseAllTopology,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, selectWorkerView, findRigTab,
@@ -72,10 +73,13 @@ import {
   parseSidebarState, serializeSidebarState, treeKeyNav, rigViewsBranch, attachToSeat, isLoopbackDaemonUrl, formatSeatContextPct, isSeatContextWarning,
   tierOf, sortNeedsByTier, enrichAttentionItems, quietModeHeaderChip, whoseQueueSummary, statusMark, statusMarkElement, pageRevealOpen,
   attachRelayPath, isValidSessionName, sessionNameRefusal,
-  findAttachedSeat, seatTerminalIndex, seatOrigin, seatNameShared, newRigOverlay, rigSpaceMarks } from "./rig-lib.js";
+  findAttachedSeat, seatTerminalIndex, seatOrigin, seatNameShared, newRigOverlay, rigSpaceMarks, waitWith } from "./rig-lib.js";
+import { installHerdrTransport } from "./rig-openrig-wire.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.sidebar` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
 const ASSETS = `mods/${MOD_IDS.sidebar}`;
+/** A JavaScript error thrown while a feed reads (herdrig's code, or an answer it can't parse), not a connection that failed: said as what it is, never as "couldn't reach". */
+import { isCodeError, codeErrorMessage, describeCodeError, CODE_ERROR_NEXT, SAVE_NEXT, refreshFailureMessage } from "./rig-connections.js";
 const icon = iconsAt(ASSETS);
 
 const STACK = "rig-work", PAGE = "rig-page";
@@ -128,10 +132,49 @@ export function openPage(entry, selKey = null, stateHost = null) {
 import {openRigEventStream,pumpEvents} from "./rig-event-stream.js";
 import {ConnectionFeed} from "./rig-feed.js";
 import {followedConnection,spaceMachine} from "./rig-follow.js";
-import {SIDEBAR_VIEW_FIELDS,cleanSidebarViews,cleanSidebarView,readSidebarView,writeSidebarView} from './rig-sidebar-view-state.js';
+import {SIDEBAR_VIEW_FIELDS,cleanSidebarViews,cleanSidebarView,readSidebarView,writeSidebarView,cleanAwayStates,restoreAwayStateMap,cleanNotifiedNeeds,cleanNotifiedNeedsMap} from './rig-sidebar-view-state.js';
 import {StatusMotion} from "./rig-status-motion.js";
 /** A request whose OpenRig connection was removed or edited while it ran. */
+// An Attach on a Herdr machine says what it is doing after 15 s and gives up after 120 s (a busy machine can take minutes).
+const ATTACH_PROGRESS_MS = 15000, ATTACH_DEADLINE_MS = 120000, TIMED_OUT = Symbol("timed out");
+/** A background sync still marked as running after this long lost its end (an interrupted job skips its finally): the next refresh may start one. */
+const SYNC_STALE_MS = 2 * 60 * 1000;
 const CONNECTION_CHANGED_DURING = "That OpenRig connection changed while this was running. Nothing more was done for it; check its space before trying again.";
+/** Structural equality that allocates nothing: identical references return at once, so the arrays a refresh carried over compare in one step. */
+function sameValue(a, b) {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return Number.isNaN(a) && Number.isNaN(b);
+  const arr = Array.isArray(a);
+  if (arr !== Array.isArray(b)) return false;
+  if (arr) { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (!sameValue(a[i], b[i])) return false; return true; }
+  let n = 0;
+  for (const k in a) { if (!Object.hasOwn(a, k)) continue; n++; if (!Object.hasOwn(b, k) || !sameValue(a[k], b[k])) return false; }
+  for (const k in b) if (Object.hasOwn(b, k)) n--;
+  return n === 0;
+}
+/** The same published rig.data apart from its refresh times (`at`, at the top and in each connection's entry). */
+function sameRigData(a, b) {
+  if (!a || !b) return false;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    if (k === "at") continue;
+    if (k !== "byConnection") { if (!sameValue(a[k], b[k])) return false; continue; }
+    const ids = new Set([...Object.keys(a.byConnection ?? {}), ...Object.keys(b.byConnection ?? {})]);
+    for (const id of ids) {
+      const x = a.byConnection?.[id], y = b.byConnection?.[id];
+      if (!x || !y) return false;
+      for (const f of new Set([...Object.keys(x), ...Object.keys(y)])) if (f !== "at" && !sameValue(x[f], y[f])) return false;
+    }
+  }
+  return true;
+}
+/** The parts of a feed's data a refresh reads again each time. One that reads the same as before keeps the previous value, so what was published
+ *  compares by reference and the memos keyed on these arrays stay warm. The comparison runs once per refresh, never in a draw. */
+const CARRIED_KEYS = ["topology", "hostedMembers", "attentionItems", "attentionRaw", "attentionHealth", "attentionPerspective", "nodesByRig", "capabilities", "sidebarState", "healthz"];
+function carryUnchanged(data, prev) {
+  if (!data || !prev) return;
+  for (const key of CARRIED_KEYS) if (key in data && key in prev && sameValue(data[key], prev[key])) data[key] = prev[key];
+}
 export default class RigSidebar extends View {
   /** A page opened from the sidebar belongs to the box the sidebar shows (with several connections): its entry names that connection unless it already names one. The page then reads, and acts on, that
    *  connection for as long as it is open, whichever box the sidebar follows later. One connection: the entry is untouched. */
@@ -140,13 +183,18 @@ export default class RigSidebar extends View {
   open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config, spec?.props?.target?.conn))); }
   init(_p, cx) {
     this.listScroll = ScrollHandle.new();
+    // OpenRigs over Herdr's connection (herdr:// addresses): reads and the event stream go through the pinned helper on that machine.
+    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, wait: waitWith(cx), appHome, readTextFile, writeTextFile, config: () => this.config,
+      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.sidebar).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") });
     registerRigRouting(cx, (context, conn) => {
-      const feed = conn ? this.feeds.find(f => f.id === conn) : this.primary;
+      if (!this.primary.config) return { config: null, notify };
+      if (this.primary.config.configInvalid) return { config: this.primary.config, notify };
+      const feed = conn ? this.ownFeed(conn) : this.primary;
       return feed ? { ...(conn ? this.routeHost(context, null, feed) : this.routeHost(context)), config: feed.config, notify }
         : { config: { configInvalid: UNKNOWN_CONNECTION }, notify };
     });
     this.routeReceiverId=`sidebar-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    setShared("rig.routeReceivers",{...(shared("rig.routeReceivers")??{}),[this.routeReceiverId]:true});
+    setShared("rig.routeReceivers",receiversWithBeat(shared("rig.routeReceivers"),this.routeReceiverId)); // the time it last said it is alive (every 10 s), leftovers pruned
     this.statusMotion = new StatusMotion();
     this.config = null;
     this.data = null; // { topology, attention, at }
@@ -172,6 +220,8 @@ export default class RigSidebar extends View {
       const first = await this.readConfigText();
       if (!first.superseded()) this.config = first.config;
       this.restoreSidebarViews();
+      this.syncFeeds(cx);
+      cx.notify();
       try { await this.refresh(cx); } finally { this.syncFeeds(cx); } // the other connections' feeds start whatever the first one's refresh did
       this.stream(cx);
     });
@@ -186,13 +236,23 @@ export default class RigSidebar extends View {
     });
     cx.timer.every(1000, (cx) => {
       if (this.closed) return;
+      this.checkInterruptedOpens(cx);
+      if (narrow()) this.publishSpaceMarks(); // the rail skips them in its render
+      // A route request whose rig.route:<id> command hasn't reached this loop yet (Herdr can deliver it behind busy frames): taken here too.
+      // acceptRigOpen consumes it before acknowledging, so a command that arrives later finds nothing; the request keeps its own connection.
+      for (const id of Object.keys(shared("rig.routeRequests") ?? {})) { const request = acceptRigOpen({ shared, setShared }, id); if (request) this.routeRequest(cx, request); }
       if (this.config?.missing) cx.spawn(async (cx) => this.reloadConfig(cx));
-      if (this.dismissals && !this.dismissFlushing) cx.spawn(async (cx) => {
+      if (this.dismissalModels?.size && !this.dismissFlushing) cx.spawn(async (cx) => {
         this.dismissFlushing = true;
-        const model = this.dismissalModel(), config = { ...this.config };
-        if (!model) { this.dismissFlushing = false; return; }
-        try { await model.flush((item) => this.commitDismissalFor(cx, item), () => this.saveDismissals(model)); }
-        catch (_) { setShared("rig.dismissSaveError", "Could not save dismissal state. No further closes will be attempted for that update; check OpenRig."); }
+        try {
+          for (const feed of [...this.feeds]) {
+            if (feed.closed) continue;
+            const model = this.dismissalModel(feed);
+            if (!model) continue;
+            await model.flush((item) => this.commitDismissalFor(cx, item, model.scope), () => this.saveDismissals(model));
+          }
+        }
+        catch (_) { setShared("rig.dismissSaveError", `Couldn't save which updates are dismissed. No further closes will be attempted for that update. ${SAVE_NEXT}`); }
         finally { this.dismissFlushing = false; this.publishDismissals(); cx.notify(); }
       });
     });
@@ -200,6 +260,7 @@ export default class RigSidebar extends View {
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
+        if (this.closed) return;
         const cmdName = typeof c === "object" && c !== null ? String(c.name ?? c.command ?? "") : String(c ?? "");
         const cmdArgs = typeof c === "object" && c !== null ? (c.args ?? {}) : null;
         const section = cmdName.startsWith("open:") ? cmdName.slice(5) : cmdName;
@@ -220,13 +281,17 @@ export default class RigSidebar extends View {
           }
         }
         else if (cmdName === "tui" || cmdName === "open-tui" || cmdName === "rig.open-tui") this.tui(cx);
+        // A named connection (`tuiCommandFor`): that OpenRig's TUI only; exactFeed refuses one that isn't this sidebar's.
+        else if (cmdName.startsWith("tui:")) this.tui(cx, cmdName.slice("tui:".length) || null);
+        // The Needs section of a named connection (a toast's action): never the box the sidebar happens to draw.
+        else if (cmdName.startsWith("needs:")) this.pickSection("needs", cx, { conn: cmdName.slice("needs:".length) || null });
         else if (cmdName === "operator" || cmdName === "rig.operator" || cmdName === "open-operator") this.openOperator(cx);
         // A named connection (`operatorCommandFor`: a forwarded operator Attach, a space's home menu): that OpenRig's operator only; exactFeed refuses one that isn't this sidebar's.
         else if (cmdName.startsWith("operator:")) this.openOperator(cx, null, cmdName.slice("operator:".length) || null);
         else if (cmdName === "start-daemon" || cmdName === "rig.start-daemon") this.startDaemon(cx);
         else if (cmdName === "open-page" || cmdName === "rig.open-page" || cmdName === "open") {
           const fallbackEntry = this.viewState("rig.sel")?.entry ?? shared("rig.nav")?.stack?.at(-1) ?? { section: "topology" };
-          openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, this.entryOf(fallbackEntry)); // the shown box's page, never the first connection's
+          openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, mayCreate: true }, this.entryOf(fallbackEntry)); // the shown box's page, never the first connection's
         }
         else if (cmdName.startsWith("update-action:")) this.updateAction(cx, cmdName.slice(14));
         else if (cmdName === "refresh") { this.forceCapabilityProbe = true; cx.spawn(async (cx) => { await this.reloadConfig(cx); await this.refreshFeeds(cx); }); }
@@ -250,6 +315,15 @@ export default class RigSidebar extends View {
           if(approved)this.openRigSpace(cx,approved.rigId,approved.continuation?.rebuild??null,null,approved.recovery,approved.continuation?.worker,approved.continuation?.conn??null);
         }
         else if (cmdName.startsWith("space:")) { const [conn, rigId] = this.commandTarget(cmdName.slice(6)); this.openRigSpace(cx, rigId, null, null, null, null, conn); }
+        else if (cmdName.startsWith("approve-helper:")) {
+          const [conn, rigId] = this.commandTarget(cmdName.slice("approve-helper:".length));
+          const feed = conn ? this.exactFeed(conn) : (this.feeds.length === 1 ? this.primary : null);
+          const rig = (feed?.data?.topology ?? []).find((r) => r.id === rigId);
+          const status = rig ? shared("rig.spaceStatus")?.[this.statusKey(rig)] : null;
+          if (!rig || !feed) notify({ title: "Rig space", body: UNKNOWN_CONNECTION, level: "warning" });
+          else if (status?.needsConsent && status.confirmation) this.reviewMachine(status, (cx, approval) => this.openRigSpace(cx, rig.id, null, approval, null, null, rig.conn), feed, rig.name);
+          else this.openRigSpace(cx, rig.id, null, null, null, null, rig.conn);
+        }
         else if (cmdName === "space" || cmdName === "rig.space") this.openRigSpace(cx, cmdArgs?.rigId ?? cmdArgs?.rig ?? this.viewState("rig.sel")?.entry?.rigId,null,null,null,null,cmdArgs?.conn??null);
         else if (cmdName === "oneclick") this.oneClicks(cx);
         else if (cmdName.startsWith("open-seat:")) {
@@ -265,8 +339,13 @@ export default class RigSidebar extends View {
           this.openNeedTarget(cx, fallbackId, cmdArgs?.conn ?? null);
         }
         else if (cmdName === "back") {
-          setShared("rig.nav", navBack(shared("rig.nav")));
-          openOrFocusRigTab({ run, spaces, panes, layout, section: "topology" });
+          const prevNav = shared("rig.nav");
+          const backConn = this.feeds.length > 1 ? (prevNav?.stack?.at(-1)?.conn ?? this.follow?.shownId ?? null) : null;
+          const target = backTarget(prevNav, backConn);
+          const nextNav = navBack(prevNav, backConn);
+          setShared("rig.nav", nextNav);
+          const backEntry = target ?? nextNav.stack?.at(-1) ?? this.entryOf({ section: "topology" });
+          openOrFocusRigTab({ run, spaces, panes, layout, section: backEntry?.section ?? "topology" }, backEntry);
         }
         else if (cmdName === "zoom" || cmdName === "rig.zoom") void this.handleZoomCommand(cx, cmdArgs);
         else if (cmdName === "close-cell" || cmdName === "rig.close-cell") void this.handleCloseCellCommand(cx, cmdArgs);
@@ -294,6 +373,8 @@ export default class RigSidebar extends View {
         cx.notify();
       }
     });
+    // Still alive, so an Attach forwarded here waits for this sidebar (every 10 s: each change of shared state is written whole and redraws every mod).
+    cx.timer.every(10000, () => { if (!this.closed) setShared("rig.routeReceivers", receiversWithBeat(shared("rig.routeReceivers"), this.routeReceiverId)); });
     // SSE accelerates updates; polling also covers lifecycle changes the stream does not announce.
     cx.timer.every(5000, (cx) => {
       if (this.closed) return;
@@ -302,6 +383,7 @@ export default class RigSidebar extends View {
   }
 
   primaryStateId() { return this.primary.config?.connectionId ?? this.primary.id ?? LEGACY_CONNECTION_ID; }
+  notifiedNeedsKey(connId) { return connId === this.primaryStateId() ? "rig.notifiedNeeds" : `${connId}|rig.notifiedNeeds`; }
   sidebarConnection() { return this.viewFeed?.id ?? this.follow?.shownId ?? this.primaryStateId(); }
   // Within a render each view field is read once (rig.sidebar.views is copied whole on every read); a write drops what was read.
   viewState(key,conn=this.sidebarConnection()) {
@@ -327,11 +409,47 @@ export default class RigSidebar extends View {
     setShared('rig.sidebar.views',views);
     for(const [key,field]of Object.entries(SIDEBAR_VIEW_FIELDS))setShared(key,views[id][field]??(field==='open'?{}:field==='topologyView'?'priority':null));
     setShared('rig.sidebar.primary',id);
+    restoreAwayStateMap({ shared, setShared }, id);
+    this.restoreNotifiedNeeds();
+  }
+  restoreNotifiedNeeds() {
+    if (!this.primary.config) return;
+    const primary = this.primaryStateId();
+    const byConn = cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn"));
+    const owner = shared("rig.notifiedNeeds.primary");
+    const legacy = cleanNotifiedNeeds(shared("rig.notifiedNeeds"));
+    if (legacy) {
+      const target = owner ?? primary;
+      if (!Object.hasOwn(byConn, target)) byConn[target] = legacy;
+    }
+    setShared("rig.notifiedNeeds", byConn[primary] ?? null);
+    setShared("rig.notifiedNeeds.primary", primary);
+    for (const [connId, entry] of Object.entries(byConn)) {
+      if (connId === primary) continue;
+      const key = this.notifiedNeedsKey(connId);
+      const live = cleanNotifiedNeeds(shared(key));
+      if (live) byConn[connId] = live;
+      else setShared(key, entry);
+    }
+    setShared("rig.notifiedNeeds.byConn", byConn);
   }
   selectRow(entry,key) { entry=this.entryOf(entry);if(entry)this.setViewState('rig.sel',{key:key??navKey(entry),entry,at:Date.now()}); }
   openPage(entry,key) {
     entry=this.entryOf(entry);
     const conn=entry?.conn??this.sidebarConnection();
+    if(entry?.showDismissed){
+      const feed=this.exactFeed(conn),prevFeed=this.viewFeed;
+      let model=null;
+      if(feed){
+        this.viewFeed=feed;
+        try{model=this.dismissalModel(feed);}finally{this.viewFeed=prevFeed;}
+      }
+      if(model&&!model.show){
+        model.show=true;
+        this.publishDismissals();
+        this.saveDismissals(model).catch(()=>{});
+      }
+    }
     return openPage(entry,key,{shared:k=>SIDEBAR_VIEW_FIELDS[k]?this.viewState(k,conn):shared(k),setShared:(k,v)=>SIDEBAR_VIEW_FIELDS[k]?this.setViewState(k,v,conn):setShared(k,v)});
   }
 
@@ -347,7 +465,7 @@ export default class RigSidebar extends View {
       const parsed = parseSidebarState(raw);
       try {
         const saved = JSON.parse(raw);
-        const spaceState = { homeSpace: saved.homeSpace, homeSpaces:saved.homeSpaces, machineDeclined:saved.machineDeclined,machineSearchDeclined:saved.machineSearchDeclined,machineAddDeclined:saved.machineAddDeclined,
+        const spaceState = { homeSpace: saved.homeSpace, homeSpaces:saved.homeSpaces, inPlaceOpen:saved.inPlaceOpen, machineDeclined:saved.machineDeclined,machineSearchDeclined:saved.machineSearchDeclined,machineAddDeclined:saved.machineAddDeclined,
           sidebarSize: saved.sidebarSize, autoFoldRetired: saved.autoFoldRetired, tabMigration: saved.tabMigration,workerViews:saved.workerViews };
         setShared("rig.spaceState", { ...spaceState, ...(shared("rig.spaceState") ?? {}) });
         setShared("rig.workerViews",shared("rig.spaceState")?.workerViews??{});
@@ -356,6 +474,12 @@ export default class RigSidebar extends View {
       if (parsed.topologyView && !shared("rig.topology.view")) setShared("rig.topology.view", parsed.topologyView);
       if(parsed.sidebarViews)setShared('rig.sidebar.views',{...parsed.sidebarViews,...cleanSidebarViews(shared('rig.sidebar.views'))});
       if (parsed.notifiedNeeds && !shared("rig.notifiedNeeds")) setShared("rig.notifiedNeeds", parsed.notifiedNeeds);
+      if (parsed.notifiedNeedsByConnection) {
+        setShared("rig.notifiedNeeds.byConn", { ...parsed.notifiedNeedsByConnection, ...cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn")) });
+      }
+      if (parsed.awayStates) {
+        setShared("rig.away.states", { ...parsed.awayStates, ...cleanAwayStates(shared("rig.away.states"), { keepEmpty: true }) });
+      }
       if (Object.keys(parsed.open).length > 0) {
         setShared("rig.open.sidebar", { ...parsed.open, ...(shared("rig.open.sidebar") ?? {}) });
       }
@@ -377,28 +501,49 @@ export default class RigSidebar extends View {
     } catch (_) {}
   }
 
+  /** A state save that could not be done is said once per distinct message, and a save that works clears it (the same failure on every later save is not said again). */
+  sayStateSave(error) {
+    if (!error) { this.stateSaveSaid = null; return; }
+    const body = stateSaveFailure("the sidebar's folds, order and what you last saw", error);
+    if (this.stateSaveSaid === body) return;
+    this.stateSaveSaid = body;
+    notify({ title: "OpenRig", level: "warning", body });
+  }
+
   persistSidebarState(openMap = this.viewState("rig.open.sidebar"), orderMap = shared("rig.order")) {
     if (typeof appHome !== "function" || typeof writeTextFile !== "function") return;
     const path = `${appHome()}/openrig/state.json`;
-    this.sidebarPersist=(this.sidebarPersist??Promise.resolve()).catch(()=>{}).then(()=>readTextFile?.(path))
-      .catch(() => null)
-      .then((prevText) => {
+    this.sidebarPersist=(this.sidebarPersist??Promise.resolve()).catch(()=>{}).then(async () => {
+      const error = await saveStateFile({ path, read: (p) => readTextFile?.(p), write: writeTextFile, build: (prevText) => {
         const primary=this.primaryStateId(),views=cleanSidebarViews(shared('rig.sidebar.views'));
         views[primary]=cleanSidebarView({topologyView:this.viewState('rig.topology.view',primary),open:this.viewState('rig.open.sidebar',primary),selection:this.viewState('rig.sel',primary)});
-        const nextText = serializeSidebarState(prevText, {
+        const prevParsed = parseSidebarState(prevText ?? "{}");
+        const configuredIds = new Set([primary, ...(this.primary.config?.connections ?? []).map((c) => c.id)]);
+        const rawByConn = cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn"));
+        const primaryNeeds = cleanNotifiedNeeds(shared("rig.notifiedNeeds"));
+        if (primaryNeeds) rawByConn[primary] = primaryNeeds;
+        else delete rawByConn[primary];
+        for (const f of this.feeds.slice(1)) {
+          const entry = cleanNotifiedNeeds(shared(this.notifiedNeedsKey(f.id))) ?? rawByConn[f.id] ?? null;
+          if (entry) rawByConn[f.id] = entry;
+          else delete rawByConn[f.id];
+        }
+        const byConn = Object.fromEntries(Object.entries(rawByConn).filter(([id]) => configuredIds.has(id)));
+        return serializeSidebarState(prevText, {
           open: this.viewState('rig.open.sidebar',this.primaryStateId()),
           order: orderMap ?? {},
           topologyView: this.viewState('rig.topology.view',this.primaryStateId()),
           sidebarViews: this.feeds.length>1||Object.keys(views).some(id=>id!==primary)?views:undefined,
           notifiedNeeds: shared("rig.notifiedNeeds"),
+          notifiedNeedsByConnection: this.feeds.length > 1 || Object.keys(byConn).some((id) => id !== primary) || Boolean(prevParsed.notifiedNeedsByConnection) ? byConn : undefined,
           lastSeenNeedsAt: shared("rig.lastSeenNeedsAt"),
           needsView: shared("rig.needsView"),
           lastEndedModeApplicationId: shared("rig.lastEndedModeApplicationId"),
           lastActiveModeApplicationId: shared("rig.lastActiveModeApplicationId"),
         });
-        return writeTextFile(path, nextText, prevText);
-      })
-      .catch(() => {});
+      } });
+      this.sayStateSave(error);
+    }).catch(() => {});
     return this.sidebarPersist;
   }
 
@@ -421,29 +566,41 @@ export default class RigSidebar extends View {
     // A settings change that is not just the same config enriched (the gate's own identity): the rows on screen came from the OLD daemon, and a row is something a person can
     // act on (Pause runs `rig down <name>` against whatever the config names now). They go at once, before the new daemon's first refresh publishes its own.
     const changed = !!this.config && !gateSameConfig(this.config, next);
+    const prevPrimary = this.primaryStateId();
     this.config = next;
     if (changed) {
       this.data = null; this.live = false; this.lists = {};
       this.healthz = null; this.cliVersion = null; // the old daemon's health and version are not the new one's; a failed read of the new one leaves them unknown (routeHost's selfHostId too)
-      publishRigData(setShared, { topology: [], live: false, error: null, config: this.config });
+      if (this.primaryStateId() === prevPrimary) {
+        this.primary.prioritySeeded = false;
+        setShared("rig.notifiedNeeds", null);
+        const byConn = cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn"));
+        delete byConn[prevPrimary];
+        setShared("rig.notifiedNeeds.byConn", byConn);
+      }
+      this.setRigData({ topology: [], live: false, error: null, config: this.config });
       cx.notify();
     }
+    this.restoreSidebarViews();
+    this.syncFeeds(cx);
     if (reconnect || rigChanged) this.forceCapabilityProbe = true;
     if (reconnect) { try { this.sock?.close(); } catch (_) {} }
     try { await this.refresh(cx); } finally { this.syncFeeds(cx); } // the other connections' feeds start whatever the first one's refresh did
   }
 
   /** Expand a top-level branch in the tree and select it (`rig.<section>` command or branch click). */
-  pickSection(section, cx, { openInPage = false } = {}) {
+  pickSection(section, cx, { openInPage = false, conn = null } = {}) {
+    if (conn && !this.exactFeed(conn)) { notify({ title: "OpenRig", body: UNKNOWN_CONNECTION, level: "warning" }); return; } // a named connection that isn't this sidebar's: said, not replaced by another
+    const stateConn = conn ?? undefined; // undefined: the box the sidebar shows
     const bKey = branchKey(section);
-    const curOpen = this.viewState("rig.open.sidebar") ?? {};
+    const curOpen = this.viewState("rig.open.sidebar", stateConn) ?? {};
     const nextOpen = { ...curOpen, [bKey]: true };
-    this.setViewState("rig.open.sidebar", nextOpen);
+    this.setViewState("rig.open.sidebar", nextOpen, stateConn);
     this.persistSidebarState(nextOpen, shared("rig.order"));
-    const entry = this.entryOf({ section }); // a section opened from the sidebar belongs to the box it shows
-    this.setViewState("rig.sel", { key: bKey, entry, at: Date.now() });
+    const entry = this.entryOf(conn ? { section, conn } : { section }); // a section opened from the sidebar belongs to the box it shows, or to the one it names
+    this.setViewState("rig.sel", { key: bKey, entry, at: Date.now() }, stateConn);
     if (openInPage) {
-      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout }, entry);
+      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, mayCreate: true }, entry);
     } else if (findRigTab(spaces?.() ?? [], panes?.() ?? []) || hasRigWorkStack(layout())) {
       // A Rig page already open follows the section (rig.<section> from the palette or keys), as a branch click does.
       setShared("rig.nav", navPush(shared("rig.nav"), entry));
@@ -464,7 +621,16 @@ export default class RigSidebar extends View {
         : (shared("rig.pendingNeed") ?? this.lastNeedId ?? null);
     const all = this.data?.attentionItems ?? shared("rig.data")?.attentionItems ?? null;
     // The same ask id can exist on two OpenRigs: a toast names its connection, and the request opened is that connection's.
-    const wanted = conn ?? (typeof idOrArgs === "object" && idOrArgs !== null ? idOrArgs.conn ?? null : null) ?? (id === this.lastNeedId ? this.lastNeedConn ?? null : null);
+    let wanted = conn ?? (typeof idOrArgs === "object" && idOrArgs !== null ? idOrArgs.conn ?? null : null) ?? (id === this.lastNeedId ? this.lastNeedConn ?? null : null);
+    // No connection named and the id is on more than one OpenRig: the one the sidebar shows if it has it, else none (never the first one's).
+    if (!wanted && this.feeds.length > 1 && id && Array.isArray(all)) {
+      const owners = [...new Set(all.filter((i) => String(i?.id ?? "") === String(id)).map((i) => i?.conn ?? this.primary.id))];
+      if (owners.length > 1) {
+        const shown = this.sidebarConnection();
+        if (owners.includes(shown)) wanted = shown;
+        else { notify({ title: "Request", body: AMBIGUOUS_REQUEST, level: "warning" }); if (shared("rig.pendingNeed")) setShared("rig.pendingNeed", null); cx?.notify?.(); return null; }
+      }
+    }
     const items = wanted && Array.isArray(all) ? all.filter((i) => (i?.conn ?? this.primary.id) === wanted) : all;
     const res = openNeed(id, { shared, setShared, run, items, layout, spaces, panes, conn: wanted });
     if (shared("rig.pendingNeed")) setShared("rig.pendingNeed", null);
@@ -473,10 +639,12 @@ export default class RigSidebar extends View {
   }
 
   /** The active space's Rig TUI, shown, or opened once (works without config.json). */
-  tui(cx) {
+  tui(cx, conn = null) {
     // Before config.json has been read a refused list cannot be seen: wait, never fall back to a default config (it could open a home space and a TUI).
     if (!this.config) { notify({ title: "Open TUI", body: "OpenRig is still loading; try again in a moment", level: "warning" }); return; }
-    const feed = this.followedFeed(), config = feed.config, inRigLayout = inRigLayoutNow();
+    const feed = conn ? this.exactFeed(conn) : this.followedFeed(); // a named connection is that OpenRig's TUI, exactly
+    if (!feed) { notify({ title: "Open TUI", body: UNKNOWN_CONNECTION, level: "warning" }); return; }
+    const config = feed.config, inRigLayout = inRigLayoutNow();
     cx.spawn(async (cx) => {
       const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
       if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
@@ -494,7 +662,7 @@ export default class RigSidebar extends View {
       return;
     }
     const config = feed.config; // loaded: the guard above returned otherwise
-    if (config?.daemonUrl && !isLoopbackDaemonUrl(config.daemonUrl)) {
+    if (config?.daemonUrl && !isLoopbackDaemonUrl(config.daemonUrl) && !herdrIdentityOf(config)) { // a switched box's operator is reached like its seats
       notify({ title: "Open operator", body: REMOTE_OPERATOR_REASON, level: "warning" });
       cx?.notify?.();
       return;
@@ -520,10 +688,11 @@ export default class RigSidebar extends View {
             });
     const current = () => this.stillCurrent(feed, config); // the box this began for
     cx.spawn(async (cx) => {
-      const res = await this.routeOpen(this.routeHost(cx, consent, feed), config, { kind: "attach", seat: opSeat,
-        options: { name: "Operator", operator: true, daemonUrl: config?.daemonUrl } });
+      const res = await this.routeAttach((attempt) => this.routeHost(cx, consent, feed, attempt), config, { kind: "attach", seat: opSeat,
+        options: { name: "Operator", operator: true, daemonUrl: config?.daemonUrl } }, "Open operator");
+      if (res?.notified) { cx.notify(); return; } // its give-up already said it (one message per Attach)
       if (!current()) { notify({ title: "Open operator", body: CONNECTION_CHANGED_DURING, level: "warning" }); cx.notify(); return; }
-      if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.openOperator(cx, approval, conn), feed);
+      if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.openOperator(cx, approval, feed.id), feed); // the approved retry is this box's, even when the click named none and the sidebar follows another box by then
       else if (res?.needsViewerRefresh) this.reviewViewerReplace(res, opSeat, { operator: true, name: "Operator" });
       else this.notifyResult("Open operator", res, true, { machine: config?.daemonMachine });
       cx.notify();
@@ -567,7 +736,7 @@ export default class RigSidebar extends View {
         }
       } catch (e) {
         this.startingDaemon = false;
-        this.startDaemonError = String(e?.message ?? e ?? "Failed to start OpenRig.").split("\n")[0];
+        this.startDaemonError = plainExecError(e, { kind: "write" }).split("\n")[0];
         cx.notify();
       }
     });
@@ -599,10 +768,11 @@ export default class RigSidebar extends View {
     const config = feed.config, current = () => this.stillCurrent(feed, config);
     cx.spawn(async (cx) => {
       if (!current()) { notify({ title: `Attach ${session}`, body: CONNECTION_CHANGED_DURING, level: "warning" }); return; }
-      const res = await this.routeOpen(this.routeHost(cx, consent, feed), config, { kind: "attach", seat });
+      const res = await this.routeAttach((attempt) => this.routeHost(cx, consent, feed, attempt), config, { kind: "attach", seat }, `Attach ${seat.logicalId ?? session}`);
+      if (res?.notified) { cx.notify(); return; } // its give-up already said it (one message per Attach)
       // A late answer for a connection removed or edited during the await asks no approval and reports no result for it.
       if (!current()) { notify({ title: `Attach ${session}`, body: CONNECTION_CHANGED_DURING, level: "warning" }); cx.notify(); return; }
-      if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.attachSeatBySession(cx, session, approval, conn), feed); // the approved retry is for the same OpenRig
+      if (res?.needsConsent) this.reviewMachine(res, (cx, approval) => this.attachSeatBySession(cx, session, approval, feed.id), feed); // the approved retry is for the same OpenRig's seat, even when the Attach named none
       else if (res?.needsViewerRefresh) this.reviewViewerReplace(res, seat);
       else this.notifyResult(`Attach ${seat.logicalId ?? session}`, res, true, { machine: config.daemonMachine });
       cx.notify();
@@ -618,14 +788,37 @@ export default class RigSidebar extends View {
   feedOf(conn) { return this.feeds.find((f) => f.id === conn) ?? this.primary; }
   /** The feed of exactly this connection id, or null: unlike feedOf, never the first connection in place of a removed one. With one connection, a
    *  row that names none (or names that one) is the first's. */
-  exactFeed(conn) {
-    const found = this.feeds.find((f) => f.id === conn);
-    if (found) return found;
-    const firstId = this.primary.id ?? this.primary.config?.connectionId ?? LEGACY_CONNECTION_ID;
-    return this.feeds.length === 1 && (!conn || conn === firstId) ? this.primary : null;
-  }
+  exactFeed(conn) { return this.ownFeed(conn); }
   /** The open route (a seam at the await, so a test can hold it). */
   routeOpen(host, config, request) { return routeRigOpen(host, config, request); }
+  /** An Attach on a Herdr machine: says what it is doing after ATTACH_PROGRESS_MS, and gives up at ATTACH_DEADLINE_MS with the step it was
+   *  on. Once it gave up, the preparation stops at its next remote call and nothing is started, focused or replaced. Local attaches run as before. */
+  async routeAttach(makeHost, config, request, title) {
+    const machine = config?.daemonMachine, state = { step: null, done: false, cancelled: false }, host = makeHost(state);
+    if (!machine || typeof host.wait !== "function") return this.routeOpen(host, config, request);
+    const run = Promise.resolve().then(() => this.routeOpen(host, config, request)).finally(() => { state.done = true; });
+    // Both timers belong to no view, and the give-up is said inside its own timer: neither a view that went away nor a lost continuation of
+    // the open (a script interrupt drops the job it was running) can leave a failed Attach silent.
+    const deadline = host.deadline ?? host.wait;
+    deadline(ATTACH_PROGRESS_MS).then(() => {
+      if (!state.done && !state.cancelled) notify({ title, body: `Still working on ${machine}: ${state.step ?? "starting"}.`, level: "info" });
+    });
+    let givenUp = null;
+    const giveUp = deadline(ATTACH_DEADLINE_MS).then(() => {
+      if (state.done) return null;
+      state.cancelled = true;
+      // A start already sent to Herdr can't be taken back: then the viewer may still appear.
+      const next = state.step === "starting the viewer" ? "It may still appear; check before trying again."
+        : state.step === "replacing the old viewer" ? "The old viewer may already be stopped; Attach again to start a new one." : "Nothing more will happen; try again.";
+      givenUp = { ok: false, timedOut: true, notified: true, reason: `${title} didn't finish on ${machine} in ${ATTACH_DEADLINE_MS / 1000} s: it was ${state.step ?? "starting"}. ${next}` };
+      notify({ title, body: givenUp.reason, level: "warning" });
+      return TIMED_OUT;
+    });
+    const result = await Promise.race([run, giveUp]);
+    if (result !== TIMED_OUT) return result;
+    run.catch(() => {});
+    return givenUp;
+  }
   /** The connection the sidebar shows right now, for a lookup by NAME: with several, only a box that is actually shown (no fallback to the first); the only one with one connection. */
   shownConnId() { return this.feeds.length > 1 ? (this.drawnConnId ?? this.follow?.shownId ?? null) : this.primary.id; }
   /** `rig.open-seat:<session>`: the seat of the box the sidebar shows; a session name two OpenRigs hold and no shown box that has it is refused, never the first. */
@@ -641,33 +834,79 @@ export default class RigSidebar extends View {
     if (row) { this.seatClick(row.rig, row.seat, row.pod); return; }
     if (rows.length > 1) notify({ title: `Open ${session}`, body: AMBIGUOUS_NAME, level: "warning" });
   }
-  /** The feed the sidebar's own header actions (Open TUI, Operator) act for: the box it shows (follow mode), else the first. */
-  followedFeed() { return (this.feeds.length > 1 && this.feeds.find((f) => f.id === (this.drawnConnId ?? this.follow?.shownId))) || this.primary; }
+  /** The feed the sidebar's own header actions (Open TUI, Operator) act for: the box it shows (follow mode), the first when none is named, or null when the drawn connection was removed. */
+  followedFeed() {
+    const id = this.drawnConnId ?? this.follow?.shownId ?? null;
+    if (!id) return this.primary;
+    return this.feeds.find((f) => f.id === id) ?? null;
+  }
+
+  trackRouteOp(feed, attempt, countInflight, startPromise, { attemptOnly = false } = {}) {
+    if (countInflight) {
+      if (attempt) { attempt.inflight = (attempt.inflight ?? 0) + 1; attempt.lastBeat = Date.now(); }
+      if (feed && !attemptOnly) feed.inflightRouteOps = (feed.inflightRouteOps ?? 0) + 1;
+    } else if (attempt) {
+      attempt.lastBeat = Date.now();
+    }
+    const done = () => {
+      if (countInflight) {
+        if (attempt) { attempt.inflight = Math.max(0, (attempt.inflight ?? 1) - 1); attempt.lastBeat = Date.now(); }
+        if (feed && !attemptOnly) feed.inflightRouteOps = Math.max(0, (feed.inflightRouteOps ?? 1) - 1);
+      } else if (attempt) {
+        attempt.lastBeat = Date.now();
+      }
+    };
+    try { return Promise.resolve(startPromise()).finally(done); }
+    catch (error) { done(); throw error; }
+  }
 
   /** The host a connection's rig-space routing, attach and machine setup run through: every send is checked against THAT connection's gate scope (its address and home), never the first one's. */
-  attachHost(cx, consent = null, feed = this.primary) {
+  attachHost(cx, consent = null, feed = this.primary, attempt = null) {
     const config = feed.config, connectionId = config?.connectionId ?? LEGACY_CONNECTION_ID;
-    const host = { exec: execFor(config), spaces, panes, terminals, hc: hcFor(config), run: runFor(config), machines, layout, shared, setShared, routeOwner: true, seatShared: this.seatShared(),currentConfig:()=>feed.config,openOverlay:spec=>this.open(spec),closeOverlay,
+    const track = (fn, countInflight = true, opts) => this.trackRouteOp(feed, attempt, countInflight, fn, opts);
+    const host = {
+      onStep: (words, rebuilding = false) => {
+        if (attempt) { attempt.step = words; attempt.lastBeat = Date.now(); attempt.onStepChange?.(words, rebuilding); }
+      },
+      onRebuildStart: () => { if (attempt) { attempt.lastBeat = Date.now(); attempt.onRebuildStart?.(); } },
+      currentStep: () => attempt?.step ?? attempt?.defaultStep ?? null,
+      cancelled: () => !!attempt?.cancelled,
+      waitQueue: (fn) => track(fn, true, { attemptOnly: true }),
+      registerBarrier: (release) => {
+        if (attempt) (attempt.releases ??= new Set()).add(release);
+        const own = (this.ownRouteReleases ??= new Set());
+        own.add(release);
+        return () => {
+          attempt?.releases?.delete(release);
+          own.delete(release);
+        };
+      },
+      exec: (command, args, options) => track(() => execFor(config)(command, args, options)),
+      spaces, panes, terminals,
+      hc: (args, bytes) => track(() => hcFor(config)(args, bytes)),
+      run: runFor(config), machines, layout, shared, setShared, routeOwner: true, seatShared: this.seatShared(), currentConfig: () => feed.config, openOverlay: spec => this.open(spec), closeOverlay,
       relayPath: attachRelayPath(appHome(), MOD_IDS.sidebar),
-      wait: (ms) => new Promise((resolve) => cx.timer.after(ms, resolve)),
-      health: async (url) => { const r = await fetchFor(config)(`${url}/healthz`); if (!r.ok) throw new Error("Cannot read the tunnel's OpenRig health."); return r.json(); },
-      readConsent: async () => consentOf(await readTextFile(`${appHome()}/openrig/machine-consent.json`).catch(() => null), connectionId),
-      writeConsent: async (value) => {
+      wait: (ms) => track(() => new Promise((resolve) => cx.timer.after(ms, resolve)), ms < 10000),
+      // A timer with no owner view: Herdr settles a view-owned timer only while its view lives, so a deadline must not depend on one.
+      deadline: (ms) => new Promise((resolve) => cx.timer.after(ms, resolve, { owner: null })),
+      health: (url) => track(async () => { const r = await fetchFor(config)(`${url}/healthz`); if (!r.ok) throw new Error("Cannot read the tunnel's OpenRig health."); return r.json(); }),
+      readConsent: () => track(async () => consentOf(await readTextFile(`${appHome()}/openrig/machine-consent.json`).catch(() => null), connectionId)),
+      writeConsent: (value) => track(async () => {
         const path = `${appHome()}/openrig/machine-consent.json`;
         const previous = await readTextFile(path).catch(() => null);
         const text = consentText(previous, connectionId, value);
         await writeTextFile(path, previous === null ? text.trimEnd() : text.trimEnd(), previous);
-      } };
+      }) };
     const remote = new RemoteMachine(host);
     host.prepareRemote = (config, opts = {}) => remote.prepare(config, { ...opts, consent });
     host.prepareHome = config => remote.home(config);
     return host;
   }
 
-  routeHost(cx, consent = null, feed = this.primary) {
-    return { ...this.attachHost(cx, consent, feed), currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], selfHostId: () => feed.healthz?.selfHostId,
-      saveRouteState: patch => this.saveSpaceState(patch),
-      syncGrid: (rig, options) => this.spaceController(cx, consent, feed).sync(rig, feed.config, options) };
+  routeHost(cx, consent = null, feed = this.primary, attempt = null) {
+    return { ...this.attachHost(cx, consent, feed, attempt), currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], selfHostId: () => feed.healthz?.selfHostId,
+      saveRouteState: patch => this.trackRouteOp(feed, attempt, true, () => this.saveSpaceState(patch)),
+      syncGrid: (rig, options) => this.spaceController(cx, consent, feed, attempt).sync(rig, feed.config, options) };
   }
 
   async saveSpaceState(patch) {
@@ -771,11 +1010,18 @@ export default class RigSidebar extends View {
         if(this.closed||this.config?.daemonMachine||this.config?.daemonUrl!==config.daemonUrl)return;
         if(!local.reachable||rigOrigin(local.daemonUrl)!==rigOrigin(config.daemonUrl))await this.findDaemonMachine(cx,config);
       }catch(error){this.machineDetectionError=String(error?.message??error);}
-      this.machineOfferHandle??=cx.focus_handle?.();this.machineHintHandle??=cx.focus_handle?.();this.machineFindHandle??=cx.focus_handle?.();
-      cx.notify();
+      cx.notify(); // the next draw makes the card's focus handles (ensureMachineHandles)
     }));
   }
 
+  /** The machine card's focus handles, made through a timer set from the draw (this sidebar's own call), never after an await; a released one is
+   *  made again. */
+  ensureMachineHandles(cx){
+    const names=["machineOfferHandle","machineHintHandle","machineFindHandle","machineUseHandle","machineDeclineHandle"];
+    if(this.machineHandlesPending||!cx?.timer?.after||names.every(name=>liveFocus(this[name])))return;
+    this.machineHandlesPending=true;
+    cx.timer.after(0,next=>{this.machineHandlesPending=false;if(this.closed||!next?.focus_handle)return;for(const name of names)if(!liveFocus(this[name]))this[name]=next.focus_handle();next.notify?.();});
+  }
   async findDaemonMachine(cx,config={...this.config}) {
     if(this.machineFinding||config.daemonMachine)return;
     this.machineFinding=true;this.machineDetectionError=null;
@@ -784,13 +1030,13 @@ export default class RigSidebar extends View {
       if(this.closed||this.config?.daemonMachine||this.config?.daemonUrl!==config.daemonUrl)return;
       this.daemonMachineOffer=offer&&!shared("rig.spaceState")?.machineDeclined?.[offer.key]?{...offer,origin:config.daemonUrl}:null;
       this.machineSearchComplete=true;
-      this.machineOfferHandle??=cx.focus_handle?.();this.machineHintHandle??=cx.focus_handle?.();
-      this.machineUseHandle??=cx.focus_handle?.();this.machineDeclineHandle??=cx.focus_handle?.();
+      // The next draw makes the offer's focus handles (ensureMachineHandles), never this continuation.
     }catch(error){this.machineDetectionError=String(error?.message??error);}
     finally{this.machineFinding=false;cx.notify();}
   }
 
-  machineOfferCard(t) {
+  machineOfferCard(t,cx) {
+    this.ensureMachineHandles(cx);
     const offer=this.daemonMachineOffer;
     if(!offer)return v_flex().id("rig-daemon-machine-search").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
       .when(!!this.machineOfferHandle,el=>el.track_focus(this.machineOfferHandle).tab_stop(true).tab_index(0))
@@ -824,7 +1070,7 @@ export default class RigSidebar extends View {
     };
     return v_flex().id("rig-daemon-machine-offer").mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
       .when(!!this.machineOfferHandle,el=>el.track_focus(this.machineOfferHandle).tab_stop(true).tab_index(0))
-      .when(!!this.machineOfferHandle?.is_focused?.(),el=>el.border_1().border_color(t.accent))
+      .when(!!liveFocus(this.machineOfferHandle)?.is_focused?.(),el=>el.border_1().border_color(t.accent))
       .child(div().text_size(11.5).text_color(t.muted).child(`OpenRig runs on ${offer.machine}. Put OpenRig's spaces and Attach there?`))
       .child(h_flex().gap(8)
         .child(div().id("rig-use-daemon-machine").px(6).py(3).rounded(4).text_size(11.5).text_color(t.accent).cursor_pointer()
@@ -914,10 +1160,11 @@ export default class RigSidebar extends View {
         const allowedOptions = (options) => Object.fromEntries(["replaceViewer", "operator", "name"].filter((key) => options?.[key] !== undefined).map((key) => [key, options[key]]));
         let selected = { ...request, options: allowedOptions(request.options), background: false };
         // The connection comes from the request (a rig's or a seat's own). With several OpenRigs one that names none is refused: it is never the first's by default.
-        if (this.feeds.length > 1 && !request.conn && !request.seat?.conn && request.kind !== "page") { this.notifyResult("OpenRig", { ok: false, reason: NO_CONNECTION }); return; }
+        const pageNeedsConn = request.kind === "page" && request.entry?.section !== "system" && request.entry?.section !== "file";
+        if ((this.primary.config?.connections?.length ?? this.feeds.length) > 1 && !request.conn && !request.seat?.conn && (request.kind !== "page" || pageNeedsConn)) { this.notifyResult("OpenRig", { ok: false, reason: NO_CONNECTION }); return; }
         // feedOf falls back to the primary for an id it lacks, so a request for a connection removed meanwhile is refused here, before any host is built.
-        if (request.conn && !this.feeds.some((f) => f.id === request.conn)) { this.notifyResult("OpenRig", { ok: false, reason: UNKNOWN_CONNECTION }); return; }
-        let feed = request.conn ? this.exactFeed(request.conn) : this.feedOf(null); // a page request with no connection is the first's, as before
+        let feed = request.conn ? this.ownFeed(request.conn) : this.feedOf(null); // a page request with no connection is the first's, as before
+        if (request.conn && !feed) { this.notifyResult("OpenRig", { ok: false, reason: UNKNOWN_CONNECTION }); return; }
         if (request.kind === "attach") {
           const session = request.seat?.session ?? request.seat?.canonicalSessionName;
           const wanted = request.conn ?? request.seat?.conn ?? null; // the request's connection decides which OpenRig's seat a shared name means
@@ -933,7 +1180,9 @@ export default class RigSidebar extends View {
         // The feed and config this request began with: re-checked after the await, so a removed or edited connection's late answer
         // asks no approval and reports nothing for it, and is never resolved to the first connection.
         const config = feed.config, current = () => this.stillCurrent(feed, config);
-        const result = await this.routeOpen(this.routeHost(cx, consent, feed), config, selected);
+        const result = selected.kind === "attach" ? await this.routeAttach((attempt) => this.routeHost(cx, consent, feed, attempt), config, selected, "Attach")
+          : await this.routeOpen(this.routeHost(cx, consent, feed), config, selected);
+        if (result?.notified) return; // its give-up already said it (one message per Attach)
         if (!current()) { this.notifyResult(request.kind === "attach" ? "Attach" : "OpenRig", { ok: false, reason: CONNECTION_CHANGED_DURING }); return; }
         if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.routeRequest(cx, request, approval), feed);
         else if (result.needsViewerRefresh) this.reviewViewerReplace(result, selected.seat ?? request.seat ?? {}, selected.options ?? {});
@@ -944,7 +1193,7 @@ export default class RigSidebar extends View {
     });
   }
 
-  reviewMachine(result, resume, feed = null) {
+  reviewMachine(result, resume, feed = null, waitingForRig = null) {
     this.machineConfirmations ??= new Map();
     // One active first-use dialog per sidebar; a stale dialog cannot authorize a later request.
     this.machineConfirmations.clear();
@@ -952,8 +1201,9 @@ export default class RigSidebar extends View {
     this.machineConfirmations.set(token, { confirmation: result.confirmation, resume });
     setShared("rig.machineSetupToken",token);
     if(this.machineSetupOverlay)closeOverlay(this.machineSetupOverlay);
-    this.machineSetupOverlay=this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 600, height: 680,
-      props: { target: { kind: "machine" }, step: { action: "confirm-machine", token, confirmation: result.confirmation, ...(feed && this.feeds.length > 1 ? { conn: feed.id } : {}) } } }); // the connection the review is for: the dialog's checks and writes act for it
+    const connProp = feed && this.feeds.length > 1 ? { conn: feed.id } : {};
+    this.machineSetupOverlay=this.open({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 600, height: 680,
+      props: { target: { kind: "machine", ...connProp }, step: { action: "confirm-machine", token, confirmation: result.confirmation, ...(waitingForRig ? { waitingForRig } : {}), ...connProp } } }); // the connection the review is for: the dialog's checks and writes act for it
   }
 
   /** An Attach tab from before an update runs an older viewer. The person is asked before anything is
@@ -964,27 +1214,37 @@ export default class RigSidebar extends View {
         ...(options.operator ? { operator: true } : {}), ...(options.name ? { name: options.name } : {}) } } });
   }
 
-  spaceController(cx, consent = null, feed = this.primary) {
+  spaceController(cx, consent = null, feed = this.primary, attempt = null) {
     const key = feed.id ?? "", all = (this.rigSpacesBy ??= new Map());
     if (!all.has(key)) all.set(key, new RigSpaces({ spaces, panes, terminals, focused, commands, hc: hcFor(feed.config), run: runFor(feed.config),
       currentConfig:()=>feed.config,
       gateToken: () => gateGeneration(feed.config?.connectionId), gateCurrent: (token) => gateGeneration(feed.config?.connectionId) === token, // the settings this build began under
-      recoveryShell: async () => {
+      recoveryShell: () => this.trackRouteOp(feed, this.currentSpaceAttempt?.get(key) ?? null, true, async () => {
         const node = feed.config?.rig?.[0]?.match(/(?:^|\/)node$/) ? feed.config.rig[0] : "node";
         const result = await execFor(feed.config)(node, [`${appHome()}/mods/${MOD_IDS.sidebar}/rig-shell-config.cjs`]);
         return result.code === 0 ? JSON.parse(result.stdout) : null;
-      },
+      }),
       padPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-pad.cjs`,
       viewerPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-viewer.cjs`, selfHostId: () => feed.healthz?.selfHostId,
-      wait: (ms) => new Promise((resolve) => cx.timer.after(ms, resolve)) }));
+      wait: (ms) => this.trackRouteOp(feed, this.currentSpaceAttempt?.get(key) ?? null, ms < 10000, () => new Promise((resolve) => cx.timer.after(ms, resolve))) }));
+    (this.currentSpaceAttempt ??= new Map()).set(key, attempt);
     const controller = all.get(key);
-    controller.host.prepareRemote = this.attachHost(cx, consent, feed).prepareRemote;
-    controller.host.prepareHome = this.attachHost(cx, consent, feed).prepareHome;
-    controller.host.health = this.attachHost(cx, consent, feed).health;
+    const attached = this.attachHost(cx, consent, feed, attempt);
+    controller.host.prepareRemote = attached.prepareRemote;
+    controller.host.prepareHome = attached.prepareHome;
+    controller.host.health = attached.health;
+    controller.host.exec = attached.exec;
+    controller.host.hc = attached.hc;
+    controller.host.onStep = attached.onStep;
+    controller.host.onRebuildStart = attached.onRebuildStart;
+    controller.host.currentStep = attached.currentStep;
+    controller.host.deadline = attached.deadline;
+    controller.host.waitQueue = attached.waitQueue;
+    controller.host.registerBarrier = attached.registerBarrier;
+    controller.host.explicitRequested = () => Boolean(attempt?.rigKey && this.opening?.has(attempt.rigKey));
     controller.host.openOverlay = spec=>this.open(spec);
     controller.host.closeOverlay = closeOverlay;
     controller.host.shared = shared;controller.host.setShared = setShared;
-    controller.host.exec = execFor(feed.config);
     if (feed === this.primary) this.rigSpaces = controller;
     return controller;
   }
@@ -1039,6 +1299,76 @@ export default class RigSidebar extends View {
       .child(action("rig-grid-move-dismiss","Dismiss",(_e,cx)=>{this.gridMoveResult=null;cx.notify();}));
   }
 
+  /** The key of this rig's space card and "opening" mark: the rig id with one OpenRig, qualified by its connection with several (two OpenRigs can hold the same rig id). */
+  statusKey(rig) { return spaceStatusKey(rig?.conn, rig?.id, this.feeds.length > 1); }
+
+  isWaitingConsent(status, config) {
+    return Boolean(status?.needsConsent && (!status.confirmation
+      || (status.confirmation.machine === config?.daemonMachine && status.confirmation.origin === config?.daemonUrl)));
+  }
+
+  /** Publishes the spinner lines of the spaces being opened or rebuilt, only when they changed: a background sync calls this once per rig per refresh,
+   *  and each publish re-renders every mod. The status map is read only while a rebuild is pending. */
+  publishSpaceOpening() {
+    const next = {};
+    for (const [k, a] of this.openingAttempts ?? []) {
+      if (!a.settled && this.opening?.has(k)) next[k] = this.openingLine(a.rig);
+    }
+    if (this.gridSteps?.size) {
+      const statuses = shared("rig.spaceStatus") ?? {};
+      for (const [k, g] of this.gridSteps) {
+        if (!next[k] && g?.rebuilding && !this.isWaitingConsent(statuses[k], this.feedOf(g.rig?.conn)?.config)) {
+          next[k] = this.openingLine(g.rig, g.step, true);
+        }
+      }
+    }
+    if (this.publishedSpaceOpening && sameValue(next, this.publishedSpaceOpening)) return;
+    this.publishedSpaceOpening = next;
+    setShared("rig.spaceOpening", next);
+  }
+
+  /** Detect an open or background grid sync whose QuickJS continuation was interrupted mid-turn without settling its Promise. */
+  checkInterruptedOpens(cx, now = Date.now()) {
+    const OPEN_INTERRUPT_STALE_MS = 2000;
+    const bg = this.activeBgSync;
+    if (bg && !bg.settled && (bg.inflight ?? 0) === 0 && (bg.feed?.inflightRouteOps ?? 0) === 0 && now - bg.lastBeat >= OPEN_INTERRUPT_STALE_MS) {
+      bg.settled = true;
+      bg.interrupted = true;
+      this.activeBgSync = null;
+      this.spaceSyncing = false;
+      this.gridSteps?.delete(bg.statusKey);
+      for (const release of [...(bg.releases ?? [])]) release();
+      clearInterruptedRouteJob(bg.config, bg.rig.name);
+      this.rigSpacesBy?.get(bg.feed?.id ?? "")?.clearPending(bg.rig, bg.config);
+      this.publishSpaceOpening();
+      cx.notify();
+    }
+    if (!this.openingAttempts?.size) return;
+    for (const [key, attempt] of [...this.openingAttempts.entries()]) {
+      if (attempt.settled) { this.openingAttempts.delete(key); continue; }
+      if ((attempt.inflight ?? 0) > 0 || (attempt.feed?.inflightRouteOps ?? 0) > 0) continue;
+      if (now - attempt.lastBeat < OPEN_INTERRUPT_STALE_MS) continue;
+      attempt.settled = true;
+      attempt.interrupted = true;
+      this.opening?.delete(key);
+      this.openingNames?.delete(key);
+      this.openingAttempts.delete(key);
+      const step = this.gridSteps?.get(key)?.step ?? attempt.step ?? attempt.defaultStep;
+      this.gridSteps?.delete(key);
+      for (const release of [...(attempt.releases ?? [])]) release();
+      clearInterruptedRouteJob(attempt.config, attempt.rig.name);
+      this.rigSpacesBy?.get(attempt.feed?.id ?? "")?.clearPending(attempt.rig, attempt.config);
+      this.publishSpaceOpening();
+      if (this.stillCurrent(attempt.feed, attempt.config)) {
+        const reason = `Opening ${attempt.rig.name} was interrupted while ${step}. Try opening the rig space again.`;
+        const result = { ok: false, retryable: true, preparationFailed: true, interrupted: true, reason };
+        setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [key]: result });
+        notify({ title: `${attempt.rig.name} space`, body: reason, level: "warning" });
+      }
+      cx.notify();
+    }
+  }
+
   openRigSpace(cx, id, rebuild = null, consent = null, relocation = null, continueWorker = null, conn = null) {
     // By id first (unique per OpenRig); a bare NAME two OpenRigs share is refused, never the first one's.
     const topology = (this.data?.topology ?? []).filter(r=>!conn||(r.conn??this.primary.id)===conn), byId = topology.find((r) => r.id === id), named = topology.filter((r) => r.name === id);
@@ -1050,20 +1380,72 @@ export default class RigSidebar extends View {
     const failure = rig ? feed.error : this.error;
     if (!rig || failure) { notify({ title: "Rig space", body: failure ? String(failure) : "OpenRig hasn't loaded this rig yet. Try again in a moment.", level: "warning" }); return; }
     const config = feed.config, current = () => this.stillCurrent(feed, config);
+    if (activeInPlaceOpen({ spaces, panes, shared }, config, rig.id)) {
+      notify({ title: `${rig.name} space`, body: inPlaceSpaceRefusal(rig.name), level: "warning" });
+      return;
+    }
+    const statusKey = this.statusKey(rig);
     // Already building: a repeat click keeps the line and is a true no-op (no second open, no selection write).
-    if ((this.opening ??= new Set()).has(rig.id)) return;
+    if ((this.opening ??= new Set()).has(statusKey)) return;
     this.setViewState("rig.sel", { key: rigKey(rig.id), entry: { section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name }, at: Date.now() });
+    const attempt = {
+      rig, feed, config, statusKey, rigKey: statusKey,
+      step: null, defaultStep: "checking existing space",
+      inflight: 0, lastBeat: Date.now(), settled: false,
+      onStepChange: (words) => {
+        (this.gridSteps ??= new Map()).set(statusKey, { rig, step: words, rebuilding: false });
+        this.publishSpaceOpening();
+        cx.notify();
+      },
+    };
+    (this.openingAttempts ??= new Map()).set(statusKey, attempt);
     // A box grid takes 10-20 s to build: say so on the list until it is verified, so the click doesn't feel dead.
-    this.opening.add(rig.id); cx.notify();
+    this.opening.add(statusKey);
+    (this.openingNames ??= new Map()).set(statusKey, rig.name);
+    this.publishSpaceOpening();
+    cx.notify();
     cx.spawn(async (cx) => {
-      let result;
-      try { result = await this.routeOpen(this.routeHost(cx, consent, feed), config, { kind: "grid", rigId: rig.id, conn: rig.conn, options: { rebuild, relocation } }); }
-      finally { this.opening.delete(rig.id); }
+      let result, alreadySettled = false;
+      try {
+        result = await this.routeOpen(this.routeHost(cx, consent, feed, attempt), config, { kind: "grid", rigId: rig.id, conn: rig.conn, options: { rebuild, relocation } });
+      } catch (error) {
+        const step = this.gridSteps?.get(statusKey)?.step ?? attempt.step ?? attempt.defaultStep;
+        const msg = String(error?.message ?? error);
+        result = { ok: false, retryable: true, preparationFailed: true, reason: msg.includes(step) ? msg : `Couldn't open ${rig.name} while ${step}: ${msg}` };
+      } finally {
+        alreadySettled = attempt.settled;
+        attempt.settled = true;
+        this.opening.delete(statusKey);
+        this.openingNames?.delete(statusKey);
+        if (this.openingAttempts?.get(statusKey) === attempt) this.openingAttempts.delete(statusKey);
+        if (!this.gridSteps?.get(statusKey)?.rebuilding) this.gridSteps?.delete(statusKey);
+        this.publishSpaceOpening();
+      }
+      if (alreadySettled) {
+        if (result?.ok && current()) {
+          const prevStatus = shared("rig.spaceStatus") ?? {};
+          if (!prevStatus[statusKey] || prevStatus[statusKey]?.interrupted) {
+            setShared("rig.spaceStatus", { ...prevStatus, [statusKey]: result });
+          }
+          if (this.machineNotices && config?.daemonMachine && !result.closed) this.machineNotices.delete(config.daemonMachine);
+          if (continueWorker) await this.hostWorkerAction(cx, continueWorker.id, continueWorker.target, continueWorker.action);
+          cx.notify();
+        }
+        return;
+      }
       // A late answer for a connection removed or edited during the build writes no card, asks nothing and continues no worker view (as Close all does).
       if (!current()) { notify({ title: `${rig.name} space`, body: CONNECTION_CHANGED_DURING, level: "warning" }); cx.notify(); return; }
-      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
+      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [statusKey]: result });
       if (result.needsRelocation) this.reviewGridMove(rig,result.relocation,rebuild,continueWorker);
-      else if (result.needsConsent) this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval,relocation,continueWorker,conn), feed);
+      else if (result.needsConsent) {
+        const activeSp = spaces().find((s) => s?.active);
+        const viewPane = activeSp ? panes().find((p) => p.mod === MOD_IDS.view && activeSp.tabs?.some((tb) => tb.id === p.tab && !tb.settled)) : null;
+        if (viewPane) {
+          setShared("rig.nav", navPush(shared("rig.nav"), this.entryOf({ section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name })));
+          if (commands().some((c) => c.name === "tab.select")) run("tab.select", { id: viewPane.tab });
+        }
+        this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval,relocation,continueWorker,conn), feed, rig.name);
+      }
       else if (result.relocated)this.gridMoveResult={...result,name:rig.name,rigId:rig.id,conn:rig.conn,machine:config.daemonMachine,
         changedRows:(result.changed??[]).map(session=>({name:this.gridSeatName(rig,session),reason:result.changedReasons?.[session]??"it changed"})),
         failed:(result.failed??[]).map(session=>this.gridSeatName(rig,session))};
@@ -1074,16 +1456,27 @@ export default class RigSidebar extends View {
     });
   }
 
-  /** What the list says while a rig's grid builds (the machine as Herdr names it). */
-  openingLine(rig) { const machine = this.feedOf(rig?.conn).config?.daemonMachine; return machine ? `Opening ${rig.name} on ${machine}…` : `Opening ${rig.name}…`; }
+  /** What the list says while a rig's grid builds (the machine as Herdr names it, plus the live step once preparation or tile work starts). */
+  openingLine(rig, explicitStep = null, rebuilding = false) {
+    const machine = this.feedOf(rig?.conn).config?.daemonMachine;
+    const key = rig?.id ? this.statusKey(rig) : null;
+    const step = explicitStep ?? (key ? (this.gridSteps?.get(key)?.step ?? this.openingAttempts?.get(key)?.step ?? null) : null);
+    const base = rebuilding
+      ? (machine ? `Rebuilding ${rig.name} on ${machine}` : `Rebuilding ${rig.name}`)
+      : (machine ? `Opening ${rig.name} on ${machine}` : `Opening ${rig.name}`);
+    return step ? `${base} · ${step}…` : `${base}…`;
+  }
 
   /** A result as a toast. A machine notice (a Herdr machine that lost its connection, an OpenRig not answering there) is shown once per machine
    *  for the BACKGROUND space sync; an action the person took (Attach, an open, a worker view) always shows its failure, the notice included.
    *  A success clears the notice of the result's own machine (`machine`: its connection's), not the first connection's. */
   notifyResult(title, result, changed = true, { background = false, machine = null } = {}) {
+    if (result?.notified) return; // already said where it happened (an Attach's give-up toasts from its own timer)
     this.machineNotices ??= new Map();
-    if (result.ok && !result.closed && machine) this.machineNotices.delete(machine);
-    if (result.machineNotice) {
+    if (result.ok && !result.closed && !result.skipped && !result.inPlace && machine) this.machineNotices.delete(machine);
+    if (result.inPlace && (result.note || result.reason)) {
+      notify({ title, body: result.note ?? result.reason, level: "warning" });
+    } else if (result.machineNotice) {
       const { machine: noticeMachine, body } = result.machineNotice;
       const shown = this.machineNotices.has(noticeMachine);
       if (!shown) this.machineNotices.set(noticeMachine, body);
@@ -1094,29 +1487,70 @@ export default class RigSidebar extends View {
   }
 
   syncRigSpaces(cx) {
-    if (this.spaceSyncing) { this.spaceAgain = true; return; }
-    this.spaceSyncing = true;
+    if (this.spaceSyncing && Date.now() - (this.spaceSyncingAt ?? 0) < SYNC_STALE_MS) { this.spaceAgain = true; return; }
+    const pass = {}; // only the latest pass ends the turn: an older one that outlived SYNC_STALE_MS finishes without clearing it
+    this.spaceSyncing = true; this.spaceSyncingAt = Date.now(); this.spacePass = pass;
     cx.spawn(async (cx) => {
       try {
         // Keep the owner with each snapshot row: removal can happen during the previous rig's await, and feedOf
         // deliberately falls back to the primary. A removed box must not become an attempted open on that primary.
         const work = this.feeds.flatMap(feed => (feed.data && !feed.error ? feed.data.topology ?? [] : [])
           .map(rig => ({ feed, config: feed.config, rig })));
-        for (const { feed, config, rig } of work) {
+        for (const [n, { feed, config, rig }] of work.entries()) {
+          if (n) await Promise.resolve(); // each rig's sync continues in its own job, so one long pass over every rig can't run out the time budget
           const current = () => this.stillCurrent(feed, config);
           if (!current() || feed.error) continue;
           if (rig.nodesUnavailable) continue;
-          const result = await routeRigOpen(this.routeHost(cx, null, feed), config, { kind: "grid", rigId: rig.id, conn: rig.conn, background: true });
+          if (activeInPlaceOpen({ spaces, panes, shared }, config, rig.id)) continue;
+          const statusKey = this.statusKey(rig);
+          const prevStatus = (shared("rig.spaceStatus") ?? {})[statusKey];
+          if (prevStatus?.confirmation?.key && this.isWaitingConsent(prevStatus, config)) {
+            const stored = consentOf(
+              await readTextFile?.(`${appHome?.()}/openrig/machine-consent.json`).catch(() => null),
+              config?.connectionId ?? LEGACY_CONNECTION_ID,
+            );
+            if (stored?.key !== prevStatus.confirmation.key) continue;
+          }
+          const bgAttempt = {
+            rig, feed, config, statusKey, rigKey: statusKey,
+            step: null, defaultStep: "checking existing space",
+            inflight: 0, lastBeat: Date.now(), settled: false, background: true,
+            onRebuildStart: () => {
+              (this.gridSteps ??= new Map()).set(statusKey, { rig, step: bgAttempt.step ?? "checking existing grid", rebuilding: true });
+              this.publishSpaceOpening();
+              cx.notify();
+            },
+            onStepChange: (words, rebuilding) => {
+              const prev = this.gridSteps?.get(statusKey);
+              if (rebuilding || prev?.rebuilding || this.opening?.has(statusKey)) {
+                (this.gridSteps ??= new Map()).set(statusKey, { rig, step: words, rebuilding: Boolean(rebuilding || prev?.rebuilding) });
+                this.publishSpaceOpening();
+                cx.notify();
+              }
+            },
+          };
+          this.activeBgSync = bgAttempt;
+          let result;
+          try {
+            result = await routeRigOpen(this.routeHost(cx, null, feed, bgAttempt), config, { kind: "grid", rigId: rig.id, conn: rig.conn, background: true });
+          } finally {
+            bgAttempt.settled = true;
+            if (this.activeBgSync === bgAttempt) this.activeBgSync = null;
+            this.gridSteps?.delete(statusKey);
+            this.publishSpaceOpening();
+          }
           if (!current()) continue; // a late result cannot publish a card or toast for a removed or edited connection
           const statuses = shared("rig.spaceStatus") ?? {};
           // A background skip means "nothing to update here". It must not wipe the card of a failed explicit open.
-          if ((result.skipped || result.closed) && statuses[rig.id] && !statuses[rig.id].ok && !statuses[rig.id].skipped) continue;
-          this.notifyResult(`${rig.name} space`, result, statuses[rig.id]?.reason !== result.reason, { background: true, machine: config?.daemonMachine });
-          setShared("rig.spaceStatus", { ...statuses, [rig.id]: result });
+          if ((result.skipped || result.closed) && statuses[statusKey] && !statuses[statusKey].ok && !statuses[statusKey].skipped) continue;
+          this.notifyResult(`${rig.name} space`, result, statuses[statusKey]?.reason !== result.reason, { background: true, machine: config?.daemonMachine });
+          if (JSON.stringify(result) !== JSON.stringify(statuses[statusKey])) setShared("rig.spaceStatus", { ...statuses, [statusKey]: result }); // an equal one is not sent again
         }
       } finally {
-        this.spaceSyncing = false;
-        if (this.spaceAgain) { this.spaceAgain = false; if (!this.error) this.syncRigSpaces(cx); }
+        if (this.spacePass === pass) {
+          this.spaceSyncing = false;
+          if (this.spaceAgain) { this.spaceAgain = false; if (!this.error) this.syncRigSpaces(cx); }
+        }
         cx.notify();
       }
     });
@@ -1131,7 +1565,7 @@ export default class RigSidebar extends View {
       if (!current()) return;
       const result = await this.spaceController(cx, null, feed).sync(rig, config, { explicit: true, closeAll: true });
       if (!current()) return;
-      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [rig.id]: result });
+      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [this.statusKey(rig)]: result });
       this.notifyResult(`${rig.name} space`, result, true, { machine: config.daemonMachine });
       cx.notify();
     });
@@ -1148,7 +1582,9 @@ export default class RigSidebar extends View {
     for (const id of ids) {
       const { target, action, actionKey } = queued[id] ?? {};
       if (!target || !ONE_CLICK.has(action)) {
-        setShared("rig.busyAction", null);
+        const invalidKey = oneClickBusyKey(target, action ?? "", actionKey);
+        const cur = shared("rig.busyAction");
+        if (cur === invalidKey || (action && cur === qualifyBusyKey(target?.conn, action))) setShared("rig.busyAction", null);
         continue;
       }
       cx.spawn(async (cx) => this.oneClick(cx, id, target, action, actionKey));
@@ -1156,24 +1592,37 @@ export default class RigSidebar extends View {
   }
 
   async oneClick(cx, id, target, action, actionKey = null) {
+    const busyKey = oneClickBusyKey(target, action, actionKey);
+    const clearBusy = () => {
+      const cur = shared("rig.busyAction");
+      if (cur === busyKey || cur === qualifyBusyKey(target?.conn, action)) {
+        setShared("rig.busyAction", null);
+      }
+    };
     // The rows this click came from were read under the settings their producer stamped; this sidebar acts under its own. A different identity refuses (the rows are from another address).
     if (target?.rowsConfig && this.config) {
       // Judged against the ROW'S OWN connection (a row of B against the config's own connection A would never match), as the menu does; a connection no longer listed refuses too.
       const now = configOfConnection(this.config, target.rowsConfig.connectionId);
-      if (!now || !gateSameConfig(target.rowsConfig, now)) { setShared("rig.busyAction", null); setShared("rig.status", { id, busy: false, ok: false, text: now ? ROWS_STALE : UNKNOWN_CONNECTION, at: Date.now() }); cx.notify(); return; }
+      if (!now || !gateSameConfig(target.rowsConfig, now)) { clearBusy(); setShared("rig.status", { id, busy: false, ok: false, text: now ? ROWS_STALE : UNKNOWN_CONNECTION, at: Date.now() }); cx.notify(); return; }
     }
     const assistantReason=assistantActionRefusal(target,action);
-    if(assistantReason){setShared('rig.busyAction',null);setShared('rig.status',{id,busy:false,ok:false,text:assistantReason,at:Date.now()});cx.notify();return;}
+    if(assistantReason){clearBusy();setShared('rig.status',{id,busy:false,ok:false,text:assistantReason,at:Date.now()});cx.notify();return;}
     if(target?.kind==='assistant'&&action==='queue'){
       // All assistant sends use the composer, including a stale one-click/palette target.
       // It obtains text and re-observes settings after roster verification before dispatch.
-      setShared('rig.busyAction',null);
+      clearBusy();
       const conn=targetConnection(this.config,target);
       if(!conn.ok){setShared('rig.status',{id,busy:false,ok:false,text:conn.reason,at:Date.now()});cx.notify();return;}
       this.open({mod:MOD_IDS.menu,kind:'dialog',modal:true,width:460,height:300,props:{target,step:{action:'queue',input:true,multiLine:true,placeholder:'One-line summary; the body follows on the next lines'}}});
       cx.notify();return;
     }
-    const workerCaps=currentCapabilities(shared,terminals()),hostActions=["open-view","follow","unfollow","prune"];
+    const workerCaps=connectionCapabilities(shared,this.config,target?.conn??null,terminals())??{},hostActions=["open-view","follow","unfollow","prune"];
+    if(hostActions.includes(action)){
+      const acting=targetConnection(this.config,{...target,conn:adoptConnection(this.config,target?.conn)});
+      if(!acting.ok||!this.exactFeed(acting.config.connectionId??LEGACY_CONNECTION_ID)){
+        setShared("rig.busyAction",null);setShared("rig.status",{id,busy:false,ok:false,text:acting.ok?UNKNOWN_CONNECTION:acting.reason,at:Date.now()});cx.notify();return;
+      }
+    }
     // OpenRig's herdr-app provider opens a view in a window on the DAEMON's machine, and these actions pass it this computer's app home, a
     // path that means nothing on a Herdr machine. So a machine connection added through the connections list never takes the provider path:
     // herdrig's own worker views where OpenRig offers them, else a plain refusal with nothing sent. The legacy connection (daemonMachine, or a
@@ -1181,7 +1630,7 @@ export default class RigSidebar extends View {
     if(PROVIDER_HOME_ACTIONS.has(action)){
       const acting=targetConnection(this.config,target),refusal=acting.ok?providerHomeRefusal(acting.config,action):null;
       if(refusal){
-        setShared("rig.busyAction",null);
+        clearBusy();
         // herdrig's own views act per connection (PR 5c): offered where THAT connection's OpenRig offers host-built views (its own capabilities;
         // the first connection's are the published ones), else the plain app-home refusal. This computer's app home is never sent either way.
         const actingId=acting.config.connectionId??LEGACY_CONNECTION_ID,primaryId=this.primary.id??this.primary.config?.connectionId??LEGACY_CONNECTION_ID;
@@ -1193,17 +1642,10 @@ export default class RigSidebar extends View {
       }
     }
     if(workerCaps.hostWorkerViews&&workerCaps.herdrAppAvailable===false&&hostActions.includes(action)){
-      setShared("rig.busyAction",null);return this.hostWorkerAction(cx,id,target,action);
+      clearBusy();return this.hostWorkerAction(cx,id,target,action);
     }
 
     const title = actionTitle(target, action);
-    const busyKey = actionKey ?? target?.actionKey ?? `${action}:${target?.rig ?? target?.view ?? target?.session ?? ""}:${target?.viewId ?? ""}:${target?.cellId ?? ""}`;
-    const clearBusy = () => {
-      const cur = shared("rig.busyAction");
-      if (cur === busyKey || cur === action || (typeof cur === "string" && cur.startsWith(`${action}:`))) {
-        setShared("rig.busyAction", null);
-      }
-    };
     const actingCaps=connectionCapabilities(shared,this.config,target?.conn??null,terminals?.()??[]);
     const reason = actingCaps ? capabilityDisableReason(action, actingCaps) : null;
     if (reason) {
@@ -1215,6 +1657,8 @@ export default class RigSidebar extends View {
     }
     setShared("rig.busyAction", busyKey);
     setShared("rig.status", { id, busy: true, ok: null, text: `${title}…`, at: Date.now() });
+    const ranFor = target?.rig ?? (typeof target?.view === "string" && target.view.startsWith("rig:") ? target.view.slice(4) : null);
+    (this.inFlightActions ??= new Map()).set(id, { title, clearBusy, rig: ranFor, rigId: target?.rigId ?? null, conn: target?.conn ?? null }); // close() settles it
     let r;
     try {
       const config = this.config ?? parseConfig(await readTextFile(`${appHome()}/openrig/config.json`));
@@ -1225,7 +1669,7 @@ export default class RigSidebar extends View {
       r = !conn.ok ? { ok: false, text: conn.reason } : args && appHomeArgsRefusal(conn.config, args) ? { ok: false, text: appHomeArgsRefusal(conn.config, args) }
         : cmd ? writeOutcome(await execFor(conn.config)(cmd.command, cmd.args, { timeout: 180000 }))
         : { ok: false, text: args ? NO_PERSON : ACTION_REFUSED };
-    } catch (e) { r = { ok: false, text: String(e?.message ?? e) }; }
+    } catch (e) { r = { ok: false, text: plainExecError(e, { kind: "write" }) }; }
     if (r.ok && action === "unarchive-rig") run("rig.refresh");
     const words = r.ok ? (action === "unarchive-rig" ? `${target.rig} restored. It's stopped; Resume it from its row.` : r.text || doneWords(target, action)) : (r.text || "It didn't work, and the CLI gave no reason.");
     const statusRig = target?.rig ?? (typeof target?.view === "string" && target.view.startsWith("rig:") ? target.view.slice(4) : null);
@@ -1233,6 +1677,7 @@ export default class RigSidebar extends View {
       && (action === "open-view" || action === "open-seat" || action === "follow")
       && Boolean(statusRig)
       && /no running|no attachable|stopped|recoverable|exited/i.test(words);
+    this.inFlightActions?.delete(id);
     clearBusy();
     setShared("rig.status", {
       id,
@@ -1301,9 +1746,14 @@ export default class RigSidebar extends View {
     return feed?{ok:true,config:conn.config,feed}:{ok:false,reason:UNKNOWN_CONNECTION};
   }
   /** The feed of exactly this connection id, or null: unlike feedOf, never the first connection in place of a missing one. */
-  ownFeed(id){
-    if(id===undefined||id===null)return (this.config?.connections??[]).length<=1?this.primary:null;
-    return this.feeds.find(f=>f.id===id)??((this.primary.id??this.primary.config?.connectionId??LEGACY_CONNECTION_ID)===id?this.primary:null);
+  ownFeed(id) {
+    if (!this.primary || this.primary.config?.configInvalid) return null;
+    if (id === undefined || id === null || id === "") return (this.primary.config?.connections ?? []).length <= 1 && this.feeds.length <= 1 ? this.primary : null;
+    const firstId = this.primary.config ? (this.primary.config.connectionId ?? LEGACY_CONNECTION_ID) : this.primary.id;
+    if (firstId && id === firstId) return this.primary;
+    const conns = this.primary.config?.connections;
+    if (Array.isArray(conns) && conns.length > 0 && !conns.some((c) => c.id === id)) return null;
+    return this.feeds.slice(1).find((f) => f.id === id) ?? null;
   }
   async hostWorkerAction(cx,id,target,action,consent=null){
     const own=this.workerConnection(target);
@@ -1326,7 +1776,7 @@ export default class RigSidebar extends View {
     else if(result.needsRelocation)this.reviewGridMove(rig,result.relocation,null,{id,target,action});
     else{
       // The same card as the grid's failures, so the way forward stays on screen (see listRows).
-      if(result.unconfirmedSpace&&rig)setShared("rig.spaceStatus",{...(shared("rig.spaceStatus")??{}),[rig.id]:result});
+      if(result.unconfirmedSpace&&rig)setShared("rig.spaceStatus",{...(shared("rig.spaceStatus")??{}),[this.statusKey(rig)]:result});
       const words=result.ok?(result.reason??`Worker view open here: ${result.pages?.length??0} pages.`):result.reason;
       setShared("rig.status",{id,ok:result.ok,busy:false,text:words,at:Date.now()});
       this.notifyResult("Worker view",result,true,{machine:config.daemonMachine});
@@ -1465,24 +1915,73 @@ export default class RigSidebar extends View {
 
   async close() {
     this.closed = true;
+    try { this.herdr?.release?.(); } catch (_) {} // this view's herdr:// transport registration ends with it
+    releaseFocusTargets(this); // the follow hint's buttons
+    // Herdr drops every continuation a gone view owns, so a write or a space build this copy started would never report. Say it now, while
+    // it is still this copy's to say: the write may have finished, the build was cut short.
+    for (const [id, a] of this.inFlightActions ?? []) {
+      a.clearBusy();
+      const text = `The Rig sidebar closed while ${a.title} ran; it may have finished. Check ${a.rig ?? "OpenRig"}.`;
+      setShared("rig.status", { id, busy: false, ok: null, text, at: Date.now(), rig: a.rig, rigId: a.rigId, conn: a.conn });
+      notify({ title: a.title, body: text, level: "warning" });
+    }
+    this.inFlightActions?.clear();
+    for (const [key, name] of this.openingNames ?? []) {
+      const reason = `The ${name} space build was cut short when the Rig sidebar closed; some tiles may have started. Open the space again.`;
+      setShared("rig.spaceStatus", { ...(shared("rig.spaceStatus") ?? {}), [key]: { ok: false, interrupted: true, reason } });
+      notify({ title: `${name} space`, body: reason, level: "warning" });
+    }
+    this.openingNames?.clear(); // close() is idempotent by consumption: both maps are cleared, so add nothing to them in here
+    const hadInflightGrid = Boolean(this.openingAttempts?.size || this.activeBgSync || this.gridSteps?.size);
+    for (const attempt of this.openingAttempts?.values() ?? []) {
+      attempt.settled = true;
+      attempt.interrupted = true;
+      for (const release of [...(attempt.releases ?? [])]) release();
+      clearInterruptedRouteJob(attempt.config, attempt.rig.name);
+      this.rigSpacesBy?.get(attempt.feed?.id ?? "")?.clearPending(attempt.rig, attempt.config);
+    }
+    this.openingAttempts?.clear();
+    this.opening?.clear();
+    const bg = this.activeBgSync;
+    if (bg) {
+      bg.settled = true;
+      bg.interrupted = true;
+      this.activeBgSync = null;
+      this.spaceSyncing = false;
+      for (const release of [...(bg.releases ?? [])]) release();
+      clearInterruptedRouteJob(bg.config, bg.rig.name);
+      this.rigSpacesBy?.get(bg.feed?.id ?? "")?.clearPending(bg.rig, bg.config);
+    }
+    for (const release of [...(this.ownRouteReleases ?? [])]) release();
+    this.ownRouteReleases?.clear();
+    this.gridSteps?.clear();
+    if (hadInflightGrid) this.publishSpaceOpening();
     this.cancelTreeReveal();
     for (const handle of this.listScrolls?.values() ?? []) handle?.release?.();
+    this.listScrolls?.clear();
     this.workerViews?.dispose();
     this.statusMotion.close();
     const receivers={...(shared("rig.routeReceivers")??{})};delete receivers[this.routeReceiverId];setShared("rig.routeReceivers",receivers);
     try { this.sock?.close(); } catch (_) {}
   }
 
-  dismissalModel() {
-    const origin = this.config?.daemonUrl;
+  dismissalModel(feed = this.viewFeed ?? this.primary) {
+    const cfg = feed?.config;
+    const origin = cfg?.daemonUrl;
     if (!origin) return null;
-    const scope = dismissalScope(this.config);
-    if (this.dismissals?.scope !== scope) {
-      this.dismissals = new DismissedUpdates(this.dismissalOrigins?.[scope]);
-      this.dismissals.origin = origin;
-      this.dismissals.scope = scope;
+    const scope = dismissalScope(cfg);
+    const key = cfg.connectionId || LEGACY_CONNECTION_ID;
+    const models = (this.dismissalModels ??= new Map());
+    let model = models.get(key);
+    if (model?.scope !== scope) {
+      const lookupCfg = this.primary.config?.connections && !cfg.connections ? { ...cfg, connections: this.primary.config.connections } : cfg;
+      model = new DismissedUpdates(savedDismissalsFor(this.dismissalOrigins, lookupCfg));
+      model.origin = origin;
+      model.scope = scope;
+      models.set(key, model);
     }
-    return this.dismissals;
+    if (feed === this.primary) this.dismissals = model;
+    return model;
   }
 
   async saveDismissals(model = this.dismissals) {
@@ -1498,21 +1997,57 @@ export default class RigSidebar extends View {
     }
   }
 
+  /** Publishes every open connection's dismissal state, only when it changed. The dismiss loop calls this every second, and each publish makes
+   *  herdr copy the value, write its whole shared file and re-render every mod: with several OpenRigs and hundreds of dismissed updates that
+   *  was megabytes a second while nothing changed. The comparison reads each model's revision (new whenever one of its records changes, so
+   *  hundreds of records are never re-read each second) and the receipts still inside their Undo window. */
   publishDismissals() {
-    const model = this.dismissalModel(); if (!model) return;
-    setShared("rig.dismissedUpdates", { ...model.saved(), receipts: model.receiptRows(), origin: model.origin, scope: model.scope });
-    if (this.data) {
-      this.data.attention = needsRequestCount(this.data.topology, this.data.attentionItems);
-      publishRigData(setShared, { ...(shared("rig.data") ?? {}), attention: this.data.attention });
+    const byScope = {}, print = [];
+    for (const feed of this.feeds) {
+      if (feed.closed) continue;
+      const m = this.dismissalModel(feed);
+      if (!m) continue;
+      const receipts = m.receiptRows();
+      byScope[m.scope] = { ...m.saved(), receipts, origin: m.origin, scope: m.scope };
+      print.push(m.scope, m.origin, m.show, receipts.map((r) => r.id).join(","), m.revision);
     }
+    const primaryModel = this.dismissalModel(this.primary);
+    if (!primaryModel && !Object.keys(byScope).length) return;
+    const top = primaryModel ? byScope[primaryModel.scope] : Object.values(byScope)[0];
+    print.push(top?.scope);
+    const fingerprint = print.join("\n");
+    if (fingerprint !== this.dismissalPrint) {
+      this.dismissalPrint = fingerprint;
+      setShared("rig.dismissedUpdates", { ...top, byScope });
+    }
+    // The request count follows the sidebar's own rows, so rig.data is published again only when that count moved, from what the sidebar
+    // last published (never a copy read back from the shared store).
+    if (this.data) {
+      // The count follows the rows and requests only, never the dismissals, and this runs every second: it is computed again only when those arrays
+      // are new (a refresh that read the same keeps them, and the merged view of several connections is rebuilt only when one of them changed).
+      // With no request list (OpenRig didn't answer it) the count is unknown: the refresh published null, and it stays null rather than 0.
+      const topology = this.data.topology, items = this.data.attentionItems, memo = this.attentionCount;
+      const attention = !items ? (this.data.attention ?? null)
+        : memo && memo.topology === topology && memo.items === items ? memo.count
+        : (this.attentionCount = { topology, items, count: needsRequestCount(topology, items) }).count;
+      this.data.attention = attention;
+      if (this.publishedRigData && this.publishedRigData.attention !== attention) this.setRigData({ ...this.publishedRigData, attention });
+    }
+  }
+  /** Every rig.data publish of the sidebar goes through here, so the dismissal path above patches the value that is actually published. */
+  setRigData(value) {
+    this.publishedRigData = value;
+    publishRigData(setShared, value);
   }
 
   updateAction(cx, id) {
     const requests = { ...(shared("rig.updateActions") ?? {}) }, req = requests[id]; delete requests[id];
     setShared("rig.updateActions", requests);
-    const model = this.dismissalModel(); if (!req || !model || req.scope !== model.scope) return;
+    const feed = req?.scope ? this.feeds.find((f) => !f.closed && f.config?.daemonUrl && dismissalScope(f.config) === req.scope) : null;
+    const model = feed ? this.dismissalModel(feed) : null;
+    if (!req || !model || req.scope !== model.scope) return;
     if (req.action === "dismiss") {
-      const items = liveDismissalItems(Array.isArray(req.value) ? req.value : [req.value], this.data?.attentionItems ?? [], model.records);
+      const items = liveDismissalItems(Array.isArray(req.value) ? req.value : [req.value], feed.data?.attentionItems ?? [], model.records);
       if (model.dismiss(items).length) model.receipts = model.receipts.slice(-1);
     }
     else if (req.action === "undo") model.undo(req.value);
@@ -1522,7 +2057,7 @@ export default class RigSidebar extends View {
     this.publishDismissals();
     cx.spawn(async (cx) => {
       try { await this.saveDismissals(model); }
-      catch (_) { setShared("rig.dismissSaveError", "Could not save dismissed updates. They may return after restarting Herdr."); }
+      catch (_) { setShared("rig.dismissSaveError", `Couldn't save which updates are dismissed. They may come back after a restart. ${SAVE_NEXT}`); }
       cx.notify();
     });
   }
@@ -1541,7 +2076,7 @@ export default class RigSidebar extends View {
     }
     const scoped = op ?? gatedOperationOrRefusal(feed.config.connectionId); // every read is under the gate scope of ITS connection
     const r = await scoped.fetch(`${feed.config.daemonUrl}${path}`);
-    if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
+    if (!r.ok) throw new Error(requestFailed(requestWhat(path), r.status));
     return stampConnection(await r.json(), feed.config.connectionId);
   }
 
@@ -1550,11 +2085,14 @@ export default class RigSidebar extends View {
   refuseInvalidConfig(cx) {
     for (const feed of this.feeds) { try { feed.sock?.close(); } catch (_) {} feed.sock = null; feed.data = null; feed.live = false; feed.error = null; feed.sidebarState = null; if (feed !== this.primary) { feed.closed = true; const wake = feed.wake; feed.wake = null; wake?.(); } }
     this.feedList.splice(1);
-    publishRigData(setShared, { topology: [], live: false, error: this.config.configInvalid, config: this.config });
+    this.dismissalModels?.clear(); this.dismissals = null; this.dismissalPrint = null; setShared("rig.dismissedUpdates", null);
+    this.setRigData({ topology: [], live: false, error: this.config.configInvalid, config: this.config });
     cx.notify();
   }
 
   async refresh(cx, feed = this.primary) {
+    let notifyArgs = null; // the needs notifications to run once the read is done (runNotifyNeeds)
+    let observeRaw = false; // this feed's live updates were read: its dismissals are observed against them once the read is done (observeDismissals)
     let op = null; // this refresh's ONE gate operation (taken below, before its first request); every read of the feed goes through it
     const get = (path) => this.get(path, feed, op);
     if (!feed.config) {
@@ -1575,10 +2113,21 @@ export default class RigSidebar extends View {
     // instead of mixing two daemons' answers, and nothing is published for the config that is gone.
     op = gatedOperationOrRefusal(feed.config.connectionId); // the scope is this feed's connection (the gate keys by it)
     try {
-      const hasExplicitConfigUrl = Boolean(feed.config.daemonUrl && feed.config.daemonUrlSource !== "cli" && feed.config.daemonUrlSource !== "default");
+      const startCfg = feed.config;
+      const hasExplicitConfigUrl = Boolean(startCfg.daemonUrl && startCfg.daemonUrlSource !== "cli" && startCfg.daemonUrlSource !== "default");
       let unreachableState = false;
       if (!hasExplicitConfigUrl) {
-        probed = await probeOpenRigState(feed.config, { exec: execFor(feed.config), fetch: op.fetch, sidebarModId: MOD_IDS.sidebar });
+        const probeFetch = (url, init) => {
+          if (feed === this.primary && this.feeds.length === 1 && !this.primary.config?.configInvalid && gateSameConfig(this.primary.config, startCfg)) {
+            const found = addressParts(String(url))?.origin ?? null;
+            if (found && found !== this.primary.config?.daemonUrl) {
+              this.config = { ...this.primary.config, daemonUrl: found, daemonUrlSource: "cli" };
+              op = gatedOperationOrRefusal(this.primary.config.connectionId);
+            }
+          }
+          return op.fetch(url, init);
+        };
+        probed = await probeOpenRigState(feed.config, { exec: execFor(feed.config), fetch: probeFetch, sidebarModId: MOD_IDS.sidebar });
         if (probed.cliVersion) feed.cliVersion = probed.cliVersion;
         if (probed.healthzProbe?.data) feed.healthz = probed.healthzProbe.data;
         if (!probed.daemonUrl || probed.state.id === "S1" || probed.state.id === "S2" || probed.state.id === "S3" || probed.state.id === "S7") {
@@ -1635,11 +2184,7 @@ export default class RigSidebar extends View {
           if (row) queueRows[id] = row.item ?? row.qitem ?? row;
         }));
         const attentionItems = rawAttentionItems ? enrichAttentionItems(rawAttentionItems, attentionAgg, queueRows, attentionHealth?.records ?? []) : null;
-        if (rawAttentionItems) {
-          const model = this.dismissalModel();
-          const before = JSON.stringify(model?.saved()); model?.observe([...rawAttentionItems, ...this.otherRawAttention()]);
-          if (model && before !== JSON.stringify(model.saved())) await this.saveDismissals(model);
-        }
+        if (rawAttentionItems) observeRaw = true; // after the read: see observeDismissals
         const rawPerson = feed.config?.person || attention?.perspective?.personId || null;
         const personId = rawPerson ? String(rawPerson).replace(/@external$/i, "") : null;
         let quietRes = null;
@@ -1698,7 +2243,7 @@ export default class RigSidebar extends View {
           rig.hostKnown = Boolean(knownHost);
           if (rig.nodesUnavailable) rig.host = knownHost || "Host unknown";
         }
-        if (attentionItems !== null) this.notifyNeeds(feed, topology, attentionItems, attention?.sources, quietModeChip);
+        if (attentionItems !== null) notifyArgs = [feed, topology, attentionItems, attention?.sources, quietModeChip]; // run after the read: see runNotifyNeeds
         const kernelRig = summary.find((r) => r && !r.archivedAt && r.name === "kernel") ?? null;
         const kernelNodes = kernelRig ? (nodesByRig[kernelRig.id] ?? null) : null;
         const strictKernel = Boolean(probed?.statusProbe || kernelStatus !== null || feed.config?.missing || feed.config?.daemonUrlSource === "cli");
@@ -1714,6 +2259,7 @@ export default class RigSidebar extends View {
           strictKernel,
         });
         const versionLine = formatOpenRigVersionLine({ healthz: feed.healthz, cliVersion: feed.cliVersion });
+        const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
         feed.data = {
           daemonUrl: feed.config.daemonUrl,
           topology,
@@ -1732,13 +2278,14 @@ export default class RigSidebar extends View {
           cliVersion: feed.cliVersion,
           versionLine,
         };
+        carryUnchanged(feed.data, carryFrom);
         feed.error = null;
         for (const path of Object.keys(feed.lists)) feed.lists[path] = { ...feed.lists[path], stale: true };
       }
     } catch (e) {
       // A gate refusal (the settings changed while this ran) is not a connection problem: the person gets its sentence.
-      const runtimeError=e?.name==="TypeError";
-      const errMsg = e?.code === "GATE_REFUSED" ? e.message : runtimeError ? `Herdr couldn't read OpenRig: TypeError: ${e.message}` : "Couldn't refresh OpenRig. Check the connection and retry.";
+      const runtimeError=isCodeError(e); // herdrig's own error while reading, not a connection problem
+      const errMsg = e?.code === "GATE_REFUSED" ? e.message : runtimeError ? codeErrorMessage(e) : refreshFailureMessage(e, "Couldn't refresh OpenRig. Check the connection and retry.");
       feed.error = errMsg;
       if (!feed.data) {
         // Display only (what the sidebar says while the feed is down): a refusal here (several connections, a changed config) is not worth escaping the error handler for, and it must never
@@ -1750,10 +2297,10 @@ export default class RigSidebar extends View {
         if (fallbackProbe && (fallbackProbe.state.id === "S1" || fallbackProbe.state.id === "S2" || fallbackProbe.state.id === "S7")) {
           feed.sidebarState = fallbackProbe.state;
         } else {
-          feed.sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Herdr couldn't read OpenRig." : STATE_COPY.S3.headline, detail: errMsg };
+          feed.sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Couldn't read OpenRig: a herdrig error." : STATE_COPY.S3.headline, detail: errMsg };
         }
       } else {
-        feed.sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Herdr couldn't read OpenRig." : STATE_COPY.S3.headline, detail: errMsg };
+        feed.sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Couldn't read OpenRig: a herdrig error." : STATE_COPY.S3.headline, detail: errMsg };
       }
       if (!shared("rig.capabilities") && !feed.config?.capabilities) {
         setShared("rig.capabilities", { probed: false });
@@ -1763,6 +2310,8 @@ export default class RigSidebar extends View {
     }
     // A list that became invalid while this refresh was in flight: whatever it read belongs to the config that is gone, so nothing of it is stored or published.
     if (this.config?.configInvalid) { this.refuseInvalidConfig(cx); return; }
+    if (notifyArgs && feed.data && !feed.error) this.runNotifyNeeds(...notifyArgs);
+    if (observeRaw && feed.data && !feed.error) await this.observeDismissals(feed);
     this.publishData(cx, feed);
     this.publishDismissals();
     cx.notify();
@@ -1772,8 +2321,12 @@ export default class RigSidebar extends View {
 
   /** Publishes `rig.data`: the primary feed's state, with the merged rows of every connection that answers when there are several. */
   publishData(cx, feed = this.primary) {
-    publishRigData(setShared, {
-      ...(this.data ?? {}),
+    // The requests are published once: merged at the top level, and each connection's own under its entry only with several connections (a page
+    // reads its own entry then; with one it reads the top level). The raw rows kept for the dismissals are the sidebar's own and never published.
+    const several = this.feeds.length > 1;
+    const published = ({ attentionRaw: _raw, ...rest } = {}, own = false) => (own && !several ? (({ attentionItems: _items, ...entry }) => entry)(rest) : rest);
+    const value = {
+      ...published(this.data ?? {}),
       live: feed.live,
       error: feed.error,
       config: feed.config,
@@ -1785,26 +2338,38 @@ export default class RigSidebar extends View {
       // Each connection's own state under its id: a second connection writes only its own entry, never another's (the readers above still see
       // the merged rows of the connections that answer).
       byConnection: Object.fromEntries(this.feeds.map((f) => [f.id ?? f.config?.connectionId ?? LEGACY_CONNECTION_ID, {
-        machine: f.config?.daemonMachine ?? null, answering: Boolean(f.data) && !f.error, error: f.error, live: f.live, config: f.config, healthz: f.healthz, ...(f.data && !f.error ? f.data : {}), // no stale rows or roster of a connection that does not answer
+        machine: f.config?.daemonMachine ?? null, answering: Boolean(f.data) && !f.error, error: f.error, live: f.live, config: f.config, healthz: f.healthz, ...(f.data && !f.error ? published(f.data, true) : {}), // no stale rows or roster of a connection that does not answer
       }])),
-    });
+    };
+    // rig.data is large and herdr copies it into every reader and rewrites its shared file on each change, so a refresh that read the same content
+    // publishes nothing there. Its refresh times go to the small rig.refreshed instead: a Rig page re-reads its own lists when its connection refreshed.
+    if (!sameRigData(value, this.publishedRigData)) this.setRigData(value);
+    setShared("rig.refreshed", { at: value.at ?? null, byConnection: Object.fromEntries(Object.entries(value.byConnection).map(([id, entry]) => [id, entry.at ?? null])) });
   }
 
   // ---- more than one connection (a hand-written `connections` list) ---------------------------------------------------------------
   /** The feeds for the configured connections: the first is the primary (the sidebar's own `config`, `data`, ...), each other gets its own. */
   syncFeeds(cx) {
     const base = this.primary.config;
-    if (!base || base.missing) return;
+    if (!base || base.configInvalid) return;
     const connections = base.connections ?? [];
-    this.primary.id = base.connectionId ?? connections[0]?.id ?? null;
+    this.primary.id = base.connectionId ?? connections[0]?.id ?? LEGACY_CONNECTION_ID;
+    if (base.missing) return;
     const wanted = connections.slice(1);
+    let removedAny = false;
     for (const old of this.feedList.slice(1)) {
       if (wanted.some((c) => c.id === old.id)) continue;
       try { old.sock?.close(); } catch (_) {}
       old.closed = true; const wake = old.wake; old.wake = null; wake?.(); // its stream loop ends at once, not after its backoff
-      try { this.listScrolls?.get(old.id)?.release?.(); } catch (_) {} this.listScrolls?.delete(old.id); // its scroll handle goes with it
+      this.dismissalModels?.delete(old.id);
+      try { this.listScrolls?.get(old.id)?.release?.(); } catch (_) {} this.listScrolls?.delete(old.id); this.listScrollTops?.delete(old.id); // its scroll handle goes with it
+      setShared(this.notifiedNeedsKey(old.id), null);
+      const byConn = cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn"));
+      if (Object.hasOwn(byConn, old.id)) { delete byConn[old.id]; setShared("rig.notifiedNeeds.byConn", byConn); }
+      removedAny = true;
       this.feedList.splice(this.feedList.indexOf(old), 1);
     }
+    if (removedAny) this.persistSidebarState();
     for (const connection of wanted) {
       const config = connectionConfig(base, connection);
       let feed = this.feedList.find((f) => f.id === connection.id);
@@ -1818,8 +2383,11 @@ export default class RigSidebar extends View {
         const moved = feed.config?.daemonUrl !== config.daemonUrl, other = !gateSameConfig(feed.config, config); // another address, home or machine: another OpenRig
         feed.config = config;
         if (other) { // the old OpenRig's rows must not stay drawn (or be acted on under the new identity) while the new one is read, as the first connection's are not
-          feed.moved(); setShared(qualifyKey(feed.id, "rig.notifiedNeeds"), null);
-          this.publishData(cx); cx.notify();
+          feed.moved(); this.listScrollTops?.delete(feed.id); this.dismissalModels?.delete(feed.id); setShared(this.notifiedNeedsKey(feed.id), null);
+          const byConn = cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn"));
+          delete byConn[feed.id]; setShared("rig.notifiedNeeds.byConn", byConn);
+          this.persistSidebarState();
+          this.publishData(cx); this.publishDismissals(); cx.notify();
         }
         if (moved) { try { feed.sock?.close(); } catch (_) {} }
         cx.spawn(async (cx) => this.refreshSecondary(cx, feed));
@@ -1828,10 +2396,9 @@ export default class RigSidebar extends View {
   }
 
   /** The raw requests of every answering connection but the first. */
-  otherRawAttention() { return this.feeds.slice(1).flatMap((f) => (f.data && !f.error ? f.data.attentionRaw ?? [] : [])); }
   /** The connection a dismissal belongs to: the update's own `conn` (an older stored update has none: with exactly one connection it is
    *  that one). Unknown or missing otherwise: refused, never defaulted. */
-  dismissalTarget(item) { return targetConnection(this.config, { ...(item ?? {}), conn: adoptConnection(this.config, item?.conn) }); }
+  dismissalTarget(item) { return targetConnection(this.primary.config, { ...(item ?? {}), conn: adoptConnection(this.primary.config, item?.conn) }); }
   /** The bounded HTTP request function for one connection's dismissals: every call goes to that connection's own address. */
   dismissalRequester(cx, config) {
     return boundedDismissalRequest(async (req) => {
@@ -1842,13 +2409,14 @@ export default class RigSidebar extends View {
     }, (ms, done) => cx.timer.after(ms, done));
   }
   /** One dismissal, committed through the update's OWN connection; an unknown or missing connection stays a local hide and sends nothing. */
-  async commitDismissalFor(cx, item) {
+  async commitDismissalFor(cx, item, expectedScope = null) {
     const target = this.dismissalTarget(item);
     if (!target.ok) return { status: "local", note: `Hidden here only; ${target.reason}` };
     const config = { ...target.config };
     const feed = this.feeds.find((f) => f.id === config.connectionId) ?? this.primary;
+    const liveScope = this.dismissalModel(feed)?.scope ?? null;
     return commitDismissal(config, item, this.dismissalRequester(cx, config), {
-      attentionItems: this.dismissals?.scope === this.dismissalModel()?.scope ? feed.data?.attentionItems ?? [] : [],
+      attentionItems: (expectedScope ?? liveScope) === liveScope ? feed.data?.attentionItems ?? [] : [],
       person: dismissalRecipient(config, feed.data?.attentionPerspective),
     });
   }
@@ -1917,6 +2485,7 @@ export default class RigSidebar extends View {
     feed.refreshing = true;
     const op = gatedOperationOrRefusal(feed.config?.connectionId); // ONE operation for this feed's refresh, under ITS scope
     const get = (path) => this.get(path, feed, op);
+    let notifyArgs = null;
     try {
       if (!feed.config?.daemonUrl) throw new Error(EXPLICIT_ADDRESS_NEEDED);
       feed.uiTimezone = timezoneValue(await get("/api/config/ui.timezone").catch(rethrowGate(null)));
@@ -1926,6 +2495,9 @@ export default class RigSidebar extends View {
         try { nodesByRig[r.id] = await get(`/api/rigs/${encodeURIComponent(r.id)}/nodes`); } catch { unavailable.add(r.id); }
       }));
       const attention = await get("/api/attention").catch(rethrowGate(null));
+      const attentionHealth = (attention?.items ?? []).some((i) => String(i.id ?? "").startsWith("health:") || String(i.source ?? "").startsWith("/api/health/"))
+        ? await get("/api/health").catch(rethrowGate(null)) : null;
+      const attentionAgg = await get("/api/queue/attention-aggregate").catch(rethrowGate(null));
       const native = await get("/api/native-seats").catch(rethrowGate(null));
       // Quiet hours and the mode are this OpenRig's own: its toasts honour them like the first connection's do.
       const rawPerson = feed.config?.person || attention?.perspective?.personId || null, personId = rawPerson ? String(rawPerson).replace(/@external$/i, "") : null;
@@ -1933,7 +2505,13 @@ export default class RigSidebar extends View {
       if (personId) [quietRes, modeRes] = await Promise.all([get(`/api/gateway/human/${encodeURIComponent(personId)}/quiet`).catch(rethrowGate(null)), get(`/api/gateway/human/${encodeURIComponent(personId)}/mode`).catch(rethrowGate(null))]);
       const quietChip = quietModeHeaderChip({ quiet: quietRes, mode: modeRes, timezone: feed.uiTimezone });
       const raw = Array.isArray(attention?.items) ? attention.items : null;
-      const attentionItems = raw ? enrichAttentionItems(raw, null, Object.create(null), []) : null;
+      const queueRows = Object.create(null);
+      await Promise.all((raw ?? []).filter((a) => a.answer?.verb === "resolve" && String(a.id).startsWith("queue:")).map(async (a) => {
+        const id = a.id.slice(6);
+        const row = await get(`/api/queue/${encodeURIComponent(id)}`).catch(rethrowGate(null));
+        if (row) queueRows[id] = row.item ?? row.qitem ?? row;
+      }));
+      const attentionItems = raw ? enrichAttentionItems(raw, attentionAgg, queueRows, attentionHealth?.records ?? []) : null;
       feed.hostedReader ??= new HostedMembersReader();
       const hostedMembers = await feed.hostedReader.read(op.fetch, feed.config, (ms, done) => cx.timer.after(ms, done));
       const topology = buildTopology(summary, nodesByRig, native?.seats, feed.config.connectionId);
@@ -1959,20 +2537,24 @@ export default class RigSidebar extends View {
         summary, kernelStatus, kernelNodes: kernelRig ? nodesByRig[kernelRig.id] : null,
         strictKernel: kernelStatus !== null, sidebarModId: MOD_IDS.sidebar,
       });
+      const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
       feed.data = { daemonUrl: feed.config.daemonUrl, topology, attention: attentionItems ? needsRequestCount(topology, attentionItems) : null, attentionItems, attentionRaw: raw ?? [], hostedMembers,
-        attentionHealth: [], attentionPerspective: attention?.perspective ?? null, at: new Date().toISOString(), nodesByRig, healthz: feed.healthz, capabilities };
+        attentionHealth: attentionHealth?.records ?? [], attentionPerspective: attention?.perspective ?? null, at: new Date().toISOString(), nodesByRig, healthz: feed.healthz, capabilities };
+      carryUnchanged(feed.data, carryFrom);
       feed.error = null;
       for (const path of Object.keys(feed.lists)) feed.lists[path] = { ...feed.lists[path], stale: true }; // this connection's lazy reads (its System badge's /api/health) follow its own refresh, as the first connection's do
-      if (attentionItems !== null) this.notifyNeeds(feed, topology, attentionItems, attention?.sources, quietChip); // this connection's own needs notifications
+      if (attentionItems !== null) notifyArgs = [feed, topology, attentionItems, attention?.sources, quietChip]; // this connection's own needs notifications, run after the read (runNotifyNeeds)
     } catch (e) {
       feed.data = null;
-      feed.error = e?.code === "GATE_REFUSED" ? e.message : e?.message === EXPLICIT_ADDRESS_NEEDED ? EXPLICIT_ADDRESS_NEEDED : e?.name==="TypeError" ? `Herdr couldn't read OpenRig: TypeError: ${e.message}` : "Couldn't reach this OpenRig. Check the connection and retry.";
+      feed.error = e?.code === "GATE_REFUSED" ? e.message : e?.message === EXPLICIT_ADDRESS_NEEDED ? EXPLICIT_ADDRESS_NEEDED : isCodeError(e) ? codeErrorMessage(e) : refreshFailureMessage(e, "Couldn't reach this OpenRig. Check the connection and retry.");
     } finally {
       feed.refreshing = false;
     }
-    // The dismissal model needs the whole live list of every connection (what is no longer there is retired).
-    try { const model = this.dismissalModel(); if (model && this.primary.data) model.observe([...(this.primary.data.attentionRaw ?? []), ...this.otherRawAttention()]); } catch (_) {}
+    if (notifyArgs && feed.data && !feed.error) this.runNotifyNeeds(...notifyArgs);
+    // Each connection's dismissal model observes its own live list, after the read and in its own try (a failure is said, see observeDismissals).
+    if (feed.data && !feed.error) await this.observeDismissals(feed);
     this.publishData(cx);
+    this.publishDismissals();
     cx.notify();
     if (feed.again) { feed.again = false; await this.refreshSecondary(cx, feed); }
   }
@@ -1994,10 +2576,47 @@ export default class RigSidebar extends View {
   /** The machine a feed's toasts name, or null with one connection (a toast is what it always was). */
   toastWhere(feed) { return this.feeds.length > 1 ? feed?.config?.daemonMachine ?? "this computer" : null; }
 
+  /** Retires one connection's saved dismissals whose update is no longer live in ITS OWN list (each connection has its own dismissal model), and saves the result: AFTER a read, in its own try. OpenRig answered, so a state file
+   *  that can't be written is herdrig's trouble, never "not answering"; it is said once in words, the data stays, and the next round that saves clears it. */
+  async observeDismissals(feed) {
+    try {
+      const model = this.dismissalModel(feed);
+      if (!model) return;
+      const before = JSON.stringify(model.saved());
+      model.observe(feed.data?.attentionRaw ?? []);
+      if (feed.dismissObserveFailed || before !== JSON.stringify(model.saved())) await this.saveDismissals(model);
+      if (feed.dismissObserveFailed && shared("rig.dismissSaveError") === feed.dismissObserveFailed) setShared("rig.dismissSaveError", null);
+      feed.dismissObserveFailed = null;
+    } catch (e) {
+      // Herdr's file write throws a plain Error with only a message, never a code, and that message may carry the file's private path: it is never printed. The
+      // cause is told from the sentence it sends (stateSaveReason: a fixed phrase); herdrig's own error is said as that, cut short.
+      const why = isCodeError(e) ? describeCodeError(e) : stateSaveReason(e);
+      const text = `Couldn't save which updates are dismissed (${why}). They stay hidden for now and may come back after a restart. ${SAVE_NEXT}`;
+      feed.dismissObserveFailed = text;
+      setShared("rig.dismissSaveError", text);
+    }
+  }
+
+  /** Runs a feed's needs notifications AFTER its read, in their own try: OpenRig answered, so a failure here is herdrig's, never "not answering". The
+   *  data stays; the person is told once per distinct failure, and a round that works clears it. */
+  runNotifyNeeds(feed, ...args) {
+    try { this.notifyNeeds(feed, ...args); feed.notifyError = null; }
+    catch (e) {
+      const message = String(e?.message ?? e);
+      if (feed.notifyError !== message) {
+        feed.notifyError = message;
+        const where = this.toastWhere(feed);
+        notify({ title: "OpenRig", level: "warning",
+          body: `Needs notifications stopped working${where ? ` for ${where}` : ""}: ${message}. The sidebar still shows OpenRig; this is a herdrig error, not a connection problem.` });
+      }
+    }
+  }
+
   /** Needs notifications for ONE connection (every feed runs its own, whichever box is shown): its own seen-state, so an ask id another box also issued neither silences nor repeats this one's. The
    *  first feed keeps the original `rig.notifiedNeeds` key; another connection's is that key qualified by its id. A toast names the machine and its action names the connection. */
   notifyNeeds(feed, topology, attentionItems, sources, quietChip) {
-    const stateKey = feed === this.primary ? "rig.notifiedNeeds" : qualifyKey(feed.id, "rig.notifiedNeeds");
+    const connId = feed === this.primary ? this.primaryStateId() : feed.id;
+    const stateKey = this.notifiedNeedsKey(connId);
     const lists = this.hostLists();
     const { toasts, nextState } = diffPriorityNotifications(topology, attentionItems, feed.prioritySeeded ? shared(stateKey) : null, {
       quiet: Boolean(quietChip), needsVisible: isNeedsVisible({ nav: shared("rig.nav"), activeChild: shownChild() }), notificationsEnabled: (shared("rig.settings")?.notifications ?? true) !== false, sources,
@@ -2005,7 +2624,13 @@ export default class RigSidebar extends View {
     });
     feed.prioritySeeded = true;
     setShared(stateKey, nextState);
-    if (feed === this.primary) this.persistSidebarState();
+    const byConn = cleanNotifiedNeedsMap(shared("rig.notifiedNeeds.byConn"));
+    const cleanedNext = cleanNotifiedNeeds(nextState);
+    if (cleanedNext) byConn[connId] = cleanedNext;
+    else delete byConn[connId];
+    setShared("rig.notifiedNeeds.byConn", byConn);
+    setShared("rig.notifiedNeeds.primary", this.primaryStateId());
+    this.persistSidebarState();
     const where = this.toastWhere(feed);
     for (const t0 of toasts) {
       const t = where ? { ...t0, title: String(t0.title ?? "").includes(" needs you") ? String(t0.title).replace(" needs you", ` on ${where} needs you`) : `${t0.title} · ${where}`,
@@ -2028,7 +2653,7 @@ export default class RigSidebar extends View {
     if (kind === "seat.native_ended") {
       const where = this.toastWhere(feed);
       notify({ title: `${d.sessionName} ended${where ? ` on ${where}` : ""}`, body: "The herdr-core terminal closed outside OpenRig. Relaunch or Resume it from Needs-You.", level: "warning",
-        action: hasStack ? { name: "layout.select", args: { stack: "rig-work", child: "rig-page" } } : { name: "rig.needs", args: {} } });
+        action: hasStack ? { name: "layout.select", args: { stack: "rig-work", child: "rig-page" } } : { name: this.feeds.length > 1 ? `rig.needs:${feed.id}` : "rig.needs", args: {} } });
     } else {
       const where = this.toastWhere(feed);
       notify({ title: `${d.by} opened ${d.viewName ?? d.view}${where ? ` on ${where}` : ""}`, body: hasStack ? "In the Rig layout; nothing was moved." : "In a native tab; nothing was moved.", level: "info",
@@ -2037,13 +2662,27 @@ export default class RigSidebar extends View {
   }
 
   /** One shared event stream, detected by its HTTP response; no subscription per page. */
+  /** The live-updates loop reconnects after any failure: a dropped connection is that and nothing more. An error of herdrig's own code inside it (a toast,
+   *  a refresh, the graph state) would reconnect forever in silence, so it is said once per distinct message for this connection. */
+  sayStreamBug(feed, e) {
+    if (!isCodeError(e)) return;
+    const message = describeCodeError(e);
+    if (feed.streamBug === message) return;
+    feed.streamBug = message;
+    const where = this.toastWhere(feed);
+    notify({ title: "OpenRig", level: "warning",
+      body: `Live updates stopped working${where ? ` for ${where}` : ""}: ${message}. The sidebar still refreshes on its own; this is a herdrig error, not a connection problem. ${CODE_ERROR_NEXT}` });
+  }
+
   stream(cx, feed = this.primary) {
     cx.spawn(async (cx) => {
       while (!this.closed && !feed.closed) {
         if (!feed.config?.daemonUrl) { await new Promise((resolve) => cx.timer.after(1000, () => resolve())); continue; }
         try {
-          const origin=feed.config.daemonUrl,url = new URL(origin);
-          const opened=await openRigEventStream(netFor(feed.config),url,socket=>{feed.sock=socket;});
+          // herdr:// has no socket to parse: the helper's long-poll stands in (plain JS, the mod runtime need not have `URL`).
+          const origin=feed.config.daemonUrl,url = String(origin??"").startsWith("herdr://") ? { protocol: "herdr:", origin } : addressParts(origin);
+          if(!url)throw new Error("OpenRig's address is not an http address the event stream can read.");
+          const opened=await openRigEventStream(netFor(feed.config),url,socket=>{feed.sock=socket;},()=>this.herdr.eventSocket(origin,feed.config?.connectionId)); // herdr://: the helper's long-poll
           if(this.closed||feed.closed||feed.config?.daemonUrl!==origin){opened.socket.close();continue;}
           feed.hostedReader?.reconnect(feed.config);
           let carry = new Uint8Array(0), pending = false;
@@ -2071,7 +2710,7 @@ export default class RigSidebar extends View {
             }),
             stop: () => this.closed || feed.closed || feed.config?.daemonUrl !== origin,
           });
-        } catch (_) { /* reconnect below */ }
+        } catch (e) { this.sayStreamBug(feed, e); /* then reconnect below */ }
         try { feed.sock?.close(); } catch (_) {}
         // Publish the merged view (this connection's state goes under its own id): never replace rig.data with one connection's data.
         if (feed.live) { feed.live = false; feed.hadDisconnect = true; this.publishData(cx); }
@@ -2141,6 +2780,25 @@ export default class RigSidebar extends View {
   /** herdr's terminals, spaces and panes, with the terminal index (seatTerminalIndex). Native herdr copies each list into the mod on every
    *  call, and finding the focused seat looks at every seat: within one render they are read once; outside a render (a click, a feed's
    *  notification) they are read now, once per call. */
+  /** herdrig's Spaces list marks rig spaces from this, published only when it changes. Each connection marks its own spaces (a space on a machine
+   *  belongs to that machine's connection); with one connection this is the original call. The marks are made again only when what they read
+   *  changes (the spaces, the terminals' labels, the panes, the space state, a connection's topology, config or host id): with 30 spaces and 3
+   *  OpenRigs, making them on every render cost about 22 ms. */
+  publishSpaceMarks(lists = this.hostLists()) {
+    const state = shared("rig.spaceState") ?? {};
+    const sources = this.feeds.length > 1
+      ? this.feeds.filter((f) => f.config && f.data && !f.error).map((f) => ({ topology: f.data.topology ?? [], config: f.config, hostId: f.healthz?.selfHostId }))
+      : [{ topology: this.data?.topology ?? [], config: this.config ?? {}, hostId: this.healthz?.selfHostId }];
+    const key = JSON.stringify([lists.spaces.map((s) => [s.id, s.machine ?? null, (s.tabs ?? []).map((tab) => tab.id)]),
+      lists.terminals.map((tm) => [tm.address, tm.labels ?? null]), lists.panes.map((p) => [p.terminal, p.tab, p.mod ?? null]), state]);
+    const marks = this.memoBy("spaceMarks", [key, ...sources.flatMap((x) => [x.topology, x.config, x.hostId])], () => {
+      const contexts = openRigSpaceContext(lists.spaces, lists.terminals, lists.panes, state);
+      const markWorld = { spaces: lists.spaces, terminals: lists.terminals, panes: lists.panes, state, contexts };
+      return JSON.stringify(this.feeds.length > 1 ? Object.assign({}, ...sources.map((x) => rigSpaceMarks({ ...markWorld, ...x }))) : rigSpaceMarks({ ...markWorld, ...sources[0] }));
+    });
+    if (marks !== this.publishedMarks) { this.publishedMarks = marks; setShared("herdrig.spaces", JSON.parse(marks)); }
+  }
+
   hostLists() {
     const read = () => { const tm = terminals?.() ?? [], pn = panes?.() ?? []; return { terminals: tm, spaces: spaces?.() ?? [], panes: pn, index: seatTerminalIndex(pn, tm) }; };
     const memo = this.renderMemo;
@@ -2168,6 +2826,27 @@ export default class RigSidebar extends View {
   }
   /** The dismissal records as one comparable value: the records change in place, so a memo over visible items compares this too. */
   dismissalRecordsKey(model) { return model ? model.records.map((r) => `${r.restored ? 1 : 0}${r.key}`).join("\n") : null; }
+  /** The items without the dismissed ones. Each item goes through ITS OpenRig's own dismissals: a list that holds several OpenRigs' items (no single box
+   *  is being drawn) is grouped by connection first, so a dismissal on one never hides or shows another's row of the same id and summary. */
+  visibleItems(items) {
+    if (this.feeds.length < 2 || this.viewFeed) return this.dismissalModel()?.visible(items) ?? items;
+    const groups = new Map();
+    for (const item of items) { const id = item?.conn || this.primary.id; if (!groups.has(id)) groups.set(id, []); groups.get(id).push(item); }
+    return [...groups].flatMap(([id, group]) => { const feed = this.feeds.find((f) => f.id === id); return feed ? this.dismissalModel(feed)?.visible(group) ?? group : group; });
+  }
+  /** The drawn box's items without the dismissed ones: ONE visible() pass a read and dismissal change, shared by the count and the Needs list
+   *  (a cold render after a refresh made it twice). Filtered raw: an item's key is the same raw or as a target, so the Needs list then makes
+   *  targets for the visible items only. */
+  visibleRawItems(items) {
+    // One slot per source: the feed's items (shared by the count and the list) and, when a Needs page had the list read, that read's own array.
+    const source = items === this.data?.attentionItems ? "feed" : "list";
+    return this.memoBy(`needs:visible:${source}:${this.viewFeed?.id ?? this.primary?.id ?? ""}`, [items, ...this.visibleItemsDeps()], () => this.visibleItems(items));
+  }
+  /** What `visibleItems` depends on, for a memo: the one drawn box's model and records, or every box's when the list merges them. */
+  visibleItemsDeps() {
+    const models = this.feeds.length < 2 || this.viewFeed ? [this.dismissalModel()] : this.feeds.map((f) => this.dismissalModel(f));
+    return models.flatMap((m) => [m, this.dismissalRecordsKey(m)]);
+  }
 
   /** `session => boolean` over the merged topology of every connection; undefined with one. */
   seatShared() { return this.feeds.length > 1 ? (session) => seatNameShared(this.data?.topology, session) : undefined; }
@@ -2198,6 +2877,8 @@ export default class RigSidebar extends View {
     const model = this.dismissalModel();
     if (!model) return null;
     const items = this.data?.attentionItems ?? [];
+    // The drawn box's own model: the shared pass is the same list then; a merged list of several boxes keeps the drawn box's count.
+    if (this.feeds.length < 2 || this.viewFeed) return this.visibleRawItems(items).length;
     return this.memoBy("needs:visible-count", [items, model, this.dismissalRecordsKey(model)], () => model.visible(items).length);
   }
 
@@ -2219,11 +2900,34 @@ export default class RigSidebar extends View {
     const stateConn=this.sidebarConnection();
     const rows = this.priorityRows();
     if (this.sidebarState?.id === "S4" && !this.data?.topology?.some((r) => r.name !== "kernel")) return this.topologyRows(t, cx);
+    const folds = this.viewState("rig.open.sidebar") ?? {};
+    const reqCount = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
+    const many = rows.filter((r) => r.kind === "seat").length > 12;
+    for (const group of PRIORITY_GROUPS) {
+      const members = rows.filter((r) => r.rank === group.rank);
+      if (!members.length) continue;
+      const gKey = `priority:${group.rank}`;
+      const expanded = folds[gKey] ?? (group.rank === 0 ? false : !(group.rank === 1 && many));
+      if (expanded && this.stickyTopologySpecs) {
+        this.stickyTopologySpecs.set(gKey, {
+          key: gKey,
+          foldKey: gKey,
+          kind: "priority",
+          isOpen: true,
+          parentKey: "branch:topology",
+          entry: null,
+          title: group.label,
+          tone: group.tone,
+          count: String(group.rank === 4 && reqCount !== null ? reqCount : members.length),
+          stateConn,
+        });
+      }
+    }
     const registered=[];
     const elements=priorityElements({ div, svg, h_flex }, t, rows, {
-      requestCount: this.requestCountOf(this.data?.topology, this.data?.attentionItems),
+      requestCount: reqCount,
       askOwner:ask=>{if(ask?.reply==='resolve'||ask?.answer?.verb==='resolve')return ask.waiting?.owner??ask.destinationSession??null;const member=assistantForNeed(ask,this.rosterOf(ask?.conn));return member?assistantOwner(member):null;},
-      folds: this.viewState("rig.open.sidebar") ?? {}, selected: this.viewState("rig.sel")?.key, iconOf: icon,
+      folds, selected: this.viewState("rig.sel")?.key, iconOf: icon,
       register: (row) => {this.visibleTreeRows.push(row);registered.push(row);},
       fold: (key, value, cx) => { this.fold(key, value,[],stateConn); cx.notify(); },
       open: (row, event, cx) => {
@@ -2239,7 +2943,7 @@ export default class RigSidebar extends View {
       machineOf: null, // one connection is drawn: no machine label on its rows
     });
     return [...(this.data?.topology ?? []).filter(r => r.nodesUnavailable).map(r => this.rigSeatsUnavailable(t, cx, r)),
-      ...elements.map((el,i)=>this.scrollRow(el,registered[i]?.key)),...this.archivedRows(t,cx)];
+      ...elements.map((el,i)=>this.scrollRow(el,registered[i]?.key,registered[i]?.key?.startsWith("priority-helper:")?26:30)),...this.archivedRows(t,cx)];
   }
 
   archivedRows(t, cx, host = null, indent = 18) {
@@ -2250,13 +2954,14 @@ export default class RigSidebar extends View {
     const records = withArchivedHosts(got.data, id => this.list(cx, `/api/rigs/${encodeURIComponent(id)}/nodes`).data, this.config?.connectionId);
     const showHost = host === null && new Set([...(this.data?.topology ?? []).map(r => hostOf(r) ?? "local"), ...records.flatMap(r => r.hosts)]).size > 1;
     const registered=[];
+    const open = Boolean(this.viewState("rig.open.sidebar")?.[key]);
     const elements=archivedElements({ div, svg, h_flex }, t, records, { host, showHost, indent, icon,
-      open: Boolean(this.viewState("rig.open.sidebar")?.[key]), register: row => {this.visibleTreeRows.push(row);registered.push(row);},
+      open, register: row => {this.visibleTreeRows.push(row);registered.push(row);},
       toggle: (_e, cx) => { this.fold(key, !this.viewState("rig.open.sidebar",stateConn)?.[key],[],stateConn); cx.notify(); },
       restore: r => startOneClick({ shared, setShared, run, layout, openOverlay: (spec) => this.open(spec) }, { kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }, "unarchive-rig"),
       menu: r => this.menu({ kind: "rig", rig: r.name, rigId: r.id, conn: r.conn, archived: true, lifecycle: "stopped" }),
     });
-    return elements.map((el,i)=>this.scrollRow(el,registered[i]?.key));
+    return elements.map((el,i)=>this.scrollRow(el,registered[i]?.key ?? null,i===0?22:24,i===0?null:key));
   }
 
   revealPriorityNeeds(cx,conn=this.sidebarConnection()) {
@@ -2304,7 +3009,7 @@ export default class RigSidebar extends View {
       .child(h_flex().flex_none().gap(compact ? 1 : 2).items_center()
         .child(iconButton("rig-new-rig", "plus", (_e, cx) => {
           cx.stop_propagation();
-          this.open(newRigOverlay(this.config?.connectionId));
+          this.open(newRigOverlay(this.feeds.length > 1 ? stateConn : this.config?.connectionId)); // the box this header draws: at click time `this.config` is the first connection's
         }).tooltip("New rig…"))
         .when(showOperatorIcon, (el) => el.child(
           iconButton("rig-open-operator", "rig-operator", (_e, cx) => {
@@ -2434,7 +3139,8 @@ export default class RigSidebar extends View {
     if(!conn)return false; // A rendered control must supply its owner; never borrow the live box.
     this.cancelTreeReveal();
     if (!open && [branchKey("needs"), "needs:updates"].includes(key)) {
-      this.dismissalModel()?.leave();
+      const feed = this.exactFeed(conn) ?? this.primary;
+      this.dismissalModel(feed)?.leave();
       this.publishDismissals();
     }
     const nextOpen = foldChoice(this.viewState("rig.open.sidebar",conn), key, open, seats);
@@ -2451,6 +3157,7 @@ export default class RigSidebar extends View {
     itemId = null,
     siblingIds = null,
     showElsewhere = true,
+    height = null,
   } = {}) {
     // Read once per render, not once per row: every row of a draw sees the same selection and navigation, and each read is a
     // native shared() call that converts the stored value (a sidebar with many rows ran past the render budget).
@@ -2538,7 +3245,7 @@ export default class RigSidebar extends View {
     if (elsewhere && showElsewhere) {
       out = out.child(div().id(`elsewhere-${rowKey}`).text_size(11).text_color(t.muted).child("·"));
     }
-    return this.scrollRow(out, rowKey);
+    return this.scrollRow(out, rowKey, height);
   }
 
   /** Render a top-level collapsible Explorer branch header (`Topology`, `Specs`, `Scopes`, `Terminals`, `Needs`, `System`). */
@@ -2663,6 +3370,22 @@ export default class RigSidebar extends View {
       }));
 
       if (!openRig) return;
+      this.stickyTopologySpecs?.set(rKey, {
+        key: rKey,
+        foldKey: rKey,
+        kind: "rig",
+        isOpen: true,
+        parentKey: hostParentKey,
+        entry: rigEntry,
+        indent: baseIndent,
+        rig,
+        seats: rigSeats,
+        stoppedRig,
+        stale,
+        views,
+        stateConn,
+        onMenu: () => this.menu({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle, orderGroupKey: `rig:${rig.id}:pods` }, 320, rKey),
+      });
 
       // Pods under Rig
       const podGroupKey = `rig:${rig.id}:pods`;
@@ -2698,6 +3421,20 @@ export default class RigSidebar extends View {
         }));
 
         if (!openPod) continue;
+        this.stickyTopologySpecs?.set(pKey, {
+          key: pKey,
+          foldKey: pKey,
+          kind: "pod",
+          isOpen: true,
+          parentKey: rKey,
+          entry: podEntry,
+          indent: baseIndent + 12,
+          title: pod.name || "—",
+          count: String(pod.seats.length),
+          seats: pod.seats,
+          stateConn,
+          onMenu: () => this.menu({ kind: "pod", rig: rig.name, rigId: rig.id, conn: rig.conn, pod: pod.name, lifecycle: rig.lifecycle, orderGroupKey: `pod:${key}:seats` }, 320, pKey),
+        });
         const seatGroupKey = `pod:${key}:seats`;
         const orderedSeats = orderSiblings(pod.seats, seatGroupKey, orderMap, (s) => s.session || s.logicalId);
         const seatSiblingIds = orderedSeats.map((s) => s.session || s.logicalId);
@@ -2752,19 +3489,36 @@ export default class RigSidebar extends View {
           }));
 
           for (const child of openHelpers ? helpers : []) {
-            out.push(h_flex().id(`child-${child.address}`).pl(baseIndent + 3 * TREE_STEP).pr(8).h(20).gap(6).items_center().hover((s) => s.bg(t.hover))
+            out.push(this.scrollRow(h_flex().id(`child-${child.address}`).pl(baseIndent + 3 * TREE_STEP).pr(8).h(20).gap(6).items_center().hover((s) => s.bg(t.hover))
               .on_click(() => run("terminal.peek", { terminal: child.address }))
               .child(leafCell())
               .child(svg(icon("rig-helper")).size(11).flex_none().text_color(t.dim))
-              .child(div().flex_1().truncate().text_size(11.5).text_color(t.muted).tooltip(String(child.label??"")).child(child.label)));
+              .child(div().flex_1().truncate().text_size(11.5).text_color(t.muted).tooltip(String(child.label??"")).child(child.label)), null, 20, sKey));
           }
         }
       }
 
-      const assistants=assistantGroup(t,cx,this.rosterOf(rig.conn),rig,{prefix:'sidebar',icon,rows:this.visibleTreeRows,parentKey:rKey,indent:baseIndent+12,folds,
-        append:(row,key)=>out.push(this.scrollRow(row,key)),
+      const aKey = `assistants:${rig.conn}:${rig.id}`;
+      const roster = this.rosterOf(rig.conn);
+      const assistants=assistantGroup(t,cx,roster,rig,{prefix:'sidebar',icon,rows:this.visibleTreeRows,parentKey:rKey,indent:baseIndent+12,folds,
+        append:(row,key)=>out.push(this.scrollRow(row,key,key?null:20,aKey)),
         fold:(key,open)=>this.fold(key,open,[],stateConn),select:(key,entry,cx)=>{this.selectRow(entry,key);cx?.notify?.();},open:entry=>this.openPage(entry),menu:target=>this.menu(target,180),decorate:(row,options)=>this.decorateRow(t,row,options)});
       if(assistants)out.push(assistants);
+      if (folds?.[aKey] === true && this.visibleTreeRows.some((r) => r.key === aKey)) {
+        const count = this.visibleTreeRows.filter((r) => r.parentKey === aKey).length;
+        this.stickyTopologySpecs?.set(aKey, {
+          key: aKey,
+          foldKey: aKey,
+          kind: "assistants",
+          isOpen: true,
+          parentKey: rKey,
+          entry: rigEntry,
+          indent: baseIndent + 12,
+          title: "Connected assistants",
+          count: String(count),
+          stateConn,
+        });
+      }
 
       // Per-rig `Views` branch under each open rig: the saved views of the rig's OWN connection (its feed's views list). This
       // window's provider views (the strip, matched by session name) belong to the first connection only: another box's same-named seats never match them.
@@ -2796,6 +3550,19 @@ export default class RigSidebar extends View {
       }));
 
       if (openViewsBranch) {
+        this.stickyTopologySpecs?.set(vKey, {
+          key: vKey,
+          foldKey: vKey,
+          kind: "views",
+          isOpen: true,
+          parentKey: rKey,
+          entry: viewsEntry,
+          indent: baseIndent + 12,
+          title: "Views",
+          count: `⬚ ${vBranch.openCount + vBranch.savedCount}`,
+          stateConn,
+          onMenu: () => this.menu({ kind: "views", rig: rig.name, rigId: rig.id, conn: rig.conn, views, orderGroupKey: `rig:${rig.id}:views` }, 320, vKey),
+        });
         const viewItemsGroupKey = `rig:${rig.id}:views`;
         const viewItems = vBranch.items.filter((x) => x.kind !== "new-view");
         const orderedViewItems = orderSiblings(viewItems, viewItemsGroupKey, orderMap, (x) => x.id);
@@ -2858,7 +3625,7 @@ export default class RigSidebar extends View {
         }
 
         // Always expose `+ New worker view…` under a rig's Views branch
-        out.push(h_flex().id(`sidebar-design-view-${rig.id}`).pl(baseIndent + 2 * TREE_STEP).pr(8).h(20).gap(6).items_center().hover((s) => s.bg(t.hover))
+        out.push(this.scrollRow(h_flex().id(`sidebar-design-view-${rig.id}`).pl(baseIndent + 2 * TREE_STEP).pr(8).h(20).gap(6).items_center().hover((s) => s.bg(t.hover))
           .on_click(() => this.open({
             mod: MOD_IDS.menu,
             kind: "dialog",
@@ -2871,7 +3638,7 @@ export default class RigSidebar extends View {
             },
           }))
           .child(leafCell())
-          .child(div().text_size(11).text_color(t.muted).tooltip("+ New worker view…").child("+ New worker view…").flex_1().truncate()));
+          .child(div().text_size(11).text_color(t.muted).tooltip("+ New worker view…").child("+ New worker view…").flex_1().truncate()), null, 20, vKey));
       }
     };
 
@@ -2894,7 +3661,7 @@ export default class RigSidebar extends View {
             .child(div().id(`host-fold-${h}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
               .on_click((_e, cx) => { cx.stop_propagation(); this.fold(hKey, !openHost,[],stateConn); cx.notify(); })
               .child(svg(icon(openHost ? "chevron-down" : "chevron-right")).size(11)))
-            .child(div().flex_1().truncate().text_size(11.5).font_semibold().text_color(t.muted).tooltip(String(h??"")).child(h))
+            .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_semibold().text_color(t.muted).tooltip(String(h??"")).child(formatHostId(h)))
             .child(div().text_size(10.5).text_color(t.dim).child(String(rigsOnHost.length)));
           out.push(this.decorateRow(t, hostRow, {
             rowKey: hKey,
@@ -2905,6 +3672,19 @@ export default class RigSidebar extends View {
             siblingIds: hosts,
           }));
           if (!openHost) continue;
+          this.stickyTopologySpecs?.set(hKey, {
+            key: hKey,
+            foldKey: hKey,
+            kind: "host",
+            isOpen: true,
+            parentKey,
+            entry: hostEntry,
+            indent: treeIndent(depth),
+            title: h,
+            count: String(rigsOnHost.length),
+            stateConn,
+            onMenu: () => this.menu({ kind: "host", hostId: h, name: h, orderGroupKey: `topology:rigs:${h}` }, 140, hKey),
+          });
           const rigGroupKey = qualifyKey(qual, `topology:rigs:${h}`);
           const orderedRigs = orderSiblings(rigsOnHost, rigGroupKey, orderMap, (r) => r.id);
           const rigSiblingIds = orderedRigs.map((r) => r.id);
@@ -2933,13 +3713,20 @@ export default class RigSidebar extends View {
 
   /** Lazy-load a branch API list when first expanded and again on refresh. */
   list(cx, path, feed = this.viewFeed ?? this.primary) {
+    const startedConfig = feed.config;
     const get = (p) => this.get(p, feed);
     const hit = feed.lists[path];
-    if ((!hit || hit.stale) && feed.config && !hit?.loading) {
+    if ((!hit || hit.stale) && startedConfig && !hit?.loading) {
       feed.lists[path] = { ...(hit ?? {}), loading: true };
       cx.spawn(async (cx) => {
-        try { feed.lists[path] = { data: await get(path), at: new Date().toISOString() }; }
-        catch (e) { feed.lists[path] = { ...(hit ?? {}), error: String(e?.message ?? e), stale: false }; }
+        try {
+          const data = await get(path);
+          if (!gateSameConfig(startedConfig, feed.config)) return;
+          feed.lists[path] = { data, at: new Date().toISOString() };
+        } catch (e) {
+          if (!gateSameConfig(startedConfig, feed.config)) return;
+          feed.lists[path] = { ...(hit ?? {}), error: String(e?.message ?? e), stale: false };
+        }
         cx.notify();
       });
     }
@@ -2980,20 +3767,29 @@ export default class RigSidebar extends View {
         : div().size(6).rounded(3).bg(t.accent)));
   }
 
-  sidebarUpdateAction(action, value) {
-    requestDismissal({ shared, setShared, run, scope: dismissalScope(this.config) }, action, value);
+  sidebarUpdateAction(action, value, scope = dismissalScope((this.viewFeed ?? this.followedFeed()).config)) {
+    const conn = (this.viewFeed ?? this.followedFeed())?.config?.connectionId;
+    const stamp = (v) => (v && typeof v === "object" && !Array.isArray(v) && conn && !v.conn ? { ...v, conn } : v);
+    const nextValue = action === "dismiss" ? (Array.isArray(value) ? value.map(stamp) : stamp(value)) : value;
+    requestDismissal({ shared, setShared, run, scope }, action, nextValue);
   }
 
   /** The row that stands for the rows a capped sidebar list doesn't draw: it opens that OpenRig's Needs page on the list's own tab, which lists them all. */
-  moreNeedsRow(t, cx, { id, label, conn, parentKey, tab }) {
-    const entry = { section: "needs", needsTab: tab, ...(conn ? { conn } : {}) }, rowKey = `more:${id}`;
+  moreNeedsRow(t, cx, { id, label, conn, parentKey, tab, showDismissed = false }) {
+    return this.moreRow(t, cx, { id, label, parentKey, entry: { section: "needs", needsTab: tab, ...(showDismissed ? { showDismissed: true } : {}), ...(conn ? { conn } : {}) } });
+  }
+  /** The "N more" row after a list the sidebar shows SIDEBAR_ROW_CAP of: it opens the page with the whole list. */
+  moreRow(t, cx, { id, label, parentKey, entry: listEntry, indent = 1, conn = null }) {
+    const rowKey = `more:${id}`, entry = conn && !listEntry.conn ? { ...listEntry, conn } : listEntry; // the page opens on the row's own OpenRig
     this.visibleTreeRows.push({ key: rowKey, expandable: false, parentKey, entry });
-    return this.scrollRow(h_flex().id(id).pl(treeIndent(1)).pr(8).h(24).gap(6).items_center().cursor_pointer().hover(s => s.bg(t.hover))
-      .on_click(() => { this.openPage(entry, rowKey); cx.notify(); })
+    return this.scrollRow(h_flex().id(id).pl(treeIndent(indent)).pr(8).h(24).gap(6).items_center().cursor_pointer().hover(s => s.bg(t.hover))
+      .on_click((_e, ctx) => { this.openPage(entry, rowKey); (ctx ?? cx)?.notify?.(); })
       .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.accent).child(label)), rowKey);
   }
   sidebarUpdates(t, cx, updates) {
     const stateConn=this.sidebarConnection();
+    const rowConn = this.feeds.length > 1 ? ((this.viewFeed ?? this.primary)?.id ?? null) : undefined;
+    const scope = dismissalScope((this.viewFeed ?? this.followedFeed()).config);
     const model = this.dismissalModel(), hidden = model?.hidden() ?? [], receipts = model?.receiptRows() ?? [];
     if (!updates.length && !hidden.length && !receipts.length) return [];
     const key = "needs:updates", expanded = branchFoldOpen(this.viewState("rig.open.sidebar") ?? {}, key, true);
@@ -3001,17 +3797,17 @@ export default class RigSidebar extends View {
     const hovered = (id) => this.hoveredUpdate === id || selected === id;
     const hover = (id) => (over, ctx) => { this.hoveredUpdate = over ? id : null; (ctx ?? cx).notify(); };
     const action = (verb, value) => (_e, ctx) => {
-      (ctx ?? cx).stop_propagation(); this.sidebarUpdateAction(verb, value); (ctx ?? cx).notify();
+      (ctx ?? cx).stop_propagation(); this.sidebarUpdateAction(verb, value, scope); (ctx ?? cx).notify();
     };
     this.visibleTreeRows.push({ key, foldKey: key, expandable: true, isOpen: expanded, parentKey: branchKey("needs") });
     const head = h_flex().id("needs-updates-branch").pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
       .on_hover(hover(key)).hover(s => s.bg(t.hover))
-      .on_click(() => { this.setViewState("rig.sel", { key }); this.fold(key, !expanded,[],stateConn); cx.notify(); })
-      .on_mouse_down("right", () => this.menu({ kind: "updates-group", name: "Updates", items: updates }))
+      .on_click((_e, ctx) => { this.setViewState("rig.sel", { key }, stateConn); this.fold(key, !expanded,[],stateConn); (ctx ?? cx)?.notify?.(); })
+      .on_mouse_down("right", () => this.menu({ kind: "updates-group", ...(stateConn ? { conn: stateConn } : {}), name: "Updates", items: updates }))
       .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
       .child(div().flex_1().text_size(11.5).text_color(t.muted).child("Updates"));
     if (updates.length && hovered(key)) head.child(div().id("sidebar-dismiss-all").text_size(11).text_color(t.dim)
-      .hover(s => s.text_color(t.foreground)).cursor_pointer().on_click(action("dismiss", updates)).child(`Dismiss all ${updates.length}`)); // every update, drawn or not: the count says so
+      .hover(s => s.text_color(t.foreground)).cursor_pointer().on_click(action("dismiss", updates)).child(updates.length === 1 ? "Dismiss" : `Dismiss all ${updates.length}`));
     else head.child(div().text_size(11).text_color(t.dim).child(String(updates.length)));
     const out = [this.scrollRow(head,key)];
     if (!expanded) return out;
@@ -3022,8 +3818,8 @@ export default class RigSidebar extends View {
       this.visibleTreeRows.push({ key: rowKey, expandable: false, parentKey: key, entry, update: record ? null : { ...n, dismissalPosition: position } });
       const el = h_flex().id(record ? `sidebar-hidden-${n.id}` : `need-${n.id}`).pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
         .on_hover(hover(rowKey)).hover(s => s.bg(t.hover))
-        .on_click(() => { this.selectRow(entry, rowKey); cx.notify(); })
-        .on_mouse_down("right", () => this.menu({ ...n, dismissed: !!record }))
+        .on_click((_e, ctx) => { this.selectRow(entry, rowKey); (ctx ?? cx)?.notify?.(); })
+        .on_mouse_down("right", () => this.menu({ ...(n.conn || !stateConn ? n : { ...n, conn: stateConn }), dismissed: !!record }))
         .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(12).text_color(hovered(rowKey) ? t.foreground : t.dim).tooltip(String(n.summary??"")).child(n.summary));
       if (hovered(rowKey) && dismissible(n)) {
         el.child(div().id(`sidebar-${record ? "restore" : "dismiss"}-${n.id}`).size(16).flex_none().items_center().justify_center()
@@ -3047,15 +3843,18 @@ export default class RigSidebar extends View {
         .child(div().truncate().text_color(t.muted).tooltip(String((receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`)??"")).child(receipt.keys.length === 1 ? "✓ Dismissed ·" : `✓ Dismissed ${receipt.keys.length} ·`))
         .child(div().id(`sidebar-undo-${receipt.id}`).text_color(t.accent).cursor_pointer().on_click(action("undo", receipt.id)).child("Undo")));
     out.push(...rows);
-    if (updates.length > SIDEBAR_ROW_CAP) out.push(this.moreNeedsRow(t, cx, { id: "sidebar-updates-more", parentKey: key, tab: "updates", conn: updates[0]?.conn ?? null,
+    if (updates.length > SIDEBAR_ROW_CAP) out.push(this.moreNeedsRow(t, cx, { id: "sidebar-updates-more", parentKey: key, tab: "updates", conn: updates[0]?.conn ?? rowConn ?? null,
       label: `${updates.length - SIDEBAR_ROW_CAP} more update${updates.length - SIDEBAR_ROW_CAP === 1 ? "" : "s"}` }));
     if (hidden.length) {
       out.push(div().id("sidebar-show-dismissed").pl(treeIndent(1)).h(24).text_size(11).text_color(t.dim).cursor_pointer()
         .on_click(action("show")).child(`${model.show ? "Hide" : "Show"} dismissed (${hidden.length})`));
       if (model.show) {
         out.push(...hidden.slice(0, SIDEBAR_ROW_CAP).map(record => row(record.item, record)));
-        if (hidden.length > SIDEBAR_ROW_CAP) out.push(div().id("sidebar-dismissed-more").pl(treeIndent(1)).h(24).text_size(11).text_color(t.dim)
-          .child(`${hidden.length - SIDEBAR_ROW_CAP} more dismissed, not shown here`));
+        if (hidden.length > SIDEBAR_ROW_CAP) out.push(this.moreNeedsRow(t, cx, {
+          id: "sidebar-dismissed-more", parentKey: key, tab: "updates", showDismissed: true,
+          conn: hidden[0]?.item?.conn ?? rowConn ?? null,
+          label: `${hidden.length - SIDEBAR_ROW_CAP} more dismissed`,
+        }));
       }
     }
     return out;
@@ -3063,7 +3862,8 @@ export default class RigSidebar extends View {
 
   /** Keep sidebar counts, rows and their workflow reads on one effective project. */
   scopesProject(cx) {
-    return effectiveScopeProject(null,shared('rig.project'),this.list(cx,'/api/scopes/projects').data);
+    const catalog = this.list(cx, "/api/scopes/projects").data;
+    return effectiveScopeProject(null, readScopeProject(shared, this.primary.config ?? this.config, this.sidebarConnection(), catalog), catalog);
   }
   /** Render the children of `Specs`, `Scopes`, `Terminals`, `Needs`, or `System` when expanded. */
   sectionBranchChildren(t, cx, section) {
@@ -3158,7 +3958,7 @@ export default class RigSidebar extends View {
       }
       out.push(div().px(18).py(4).text_size(11.5).text_color(t.blocked).child(got.error));
       out.push(div().id("rig-list-retry").mx(18).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().text_size(12).hover((s) => s.bg(t.hover))
-        .on_click((_e, cx) => { this.lists[path] = { ...got, stale: true }; cx.notify(); }).child("Retry"));
+        .on_click((_e, cx) => { rowFeed.lists[path] = { ...got, stale: true }; cx.notify(); }).child("Retry"));
       if (!got.data) return out;
     } else if (got.data === undefined) {
       return [div().px(18).py(4).text_size(12).text_color(t.dim).child("Reading…")];
@@ -3198,8 +3998,11 @@ export default class RigSidebar extends View {
 
         const namespaces = [...new Set(g.items.map((s) => specNamespaceOf(s)))];
         const multiNs = namespaces.length > 1;
+        // A kind's specs show SIDEBAR_ROW_CAP rows across its namespaces; the rest are behind a "more" row that opens the Specs page.
+        let drawnSpecs = 0, cappedSpecs = 0;
         for (const ns of namespaces) {
           const nsItems = g.items.filter((s) => specNamespaceOf(s) === ns);
+          if (drawnSpecs >= SIDEBAR_ROW_CAP) { cappedSpecs += nsItems.length; continue; }
           const nsKey = `specs:ns:${g.kind}:${ns}`;
           const openNs = multiNs ? branchFoldOpen(folds, nsKey, true) : true;
           if (multiNs) {
@@ -3218,7 +4021,9 @@ export default class RigSidebar extends View {
           const specGroupKey = `specs:${g.kind}:${ns}`;
           const orderedSpecs = orderSiblings(nsItems, specGroupKey, orderMap, (s) => s.id);
           const specSiblingIds = orderedSpecs.map((s) => s.id);
-          for (const s of orderedSpecs) {
+          const shownSpecs = orderedSpecs.slice(0, SIDEBAR_ROW_CAP - drawnSpecs);
+          drawnSpecs += shownSpecs.length; cappedSpecs += orderedSpecs.length - shownSpecs.length;
+          for (const s of shownSpecs) {
             const specEntry = { section: "specs", id: s.id, name: s.name };
             out.push(this.treeLeafRow(t, {
               id: `spec-${s.id}`,
@@ -3235,12 +4040,16 @@ export default class RigSidebar extends View {
             }));
           }
         }
+        // The Specs list with this kind open, never the kind header's entry: its name ("Pods") would be read as a spec name.
+        if (cappedSpecs) out.push(this.moreRow(t, cx, { conn: rowConn, id: `sidebar-specs-more-${g.kind}`, parentKey: gFoldKey, entry: { section: "specs", kindFilter: g.kind }, indent: 2,
+          label: `${cappedSpecs} more ${g.kind} spec${cappedSpecs === 1 ? "" : "s"}` }));
       }
     } else if (section === "scopes") {
       const folders = new Map((this.list(cx, '/api/slices'+(selectedProject?`?project=${encodeURIComponent(selectedProject)}`:'')).data?.slices ?? []).filter((x) => typeof x.slicePath === "string").map((x) => [x.slicePath.split(/[\\/]/).pop(), x.slicePath]));
       const missions = orderSiblings(d.missions ?? [], "scopes:missions", orderMap, (m) => m.mission);
       const missionIds = missions.map((m) => m.mission);
-      for (const m of missions) {
+      // The sidebar shows SIDEBAR_ROW_CAP missions and SIDEBAR_ROW_CAP slices of each; "more" rows open the Scopes or mission page.
+      for (const m of missions.slice(0, SIDEBAR_ROW_CAP)) {
         const mKey = `mission:${m.mission}`;
         const openMission = branchFoldOpen(folds, mKey, true);
         const context={mission:m.mission,project:selectedProject??d.project?.id,projectRoot:d.project?.root};
@@ -3278,9 +4087,11 @@ export default class RigSidebar extends View {
             .child(div().text_size(10.5).text_color(t.dim).child(String(workflows.instances.length))),{rowKey:workflowGroup,entry:groupEntry}));
           if(workflowOpen)for(const [index,wf] of workflows.instances.entries()){
             const key=`workflow:${context.project??''}:${m.mission}:${wf.id}`,expanded=branchFoldOpen(folds,key,true),entry=workflowEntry(context,wf);
+            const rowTopology=this.feeds.length>1?(rowFeed?.data?.topology??[]):(this.data?.topology??[]);
             const menuTarget=owner=>{
-              const found=resolveAskerSeat(owner,this.data?.topology),s=found.seat;
-              return {kind:'workflow',id:wf.id,name:wf.title,ownerEntry:found.found?{section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,conn:s.conn,name:s.logicalId,session:s.session}:null};
+              const found=resolveAskerSeat(owner,rowTopology,this.feeds.length>1?rowConn:null),s=found.seat;
+              const ownerConn=s?.conn??rowConn;
+              return {kind:'workflow',...(this.feeds.length>1&&rowConn?{conn:rowConn}:{}),id:wf.id,name:wf.title,ownerEntry:found.found?{section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,...(ownerConn?{conn:ownerConn}:{}),name:s.logicalId,session:s.session}:null};
             };
             const owners=[...new Set(wf.packets.map(p=>p.owner).filter(Boolean))];
             this.visibleTreeRows.push({key,foldKey:key,expandable:wf.packets.length>0,isOpen:expanded,parentKey:workflowGroup,entry});
@@ -3308,7 +4119,7 @@ export default class RigSidebar extends View {
         if(!slicesOpen)continue;
         const orderedSlices = orderSiblings(slices, sliceGroupKey, orderMap, (s) => s.dirName);
         const sliceIds = orderedSlices.map((s) => s.dirName);
-        for (const s of orderedSlices) {
+        for (const s of orderedSlices.slice(0, SIDEBAR_ROW_CAP)) {
           const sliceEntry = { ...missionEntry, slice: s.dirName, name: s.displayName ?? s.dirName };
           out.push(this.treeLeafRow(t, {
             id: `slice-${m.mission}-${s.dirName}`,
@@ -3324,11 +4135,18 @@ export default class RigSidebar extends View {
             siblingIds: sliceIds,
           }));
         }
+        const moreSlices = orderedSlices.length - SIDEBAR_ROW_CAP;
+        if (moreSlices > 0) out.push(this.moreRow(t, cx, { conn: rowConn, id: `sidebar-slices-more-${m.mission}`, parentKey: sliceGroupKey, entry: { ...missionEntry, missionTab: "slices" }, indent: 3,
+          label: `${moreSlices} more slice${moreSlices === 1 ? "" : "s"}` }));
       }
+      const moreMissions = missions.length - SIDEBAR_ROW_CAP;
+      if (moreMissions > 0) out.push(this.moreRow(t, cx, { conn: rowConn, id: "sidebar-missions-more", parentKey: parentBranchKey,
+        entry: { section: "scopes", ...(selectedProject ? { project: selectedProject } : {}) }, label: `${moreMissions} more mission${moreMissions === 1 ? "" : "s"}` }));
     } else if (section === "terminals") {
       const savedList = orderSiblings(d.saved ?? [], "terminals:saved", orderMap, (s) => s.id);
       const savedIds = savedList.map((s) => s.id);
-      for (const s of savedList) {
+      // SIDEBAR_ROW_CAP saved and derived views each; "more" rows open the Terminals page.
+      for (const s of savedList.slice(0, SIDEBAR_ROW_CAP)) {
         const entry = { section: "terminals", view: `saved:${s.id}`, name: s.name ?? s.id };
         out.push(this.treeLeafRow(t, {
           id: `view-saved-${s.id}`,
@@ -3345,8 +4163,10 @@ export default class RigSidebar extends View {
           siblingIds: savedIds,
         }));
       }
+      if (savedList.length > SIDEBAR_ROW_CAP) out.push(this.moreRow(t, cx, { conn: rowConn, id: "sidebar-saved-views-more", parentKey: parentBranchKey, entry: { section: "terminals" },
+        label: `${savedList.length - SIDEBAR_ROW_CAP} more saved view${savedList.length - SIDEBAR_ROW_CAP === 1 ? "" : "s"}` }));
       const derivedList = orderSiblings(d.rigs ?? [], "terminals:derived", orderMap, (r) => r);
-      for (const r of derivedList) {
+      for (const r of derivedList.slice(0, SIDEBAR_ROW_CAP)) {
         const entry = { section: "terminals", view: `rig:${r}`, name: `rig:${r}` };
         out.push(this.treeLeafRow(t, {
           id: `view-rig-${r}`,
@@ -3363,6 +4183,8 @@ export default class RigSidebar extends View {
           siblingIds: derivedList,
         }));
       }
+      if (derivedList.length > SIDEBAR_ROW_CAP) out.push(this.moreRow(t, cx, { conn: rowConn, id: "sidebar-rig-views-more", parentKey: parentBranchKey, entry: { section: "terminals" },
+        label: `${derivedList.length - SIDEBAR_ROW_CAP} more rig view${derivedList.length - SIDEBAR_ROW_CAP === 1 ? "" : "s"}` }));
     } else if (section === "needs") {
       const perspective = d.perspective ?? this.data?.attentionPerspective ?? null;
       const whoseLine = whoseQueueSummary(perspective, this.config);
@@ -3371,14 +4193,13 @@ export default class RigSidebar extends View {
       }
       // Every request and update as a target, without the dismissed ones, sorted: made again only when the items, the enriched items or the
       // dismissals change (the records change in place, so their keys and restored marks are part of what is compared).
-      const model = this.dismissalModel(), records = this.dismissalRecordsKey(model);
-      const rawItems = this.memoBy(`needs:${rowFeed?.id ?? ""}`, [d.items, this.data?.attentionItems, model, records], () => {
-        const enrichedById = new Map((this.data?.attentionItems ?? []).filter((x) => x?.id).map((x) => [x.id, x]));
-        const mergedItems = (d.items ?? []).map((it) => {
-          const match = enrichedById.get(it.id);
+      const visibleRaw = this.visibleRawItems(d.items ?? []); // the same pass the count uses; dismissed items get no target made
+      const rawItems = this.memoBy(`needs:${rowFeed?.id ?? ""}`, [visibleRaw, this.data?.attentionItems], () => {
+        const enrichedById = new Map((this.data?.attentionItems ?? []).filter((x) => x?.id).map((x) => [`${x.conn ?? ""}\0${x.id}`, x]));
+        return sortNeedsByTier(visibleRaw.map((it) => {
+          const match = enrichedById.get(`${it?.conn ?? ""}\0${it?.id}`);
           return needTarget(match ? { ...it, ...match } : it);
-        });
-        return sortNeedsByTier(model?.visible(mergedItems) ?? mergedItems);
+        }));
       });
       const orderedNeeds = orderSiblings(rawItems, "needs:items", orderMap, (n) => n.id);
       const needIds = orderedNeeds.map((n) => n.id);
@@ -3413,7 +4234,7 @@ export default class RigSidebar extends View {
             .child(v_flex().flex_1().min_w(0).gap(2)
               .child(div().truncate().text_size(12).text_color(t.foreground).tooltip(headline).child(headline))
               .child(div().truncate().text_size(11).text_color(t.dim).tooltip(needSub).child(needSub)));
-          out.push(this.decorateRow(t, rowEl, { rowKey, entry: { ...entry, name: headline }, popoutId: `popout-${rowId}`, groupKey: "needs:items", itemId: n.id, siblingIds: needIds }));
+          out.push(this.decorateRow(t, rowEl, { rowKey, entry: { ...entry, name: headline }, popoutId: `popout-${rowId}`, groupKey: "needs:items", itemId: n.id, siblingIds: needIds, height: 40 }));
           continue;
         }
       }
@@ -3444,6 +4265,7 @@ export default class RigSidebar extends View {
     const stateConn=this.sidebarConnection();
     this.treeStateConn=stateConn;
     this.visibleTreeRows = [];
+    this.stickyTopologySpecs = new Map();
     this.reorderRows = new Map();
     const folds = this.viewState("rig.open.sidebar") ?? {};
     const orderMap = shared("rig.order") ?? {};
@@ -3551,8 +4373,15 @@ export default class RigSidebar extends View {
     return out;
   }
 
-  scrollRow(el,key) {
-    if(key){this.scrollRowKeys??=new WeakMap();this.scrollRowKeys.set(el,key);}
+  scrollRow(el, key, height = null, parentKey = null) {
+    if (key) {
+      this.scrollRowKeys ??= new WeakMap();
+      this.scrollRowKeys.set(el, key);
+    }
+    if (key || height !== null || parentKey !== null) {
+      this.scrollRowMeta ??= new WeakMap();
+      this.scrollRowMeta.set(el, { key: key ?? null, height, parentKey });
+    }
     return el;
   }
 
@@ -3560,24 +4389,171 @@ export default class RigSidebar extends View {
     this.cancelSidebarReveal?.();this.cancelSidebarReveal=null;this.keyRevealPending=false;
   }
 
+  applySelectionRevealIndex(rawIndex) {
+    if (!Number.isInteger(rawIndex) || rawIndex < 0) return -1;
+    if (!Number.isFinite(this.listViewportHeight) || this.listViewportHeight <= 0) return rawIndex;
+    const baseTop = Number.isFinite(this.revealBaseScrollTop) ? this.revealBaseScrollTop : this.listScrollTop;
+    const { targetIndex, nextScrollTop } = revealTargetForSelection(this.scrollLayout, rawIndex, baseTop, this.listViewportHeight);
+    this.listScrollTop = nextScrollTop;
+    return targetIndex;
+  }
+
   revealTreeSelection(cx) {
     this.cancelTreeReveal();
     if(!this.listScroll)return;
     this.keyRevealPending=true;this.renderRevealKey=null;
+    this.revealBaseScrollTop=this.listScrollTop;
     this.cancelSidebarReveal=revealAfterKey(cx,this.listScroll,()=>{
       if(this.closed||!this.keyRevealPending)return -1;
       this.keyRevealPending=false;
-      return this.scrollRowIndices?.get(this.viewState("rig.sel")?.key)??-1;
+      const rawIndex=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key)??-1;
+      return this.applySelectionRevealIndex(rawIndex);
     },this);
   }
 
   scrollChildren(content) {
     this.scrollRowIndices=new Map();
-    return content.map((el,i)=>{
-      const key=this.scrollRowKeys?.get(el);
+    this.noticeHeights ??= new Map();
+    const layoutRows = [];
+    const elements = content.map((el,i)=>{
+      const meta = this.scrollRowMeta?.get(el);
+      const key = meta?.key ?? this.scrollRowKeys?.get(el) ?? null;
       if(key)this.scrollRowIndices.set(key,i);
-      return div().id(`rig-scroll-row-${encodeURIComponent(key?`key:${key}`:`notice:${i}`)}`).flex_none().w_full().child(el);
+      const token = key ? `key:${key}` : `notice:${i}`;
+      const fixedHeight = meta?.height ?? null;
+      layoutRows.push({
+        index: i,
+        key,
+        height: fixedHeight ?? (key ? null : this.noticeHeights.get(token) ?? null),
+        parentKey: meta?.parentKey ?? null,
+      });
+      let row = div().id(`rig-scroll-row-${encodeURIComponent(token)}`).flex_none().w_full().child(el);
+      if (!key && fixedHeight === null) {
+        row = row.on_size_change((size, cx) => {
+          const zoom = Number(settings()?.zoom) || 1;
+          const h = size.height / zoom;
+          if (Math.abs((this.noticeHeights.get(token) ?? -1) - h) > 0.5) {
+            this.noticeHeights.set(token, h);
+            if ((this.listScrollTop ?? 0) > 0) cx.notify();
+          }
+        });
+      }
+      return row;
     });
+    this.scrollLayout = buildStickyScrollLayout(layoutRows, this.visibleTreeRows, this.stickyTopologySpecs);
+    return elements;
+  }
+
+  handleListScrollWheel(e, cx, connKey = this.scrollShown ?? "") {
+    const dy = Number(e?.delta?.y) || 0;
+    if (dy === 0) return;
+    const zoom = Number(settings()?.zoom) || 1;
+    const prev = this.listScrollTops?.get(connKey) ?? 0;
+    const next = clampScrollTop(prev - dy / zoom, this.scrollLayout?.contentHeight ?? 0, this.listViewportHeight);
+    (this.listScrollTops ??= new Map()).set(connKey, next);
+    const sig = stickySignature(computeStickyTopology(this.scrollLayout, next, this.listViewportHeight));
+    if (sig !== (this.renderedStickySignature ?? "")) {
+      cx?.notify?.();
+    }
+  }
+
+  renderStickyTopology(t, pinned) {
+    if (!pinned?.length) {
+      this.renderedStickySignature = "";
+      return null;
+    }
+    this.renderedStickySignature = stickySignature(pinned);
+    const connKey = this.scrollShown ?? "";
+    const jumpTo = (spec, e, cx) => {
+      cx?.stop_propagation?.();
+      this.cancelTreeReveal();
+      this.focusHandle?.focus?.();
+      if ((e?.click_count ?? 1) >= 2 && spec.entry) {
+        if (spec.entry.kind === "rig") this.openRigSpace(cx, spec.entry.rigId ?? spec.entry.name);
+        else this.openPage(spec.entry, spec.key);
+        cx?.notify?.();
+        return;
+      }
+      if (spec.entry) this.selectRow(spec.entry, spec.key);
+      else this.setViewState("rig.sel", { key: spec.key, entry: null, at: Date.now() }, spec.stateConn);
+      this.listScroll?.scroll_to_item(spec.rowIndex);
+      const nextTop = nextScrollTopAfterReveal(this.scrollLayout, spec.rowIndex, this.listScrollTops?.get(connKey) ?? 0, this.listViewportHeight);
+      (this.listScrollTops ??= new Map()).set(connKey, nextTop);
+      cx?.notify?.();
+    };
+    const collapseSpec = (spec, cx) => {
+      cx?.stop_propagation?.();
+      this.cancelTreeReveal();
+      this.focusHandle?.focus?.();
+      this.fold(spec.foldKey, false, spec.seats ?? [], spec.stateConn);
+      this.listScroll?.scroll_to_item(spec.rowIndex);
+      const nextTop = nextScrollTopAfterReveal(this.scrollLayout, spec.rowIndex, this.listScrollTops?.get(connKey) ?? 0, this.listViewportHeight);
+      (this.listScrollTops ??= new Map()).set(connKey, nextTop);
+      cx?.notify?.();
+    };
+    const selKey = (this.renderMemo?.selRead ? this.renderMemo.sel : this.viewState("rig.sel"))?.key ?? null;
+    const rows = pinned.map((spec) => {
+      const isSelected = selKey === spec.key;
+      if (spec.kind === "rig") {
+        const { rig, stoppedRig, stale, views = [] } = spec;
+        let row = h_flex().id(`sticky-row-${spec.key}`).pl(spec.indent).pr(8).h(24).gap(6).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
+          .when(isSelected, (s) => s.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
+          .when(this.activeSpaceContext?.rigs?.some((name) => name === rig.name || name === rig.id), (s) => s.border_l(2).border_color(t.accent))
+          .on_click((e, cx) => jumpTo(spec, e, cx));
+        if (spec.onMenu) {
+          row = row.on_mouse_down("right", (_e, cx) => { cx?.stop_propagation?.(); spec.onMenu(); });
+        }
+        return row
+          .child(div().id(`sticky-fold-${spec.key}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => collapseSpec(spec, cx))
+            .child(svg(icon("chevron-down")).size(11)))
+          .child(div().flex_1().truncate().text_size(12.5).font_semibold().text_color(stale || stoppedRig ? t.dim : t.foreground).tooltip(String(rig.name ?? "")).child(rig.name))
+          .when(stoppedRig, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("stopped"))
+            .child(div().id(`sticky-resume-${rig.id}`).px(5).h(18).rounded(4).bg(t.raised).flex().items_center().text_size(10.5).text_color(t.accent).hover((s) => s.bg(t.hover))
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 380, props: { target: { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle }, step: { action: "resume", confirm: true } } });
+              }).child("Resume…")))
+          .child(this.dot(t, rig.tone))
+          .child(div().text_size(11).text_color(t.dim).child(`${rig.activeCount ?? 0}/${rig.seatCount}`))
+          .when(views.length > 0, (el) => el.child(div().id(`sticky-views-${rig.id}`).px(4).rounded(4).text_size(11).text_color(t.muted).hover((s) => s.bg(t.raised))
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              if (views[0]?.id) selectWorkerView(views[0].id, { run, layout, views, spaces, panes });
+            })
+            .on_mouse_down("right", (_e, cx) => { cx?.stop_propagation?.(); this.menu({ kind: "views", rig: rig.name, rigId: rig.id, conn: rig.conn, views }); })
+            .child(h_flex().gap(3).items_center().child(svg(icon("layers")).size(11)).child(String(views.length)))));
+      }
+      if (spec.kind === "priority") {
+        return h_flex().id(`sticky-row-${spec.key}`).px(16).h(30).pt(8).gap(6).items_center().text_size(11).font_medium().cursor_pointer().hover((s) => s.bg(t.hover))
+          .when(isSelected, (s) => s.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
+          .on_click((e, cx) => jumpTo(spec, e, cx))
+          .child(div().text_color(t[spec.tone] ?? t.dim).child(spec.title))
+          .child(div().text_color(t.dim).child(spec.count))
+          .child(div().flex_1())
+          .child(div().id(`sticky-fold-${spec.key}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
+            .on_click((_e, cx) => collapseSpec(spec, cx))
+            .child(svg(icon("chevron-down")).size(11)));
+      }
+      let row = h_flex().id(`sticky-row-${spec.key}`).pl(spec.indent).pr(8).h(spec.height).gap(6).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
+        .when(isSelected, (s) => s.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
+        .on_click((e, cx) => jumpTo(spec, e, cx));
+      if (spec.onMenu) {
+        row = row.on_mouse_down("right", (_e, cx) => { cx?.stop_propagation?.(); spec.onMenu(); });
+      }
+      return row
+        .child(div().id(`sticky-fold-${spec.key}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
+          .on_click((_e, cx) => collapseSpec(spec, cx))
+          .child(svg(icon("chevron-down")).size(11).flex_none()))
+        .child(div().flex_1().truncate().text_size(spec.kind === "assistants" ? 12 : 11.5).when(spec.kind === "host" || spec.kind === "assistants", (el) => el.font_semibold()).text_color(t.muted).tooltip(String(spec.title ?? "")).child(spec.title))
+        .when(Boolean(spec.count), (el) => el.child(div().text_size(10.5).text_color(t.dim).child(spec.count)));
+    });
+    return v_flex().id("rig-sticky-topology").absolute().top(0).left(0).right(10).bg(t.chrome).border_b(1).border_color(t.border)
+      .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.cancelTreeReveal(); this.focusHandle?.focus?.(); })
+      .on_mouse_up("left", (_e, cx) => { cx.stop_propagation(); this.cancelDrag(cx); })
+      .on_mouse_down("right", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => cx.stop_propagation())
+      .children(rows);
   }
 
   handleTreeKeyDown(e, cx) {
@@ -3601,7 +4577,8 @@ export default class RigSidebar extends View {
     const selectedUpdate = this.visibleTreeRows.find((row) => row.key === sel?.key)?.update;
     if (key.toLowerCase() === "delete" && dismissible(selectedUpdate)) {
       cx?.stop_propagation?.();
-      this.sidebarUpdateAction("dismiss", selectedUpdate);
+      const feed = this.exactFeed(stateConn) ?? this.followedFeed();
+      this.sidebarUpdateAction("dismiss", selectedUpdate, dismissalScope(feed.config));
       cx?.notify?.();
       return;
     }
@@ -3667,15 +4644,26 @@ export default class RigSidebar extends View {
     } finally { this.viewFeed = null; this.renderMemo = null; }
   }
 
+  /** Whether `machine` already has a configured OpenRig connection (in the primary config, its connections list, or an active feed). */
+  hasConfiguredMachine(machine) {
+    if (!machine) return false;
+    const base = this.primary.config;
+    if ((base?.daemonMachine ?? null) === machine) return true;
+    if ((base?.connections ?? []).some((c) => (c?.machine ?? c?.daemonMachine ?? null) === machine)) return true;
+    return this.feeds.some((f) => (f.config?.daemonMachine ?? null) === machine);
+  }
+
   /** Which feed the sidebar shows now, or null with one connection. See rig-follow.js for the rule; a change of box is applied after 150 ms so a fast run through spaces draws once. */
   followFeed(cx) {
     const feeds = this.feeds;
     const follow = (this.follow ??= { shownId: null, last: null, pinned: null, pending: null, hint: null, dismissed: new Set(), pickerOpen: false, pickerIndex: 0 });
     if (feeds.length < 2) {
+      follow.shownId = null; follow.last = null; follow.pinned = null; follow.pending = null; follow.pickerOpen = false;
+      if (!this.primary.config || this.primary.config.configInvalid) { follow.hint = null; return null; }
       // One connection has no follow mode (nothing to switch between), but a shown space on a machine with NO connection still gets the offer to add it:
-      // the same rule as with several (a plain machine other than the one this connection is for; a Local space says nothing).
+      // the same rule as with several (a plain machine other than any configured one; a Local space says nothing).
       const focus = focused(), space = focus ? this.hostLists().spaces.find((sp) => sp.id === focus.space) : undefined, machine = spaceMachine(space);
-      follow.hint = feeds.length === 1 && machine !== undefined && machine !== null && machine !== (feeds[0].config?.daemonMachine ?? null) ? machine : null;
+      follow.hint = feeds.length === 1 && machine !== undefined && machine !== null && !this.hasConfiguredMachine(machine) ? machine : null;
       return null;
     }
     const { connections, space, links } = this.followInputs();
@@ -3769,29 +4757,26 @@ export default class RigSidebar extends View {
     this.statusMotion.begin(JSON.stringify([this.config?.daemonUrl,this.viewState("rig.topology.view"),narrow()]),cx,{attention:this.data?.attentionItems,reducedMotion:this.config?.reducedMotion===true});
     const lists = this.hostLists(); // herdr's lists once for this render (hostLists)
     const active = lists.spaces.find(s => s.active);
-    const context = openRigSpaceContext(lists.spaces, lists.terminals, lists.panes, shared("rig.spaceState") ?? {}, MOD_IDS.view)
-      .find(c => c.id === active?.id);
-    this.activeSpaceContext = context;
-    // herdrig's Spaces list marks rig spaces from this: published only when it changes.
-    // Each connection marks its own spaces (a space on a machine belongs to that machine's connection); with one connection this is the original call.
-    const markWorld = { spaces: lists.spaces, terminals: lists.terminals, panes: lists.panes, state: shared("rig.spaceState") ?? {} };
-    const marks = JSON.stringify(this.feeds.length > 1
-      ? Object.assign({}, ...this.feeds.filter((f) => f.config && f.data && !f.error).map((f) => rigSpaceMarks({ ...markWorld, topology: f.data.topology ?? [], config: f.config, hostId: f.healthz?.selfHostId })))
-      : rigSpaceMarks({ ...markWorld, topology: this.data?.topology ?? [], config: this.config ?? {}, hostId: this.healthz?.selfHostId }));
-    if (marks !== this.publishedMarks) { this.publishedMarks = marks; setShared("herdrig.spaces", JSON.parse(marks)); }
+    // Only the active space's context: each space's context is its own, and making all of them on every render cost about 8 ms with 30 spaces.
+    this.activeSpaceContext = active ? openRigSpaceContext([active], lists.terminals, lists.panes, shared("rig.spaceState") ?? {}, MOD_IDS.view)[0] : undefined;
     const block = find(layout(), n => n.content?.mod === MOD_IDS.sidebar);
     // The OpenRig area keeps its size on every space: it folds only when the person folds Herdr's own block. An area an earlier version folded
     // to its header on a non-rig space is given its size back once.
     this.retireAutoFold(block);
     if (narrow()) {this.reorderRows = new Map();this.cancelTreeReveal();}
-    if (narrow()) return this.rail(t);
+    if (narrow()) return this.rail(t); // the rail draws no space marks; the 1 s timer keeps them current meanwhile
+    this.publishSpaceMarks(lists);
     const state = this.states(t);
     const content=this.listRows(t,cx,state);
     const scrollChildren=this.scrollChildren(content);
     if(this.keyRevealPending&&this.renderRevealKey!==this.viewState("rig.sel")?.key){
-      const index=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key);
-      if(Number.isInteger(index)){this.listScroll?.scroll_to_item(index);this.renderRevealKey=this.viewState("rig.sel")?.key;}
+      const rawIndex=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key);
+      if(Number.isInteger(rawIndex)){this.listScroll?.scroll_to_item(this.applySelectionRevealIndex(rawIndex));this.renderRevealKey=this.viewState("rig.sel")?.key;}
     }
+    this.listScrollTop = clampScrollTop(this.listScrollTop, this.scrollLayout?.contentHeight ?? 0, this.listViewportHeight);
+    const pinnedTopology = state ? [] : computeStickyTopology(this.scrollLayout, this.listScrollTop, this.listViewportHeight);
+    const stickyEl = this.renderStickyTopology(t, pinnedTopology);
+    const scrollConnKey = this.scrollShown ?? "";
     let root = v_flex().id("rig-sidebar-root").size_full().bg(t.chrome).text_color(t.foreground)
       .on_mouse_up("left", (_e, ctx) => this.cancelDrag(ctx))
       .on_mouse_down("left", () => {this.cancelTreeReveal();this.focusHandle?.focus?.();})
@@ -3801,10 +4786,30 @@ export default class RigSidebar extends View {
       .child(this.header(t))
       .when(Boolean(this.followPicker(t)), (el) => el.child(this.followPicker(t)))
       .child(div().h(1).bg(t.border).mx(8))
-      .child(v_flex().id("rig-list").flex_1().overflow_y_scrollbar().py(4)
-        .when(!!this.listScroll,el=>el.track_scroll(this.listScroll))
-        .on_size_change((_size,cx)=>{if(this.keyRevealPending){const index=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key);if(Number.isInteger(index))this.listScroll?.scroll_to_item(index);cx.notify();}})
-        .children(scrollChildren));
+      .child(div().id("rig-list-viewport").relative().flex_1().min_h(0)
+        .on_scroll_wheel((e, cx) => this.handleListScrollWheel(e, cx, scrollConnKey))
+        .child(v_flex().id("rig-list").size_full().overflow_y_scrollbar().py(4)
+          .when(!!this.listScroll,el=>el.track_scroll(this.listScroll))
+          .on_size_change((size,cx)=>{
+            const zoom = Number(settings()?.zoom) || 1;
+            const vh = size.height / zoom;
+            const vhChanged = Math.abs((this.listViewportHeight ?? -1) - vh) > 0.5;
+            if (vhChanged) this.listViewportHeight = vh;
+            if(this.keyRevealPending){
+              const rawIndex=this.scrollRowIndices?.get(this.viewState("rig.sel")?.key);
+              if(Number.isInteger(rawIndex))this.listScroll?.scroll_to_item(this.applySelectionRevealIndex(rawIndex));
+              cx.notify();
+              return;
+            }
+            if (vhChanged) {
+              const clamped = clampScrollTop(this.listScrollTop, this.scrollLayout?.contentHeight ?? 0, vh);
+              this.listScrollTop = clamped;
+              const sig = stickySignature(computeStickyTopology(this.scrollLayout, clamped, vh));
+              if (sig !== (this.renderedStickySignature ?? "")) cx.notify();
+            }
+          })
+          .children(scrollChildren))
+        .when(Boolean(stickyEl), (el) => el.child(stickyEl)));
   }
 
   /** One probe per machine, started from the follow hint and never repeated by a redraw, a refresh or a loop: it asks Herdr's own machine list, and only
@@ -3816,10 +4821,11 @@ export default class RigSidebar extends View {
     if (!machines().some((m) => m.name === machine && m.layout === "ready")) return;
     all.set(machine, { status: "looking" });
     cx.timer.after(0, (next) => next.spawn(async (cx) => {
-      let offer = null;
-      try { offer = await offerForMachine({ ...this.attachHost(cx), exec: machineProbeExec(rawExec, machine) }, machine); } catch (_) {}
+      let offer = null, failure = null;
+      try { offer = await offerForMachine({ ...this.attachHost(cx), exec: machineProbeExec(rawExec, machine) }, machine); }
+      catch (e) { if (isCodeError(e)) failure = describeCodeError(e); } // what the machine does is "none"; herdrig's own error is said as that
       if (this.closed) return;
-      all.set(machine, offer?.found ? { status: "found", offer } : { status: "none" });
+      all.set(machine, offer?.found ? { status: "found", offer } : failure ? { status: "error", message: failure } : { status: "none" });
       cx.notify();
     }));
   }
@@ -3833,7 +4839,7 @@ export default class RigSidebar extends View {
    *  last box and says so, with a way to look again. [Not now] is remembered per machine until the person looks again. Dismissed per box. */
   followHint(t, cx) {
     const follow = this.follow, machine = follow?.hint, feed = this.viewFeed ?? (this.feeds.length === 1 ? this.primary : null);
-    if (!feed || !machine || follow.dismissed.has(machine)) return null;
+    if (!feed || !this.primary.config || this.primary.config.configInvalid || !machine || this.hasConfiguredMachine(machine) || follow.dismissed.has(machine)) return null;
     this.probeAddOffer(cx, machine);
     const state = this.addOffers?.get(machine), declined = Boolean(shared("rig.spaceState")?.machineAddDeclined?.[machine]);
     const label = feed.config?.daemonMachine ?? "this computer";
@@ -3844,20 +4850,23 @@ export default class RigSidebar extends View {
       return box
         .child(div().id("rig-add-offer-text").text_size(11.5).text_color(t.muted).child(`OpenRig also runs on ${machine}. Show its rigs here too?`))
         .child(h_flex().id("rig-add-offer-buttons").gap(8).min_w(0)
-          .child(div().id("rig-add-offer-add").min_w(0).truncate().px(6).py(3).rounded(4).text_size(12).text_color(t.accent).cursor_pointer().tooltip(`Add ${machine}`)
-            .on_key_down((event, cx) => { if (event.key === "enter") { cx.stop_propagation(); add(); } })
+          .child(focusTarget(this, cx, "rig-add-offer-add", div().id("rig-add-offer-add").min_w(0).truncate().px(6).py(3).rounded(4).text_size(12).text_color(t.accent).cursor_pointer().tooltip(`Add ${machine}`),
+            () => add(), el => el.underline().bg(t.hover))
             .on_click(() => add()).child(`Add ${machine}…`))
-          .child(div().id("rig-add-offer-not-now").flex_none().px(6).py(3).text_size(12).text_color(t.muted).cursor_pointer()
-            .on_key_down((event, cx) => { if (event.key === "enter") { cx.stop_propagation(); this.declineAddOffer(cx, machine); } })
+          .child(focusTarget(this, cx, "rig-add-offer-not-now", div().id("rig-add-offer-not-now").flex_none().px(6).py(3).rounded(4).text_size(12).text_color(t.muted).cursor_pointer(),
+            (cx) => this.declineAddOffer(cx, machine), el => el.underline().bg(t.hover))
             .on_click((_e, cx) => this.declineAddOffer(cx, machine)).child("Not now")));
     }
     return box
-      .child(div().text_size(11.5).text_color(t.muted).child(`${machine} has no OpenRig connection here, so the sidebar still shows ${label}.`))
+      .child(div().text_size(11.5).text_color(t.muted).child(state?.status === "error"
+        ? `herdrig hit an error while looking for OpenRig on ${machine} (${state.message}), so it can't tell whether OpenRig is there. The sidebar still shows ${label}. ${CODE_ERROR_NEXT}`
+        : `${machine} has no OpenRig connection here, so the sidebar still shows ${label}.`))
       .child(h_flex().gap(8).flex_wrap()
-        .child(div().id("rig-follow-hint-find").text_size(12).text_color(t.accent).cursor_pointer().child("Find where OpenRig runs")
-          .on_key_down((event, cx) => { if (event.key === "enter") { cx.stop_propagation(); this.rescanAddOffer(cx, machine); } })
+        .child(focusTarget(this, cx, "rig-follow-hint-find", div().id("rig-follow-hint-find").rounded(4).text_size(12).text_color(t.accent).cursor_pointer().child("Find where OpenRig runs"),
+          (cx) => this.rescanAddOffer(cx, machine), el => el.underline().bg(t.hover))
           .on_click((_e, cx) => this.rescanAddOffer(cx, machine)))
-        .child(div().id("rig-follow-hint-dismiss").text_size(12).text_color(t.accent).cursor_pointer().child("Dismiss")
+        .child(focusTarget(this, cx, "rig-follow-hint-dismiss", div().id("rig-follow-hint-dismiss").rounded(4).text_size(12).text_color(t.accent).cursor_pointer().child("Dismiss"),
+          (cx) => { follow.dismissed.add(machine); cx.notify(); }, el => el.underline().bg(t.hover))
           .on_click((_e, cx) => { follow.dismissed.add(machine); cx.notify(); })));
   }
 
@@ -3882,7 +4891,7 @@ export default class RigSidebar extends View {
   listRows(t,cx,state) {
     const out=[];
     const ownCards = !this.viewFeed || this.viewFeed === this.primary; // the cards below act through the first connection: they are not drawn for another box
-    if(ownCards&&this.machineChoiceAvailable)out.push(this.machineOfferCard(t));
+    if(ownCards&&this.machineChoiceAvailable)out.push(this.machineOfferCard(t,cx));
     const hint = this.followHint(t, cx); if (hint) out.push(hint);
     if(ownCards&&this.gridMoveResultHere())out.push(this.gridMoveReport(t));
     if(ownCards&&(this.migrationResultHere() || (needsTabMigration(this.activeSpaceContext,this.config)
@@ -3894,23 +4903,37 @@ export default class RigSidebar extends View {
       .child(div().id(`dismiss-viewer-refresh-${space}`).text_size(12).text_color(t.accent).cursor_pointer().child("Dismiss")
         .on_click((_e,cx)=>{const next={...(shared("rig.viewerRefreshNotices")??{})};delete next[space];setShared("rig.viewerRefreshNotices",next);cx.notify();}))));
     out.push(...(this.data?.topology ?? []).flatMap((rig) => {
-          const status = shared("rig.spaceStatus")?.[rig.id];
-          if (this.opening?.has(rig.id)) return [div().id(`opening-grid-${rig.id}`).mx(8).my(4).px(8).py(6).rounded(6).bg(t.raised).text_size(11.5).text_color(t.muted)
-            .child(this.openingLine(rig))];
+          const statusKey = this.statusKey(rig);
+          const status = shared("rig.spaceStatus")?.[statusKey];
+          const rebuildEntry = this.gridSteps?.get(statusKey);
+          const rigCfg = this.feedOf(rig.conn)?.config;
+          const waitingConsent = this.isWaitingConsent(status, rigCfg);
+          if (this.opening?.has(statusKey) || (rebuildEntry?.rebuilding && !waitingConsent)) {
+            const rebuilding = !this.opening?.has(statusKey) && Boolean(rebuildEntry?.rebuilding);
+            return [div().id(`opening-grid-${rig.id}`).mx(8).my(4).px(8).py(6).rounded(6).bg(t.raised).text_size(11.5).text_color(t.muted)
+              .child(this.openingLine(rig, rebuildEntry?.step ?? null, rebuilding))];
+          }
           if (status?.unconfirmedSpace) return [v_flex().id(`unconfirmed-space-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(status.reason))
             .child(div().id(`dismiss-unconfirmed-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer().child("Dismiss")
-              .on_click((_e, cx) => { const next = { ...(shared("rig.spaceStatus") ?? {}) }; delete next[rig.id]; setShared("rig.spaceStatus", next); cx.notify(); }))];
-          if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed) return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
-            .child(div().text_size(11.5).text_color(t.muted).child(`${rig.name}: ${status.reason}`))
-            .when(!!status.needsConsent,el=>el.child(div().id(`review-grid-machine-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer().child("Review")
-              .on_click(()=>{
-                const feed=this.exactFeed(rig.conn);
-                if(!feed){notify({title:"Rig space",body:UNKNOWN_CONNECTION,level:"warning"});return;}
-                this.reviewMachine(status,(cx,approval)=>this.openRigSpace(cx,rig.id,null,approval,null,null,rig.conn),feed);
-              })))
+              .on_click((_e, cx) => { const next = { ...(shared("rig.spaceStatus") ?? {}) }; delete next[this.statusKey(rig)]; setShared("rig.spaceStatus", next); cx.notify(); }))];
+          if (status?.closeAvailable || status?.machineNotice || status?.preparationFailed || status?.interrupted) {
+            const waitingMachine = status.needsConsent ? (status.confirmation?.machine ?? rigCfg?.daemonMachine ?? "the machine") : null;
+            const approveHelper = (actCx = cx) => {
+              const feed = this.exactFeed(rig.conn);
+              if (!feed) { notify({ title: "Rig space", body: UNKNOWN_CONNECTION, level: "warning" }); return; }
+              if (status.confirmation) this.reviewMachine(status, (resumeCx, approval) => this.openRigSpace(resumeCx, rig.id, null, approval, null, null, rig.conn), feed, rig.name);
+              else this.openRigSpace(actCx, rig.id, null, null, null, null, rig.conn);
+            };
+            return [v_flex().id(`failed-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
+            .child(div().text_size(11.5).text_color(t.muted).child(waitingMachine ? `${rig.name}: Waiting for you to approve the helper on ${waitingMachine}.` : `${rig.name}: ${status.reason}`))
+            .when(!!status.needsConsent,el=>el.child(focusTarget(this,cx,`review-grid-machine-${statusKey}`,
+              div().id(`review-grid-machine-${rig.id}`).px(6).py(3).rounded(4).text_size(12).text_color(t.accent).cursor_pointer(),
+              (keyCx)=>approveHelper(keyCx),el=>el.underline().bg(t.hover))
+              .on_click((_e,clickCx)=>approveHelper(clickCx)).child("Approve helper…")))
             .when(!!status.closeAvailable, el => el.child(div().id(`close-grid-${rig.id}`).text_size(12).text_color(t.accent).cursor_pointer()
               .on_click((_e, cx) => this.closeRigTiles(cx, rig)).child("Close all viewer tiles")))];
+          }
           if (!status?.stale?.length) return [];
           return [v_flex().id(`stale-grid-${rig.id}`).mx(8).my(4).p(8).gap(5).rounded(6).bg(t.raised)
             .child(div().text_size(11.5).text_color(t.muted).child(status.recovery
@@ -3932,7 +4955,17 @@ Object.defineProperty(RigSidebar.prototype, "feeds", { get() { this.primary; ret
 // The send gate watches the primary's config: every assignment is seen at once (the class accessor above is replaced by the forwarding below, so the observer lives here).
 // The getter reads the DRAWN feed's config (`viewFeed` is set only inside `render`, and cleared in its `finally`); the setter always writes the FIRST connection's (`primary`). Anything that reads or assigns
 // `this.config` outside a draw means the first connection; do not read it after an await inside a draw path expecting the shown box's config.
-Object.defineProperty(RigSidebar.prototype, "config", { get() { return (this.viewFeed ?? this.primary).config; }, set(value) { this.primary.config = value; observeConfig(value); }, configurable: true });
+Object.defineProperty(RigSidebar.prototype, "config", {
+  get() { return (this.viewFeed ?? this.primary).config; },
+  set(value) {
+    this.primary.config = value;
+    this.primary.id = value && !value.configInvalid ? (value.connectionId ?? value.connections?.[0]?.id ?? LEGACY_CONNECTION_ID) : null;
+    observeConfig(value);
+    syncRetainedOrigins(value); // a switched connection's old labels count as it
+    this.herdr?.observe?.(value); // a changed connection forgets its prepared helper and event cursor
+  },
+  configurable: true,
+});
 for (const field of ["data", "error", "sidebarState", "cliVersion", "healthz", "live", "sock", "lists", "uiTimezone", "forceCapabilityProbe", "workerPreviewSupport", "refreshing", "again", "delay", "hadDisconnect"]) {
   Object.defineProperty(RigSidebar.prototype, field, { get() { return (this.viewFeed ?? this.primary)[field]; }, set(value) { this.primary[field] = value; }, configurable: true });
 }
@@ -3960,9 +4993,14 @@ Object.defineProperty(RigSidebar.prototype, "data", {
   set(value) { this.primary.data = value; },
   configurable: true,
 });
-// One scroll handle per connection (follow mode): switching boxes returns each list where it was left. With one connection the handle is the one made in init.
+// One scroll handle and tracked scroll offset per connection (follow mode): switching boxes returns each list where it was left. With one connection the handle is the one made in init.
 Object.defineProperty(RigSidebar.prototype, "listScroll", {
   get() { return this.listScrolls?.get(this.scrollShown ?? ""); },
   set(value) { (this.listScrolls ??= new Map()).set(this.scrollShown ?? "", value); },
+  configurable: true,
+});
+Object.defineProperty(RigSidebar.prototype, "listScrollTop", {
+  get() { return this.listScrollTops?.get(this.scrollShown ?? "") ?? 0; },
+  set(value) { (this.listScrollTops ??= new Map()).set(this.scrollShown ?? "", value); },
   configurable: true,
 });

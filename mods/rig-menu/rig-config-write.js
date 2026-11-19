@@ -1,6 +1,7 @@
 import { CONFIG_SCHEMA, configDefinition, validateConfigValue } from "./rig-config-schema.js";
 import { isLoopbackDaemonUrl } from "./rig-lib.js";
 import { gatedFetch } from "./rig-gate.js";
+import { addressParts } from "./rig-connections.js";
 const fetch = gatedFetch; // every request goes through the send gate
 
 export const CONFIG_SAVE_TIMEOUT = 'The save did not answer; nothing was confirmed. Refresh before trying again.';
@@ -16,7 +17,7 @@ const configWrites=globalThis[registryKey]??(globalThis[registryKey]=new Map());
 // The lock is ONE DAEMON's: the identity string the page builds is [origin, machine, connection], and `localhost`, `127.0.0.1` and `[::1]` on one port are the same daemon, so a write pending through one
 // spelling must still block a save through another (the gate drops the old response; it does not cancel a write already sent). Other origins keep their own spelling.
 const LOOPBACK=new Set(['localhost','127.0.0.1','::1','[::1]']);
-const lockKey=identity=>{try{const a=JSON.parse(identity);if(!Array.isArray(a))return identity;const u=new URL(String(a[0]));const origin=LOOPBACK.has(u.hostname)?`${u.protocol}//loopback:${u.port||(u.protocol==='https:'?'443':'80')}`:u.origin;return JSON.stringify([origin,...a.slice(1)]);}catch{return identity;}};
+export const lockKey=identity=>{try{const a=JSON.parse(identity);if(!Array.isArray(a))return identity;const u=addressParts(a[0]);if(!u)return identity;const origin=LOOPBACK.has(u.hostname)?`${u.protocol}//loopback:${u.port||(u.protocol==='https:'?'443':'80')}`:u.origin;return JSON.stringify([origin,...a.slice(1)]);}catch{return identity;}};
 const writeRecord=identity=>{identity=lockKey(identity);let r=configWrites.get(identity);if(!r){r={pending:new Set(),owners:new Map(),uncertain:false,failed:false,idle:new Set(),waiters:new Set()};configWrites.set(identity,r);}return r;};
 export function closeConfigWrites(owner){for(const[identity,r]of configWrites){
   if(r.pending.size&&r.owners?.has(owner)){r.ownerClosed=true;r.uncertain=true;r.daemonLabel=r.owners.get(owner);}

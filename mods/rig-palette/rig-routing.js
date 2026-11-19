@@ -2,7 +2,7 @@
 import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers } from "./rig-lib.js";
 import { openRigSpaceContext, resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, unconfirmedSpaceNextSteps, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue, prepareRigSpaceAdoption } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
-import { LEGACY_CONNECTION_ID, pickRig, AMBIGUOUS_NAME } from "./rig-connections.js";
+import { LEGACY_CONNECTION_ID, pickRig, AMBIGUOUS_NAME, qualifyKey, spaceStatusKey } from "./rig-connections.js";
 import { gateSameConfig, gateIdentity } from "./rig-gate.js";
 /** The singular `homeSpace` is the legacy connection's record (older versions read only it). Another connection keeps its home in
  *  `homeSpaces[key]` alone, whose key is [origin, machine] and so is already its own. */
@@ -75,9 +75,32 @@ const fail = reason => ({ ok:false, reason });
 const nonce = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
 const wait = (host, ms) => host.wait ? host.wait(ms) : new Promise(resolve => setTimeout(resolve,ms));
 const ROUTE_REQUEST_EXPIRY_MS = 2000;
+// A sidebar that has registered as a receiver can take longer than that to take the request: Herdr delivers rig.route:<id> to the
+// sidebar's own command loop, which can run behind busy frames (a large expanded Topology). It gets this long before the open is given up.
+const ROUTE_RECEIVER_EXPIRY_MS = 10000;
 const ROUTE_ACK_POLL_MS = 100;
-// Leave one polling interval before expiry, including the final acknowledgement check.
-const ROUTE_ACK_POLLS = Math.floor((ROUTE_REQUEST_EXPIRY_MS - ROUTE_ACK_POLL_MS) / ROUTE_ACK_POLL_MS);
+/** A sidebar is registered but did not take the request in time: not "open the sidebar", which is already open. */
+export const SIDEBAR_NO_ANSWER = "The Rig sidebar didn't answer in time. Try again.";
+const sidebarNeeded = request => request.kind==="attach" ? "Open the Rig sidebar to attach." : "Open the Rig sidebar, then try again.";
+/** A sidebar entry in rig.routeReceivers is the time it last said it was alive (every 10 s); only a recent one earns the longer wait,
+ *  so a sidebar that crashed without removing its entry fails fast instead of making every Attach wait. */
+const ROUTE_RECEIVER_FRESH_MS = 30000;
+/** Entries older than this, or not a time (older versions wrote true), are dropped when a sidebar writes its own. */
+export const ROUTE_RECEIVER_PRUNE_MS = 60000;
+/** The receivers map with `self` stamped now and leftovers pruned: what a sidebar writes when it says it is alive. */
+export function receiversWithBeat(current, self, now = Date.now()) {
+  const kept = Object.entries(current ?? {}).filter(([id, at]) => id !== self && typeof at === "number" && now - at <= ROUTE_RECEIVER_PRUNE_MS);
+  return { ...Object.fromEntries(kept), [self]: now };
+}
+/** The replies map with `id` acknowledged now. A reply is the time it was written; one nobody read within ROUTE_RECEIVER_PRUNE_MS (its
+ *  forwarder died or reloaded after the sidebar accepted), or one that isn't a time (older versions wrote true), is dropped. A forwarder
+ *  waits ROUTE_RECEIVER_EXPIRY_MS at most, so a live one always finds its reply. */
+export function repliesWithReply(current, id, now = Date.now()) {
+  const kept = Object.entries(current ?? {}).filter(([key, at]) => key !== id && typeof at === "number" && now - at <= ROUTE_RECEIVER_PRUNE_MS);
+  return { ...Object.fromEntries(kept), [id]: now };
+}
+const receiverKnown = host => Object.values(host.shared("rig.routeReceivers")??{}).some(Boolean);
+const receiverLive = host => Object.values(host.shared("rig.routeReceivers")??{}).some(at => typeof at === "number" && Date.now() - at <= ROUTE_RECEIVER_FRESH_MS);
 
 async function adopted(host, predicate) {
   for (let n=0;n<100;n++) {
@@ -88,33 +111,50 @@ async function adopted(host, predicate) {
   return null;
 }
 
+/** The sidebar's acknowledgement for `id`, removed once read. */
+function takeReply(host, id) {
+  if(!host.shared("rig.routeReplies")?.[id]) return false;
+  const replies={...(host.shared("rig.routeReplies")??{})}; delete replies[id]; host.setShared("rig.routeReplies",replies);
+  return true;
+}
+
 /** A receipt proves a live sidebar accepted the operation; its existing result notices report execution failures. */
 export async function forwardRigOpen(host, request) {
   if (!host.shared || !host.setShared || !host.run || (!host.wait && typeof setTimeout !== "function"))
-    return fail(request.kind==="attach" ? "Open the Rig sidebar to attach." : "Open the Rig sidebar, then try again.");
-  const id="open-"+nonce();
-  const expiresAt = Date.now() + ROUTE_REQUEST_EXPIRY_MS;
+    return fail(sidebarNeeded(request));
+  const id="open-"+nonce(), started=Date.now();
+  // Without a registered sidebar the request fails fast; with one it waits the longer bound (the request's own expiry follows, so a sidebar
+  // can still take it). One polling interval is always left before expiry, including the final acknowledgement check.
+  let budget = receiverLive(host) ? ROUTE_RECEIVER_EXPIRY_MS : ROUTE_REQUEST_EXPIRY_MS;
+  let expiresAt = started + budget;
   host.setShared("rig.routeRequests",{...(host.shared("rig.routeRequests")??{}),[id]:{request,expiresAt}});
-  let dispatched=false;
-  for(let n=0;n<=ROUTE_ACK_POLLS && Date.now()<expiresAt;n++){
+  let dispatched=false, waited=0, sawLive=budget===ROUTE_RECEIVER_EXPIRY_MS;
+  for(;;){
     // This lifecycle hint avoids Herdr's extra "unknown command" toast for a sidebar that never loaded.
     // A hint alone is never success: the consumed request's acknowledgement is still required.
-    if(!dispatched && Object.values(host.shared("rig.routeReceivers")??{}).some(Boolean)){
+    if(!sawLive && receiverLive(host)) sawLive=true;
+    if(!dispatched && receiverKnown(host)){
+      if(budget<ROUTE_RECEIVER_EXPIRY_MS && receiverLive(host)){ // a live sidebar registered while this request waited: it gets the longer bound too
+        budget=ROUTE_RECEIVER_EXPIRY_MS; expiresAt=started+budget;
+        const pending=host.shared("rig.routeRequests")??{};
+        if(pending[id]) host.setShared("rig.routeRequests",{...pending,[id]:{request,expiresAt}});
+      }
       try { host.run(`rig.route:${id}`); dispatched=true; }
       catch(error){
         const pending={...(host.shared("rig.routeRequests")??{})};delete pending[id];host.setShared("rig.routeRequests",pending);
         return fail(String(error?.message??error));
       }
     }
-    if(host.shared("rig.routeReplies")?.[id]){
-      const replies={...(host.shared("rig.routeReplies")??{})}; delete replies[id]; host.setShared("rig.routeReplies",replies);
-      return {ok:true,routed:true,accepted:true};
-    }
-    if(n<ROUTE_ACK_POLLS) await wait(host,ROUTE_ACK_POLL_MS);
+    // A reply is written only by acceptRigOpen, which refuses an expired request: any reply here was written in time, even when
+    // this poll comes late (a wait that overran expiry). It is read before the expiry check, and once more below before cleanup.
+    if(takeReply(host,id)) return {ok:true,routed:true,accepted:true};
+    if(Date.now()>=expiresAt || waited+2*ROUTE_ACK_POLL_MS>budget) break;
+    await wait(host,ROUTE_ACK_POLL_MS); waited+=ROUTE_ACK_POLL_MS;
   }
+  if(takeReply(host,id)) return {ok:true,routed:true,accepted:true}; // taken during the last wait
   const pending={...(host.shared("rig.routeRequests")??{})}; delete pending[id]; host.setShared("rig.routeRequests",pending);
-  const replies={...(host.shared("rig.routeReplies")??{})}; delete replies[id]; host.setShared("rig.routeReplies",replies);
-  return fail(request.kind==="attach" ? "Open the Rig sidebar to attach." : "Open the Rig sidebar, then try again.");
+  // "Didn't answer" only when a live sidebar was seen while waiting; leftovers alone (a crashed sidebar's entry) mean no sidebar is open.
+  return fail(dispatched && sawLive ? SIDEBAR_NO_ANSWER : sidebarNeeded(request));
 }
 
 /** Consume before acknowledging: a second sidebar or a late delivery cannot run an open twice. */
@@ -125,7 +165,7 @@ export function acceptRigOpen(host, id) {
   if(!envelope) return null;
   delete pending[id]; host.setShared("rig.routeRequests",pending);
   if(!Number.isFinite(envelope.expiresAt) || envelope.expiresAt<=Date.now() || !envelope.request) return null;
-  host.setShared("rig.routeReplies",{...(host.shared("rig.routeReplies")??{}),[id]:true});
+  host.setShared("rig.routeReplies",repliesWithReply(host.shared("rig.routeReplies"),id));
   return envelope.request;
 }
 
@@ -307,9 +347,10 @@ function rigSpace(host,config,rig,key,strictOrigin=false){
 }
 /** A refusal for an unconfirmed space stays on the sidebar (the card there, with a Dismiss), not only in a toast that fades with its way
  *  forward cut off: it is published as that rig's space status, the same place the grid's own failures go. */
-function publishUnconfirmed(host,rigId,result){
+function publishUnconfirmed(host,config,rigId,result){
   if(!rigId||!result?.unconfirmedSpace||typeof host?.setShared!=="function")return result;
-  host.setShared("rig.spaceStatus",{...(host.shared?.("rig.spaceStatus")??{}),[rigId]:result});
+  const key=spaceStatusKey(config?.connectionId,rigId,(config?.connections??[]).length>1); // this connection's own card, never another OpenRig's rig of the same id
+  host.setShared("rig.spaceStatus",{...(host.shared?.("rig.spaceStatus")??{}),[key]:result});
   return result;
 }
 /** ONE RIG == ONE SPACE: when the rig has a space on the machine that can't be confirmed, the open says so and asks; it never goes to the home
@@ -321,19 +362,119 @@ function unconfirmedRefusal(host,config,rig,key,request){
   return other?fail(unconfirmedSpaceReason(named,config?.daemonMachine,other.origin,config?.daemonUrl,other)):null;
 }
 
+const safeRecordKey = key => typeof key==="string" && key!=="" && key!=="__proto__" && key!=="constructor" && key!=="prototype";
+/** Whether a cached `rig.spaceStatus` entry is a failed space check or preparation (as opposed to an unconfirmed-space refusal or background skip). */
+export function isFailedSpaceStatus(status){
+  if(!status||typeof status!=="object")return false;
+  if(status.unconfirmedSpace||status.skipped||status.closed)return false;
+  return Boolean(status.preparationFailed||status.retryable||status.machineNotice||status.closeAvailable||status.ok===false);
+}
+export function readRigSpaceStatus(statuses,rigId,config){
+  if(!statuses||typeof statuses!=="object"||!safeRecordKey(rigId))return null;
+  const conn=config?.connectionId??null,many=(config?.connections?.length??0)>1;
+  const qualified=conn?qualifyKey(conn,rigId):rigId;
+  if(safeRecordKey(qualified)&&Object.hasOwn(statuses,qualified))return statuses[qualified];
+  if((!many||!conn||conn===LEGACY_CONNECTION_ID)&&Object.hasOwn(statuses,rigId))return statuses[rigId];
+  return null;
+}
+function writeRigSpaceStatus(host,config,rigId,value){
+  if(!safeRecordKey(rigId)||typeof host?.setShared!=="function")return;
+  const current={...(host.shared?.("rig.spaceStatus")??{})},conn=config?.connectionId??null,many=(config?.connections?.length??0)>1;
+  const qualified=many&&conn?qualifyKey(conn,rigId):rigId;
+  if(value===undefined){
+    if(safeRecordKey(qualified))delete current[qualified];
+    if(!many||!conn||conn===LEGACY_CONNECTION_ID)delete current[rigId];
+  }else if(safeRecordKey(qualified))current[qualified]=value;
+  host.setShared("rig.spaceStatus",current);
+}
+export function readInPlaceOpen(spaceState,rigId,conn=null){
+  const map=spaceState?.inPlaceOpen;
+  if(!map||typeof map!=="object"||!safeRecordKey(rigId))return null;
+  if(conn&&conn!==LEGACY_CONNECTION_ID&&safeRecordKey(`${conn}|${rigId}`)&&Object.hasOwn(map,`${conn}|${rigId}`)){
+    const rec=map[`${conn}|${rigId}`];
+    return rec&&typeof rec==="object"?rec:null;
+  }
+  if(Object.hasOwn(map,rigId)){
+    const rec=map[rigId];
+    if(rec&&typeof rec==="object"&&(!rec.conn||!conn||rec.conn===conn))return rec;
+  }
+  return null;
+}
+export function activeInPlaceOpen(host,config,rigId){
+  const rec=readInPlaceOpen(state(host),rigId,config?.connectionId??null);
+  if(!rec)return null;
+  if(rec.tab){
+    const allSpaces=list(host,"spaces");
+    if(allSpaces.length>0&&!allSpaces.some(s=>(s?.tabs??[]).some(t=>t?.id===rec.tab)))return null;
+  }
+  return rec;
+}
+/** Records an in-place open under `conn|rigId` when another connection already holds `rigId` (sole reader: `readInPlaceOpen`, which checks `conn` on both keys). */
+export function withInPlaceOpen(spaceState,rigId,conn,record){
+  if(!safeRecordKey(rigId))return spaceState?.inPlaceOpen;
+  const next={};
+  for(const [k,v]of Object.entries(spaceState?.inPlaceOpen??{}))if(safeRecordKey(k)&&v&&typeof v==="object")next[k]=v;
+  const stamped={...record,...(conn?{conn}:{})};
+  if(conn&&conn!==LEGACY_CONNECTION_ID&&Object.hasOwn(next,rigId)&&next[rigId]?.conn&&next[rigId].conn!==conn){
+    next[`${conn}|${rigId}`]=stamped;
+  }else{
+    if(conn&&conn!==LEGACY_CONNECTION_ID)delete next[`${conn}|${rigId}`];
+    next[rigId]=stamped;
+  }
+  return next;
+}
+export function withoutInPlaceOpen(spaceState,rigId,conn=null){
+  const prev=spaceState?.inPlaceOpen;
+  if(!prev||typeof prev!=="object"||!safeRecordKey(rigId))return undefined;
+  const next={};
+  for(const [k,v]of Object.entries(prev))if(safeRecordKey(k)&&v&&typeof v==="object")next[k]=v;
+  if(conn&&conn!==LEGACY_CONNECTION_ID)delete next[`${conn}|${rigId}`];
+  if(Object.hasOwn(next,rigId)&&(!next[rigId]?.conn||!conn||next[rigId].conn===conn))delete next[rigId];
+  return Object.keys(next).length?next:undefined;
+}
+export const inPlaceSpaceRefusal=rigName=>`${rigName}'s page is open here; close it before opening ${rigName}'s space.`;
+export function inPlaceFallbackNote(rigName,reason){
+  const detail=String(reason||"the rig's space is not reachable").trim();
+  return `Opened here — ${rigName}'s space couldn't be opened: ${detail}`;
+}
+async function retrySpacePreparation(host,config){
+  try{
+    if(config?.daemonMachine){
+      if(typeof host.prepareHome==="function")return await host.prepareHome(config);
+      if(typeof host.prepareRemote==="function")return await host.prepareRemote(config);
+      return null;
+    }
+    if(!host.relayPath&&typeof host.prepareRemote==="function")return await host.prepareRemote(config);
+    if(typeof host.health==="function"&&config?.daemonUrl){
+      const info=await host.health(config.daemonUrl);
+      return {ok:true,localHostId:info?.selfHostId??null};
+    }
+    return null;
+  }catch(error){
+    return {ok:false,retryable:true,preparationFailed:true,reason:String(error?.message??error)};
+  }
+}
+
 async function save(host,patch){
   const next={...state(host),...patch};
   host.setShared?.("rig.spaceState",next);
   if(host.saveRouteState) await host.saveRouteState(patch);
 }
 
-async function home(host,config,needTui=true){
+/** A page that wasn't asked for with an explicit open (a tab or a link on a page, Back) never makes a space: only the explicit opens may. */
+export const NO_HOME_SPACE = "OpenRig's home space isn't open, so nothing was opened. Open OpenRig from the Rig sidebar to make it.";
+async function home(host,config,needTui=true,mayCreate=true){
   const key=homeKey(config),machine=config?.daemonMachine||null;
   if(homeJobs.has(key)) {
     const pending=homeJobs.get(key),result=await pending;
     if(result.ok && needTui && !result.tab) {
       if(homeJobs.get(key)===pending) homeJobs.delete(key);
-      return home(host,config,true);
+      return home(host,config,true,mayCreate);
+    }
+    // A page request that may not build found no home: an explicit open waiting behind it builds the home itself.
+    if(!result.ok && mayCreate && result.reason===NO_HOME_SPACE) {
+      if(homeJobs.get(key)===pending) homeJobs.delete(key);
+      return home(host,config,needTui,true);
     }
     return result;
   }
@@ -344,7 +485,8 @@ async function home(host,config,needTui=true){
       remote=await host.prepareHome(config);if(!remote.ok)return remote;
       if(remote.machine!==machine)return fail("The configured Herdr machine changed. No terminal was started.");
     }
-    const scoped=state(host).homeSpaces?.[key];
+    // A recorded home that was closed since is no home: kept, it would hide every other candidate, and a new space would be built each time.
+    const recordedHome=state(host).homeSpaces?.[key],scoped=recordedHome&&list(host,"spaces").some(s=>s.id===recordedHome)?recordedHome:undefined;
     // Only a home recorded for ANOTHER listed connection is hidden from this one. A home recorded under any other key (another spelling of this daemon's address,
     // a key an earlier version wrote) is this connection's own to find, as in v0.4.7: hiding it built a second home space for the same OpenRig.
     // The own entry is left out by ID, never by key: on a default install its entry has no address (key ["",null]) while the live key carries the address the CLI found.
@@ -385,6 +527,7 @@ async function home(host,config,needTui=true){
           return {ok:true,reused:true,space:space.id,tab:pane.tab,terminal:terminal.address};
       }
     }
+    if(!space&&!mayCreate) return fail(NO_HOME_SPACE);
     if(typeof host.hc!=="function") return fail("Open the Rig sidebar to create OpenRig's home space.");
     const id=space?.id ?? machineId("sp-openrig-home-"+nonce(),machine), tab=machineId("tb-openrig-home-"+nonce(),machine);
     const argv=remote?["env","-i","--",`HOME=${remote.home}`,`PATH=${remote.searchPath}`,`OPENRIG_URL=${remote.daemonUrl}`,"rig","tui"] /* the machine's own default home: a connection's openrigHome is this computer's folder */:tuiArgv(config);
@@ -422,6 +565,8 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   // ONE RIG == ONE SPACE: a rig named only by a name that two OpenRigs share cannot be told apart, so nothing is opened for it.
   if(ambiguous&&!request.background&&(request.kind==="grid"||request.kind==="page"&&!request.home))return fail(AMBIGUOUS_NAME);
   if(request.background){
+    const targetRigId=rig?.id??request.rigId??key;
+    if(targetRigId&&activeInPlaceOpen(host,config,targetRigId))return {ok:true,skipped:true};
     const destination=rigSpace(host,config,rig,key);
     if(!destination) return {ok:true,skipped:true};
     if(request.kind!=="grid" || !host.syncGrid) return fail("Unsupported background OpenRig operation.");
@@ -429,10 +574,12 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   }
   if(request.kind==="attach"){
     const result=await attachToSeat({...host,routeOwner:true},request.seat,config,request.options??{});
-    return publishUnconfirmed(host,rig?.id??request.seat?.rigId??request.rigId,result);
+    return publishUnconfirmed(host,config,rig?.id??request.seat?.rigId??request.rigId,result);
   }
   if(request.kind==="grid"){
     if(!rig || !host.syncGrid) return fail("OpenRig hasn't loaded this rig yet. Try again in a moment.");
+    if(activeInPlaceOpen(host,config,rig.id))return fail(inPlaceSpaceRefusal(rig.name??rig.id));
+    if(readInPlaceOpen(state(host),rig.id,config?.connectionId))await save(host,{inPlaceOpen:withoutInPlaceOpen(state(host),rig.id,config?.connectionId)});
     return host.syncGrid(rig,{explicit:true,...request.options});
   }
   if(request.kind==="tui"){
@@ -443,31 +590,90 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   if(request.kind!=="page") return fail("Unknown OpenRig open request.");
   const source=contexts(host).find(c=>c.id===request.sourceSpace);
   let legacySelection=false;
-  const adoption=!request.home&&key?await prepareRigSpaceAdoption(host,config,[key,rig?.id,rig?.name],vouchOf(host,rig)):{ok:true};
-  if(!adoption.ok)return publishUnconfirmed(host,rig?.id??request.rigId,adoption);
-  if(adoption.host)host=adoption.host;
-  let destination=adoption.space??(request.home ? null : key ? rigSpace(host,config,rig,key,true) : null);
-  // An unlabelled legacy page can still be selected. This does not authorise a new tab or adopt its space.
-  if(!request.home&&!key&&!request.newPage&&source?.legacy&&!source.tuis.length&&source.pages.length
-    &&spaceMachine(source.space)===(config?.daemonMachine||null)){destination=source.space;legacySelection=true;}
-  if(!request.home&&!key&&source?.owned&&source.rigs.length){
-    // A cross-rig page still belongs to its connection. Check only its source, using the same origin/host vouch as a keyed page.
-    const scoped={...host,spaces:()=>list(host,"spaces").filter(s=>s.id===source.id)};
-    const sourceRig=(host.topology?.()??[]).find(r=>source.rigs.some(name=>name===r.id||name===r.name));
-    const vouch={...vouchOf(host,sourceRig),strictOrigin:true};
-    const adopted=await prepareRigSpaceAdoption(scoped,config,source.rigs,vouch);
-    if(!adopted.ok)return adopted;
-    if(adopted.hostId)vouch.hostId=adopted.hostId;
-    destination=adopted.space??resolveRigSpace(scoped,config,source.rigs,vouch);
-    const other=unconfirmedRigSpace(scoped,config,source.rigs,vouch);
-    if(!destination&&other)return fail(unconfirmedSpaceReason(source.space.name??source.rigs[0],config?.daemonMachine,other.origin,config?.daemonUrl,other));
+  const targetRigId=rig?.id??request.rigId??request.entry?.rigId??key;
+  const entryRef=request.entry??{};
+  const targetRigName=rig?.name??request.rig??entryRef.rig??(entryRef.kind==="rig"?entryRef.name:null)??targetRigId;
+  const cachedStatus=!request.home&&key?readRigSpaceStatus(host.shared?.("rig.spaceStatus"),targetRigId,config):null;
+  const priorInPlace=!request.home&&key?activeInPlaceOpen(host,config,targetRigId):null;
+  let retryFailure=null,retriedOk=false;
+  if(!request.home&&key&&(isFailedSpaceStatus(cachedStatus)||priorInPlace)){
+    const progressId=config?.daemonMachine&&typeof host?.setShared==="function"?`space-retry-${nonce()}`:null;
+    if(progressId)host.setShared("rig.status",{id:progressId,busy:true,ok:null,text:`Checking ${targetRigName}'s space on ${config.daemonMachine}…`,at:Date.now(),rig:targetRigName,rigId:targetRigId,conn:config.connectionId??null});
+    let prep;
+    try{prep=await retrySpacePreparation(host,config);}
+    finally{if(progressId&&host.shared?.("rig.status")?.id===progressId)host.setShared("rig.status",null);}
+    if(prep&&!prep.ok){
+      retryFailure=prep;
+      writeRigSpaceStatus(host,config,targetRigId,{...(cachedStatus??{}),...prep,ok:false,preparationFailed:true,retryable:prep.retryable??true,reason:prep.reason??cachedStatus?.reason});
+    }else if(prep){
+      retriedOk=true;
+      const verifiedHostId=prep.selfHostId??prep.localHostId;
+      if(verifiedHostId)host={...host,selfHostId:()=>verifiedHostId};
+    }
   }
-  if(!destination&&key&&!request.home){
-    const refusal=unconfirmedRefusal(host,config,rig,key,request);
-    if(refusal)return publishUnconfirmed(host,rig?.id??request.rigId??request.entry?.rigId,{...refusal,unconfirmedSpace:true});
+  let destination=null;
+  if(!retryFailure){
+    const adoption=!request.home&&key?await prepareRigSpaceAdoption(host,config,[key,rig?.id,rig?.name],vouchOf(host,rig)):{ok:true};
+    if(!adoption.ok)return publishUnconfirmed(host,config,rig?.id??request.rigId,adoption);
+    if(adoption.host)host=adoption.host;
+    destination=adoption.space??(request.home ? null : key ? rigSpace(host,config,rig,key,true) : null);
+    // An unlabelled legacy page can still be selected. This does not authorise a new tab or adopt its space.
+    if(!request.home&&!key&&!request.newPage&&source?.legacy&&!source.tuis.length&&source.pages.length
+      &&spaceMachine(source.space)===(config?.daemonMachine||null)){destination=source.space;legacySelection=true;}
+    if(!request.home&&!key&&source?.owned&&source.rigs.length){
+      // A cross-rig page still belongs to its connection. Check only its source, using the same origin/host vouch as a keyed page.
+      const scoped={...host,spaces:()=>list(host,"spaces").filter(s=>s.id===source.id)};
+      const sourceRig=(host.topology?.()??[]).find(r=>source.rigs.some(name=>name===r.id||name===r.name));
+      const vouch={...vouchOf(host,sourceRig),strictOrigin:true};
+      const adopted=await prepareRigSpaceAdoption(scoped,config,source.rigs,vouch);
+      if(!adopted.ok)return adopted;
+      if(adopted.hostId)vouch.hostId=adopted.hostId;
+      destination=adopted.space??resolveRigSpace(scoped,config,source.rigs,vouch);
+      const other=unconfirmedRigSpace(scoped,config,source.rigs,vouch);
+      if(!destination&&other)return fail(unconfirmedSpaceReason(source.space.name??source.rigs[0],config?.daemonMachine,other.origin,config?.daemonUrl,other));
+    }
+    if(!destination&&key&&!request.home){
+      const refusal=unconfirmedRefusal(host,config,rig,key,request);
+      if(refusal)return publishUnconfirmed(host,config,rig?.id??request.rigId??request.entry?.rigId,{...refusal,unconfirmedSpace:true});
+      if(!retriedOk&&isFailedSpaceStatus(cachedStatus))retryFailure=cachedStatus;
+    }
+    if(destination&&!request.home&&key){
+      if(isFailedSpaceStatus(cachedStatus))writeRigSpaceStatus(host,config,targetRigId,undefined);
+      if(readInPlaceOpen(state(host),targetRigId,config?.connectionId))await save(host,{inPlaceOpen:withoutInPlaceOpen(state(host),targetRigId,config?.connectionId)});
+    }else if(retriedOk&&isFailedSpaceStatus(cachedStatus)){
+      writeRigSpaceStatus(host,config,targetRigId,undefined);
+    }
   }
+  // Asked from a Rig page (stayIfNoSpace) for a rig whose space check failed: the page already shows it, so nothing is selected or opened (the person may
+  // have moved on while the machine was checked); the note says why the rig's own space didn't open.
+  // The page is still recorded as this rig's in-place page in the Rig tab of the space it was asked from (its notice, and no space is built for the rig
+  // while it is open), without selecting that tab.
+  if(retryFailure&&!destination&&request.stayIfNoSpace&&!request.home){
+    const reason=retryFailure.reason||cachedStatus?.reason||"the rig's space is not reachable";
+    const from=list(host,"spaces").find(s=>s.id===request.sourceSpace);
+    const viewTab=from?list(host,"panes").find(p=>p.mod===MOD_IDS.view&&(from.tabs??[]).some(t=>t.id===p.tab))?.tab:null;
+    if(viewTab){
+      host.setShared?.("rig.pageRoutes",{...(host.shared?.("rig.pageRoutes")??{}),[viewTab]:request.entry??{section:"topology"}});
+      await save(host,{inPlaceOpen:withInPlaceOpen(state(host),targetRigId,config?.connectionId,{at:Date.now(),reason,rigName:targetRigName,space:from.id,tab:viewTab})});
+    }
+    return {ok:true,stayed:true,inPlace:true,...(viewTab?{space:from.id,tab:viewTab}:{}),note:inPlaceFallbackNote(targetRigName,reason),reason};
+  }
+  if(retryFailure&&!destination){
+    const spacesNow=list(host,"spaces"),panesNow=list(host,"panes");
+    const activeSpace=spacesNow.find(s=>s.id===request.sourceSpace)??spacesNow.find(s=>s.active);
+    const activeHasView=activeSpace&&panesNow.some(p=>p.mod===MOD_IDS.view&&(activeSpace.tabs??[]).some(t=>t.id===p.tab));
+    destination=activeHasView?activeSpace
+      :contexts(host).find(c=>c.home&&(!config?.daemonMachine||spaceMachine(c.space)!==config.daemonMachine))?.space??activeSpace??spacesNow[0]??null;
+    if(!destination&&!config?.daemonMachine){
+      const result=await home(host,config,false,request.mayCreate===true||request.home===true);if(!result.ok)return result;
+      destination=list(host,"spaces").find(s=>s.id===result.space);
+    }
+    if(!destination)return fail(retryFailure.reason||cachedStatus?.reason||"OpenRig's destination space is not reachable.");
+  }
+  // Asked from a Rig page on screen, for a rig that has no space of its own: the page opens in that Rig tab, in the space in view, not in the home space.
+  if(!destination&&request.stayIfNoSpace&&!request.home)return {ok:true,stayed:true};
   if(!destination){
-    const result=await home(host,config,false); if(!result.ok) return result;
+    const result=await home(host,config,false,request.mayCreate===true||request.home===true); if(!result.ok) return result;
     destination=list(host,"spaces").find(s=>s.id===result.space);
   }
   if(!destination) return fail("OpenRig's destination space is no longer open. Try again.");
@@ -490,11 +696,43 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   }
   const routes={...(host.shared?.("rig.pageRoutes")??{}),[tab]:entry}; host.setShared?.("rig.pageRoutes",routes);
   select(host,destination.id,tab);
+  if(retryFailure){
+    const reason=retryFailure.reason||cachedStatus?.reason||"the rig's space is not reachable";
+    const note=inPlaceFallbackNote(targetRigName,reason);
+    await save(host,{inPlaceOpen:withInPlaceOpen(state(host),targetRigId,config?.connectionId,{at:Date.now(),reason,rigName:targetRigName,space:destination.id,tab})});
+    return {ok:true,inPlace:true,space:destination.id,tab,note,reason};
+  }
   return {ok:true,space:destination.id,tab};
   };
-  const previous=pageJobs.get(destination.id),job=(previous??Promise.resolve()).catch(()=>{}).then(show);
-  pageJobs.set(destination.id,job);
-  try{return await job;}finally{if(pageJobs.get(destination.id)===job)pageJobs.delete(destination.id);}
+  const previous=pageJobs.get(destination.id);
+  const waitPage=previous?(host.waitQueue?host.waitQueue(()=>previous.settled):previous.settled):Promise.resolve();
+  const job=waitPage.then(show);
+  const pageEntry=queueBarrier(job,host,PAGE_JOB_HOLD_MS,previous);
+  pageJobs.set(destination.id,pageEntry);
+  try{return await job;}finally{if(pageJobs.get(destination.id)===pageEntry)pageJobs.delete(destination.id);}
+}
+
+export const PAGE_JOB_HOLD_MS = 15000;
+function queueBarrier(promise, host, holdMs = 0, previous = null) {
+  let prev = previous, rawRelease;
+  const released = new Promise((r) => { rawRelease = r; });
+  const unregister = host?.registerBarrier?.(rawRelease);
+  const cleanup = () => { prev = null; unregister?.(); };
+  const release = () => { const p = prev; cleanup(); p?.release?.(); rawRelease(); };
+  const base = Promise.race([promise.catch(() => {}), released]).finally(cleanup);
+  const holdTimer = host?.deadline; // polling hosts without an ownerless deadline clock wait on base as before
+  return { promise, settled: holdMs > 0 && holdTimer ? Promise.race([base, holdTimer(holdMs)]) : base, release };
+}
+
+export function clearInterruptedRouteJob(config, rigNameOrKey = "home", spaceId = null) {
+  const key = JSON.stringify([rigOrigin(config?.daemonUrl) ?? origin(config), config?.daemonMachine ?? "", rigNameOrKey]);
+  const entry = jobs.get(key);
+  if (entry) { jobs.delete(key); entry.release(); }
+  const machine = config?.daemonMachine ?? "";
+  for (const [id, p] of [...pageJobs.entries()]) {
+    const sameMachine = spaceId ? id === spaceId : (machine ? String(id).startsWith(`${machine}/`) : !String(id).includes("/"));
+    if (sameMachine) { pageJobs.delete(id); p.release(); }
+  }
 }
 
 export async function routeOpen(host,config,request={}){
@@ -506,12 +744,15 @@ export async function routeOpen(host,config,request={}){
   const selected={...request,sourceSpace:request.sourceSpace??active(host)};
   if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology"}));
   const tree=typeof host.layout==="function"?host.layout():host.layout;
-  if(!host.routeOwner && layoutHasMod(tree,MOD_IDS.sidebar) && !selected.background)
-    return forwardRigOpen(host,selected.kind==="page"&&!requestRig(host,selected).key&&config?.connectionId
-      ?{...selected,conn:selected.conn??config.connectionId}:selected);
+  if(!host.routeOwner && layoutHasMod(tree,MOD_IDS.sidebar) && !selected.background){
+    const targetConn=selected.conn??selected.entry?.conn??selected.seat?.conn??(selected.kind==="page"&&!requestRig(host,selected).key?config?.connectionId:undefined);
+    return forwardRigOpen(host,targetConn?{...selected,conn:targetConn}:selected);
+  }
   const {rig,key,ambiguous}=requestRig(host,selected);
   const queueKey=JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine??"",rig?.name??key??"home"]);
-  const job=(jobs.get(queueKey)??Promise.resolve()).catch(()=>{}).then(()=>{
+  const previous=jobs.get(queueKey);
+  const waitJob=previous?(host.waitQueue?host.waitQueue(()=>previous.settled):previous.settled):Promise.resolve();
+  const job=waitJob.then(()=>{
     // The request waited behind earlier work: a connections list installed meanwhile refuses it now, whatever config it was queued under.
     const current=host.currentConfig?.();
     if(current?.configInvalid)return fail(current.configInvalid);
@@ -519,7 +760,11 @@ export async function routeOpen(host,config,request={}){
     if(!configUnchanged(host,config))return fail("OpenRig's connection changed. Nothing was opened.");
     return perform(host,config,selected,rig,key,ambiguous);
   });
-  jobs.set(queueKey,job);
-  try{return await job;}catch(error){return fail(String(error?.message??error));}
-  finally{if(jobs.get(queueKey)===job) jobs.delete(queueKey);}
+  const jobEntry=queueBarrier(job,host,0,previous);
+  jobs.set(queueKey,jobEntry);
+  try{return await job;}catch(error){
+    const msg=String(error?.message??error),step=host.currentStep?.();
+    return fail(step&&!msg.includes(step)?`Couldn't finish while ${step}: ${msg}`:msg);
+  }
+  finally{if(jobs.get(queueKey)===jobEntry) jobs.delete(queueKey);}
 }

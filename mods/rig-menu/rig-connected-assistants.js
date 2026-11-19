@@ -25,7 +25,7 @@ async function readHostedMembersUnbounded(fetch,config,expectedHostId){
  try{
   const result=await fetch(`${config.daemonUrl}/api/queue/hosted-members`);
   if(result.status===404)return{state:'off',members:[]};
-  if(result.status!==200)return unavailable(`the read failed: HTTP ${result.status}`);
+  if(result.status!==200)return unavailable(`OpenRig answered with error ${result.status}`);
   const body=await result.json();
   if(!body||!Array.isArray(body.members))return unavailable('the answer was not a roster');
   const validHost=id=>typeof id==='string'&&/^[A-Za-z0-9._:-]{1,128}$/.test(id);

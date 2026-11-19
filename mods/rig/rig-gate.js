@@ -16,8 +16,9 @@
 // applies: its payload is read with rig-relay-payload.js and judged by the token after the script (test/relay-payload-parity.test.mjs pins that reading to the real relay).
 //
 // A refused call THROWS `GateRefusal`: every caller already has a catch for a failed request, and its message is the sentence for the person.
-import { LEGACY_CONNECTION_ID, NO_CONNECTION, UNKNOWN_CONNECTION } from "./rig-connections.js";
+import { LEGACY_CONNECTION_ID, NO_CONNECTION, UNKNOWN_CONNECTION, UNREADABLE_FORM, addressParts, unreadableAddress } from "./rig-connections.js";
 import { decodeRelayToken, relayDaemonOrigin } from "./rig-relay-payload.js";
+import { isHerdrUrl, parseHerdrUrl } from "./rig-openrig-http.js";
 
 export const CONFIG_LOADING = "OpenRig's settings are still loading. Try again in a moment.";
 export const CONFIG_CHANGED_OPEN = "OpenRig's settings changed while this was open. Close it and open it again.";
@@ -31,7 +32,7 @@ export class GateRefusal extends Error {
 
 /** Commands that are not the OpenRig CLI and talk to no daemon: local read utilities a refused or unloaded config may still run. Everything else
  *  (`env`, which carries the rig CLI, `rig`, `node` running it) is refused. Listed by name so a new one is a decision, not an accident. */
-export const NON_DAEMON_COMMANDS = Object.freeze(["false", "git", "printenv", "realpath", "tmux", "which"]);
+export const NON_DAEMON_COMMANDS = Object.freeze(["false", "git", "printenv", "realpath", "test", "tmux", "which"]);
 // SCOPES (v0.5.0, several connections; DESIGN-gate-per-connection.md rev 3). One scope per connection id. A scope's IDENTITY is [id, the address the FILE names,
 // machine, OpenRig home] plus the configured `rig` argv; a change to any element of ONE connection's tuple moves THAT scope's generation and no other. An address the
 // CLI found is not file identity (a default install's first discovery must not drop calls that began before it finished) and is recorded only while exactly ONE scope is
@@ -151,18 +152,92 @@ const before = (s, since) => { if (since !== undefined && since !== s.generation
 
 const basename = (command) => String(command ?? "").split("/").pop();
 
-// THE DESTINATION CHECK (one function): a send that names an OpenRig must name the scope's own. Exact after `new URL` (scheme, host, port); no equivalence logic.
-const originOf = (url) => { try { const u = new URL(String(url)); return u.protocol + "//" + u.host; } catch { return null; } };
+// THE DESTINATION CHECK (one function): a send that names an OpenRig must name the scope's own. Exact after parsing (scheme, host, port); no equivalence logic.
+// An OpenRig over Herdr's connection is known by its machine AND its host id (herdr://<machine>/<hostId>): a request built for another OpenRig on
+// the same machine is another destination.
+const originOf = (url) => (isHerdrUrl(String(url)) ? parseHerdrUrl(url)?.origin ?? null : addressParts(url)?.origin ?? null); // plain JS: the mod runtime need not have `URL`
+// Every view of a mod registers a transport from its init, so the registrations are a list, oldest first: the gate uses the newest one still open. A view ends its own
+// registration when it closes (the function `registerHerdrTransport` returns), so a closed view's transport, whose config no longer updates, is never the one in use.
+const herdrRegistrations = [];
+// The registration for a request: the newest whose transport knows the request's connection and address (a view whose config moved on doesn't, and is skipped); when none does,
+// the newest, whose own check then refuses plainly. A transport with no `knows` is always taken.
+const liveHerdr = (scope, url) => {
+  const newest = herdrRegistrations.at(-1) ?? null;
+  if (scope === undefined) return newest;
+  for (let i = herdrRegistrations.length - 1; i >= 0; i--) {
+    const knows = herdrRegistrations[i].transport.knows;
+    if (typeof knows !== "function" || knows.call(herdrRegistrations[i].transport, scope, url)) return herdrRegistrations[i];
+  }
+  return newest;
+};
+/** The transport a mod registers for herdr:// connections (rig-openrig-http.js): `fetch(url, init, scope)`. Without one such a request sends nothing.
+ *  `bridgePath()` names this mod's own copy of the local bridge (rig-openrig-transport.cjs), which the gate then knows by its exact path.
+ *  Returns the function that ends this registration; registering `null` ends every registration. */
+export function registerHerdrTransport(transport, { bridgePath = null } = {}) {
+  if (!transport) { herdrRegistrations.length = 0; return () => {}; }
+  const entry = { transport, bridgePath: typeof bridgePath === "function" ? bridgePath : null };
+  herdrRegistrations.push(entry);
+  return () => { const at = herdrRegistrations.indexOf(entry); if (at >= 0) herdrRegistrations.splice(at, 1); };
+}
+const BRIDGE_MODES = ["inspect", "prepare", "remove", "install", "post", "rig"];
+/** The local OpenRig bridge, exactly: a Node binary running THIS mod's registered bridge file in one of its fixed modes, with no OPENRIG_* in the argv.
+ *  It names no OpenRig address of its own (it reaches the machine with hc exec and checks the machine, the pinned helper and the host id itself), so it is
+ *  not judged as the rig CLI: its "rig" mode is the helper's fixed write verb, not the CLI, and a write's values (a rig named "rig", a message "rig") are
+ *  data. Anything else that merely contains "rig" is judged as before. */
+const isHerdrBridge = (tokens) => {
+  const bridge = liveHerdr()?.bridgePath, path = bridge ? String(bridge() ?? "") : "";
+  return path !== "" && tokens.length >= 3 && /(^|\/)node$/.test(String(tokens[0])) && tokens[1] === path && BRIDGE_MODES.includes(tokens[2])
+    && !tokens.some((t) => /^OPENRIG_[A-Z_]+=/.test(String(t)));
+};
+export const HERDR_NOT_READY = "This connection reaches OpenRig over Herdr's connection, which this view can't use yet. Nothing was sent.";
+/** Over Herdr's connection the rig CLI can't start a process here (a TUI tab, a terminal view): only the helper's writes are carried. */
+export const HERDR_PROCESS_REFUSED = "This isn't available over Herdr's connection yet. Nothing was sent.";
+const herdrCli = (value) => flatten(value).some((t) => t.startsWith("OPENRIG_URL=herdr://"));
+const herdrCliRun = async (command, args, scope) => { const transport = liveHerdr(scope)?.transport; if (!transport?.cli) throw new Error(HERDR_NOT_READY); return transport.cli(command, args, scope); };
 /** Two listed OpenRigs on one machine: v0.5.0 reaches each added machine's default OpenRig, so it can't tell them apart there. */
 export const TWO_ON_ONE_MACHINE = (machine) => `Two OpenRigs on ${machine} need a home for each; this version supports one per machine. Nothing was sent.`;
+/** A connection whose own address herdrig can't check (see `addressParts`): said as that, not as a request built for another OpenRig. */
+const UNREADABLE = (address) => `${unreadableAddress(address)} ${UNREADABLE_FORM} Nothing was sent.`;
 const WRONG_DESTINATION = (expected) => `That request was built for a different OpenRig than the one it was about to reach${expected ? ` (this one is ${expected})` : ""}. Nothing was sent.`;
+const BAD_REQUEST_PATH = "That request used an unexpected OpenRig API path, so nothing was sent.";
 const knownAddress = (s) => s.address ?? s.discovered ?? null;
-const checkUrl = (s, url) => {
-  if (soleOpenCount() < 2) return; // one connection: nothing else to be mistaken for (the v0.4.5 behaviour); the destination check is for several scopes
-  const target = originOf(url), known = knownAddress(s), expected = known ? originOf(known) : null;
+const checkOrigin = (s, url, singleToo = false) => {
+  if (!singleToo && soleOpenCount() < 2) return null;
+  const known = knownAddress(s), expected = known ? originOf(known) : null;
+  if (known && expected === null) throw new GateRefusal(UNREADABLE(known));
+  if (typeof url !== "string" || /[\x00-\x20\x7f#]/.test(url)) throw new GateRefusal(WRONG_DESTINATION(expected));
+  // herdr://<machine>/<hostId> is read by its own parser (machine AND host id), never as an http address.
+  const parts = isHerdrUrl(url) ? parseHerdrUrl(url) : addressParts(url), target = parts?.origin ?? null;
   if (target === null) throw new GateRefusal(WRONG_DESTINATION(expected));
-  if (expected !== null) { if (target !== expected) throw new GateRefusal(WRONG_DESTINATION(expected)); return; }
-  if (soleOpenCount() !== 1) throw new GateRefusal(WRONG_DESTINATION(null)); // several scopes and none knows its address: nothing reaches a daemon
+  if (expected !== null) {
+    if (target !== expected) throw new GateRefusal(WRONG_DESTINATION(expected));
+  } else if (soleOpenCount() !== 1) {
+    throw new GateRefusal(WRONG_DESTINATION(null)); // several scopes and none knows its address: nothing reaches a daemon
+  }
+  return parts;
+};
+const checkUrl = (s, url) => {
+  checkOrigin(s, url, true);
+  // For herdr://<machine>/<hostId>/api/... the path starts after the host id, which is part of the origin, not of the path.
+  const herdr = isHerdrUrl(url) ? parseHerdrUrl(url) : null;
+  const authStart = herdr ? herdr.origin.length : url.indexOf("://") + 3;
+  const pathStart = herdr ? (url.startsWith(herdr.origin) && url.charAt(herdr.origin.length) === "/" ? herdr.origin.length : -1) : authStart > 2 ? url.indexOf("/", authStart) : -1;
+  const firstQuery = authStart > 2 ? url.indexOf("?", authStart) : -1;
+  if (pathStart < 0 || (firstQuery >= 0 && firstQuery < pathStart)) throw new GateRefusal(BAD_REQUEST_PATH);
+  const rest = url.slice(pathStart);
+  const qAt = rest.indexOf("?");
+  const rawPath = qAt >= 0 ? rest.slice(0, qAt) : rest;
+  const search = qAt >= 0 ? rest.slice(qAt) : "";
+  if (
+    !(rawPath.startsWith("/api/") || (rawPath === "/healthz" && search === ""))
+    || rawPath.includes("//")
+    || rawPath.includes("\\")
+    || rawPath.includes("..")
+    || rawPath.split("/").some((seg) => seg === "." || seg === "..")
+    || /%(?:2e|2f|5c|00|0a|0d)/i.test(rawPath)
+  ) {
+    throw new GateRefusal(BAD_REQUEST_PATH);
+  }
 };
 const soleOpenCount = () => [...scopes.values()].filter((s) => s.open).length;
 const flatten = (value) => (Array.isArray(value) ? value.flatMap(flatten) : [String(value ?? "")]);
@@ -172,6 +247,7 @@ const checkArgv = (s, tokens) => {
   if (soleOpenCount() < 2) return;
   const urls = envValues(tokens, "OPENRIG_URL"), homes = envValues(tokens, "OPENRIG_HOME"), several = soleOpenCount() > 1;
   const known = knownAddress(s), expected = known ? originOf(known) : null;
+  if (known && expected === null) throw new GateRefusal(UNREADABLE(known));
   if (urls.length > 1 || homes.length > 1) throw new GateRefusal(WRONG_DESTINATION(expected));
   if (urls.length === 1) { if (originOf(urls[0]) === null || expected === null || originOf(urls[0]) !== expected) throw new GateRefusal(WRONG_DESTINATION(expected)); }
   else if (several || (expected !== null && s.address)) { if (several) throw new GateRefusal(WRONG_DESTINATION(expected)); }
@@ -217,15 +293,33 @@ const relayDestinations = (tokens) => {
   return found;
 };
 /** Every process-starting sink: the rig CLI is checked by its OPENRIG_* tokens, an attach relay by the daemon its payload names. */
-const checkProcess = (s, tokens, on) => {
+const checkProcess = (s, tokens, on, viaExec = false) => {
+  if (!viaExec && tokens.some((t) => t.startsWith("OPENRIG_URL=herdr://"))) throw new GateRefusal(HERDR_PROCESS_REFUSED);
+  if (viaExec && (on === undefined || on === null || on === "") && isHerdrBridge(tokens)) return; // the bridge checks its machine, helper and host id itself
   // Started ON a Herdr machine (`hc run --on box`): where it runs is its destination (a relay there names that machine's own daemon, not the tunnel), and a rig CLI there must carry the scope's home.
   if (typeof on === "string" && on !== "") { checkOnMachine(s, on); if (carriesOpenRig(tokens)) checkHomeOnly(s, tokens); return; }
   if (carriesOpenRig(tokens)) checkArgv(s, tokens);
   for (const relay of relayDestinations(tokens)) {
     if (relay === null) { if (soleOpenCount() > 1) throw new GateRefusal(WRONG_DESTINATION(knownAddress(s) ? originOf(knownAddress(s)) : null)); }
-    else if (relay !== "") checkUrl(s, relay); // "": the relay reaches no daemon, nothing to be mistaken for
+    else if (relay !== "") checkOrigin(s, relay); // "": the relay reaches no daemon, nothing to be mistaken for
   }
 };
+
+const wrapFetchResponse = (response, s, started) => new Proxy(response, {
+  get(target, prop) {
+    if (prop === "json" || prop === "text") {
+      return async (...args) => {
+        let value;
+        try { value = await target[prop](...args); }
+        catch (error) { stillCurrentAfterSend(s, started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
+        stillCurrentAfterSend(s, started);
+        return value;
+      };
+    }
+    const value = Reflect.get(target, prop, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  },
+});
 
 /** An HTTP request. The body of the answer is read under the same check, so a settings change that arrives while it is read still drops it. */
 export async function gatedFetch(url, init, since, scope) {
@@ -236,42 +330,48 @@ export async function gatedFetch(url, init, since, scope) {
   checkUrl(s, url);
   let response;
   // A request that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error.
-  try { response = await globalThis.fetch(url, init); }
+  try {
+    if (isHerdrUrl(String(url))) { const transport = liveHerdr(s.id, String(url))?.transport; if (!transport) throw new Error(HERDR_NOT_READY); response = await transport.fetch(String(url), init, s.id); }
+    else response = await globalThis.fetch(url, init);
+  }
   catch (error) { stillCurrentAfterSend(s, started); throw error; }
   stillCurrentAfterSend(s, started);
-  return new Proxy(response, {
-    get(target, prop) {
-      if (prop === "json" || prop === "text") {
-        return async (...args) => {
-          let value;
-          try { value = await target[prop](...args); }
-          catch (error) { stillCurrentAfterSend(s, started); throw error; } // a body that fails to read under settings that are gone is not a parse error to fall back from
-          stillCurrentAfterSend(s, started);
-          return value;
-        };
-      }
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+  return wrapFetchResponse(response, s, started);
+}
+
+/** A read-only loopback `/healthz` GET for this computer's default OpenRig (single-connection localAddFolder identity check):
+ *  requires exactly one open scope, an exact `http://127.0.0.1:<port>/healthz` URL with no normalization, and checks the scope's generation before and after. */
+export async function gatedLocalHealth(url, since, scope) {
+  const s = scopeFor(scope);
+  const started = before(s, since);
+  const m = typeof url === "string" ? /^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/healthz$/.exec(url) : null;
+  const port = m ? Number(m[1]) : 0;
+  if (soleOpenCount() !== 1 || !m || port < 1 || port > 65535) throw new GateRefusal(BAD_REQUEST_PATH);
+  let response;
+  try { response = await globalThis.fetch(url); }
+  catch (error) { stillCurrentAfterSend(s, started); throw error; }
+  stillCurrentAfterSend(s, started);
+  return wrapFetchResponse(response, s, started);
 }
 
 /** A process run for the mod (the OpenRig CLI is `env ... rig ...`). Local utilities pass; everything else names an OpenRig and is checked against the scope. */
 export async function gatedExec(rawExec, command, args, options, since, scope) {
-  const local = NON_DAEMON_COMMANDS.includes(basename(command));
+  const on = options && typeof options === "object" ? options.on : undefined;
+  const local = (basename(command) !== "test" || !on) && NON_DAEMON_COMMANDS.includes(basename(command));
   let s = null, started = 0;
   if (!local) {
     s = scopeFor(scope); started = before(s, since);
-    const tokens = flatten([command, args]), on = options && typeof options === "object" ? options.on : undefined;
+    const tokens = flatten([command, args]);
     // A command run ON a Herdr machine is aimed by WHERE it runs: it carries no tunnel address (its rig CLI reads that machine's own OpenRig), so the machine is the destination and it must be the
     // scope's own. Anything else is judged like every other sink: only an argv that carries an OpenRig destination (the rig CLI, or OPENRIG_*) is checked; a helper that is not the rig CLI names none.
     // The same judgement as every other process sink: on a machine (machine AND home), otherwise the rig CLI's tokens and an attach relay's payload.
-    checkProcess(s, tokens, on);
+    checkProcess(s, tokens, on, true);
   }
   let result;
   // A process that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error it could
   // read as "that command does not work, use the default".
-  try { result = await rawExec(command, args, options); }
+  // A rig CLI aimed at an OpenRig over Herdr's connection never runs here: the transport carries it to the helper's rig verb on the machine.
+  try { result = !local && herdrCli([command, args]) ? await herdrCliRun(command, args, s.id) : await rawExec(command, args, options); }
   catch (error) { if (!local) stillCurrentAfterSend(s, started); throw error; }
   if (!local) stillCurrentAfterSend(s, started);
   return result;
@@ -315,6 +415,7 @@ export function gatedOperation(scope) {
   return {
     since, scope: id,
     fetch: (url, init) => gatedFetch(url, init, since, id),
+    localHealth: (url) => gatedLocalHealth(url, since, id),
     // The rig CLI and Herdr's process verbs under the same generation: they refuse to START after a change, and their results are judged by it.
     exec: (rawExec, command, args, options) => gatedExec(rawExec, command, args, options, since, id),
     hc: (rawHc, args, bytes) => gatedHc(rawHc, args, bytes, since, id),
@@ -328,14 +429,14 @@ export function gatedOperationOrRefusal(scope) {
   try { return gatedOperation(scope); }
   catch (error) {
     const fail = () => Promise.reject(error);
-    return { since: -1, scope: scope ?? null, fetch: fail, exec: fail, hc: fail, check: () => { throw error; } };
+    return { since: -1, scope: scope ?? null, fetch: fail, localHealth: fail, exec: fail, hc: fail, check: () => { throw error; } };
   }
 }
 
 /** An event-stream connection. The socket it returns is closed if the config changed while it was being made. */
 export async function gatedConnect(rawConnect, host, port, scope) {
   const s = scopeFor(scope), started = s.generation, known = knownAddress(s);
-  if (soleOpenCount() < 2) { /* one connection: no destination to mistake */ } else if (known !== null) { let u = null; try { u = new URL(known); } catch (_) { /* below */ } if (!u || u.hostname.replace(/^\[|\]$/g, "") !== String(host).replace(/^\[|\]$/g, "") || String(u.port || (u.protocol === "https:" ? "443" : "80")) !== String(port)) throw new GateRefusal(WRONG_DESTINATION(originOf(known))); }
+  if (soleOpenCount() < 2) { /* one connection: no destination to mistake */ } else if (known !== null) { const u = addressParts(known); if (!u) throw new GateRefusal(UNREADABLE(known)); if ( u.hostname.replace(/^\[|\]$/g, "") !== String(host).replace(/^\[|\]$/g, "") || String(u.port || (u.protocol === "https:" ? "443" : "80")) !== String(port)) throw new GateRefusal(WRONG_DESTINATION(originOf(known))); }
   else throw new GateRefusal(WRONG_DESTINATION(null));
   let socket;
   try { socket = await rawConnect(host, port); }
@@ -349,6 +450,4 @@ export const rethrowGate = (fallback) => (error) => {
   if (error?.code === "GATE_REFUSED") throw error;
   return typeof fallback === "function" ? fallback(error) : fallback;
 };
-/** The line a refused argv hand-off (the attach relay's daemon address) gives. Callers that build an argv for another process call this first. */
-export function assertMaySend(scope) { scopeFor(scope); }
 

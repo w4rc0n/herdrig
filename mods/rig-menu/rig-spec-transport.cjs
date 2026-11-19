@@ -25,30 +25,30 @@ function readTransfer(appHome){
 }
 function remove(appHome){const f=transferPath(appHome);try{const s=fs.lstatSync(f);if(s.isSymbolicLink()||!s.isFile()||(s.mode&0o777)!==0o600||s.uid!==process.getuid())throw Error("Refused unsafe spec transfer cleanup.");fs.unlinkSync(f);}catch(e){if(e.code!=="ENOENT")throw e;}return{ok:true};}
 function digest(appHome){const r=readTransfer(appHome);try{return{ok:true,sha256:hash(r.bytes)};}finally{remove(appHome);}}
-function invoke(run,args,input){
- const r=run("hc",args,{...(input!==undefined?{input}:{}),encoding:"utf8",shell:false,timeout:30000,maxBuffer:8*MAX_BYTES});
+function invoke(run,args,input,timeout=30000){
+ const r=run("hc",args,{...(input!==undefined?{input}:{}),encoding:"utf8",shell:false,timeout,maxBuffer:8*MAX_BYTES});
  if(r.error)throw Error(r.error.message);return r;
 }
-function profile(run,machine,expected){
+function profile(run,machine,expected,words={use:"Spec editing",grant:"spec-save permission"}){
  if(!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine??""))throw Error("Invalid configured Herdr machine.");
  const r=invoke(run,["machine","ls","--json"]);if(r.status!==0)throw Error("Could not check the configured Herdr machine.");
  const parsed=JSON.parse(r.stdout),rows=Array.isArray(parsed)?parsed:parsed.machines,record=rows?.find(x=>x.name===machine);
- if(!record||record.temporary!==false||record.state!=="connected")throw Error("Spec editing needs a connected persistent Herdr machine.");
+ if(!record||record.temporary!==false||record.state!=="connected")throw Error(`${words.use} needs a connected persistent Herdr machine.`);
  const identity=x=>[x.target??"",x.id??"",x.via??"",x.session??""];
- if(!expected||JSON.stringify(identity(record))!==JSON.stringify(identity(expected)))throw Error("The configured Herdr machine changed. Review spec-save permission again.");
+ if(!expected||JSON.stringify(identity(record))!==JSON.stringify(identity(expected)))throw Error(`The configured Herdr machine changed. Review ${words.grant} again.`);
  return record;
 }
-function inspect(run,machine,home){
+function inspect(run,machine,home,file=FILE){
  if(!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine??""))throw Error("Invalid configured Herdr machine.");
- const output=(cmd,args)=>{const r=invoke(run,["exec","--on",machine,"--",cmd,...args]);if(r.status!==0)throw Error(r.stderr||"Remote spec-helper check failed.");return String(r.stdout).replace(/\r?\n$/,"");};
+ const output=(cmd,args)=>{const r=invoke(run,["exec","--on",machine,"--",cmd,...args]);if(r.status!==0)throw Error(r.stderr||"Remote helper check failed.");return String(r.stdout).replace(/\r?\n$/,"");};
  const test=(flag,file)=>{const r=invoke(run,["exec","--on",machine,"--","test",flag,file]);if(![0,1].includes(r.status))throw Error("Remote path check failed.");return r.status===0;};
  if(!absolute(home)||output("printenv",["HOME"])!==home||output("readlink",["-f","--",home])!==home)throw Error("The remote home changed or is unsafe.");
  let current=home,sha256=null;
- for(const part of [...FOLDER.split("/"),FILE]){
-  current+="/"+part;if(test("-L",current))throw Error("Refused symlinked spec-helper path.");
+ for(const part of [...FOLDER.split("/"),file]){
+  current+="/"+part;if(test("-L",current))throw Error("Refused a symlinked helper path.");
   if(test("-e",current)){
-   if(!test(part===FILE?"-f":"-d",current)||output("readlink",["-f","--",current])!==current)throw Error("Refused nonregular spec-helper path.");
-   if(part===FILE){const text=output("sha256sum",["--",current]);if(!/^[a-f0-9]{64} [ *]/.test(text))throw Error("Invalid spec-helper hash.");sha256=text.slice(0,64);}
+   if(!test(part===file?"-f":"-d",current)||output("readlink",["-f","--",current])!==current)throw Error("Refused a helper path that is not a plain file or folder.");
+   if(part===file){const text=output("sha256sum",["--",current]);if(!/^[a-f0-9]{64} [ *]/.test(text))throw Error("Invalid helper hash.");sha256=text.slice(0,64);}
   }
  }
  return{path:current,sha256};
@@ -129,4 +129,4 @@ if(require.main===module){
   console.log(JSON.stringify(result));if(result.error)process.exitCode=1;
  }catch(e){console.log(JSON.stringify({error:String(e.message??e).replace(/[\r\n\x00-\x1f\x7f]+/g," ")}));process.exitCode=1;}
 }
-module.exports={SPEC_SHA256,FOLDER,FILE,transferPath,prepare,readTransfer,remove,digest,profile,inspect,install,execute,shipped,preview};
+module.exports={SPEC_SHA256,FOLDER,FILE,invoke,transferPath,prepare,readTransfer,remove,digest,profile,inspect,install,execute,shipped,preview};

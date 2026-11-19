@@ -1,6 +1,6 @@
 // Spec permission is independent of Attach permission. Every operation checks the
 // configured machine and freshly resolved box roots, including after a dialog.
-import { RemoteMachine } from './rig-remote.js';
+import { RemoteMachine,herdrIdentityOf} from './rig-remote.js';
 import { specCopyName, sameDaemon } from './rig-lib.js';
 export const SPEC_SHA256 = '737eb9b9dbd16b5271eb67cdb36fdb4805ba25f890f9138e522d0f282731baa8';
 const jobs = new Map();
@@ -21,6 +21,8 @@ export class RemoteSpecs {
   const host=this.host,machine=config.daemonMachine;
   // The helper reaches the machine's DEFAULT OpenRig; that is the one checked, against the OpenRig this page reads (its live /healthz) and, when the
   // connection recorded one, its expected host id. A null expectedHostId (the legacy connection) is decided by the live check alone.
+  // Saving a spec over Herdr's connection comes later: say so plainly before anything is checked or written.
+  if(herdrIdentityOf(config))throw Error(`Saving specs on ${machine} isn't available over Herdr's connection yet. Switch back to the tunnel to save it. Nothing was written. Your edit is kept here.`);
   const state=await new RemoteMachine(host).readIdentity(config,{defaultHome:true});
   const short=id=>`${String(id??'').slice(0,4)}…`,page=state.localHealth?.selfHostId,helper=state.remoteHealth?.selfHostId;
   if(config.expectedHostId && page && config.expectedHostId!==page)

@@ -39,10 +39,15 @@ function transport(host,previous,stage,id){
   return {...host,readConsent:async()=>consentOf(previous,id),writeConsent:async value=>stage(value)};
 }
 
-export async function reviewMachineSetup(host,config,machine){
+export async function reviewMachineSetup(host,config,machine,initialConfirmation=null){
   try{
     const before=await host.readConfig()??null,raw=parsed(before),where=connectionMatches(raw,config,machine);
     const previous=await host.readConsentText()??null;
+    if(initialConfirmation?.key&&initialConfirmation.machine===machine){
+      const stored=consentOf(previous,connectionOf(config));
+      return {ok:true,confirmation:initialConfirmation,approved:stored?.key===initialConfirmation.key,
+        before,alreadyConfigured:where==="listed"||raw.daemonMachine===machine,config:{...config,daemonMachine:machine}};
+    }
     const result=await new RemoteMachine(transport(host,previous,()=>{},connectionOf(config))).review({...config,daemonMachine:machine});
     if(!result.ok)return result;
     return {...result,before,alreadyConfigured:where==="listed"||raw.daemonMachine===machine,config:{...config,daemonMachine:machine}};

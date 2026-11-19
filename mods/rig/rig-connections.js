@@ -5,9 +5,61 @@
 
 /** The id of the connection built from the legacy keys. A generated `conn-<ULID>` would need a write; when connections are written
  *  later the first one keeps this id so the state stored under it continues. */
+/** The connections file cannot be parsed: said once, with what to do and that nothing was changed. */
+export const CONFIG_NOT_JSON = "openrig/config.json can't be read: it isn't valid JSON. Fix the file, or move it aside to start over, then try again. Nothing was changed.";
 export const LEGACY_CONNECTION_ID = "conn-legacy";
 const ID = /^conn-[A-Za-z0-9]{1,40}$/;
 const HOST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/** A bracketed IPv6 host (its text between the brackets) as `URL` writes it, or null: hex groups of one to four digits, at most one `::`, no IPv4 tail, no zone;
+ *  the longest run of two or more zero groups (the first, on a tie) is compressed and leading zeros dropped. */
+function canonicalIPv6(inner) {
+  if (!/^[0-9a-f:]+$/.test(inner)) return null;
+  const halves = inner.split("::");
+  if (halves.length > 2) return null;
+  const side = (t) => (t === "" ? [] : t.split(":")), head = side(halves[0]), tail = halves.length === 2 ? side(halves[1]) : [], given = [...head, ...tail];
+  if (!given.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  let groups;
+  if (halves.length === 2) { if (given.length > 7) return null; groups = [...head, ...Array(8 - given.length).fill("0"), ...tail]; }
+  else { if (given.length !== 8) return null; groups = head; }
+  groups = groups.map((g) => Number.parseInt(g, 16).toString(16));
+  let at = -1, run = 0;
+  for (let i = 0; i < 8;) { if (groups[i] !== "0") { i++; continue; } let j = i; while (j < 8 && groups[j] === "0") j++; if (j - i > run) { at = i; run = j - i; } i = j; }
+  return run < 2 ? groups.join(":") : `${groups.slice(0, at).join(":")}::${groups.slice(at + run).join(":")}`;
+}
+/** A host the way `URL` would keep it: a dotted quad of four plain decimal parts, a canonical bracketed IPv6, or a name of letters, digits, `_`, `~` and `-` in
+ *  non-empty labels with no trailing dot and a last label that isn't a number (`URL` reads `127.1`, `0x7f.0.0.1` and `2130706433` as IPv4 and rewrites them). */
+function canonicalHost(raw) {
+  const host = raw.toLowerCase();
+  if (host.startsWith("[")) { const v6 = host.endsWith("]") ? canonicalIPv6(host.slice(1, -1)) : null; return v6 === null ? null : `[${v6}]`; }
+  if (/^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/.test(host)) return host.split(".").every((part) => Number(part) <= 255) ? host : null;
+  if (!/^[a-z0-9_~-]+(?:\.[a-z0-9_~-]+)*$/.test(host)) return null;
+  return /^(?:[0-9]+|0x[0-9a-f]*)$/.test(host.slice(host.lastIndexOf(".") + 1)) ? null : host;
+}
+
+/** An http(s) address as { protocol, hostname, port, host, origin }, read in plain JS: Herdr's mod runtime need not provide a browser's `URL`, and a
+ *  `new URL` inside a catch turned that into a refusal or a silent null. It agrees with `URL` exactly where it answers (`port` is "" for the scheme's
+ *  default, as `URL.port` is; `hostname` keeps an IPv6 address's brackets and is written the canonical way) and answers null where it can't be sure: no
+ *  host, a user name, a backslash, a port outside 1-65535, another scheme, or a host `URL` would rewrite or reject (see canonicalHost). The gate refuses on
+ *  null, so this is never looser than `URL`. */
+export function addressParts(value) {
+  const m = /^(https?):\/\/(\[[^\]\s/?#\\@]*\]|[^\s/:?#\\@\[\]]+)(?::([0-9]{1,5}))?(?:[/?#][^\s\\]*)?$/i.exec(typeof value === "string" ? value.trim() : "");
+  if (!m) return null;
+  const protocol = `${m[1].toLowerCase()}:`, hostname = canonicalHost(m[2]);
+  if (hostname === null) return null;
+  const number = m[3] === undefined ? null : Number(m[3]);
+  if (number !== null && (number < 1 || number > 65535)) return null;
+  const port = number === null || String(number) === (protocol === "https:" ? "443" : "80") ? "" : String(number);
+  const host = port ? `${hostname}:${port}` : hostname;
+  return { protocol, hostname, port, host, origin: `${protocol}//${host}` };
+}
+
+/** The sentence for an address herdrig can't check (see `addressParts`): it names the address and the forms to write. Stored and compared exactly as typed, so a form
+ *  `URL` would rewrite (127.1, 0127.0.0.1 is 87.0.0.1) is asked for again, never mapped to another host. */
+export const UNREADABLE_FORM = "Write it as http://127.0.0.1:<port>, a host name, or http://[::1]:<port>.";
+export const unreadableAddress = (address) => `${String(address).slice(0, 80).replace(/[\x00-\x1f\x7f]+/g, " ")} isn't written in a form herdrig can check.`;
+/** True for a written address (an http(s) text) that `addressParts` reads as nothing. */
+const unreadable = (value) => typeof value === "string" && /^https?:\/\/[^\s]+$/.test(value) && addressParts(value.replace(/\/+$/, "")) === null;
 
 export const NO_CONNECTION = "This needs to know which OpenRig it is for, and it didn't say. Nothing was sent.";
 export const UNKNOWN_CONNECTION = "That OpenRig connection isn't set up any more. Nothing was sent.";
@@ -22,6 +74,8 @@ export const EXPLICIT_ADDRESS_NEEDED = "With more than one OpenRig, each needs i
 const text = (value) => (typeof value === "string" && value !== "" ? value : null);
 const LOOPBACK_ADDRESS = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i;
 const url = (value) => (typeof value === "string" && /^https?:\/\/[^\s]+$/.test(value) ? value.replace(/\/+$/, "") : null);
+/** An OpenRig over Herdr's connection: exactly herdr://<machine>/<hostId>, no path. */
+const herdrAddress = (value) => (typeof value === "string" && /^herdr:\/\/[a-z0-9][a-z0-9._-]{0,31}\/[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : null);
 
 /** One connection from a raw record; null when it can't be one. `token` is reserved and always null: the mod sends no token today
  *  (reads are plain GETs, writes go through the rig CLI, which does its own authentication from its OpenRig home). */
@@ -32,7 +86,19 @@ export function normalizeConnection(raw, fallbackId = null) {
   const machine = raw.machine === undefined || raw.machine === "" || raw.machine === null ? null : raw.machine;
   if (machine !== null && (typeof machine !== "string" || !/^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine))) return null;
   const hostId = typeof raw.expectedHostId === "string" && HOST_ID.test(raw.expectedHostId) ? raw.expectedHostId : null;
-  return { id, machine, daemonUrl: url(raw.daemonUrl), token: null, expectedHostId: hostId, openrigHome: text(raw.openrigHome) };
+  // Over Herdr's connection the address names the machine and the OpenRig's host id: both must agree with the record, or it isn't a connection.
+  const herdr = herdrAddress(raw.daemonUrl);
+  if (herdr) {
+    const [, onMachine, onHost] = /^herdr:\/\/([^/]+)\/(.+)$/.exec(herdr);
+    if (machine !== onMachine || (hostId !== null && hostId !== onHost)) return null;
+    // A connection switched from a tunnel keeps its old address (unused), so switching back is one click and its old labels stay its own (§3.1.3).
+    const kept = url(raw.retainedDaemonUrl);
+    return { id, machine, daemonUrl: herdr, token: null, expectedHostId: onHost, openrigHome: text(raw.openrigHome), transport: "herdr", ...(kept ? { retainedDaemonUrl: kept } : {}) };
+  }
+  // Switched back to its tunnel, it keeps the herdr:// address it left, only while that names this machine and its recorded host id.
+  const left = herdrAddress(raw.retainedDaemonUrl), leftParts = left ? /^herdr:\/\/([^/]+)\/(.+)$/.exec(left) : null;
+  const keptHerdr = leftParts && machine === leftParts[1] && hostId === leftParts[2] && url(raw.daemonUrl) ? left : null;
+  return { id, machine, daemonUrl: url(raw.daemonUrl), token: null, expectedHostId: hostId, openrigHome: text(raw.openrigHome), ...(keptHerdr ? { retainedDaemonUrl: keptHerdr } : {}) };
 }
 
 /** The connections a raw config.json describes: its `connections` array when it has a usable one, else (only when there is NO `connections` key) the legacy keys as a list of
@@ -44,13 +110,16 @@ export function connectionsOf(raw) {
     const notes = [], seen = new Set(), list = [];
     if (!Array.isArray(raw.connections)) return { connections: [], legacy: false, notes, invalid: CONFIG_LIST_INVALID };
     raw.connections.forEach((entry, index) => {
-      const conn = normalizeConnection(entry), n = index + 1;
+      const n = index + 1;
+      if (unreadable(entry?.daemonUrl)) { notes.push(connectionNote(n, `its address ${unreadableAddress(entry.daemonUrl)} ${UNREADABLE_FORM}`.replace(/\.$/, ""))); return; }
+      const conn = normalizeConnection(entry);
       if (!conn) notes.push(connectionNote(n, "it needs an id (letters, digits, dots or dashes), and an address or a machine"));
       else if (seen.has(conn.id)) notes.push(connectionNote(n, `the id ${conn.id} is already used by an earlier entry`));
       else { seen.add(conn.id); list.push(conn); }
     });
     return list.length ? { connections: list, legacy: false, notes, invalid: null } : { connections: [], legacy: false, notes, invalid: CONFIG_LIST_INVALID };
   }
+  if (unreadable(raw?.daemonUrl)) return { connections: [], legacy: true, notes: [], invalid: `daemonUrl in config.json: ${unreadableAddress(raw.daemonUrl)} ${UNREADABLE_FORM} Nothing was sent.` };
   const machine = raw && typeof raw === "object" ? raw.daemonMachine : undefined;
   const conn = normalizeConnection({ id: LEGACY_CONNECTION_ID, machine, daemonUrl: raw?.daemonUrl, openrigHome: raw?.openrigHome }, LEGACY_CONNECTION_ID)
     ?? { id: LEGACY_CONNECTION_ID, machine: null, daemonUrl: url(raw?.daemonUrl), token: null, expectedHostId: null, openrigHome: text(raw?.openrigHome) };
@@ -68,6 +137,7 @@ export function connectionConfig(base, conn) {
   if (conn.machine) out.daemonMachine = conn.machine;
   if (conn.openrigHome) out.openrigHome = conn.openrigHome;
   if (conn.expectedHostId) out.expectedHostId = conn.expectedHostId; // the host id this connection recorded: a write checks its address still answers as it
+  if (conn.retainedDaemonUrl) out.retainedDaemonUrl = conn.retainedDaemonUrl; // the address a switched connection left (its tunnel, or herdr:// after switching back)
   return out;
 }
 
@@ -79,6 +149,14 @@ export function connectionBoxLabel(config, id) {
   const one = list.find((c) => c.id === id);
   if (!one) return `${id ?? "an OpenRig"} (no longer set up)`;
   return list.filter((c) => name(c) === name(one)).length > 1 ? `${name(one)} (${one.id})` : name(one);
+}
+
+/** Legible host id for System > Overview/Connections, Usage, Sidebar host groups, and Add-a-machine: short ids (including OpenRig's
+ *  13-character `host-xxxxxxxx` ids) show in full; longer ids keep their prefix and unique tail instead of slicing `host-…` to `"host…"`. */
+export function formatHostId(id) {
+  if (id === null || id === undefined || id === "") return "—";
+  const text = String(id);
+  return text.length > 16 ? `${text.slice(0, 8)}…${text.slice(-6)}` : text;
 }
 
 /** The config of ONE listed connection, as a config that lists several describes it: the config itself when it is that connection's, `connectionConfig` of the listed entry for another, null when the
@@ -165,7 +243,16 @@ export const adoptConnection = (config, id) => (typeof id === "string" && id !==
 export const commandFor = (command, config, target) => `${command}:${(config?.connections?.length ?? 0) > 1 && config?.connectionId ? `${config.connectionId}|` : ""}${target}`;
 /** The forwarded operator Attach for `config`'s connection: `rig.operator:<conn>` with several connections (the sidebar opens that OpenRig's operator), `rig.operator` with one. */
 export const operatorCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.operator:${config.connectionId}` : "rig.operator");
+/** The TUI and Needs commands for `config`'s connection: `rig.tui:<conn>` / `rig.needs:<conn>` with several connections (the sidebar answers for that OpenRig, never for the box it happens to draw), the bare name with one. */
+export const tuiCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.tui:${config.connectionId}` : "rig.tui");
+export const needsCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.needs:${config.connectionId}` : "rig.needs");
+/** A request id that is on more than one OpenRig, asked for without a connection the sidebar can use. */
+export const AMBIGUOUS_REQUEST = "That request is on more than one OpenRig. Open it from its row in the sidebar. Nothing was opened.";
 export const qualifyKey = (conn, key) => (conn && conn !== LEGACY_CONNECTION_ID ? `${conn}|${key}` : key);
+
+/** The key of one rig's space status (the card on its row) and of its "opening" mark: the rig id alone with ONE OpenRig, exactly as it always was, and qualified by the
+ *  connection with several, because two OpenRigs can hold a rig with the same id and one box's card must never be drawn on the other box's row. */
+export const spaceStatusKey = (conn, rigId, many) => (many ? qualifyKey(conn, rigId) : rigId);
 
 /** Said when a name the person typed (or a bare name a row carried) is on more than one OpenRig: it is refused, never picked. */
 export const AMBIGUOUS_NAME = "That name is on more than one OpenRig. Pick it in the sidebar, which names the machine. Nothing was sent.";
@@ -187,21 +274,104 @@ export function pickRig(rigs, { rigId, conn, name } = {}) {
   return connsOf(hits) > 1 ? { ambiguous: true } : { rig: hits[0] };
 }
 
-/** The seat a predicate means across the merged list: { rig, seat }, {} when none, or { ambiguous: true } when it matches on more than one
- *  OpenRig (`dev-one@demo` exists on each). `conn` limits it to one connection (a shown row's own). */
-export function pickSeat(rigs, match, { conn } = {}) {
+/** Matches a seat reference typed or chosen in the palette: canonical session (`dev-one@demo`), rig-qualified id (`dev.one@demo`,
+ *  `demo/dev.one`, `demo/dev/dev.one`, `host/demo/dev/dev.one`), or bare logical/member id (`dev.one`, `one`). */
+export function seatMatchesRef(seat, rig, pod, rawRef) {
+  const ref = String(rawRef ?? "").trim();
+  if (!ref || !seat) return false;
+  if (seat.session === ref) return true;
+  const at = ref.lastIndexOf("@");
+  if (at > 0 && at < ref.length - 1) {
+    const left = ref.slice(0, at), right = ref.slice(at + 1);
+    return rig?.name === right && (seat.logicalId === left || seat.member === left);
+  }
+  if (ref.includes("/")) {
+    const parts = ref.split("/");
+    if (parts.length === 2) {
+      const [wantRig, wantSeat] = parts;
+      return (rig?.name === wantRig || rig?.id === wantRig) && (seat.logicalId === wantSeat || seat.member === wantSeat);
+    }
+    if (parts.length === 3) {
+      const [wantRig, wantPod, wantSeat] = parts;
+      return (rig?.name === wantRig || rig?.id === wantRig) && pod?.name === wantPod && (seat.logicalId === wantSeat || seat.member === wantSeat);
+    }
+    if (parts.length === 4) {
+      const [wantHost, wantRig, wantPod, wantSeat] = parts;
+      return (!rig?.host || rig.host === wantHost) && (rig?.name === wantRig || rig?.id === wantRig) && pod?.name === wantPod && (seat.logicalId === wantSeat || seat.member === wantSeat);
+    }
+    return false;
+  }
+  return seat.logicalId === ref || seat.member === ref;
+}
+
+/** Plain refusal when a seat name matches on more than one OpenRig or more than one rig/seat inside one connection. */
+export function ambiguousSeatMessage(seatArg, picked, { prefix = "", write = false } = {}) {
+  if (picked?.ambiguous === true) return AMBIGUOUS_NAME;
+  const example = picked?.seats?.[0] ? `${prefix}${picked.seats[0]}` : `${prefix}<seat>@<rig>`;
+  const tail = write ? " Nothing was sent." : "";
+  if ((picked?.rigs?.length ?? 0) > 1) {
+    return `More than one rig has a seat matching ${seatArg} (${picked.rigs.join(", ")}). Name the rig too, such as ${example}.${tail}`;
+  }
+  return `More than one seat matches ${seatArg} (${(picked?.seats ?? []).join(", ")}). Name the full seat, such as ${example}.${tail}`;
+}
+
+/** The seat a predicate means across the merged list: { rig, seat }, {} when none, { ambiguous: true } when it matches on more than one
+ *  OpenRig (`dev-one@demo` exists on each), or { ambiguous: "rig", rigs, seats } when it matches more than one seat inside one connection. */
+export function pickSeat(rigs, match, { conn, rigId, allowFirst = false } = {}) {
   const hits = [];
   for (const rig of Array.isArray(rigs) ? rigs : []) {
     if (!onConn(rig, conn)) continue;
-    for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) if (match(seat, rig)) hits.push({ rig, seat });
+    if (rigId && rig.id !== rigId) continue;
+    for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) if (match(seat, rig, pod)) hits.push({ rig, seat });
   }
-  return connsOf(hits.map((h) => h.rig)) > 1 ? { ambiguous: true } : (hits[0] ?? {});
+  if (connsOf(hits.map((h) => h.rig)) > 1) return { ambiguous: true };
+  if (!allowFirst && hits.length > 1) {
+    return {
+      ambiguous: "rig",
+      rigs: [...new Set(hits.map((h) => h.rig?.name).filter(Boolean))],
+      seats: hits.map((h) => `${h.seat?.logicalId ?? h.seat?.member ?? h.seat?.session}@${h.rig?.name}`),
+    };
+  }
+  return hits[0] ?? {};
 }
 
 const MACHINE_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 /** The refusal for a connection's OpenRig home (a clean absolute folder path on THIS computer), or null when it is fine. */
 export const openrigHomeProblem = (value) => (typeof value === "string" && /^\/[^\x00-\x1f\x7f]*[^/\x00-\x1f\x7f]$/.test(value) && !value.split("/").some((part) => part === "." || part === "..")
   ? null : "This connection needs its OpenRig home: an absolute folder path, such as /srv/openrig-home.");
+
+const cleanHomeFolder = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.length > 1 ? value.replace(/\/+$/, "") : value;
+  return openrigHomeProblem(trimmed) ? null : trimmed;
+};
+const pathOrChild = (p, root) => Boolean(root) && (p === root || p.startsWith(`${root}/`));
+const hasTwoSegments = (p) => Boolean(p) && p.split("/").filter(Boolean).length >= 2;
+const matchesMachineFolder = (p, folder) => Boolean(folder) && (p === folder || (hasTwoSegments(folder) && p.startsWith(`${folder}/`)));
+/** An advisory warning for a syntactically valid OpenRig home path in Add a machine: when it looks like a path on the
+ *  machine being added, or when no such folder exists on this computer yet. Returns a plain sentence, or null. */
+export function openrigHomeWarning(value, { machine = null, exists = null, localHome = null, machineHome = null, workspaceRoot = null, machineFolders = [] } = {}) {
+  if (openrigHomeProblem(value)) return null;
+  const here = cleanHomeFolder(localHome);
+  const there = cleanHomeFolder(machineHome);
+  const ws = cleanHomeFolder(workspaceRoot);
+  const wsParent = ws && ws.endsWith("/workspace") ? cleanHomeFolder(ws.slice(0, -"/workspace".length)) : null;
+  const roots = [];
+  if (ws) roots.push(ws);
+  for (const raw of Array.isArray(machineFolders) ? machineFolders : []) {
+    const f = cleanHomeFolder(raw);
+    if (f) roots.push(f);
+  }
+  const underLocalHome = pathOrChild(value, here);
+  const matchesWorkspaceParent = hasTwoSegments(wsParent) && (value === wsParent || (exists === false && value.startsWith(`${wsParent}/`)));
+  const looksRemote = (Boolean(there) && (value === there || (!underLocalHome && value.startsWith(`${there}/`))))
+    || (!underLocalHome && (matchesWorkspaceParent || roots.some((f) => matchesMachineFolder(value, f))));
+  const m = typeof machine === "string" && machine ? machine : "that machine";
+  if (looksRemote && exists === false) return `${value} looks like ${m}'s own path, and that folder doesn't exist on this computer. Choose a folder on this computer.`;
+  if (looksRemote) return `${value} looks like ${m}'s own path. OpenRig home must be a folder on this computer, not on ${m}.`;
+  if (exists === false) return `Folder ${value} doesn't exist on this computer. Create it here or choose an existing folder, not a path on ${m}.`;
+  return null;
+}
 
 /** Adds a new connection for a machine the setup gate has already checked, as a compare-and-swap write
  *  against config.json -- the same `host.readConfig()` / `host.writeConfig(text, previous)` convention
@@ -223,7 +393,7 @@ export async function addMachineConnection(host, before, { machine, daemonUrl, e
   if (homeProblem) throw new Error(homeProblem);
   let raw;
   try { raw = before === null || before === undefined ? {} : JSON.parse(before); }
-  catch { throw new Error("openrig/config.json is not valid JSON."); }
+  catch { throw new Error(CONFIG_NOT_JSON); }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("openrig/config.json must contain an object.");
   const { connections: found, invalid, legacy } = connectionsOf(raw);
   if (invalid) throw new Error(CONFIG_LIST_INVALID);
@@ -279,7 +449,7 @@ export function tunnelCommand(address, boxPort, machine, target = null) {
  *  and nothing on the machine, no tunnel and no space or tile is touched by it. A list always keeps at least one OpenRig. */
 export async function removeConnection(host, before, id) {
   let raw;
-  try { raw = JSON.parse(before ?? ""); } catch { throw new Error("openrig/config.json is not valid JSON."); }
+  try { raw = JSON.parse(before ?? ""); } catch { throw new Error(CONFIG_NOT_JSON); }
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.connections)) throw new Error("This OpenRig has no connections list to remove from. Nothing was changed.");
   const index = raw.connections.findIndex((c) => c && typeof c === "object" && c.id === id);
   if (index < 0) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
@@ -291,4 +461,152 @@ export async function removeConnection(host, before, id) {
   const nextRaw = { ...raw, connections: remaining };
   await host.writeConfig(JSON.stringify(nextRaw, null, 2) + "\n", before);
   return { removed: id };
+}
+
+/** Whether herdrig offers to switch a connection to Herdr's connection ("Use Herdr's connection instead…" and its dialog).
+ *  Off: the switching code stays in place but nothing offers or performs it; a connection that already uses Herdr's connection
+ *  keeps working and can still switch back to its tunnel. Every entry point checks this one value. */
+export const HERDR_CONNECTION_OFFERED = false;
+/** Switches one connection from its tunnel to Herdr's connection (one click, never automatic; §3.1.3): its address becomes `herdrUrl`
+ *  (herdr://<machine>/<hostId>, which the caller has verified reaches the same OpenRig as the tunnel), and the old address is kept, unused, as
+ *  `retainedDaemonUrl` (the `verifiedTunnel` the caller checked), so switching back is one click. A compare-and-swap write like removeConnection. */
+export const SWITCH_NOT_OFFERED = "This version of herdrig doesn't switch a connection away from its tunnel. Nothing was changed.";
+export async function switchConnection(host, before, id, herdrUrl, verifiedTunnel, { offered = HERDR_CONNECTION_OFFERED } = {}) {
+  if (!offered) throw new Error(SWITCH_NOT_OFFERED);
+  let raw;
+  try { raw = JSON.parse(before ?? ""); } catch { throw new Error("openrig/config.json is not valid JSON."); }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.connections)) throw new Error("This OpenRig has no connections list. Nothing was changed.");
+  const index = raw.connections.findIndex((c) => c && typeof c === "object" && c.id === id);
+  if (index < 0) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
+  const entry = raw.connections[index], m = /^herdr:\/\/([a-z0-9][a-z0-9._-]{0,31})\/([A-Za-z0-9._:-]{1,128})$/.exec(String(herdrUrl ?? ""));
+  if (!m || entry.machine !== m[1]) throw new Error("That address isn't this connection's machine. Nothing was changed.");
+  if (!url(entry.daemonUrl)) throw new Error("This connection doesn't use a tunnel, so there is nothing to switch. Nothing was changed.");
+  // The tunnel kept is the one whose /healthz was just checked against the helper: an entry edited since then isn't switched.
+  if (url(verifiedTunnel) !== url(entry.daemonUrl)) throw new Error("This connection's tunnel address changed while the switch was checked. Nothing was changed.");
+  if (entry.expectedHostId && entry.expectedHostId !== m[2]) throw new Error(`${entry.machine} now answers as another OpenRig than this connection was set up for. Nothing was changed.`);
+  const next = { ...entry, daemonUrl: herdrUrl, retainedDaemonUrl: url(verifiedTunnel), expectedHostId: m[2] };
+  const connections = raw.connections.map((c, i) => (i === index ? next : c));
+  if (!normalizeConnection(next)) throw new Error("The switched connection wouldn't be valid. Nothing was changed.");
+  await host.writeConfig(JSON.stringify({ ...raw, connections }, null, 2) + "\n", before);
+  return { switched: id, daemonUrl: herdrUrl };
+}
+
+export function localDaemonOrigin(value) {
+  if (typeof value !== "string") return "";
+  const m = /^(https?):\/\/(localhost|\[::1\]|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?\/?$/i.exec(value.trim());
+  if (!m) return "";
+  const scheme = m[1].toLowerCase(), host = m[2].toLowerCase(), port = m[3] == null ? null : Number(m[3]);
+  if (host.startsWith("127.") && host.split(".").some((part) => Number(part) > 255 || String(Number(part)) !== part)) return "";
+  if (port !== null && (port < 1 || port > 65535)) return "";
+  return `${scheme}://${host}${port !== null && port !== (scheme === "https" ? 443 : 80) ? `:${port}` : ""}`;
+}
+
+// One key per loopback ADDRESS, so spellings of it compare equal: localhost, 127.0.0.1, [::1] and 0.0.0.0 with the same
+// scheme and port are one address; any other loopback (127.0.0.4) stays its own.
+export const addressKey = (value) => {
+  const origin = localDaemonOrigin(value) ?? String(value);
+  const m = /^(https?):\/\/(\[[^\]]+\]|[^:/]+)(?::(\d+))?$/i.exec(origin);
+  if (!m) return origin;
+  const host = m[2].toLowerCase(), alias = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(host);
+  return `${m[1].toLowerCase()}|${alias ? "loopback" : host}|${m[3] ?? (m[1].toLowerCase() === "https" ? "443" : "80")}`;
+};
+
+/** Switches a connection back to the tunnel it kept (`retainedDaemonUrl`). The same compare-and-swap write. */
+export async function switchBack(host, before, id) {
+  let raw;
+  try { raw = JSON.parse(before ?? ""); } catch { throw new Error("openrig/config.json is not valid JSON."); }
+  const index = Array.isArray(raw?.connections) ? raw.connections.findIndex((c) => c && typeof c === "object" && c.id === id) : -1;
+  if (index < 0) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
+  const entry = raw.connections[index], kept = url(entry.retainedDaemonUrl);
+  if (!kept) throw new Error("This connection has no tunnel address to switch back to. Nothing was changed.");
+  // Another connection may have been given this address since the switch: switching back would put two connections on one address.
+  if (raw.connections.some((c, i) => i !== index && c && typeof c === "object" && typeof c.daemonUrl === "string" && addressKey(c.daemonUrl) === addressKey(kept))) throw new Error(`Another connection now uses ${kept}, so this one can't switch back to it. Nothing was changed.`);
+  const { retainedDaemonUrl: _kept, ...rest } = entry;
+  // The herdr:// address it leaves is kept, so tabs Attached over Herdr's connection stay this connection's (one rig == one space).
+  const left = herdrAddress(entry.daemonUrl);
+  const connections = raw.connections.map((c, i) => (i === index ? { ...rest, daemonUrl: kept, ...(left ? { retainedDaemonUrl: left } : {}) } : c));
+  await host.writeConfig(JSON.stringify({ ...raw, connections }, null, 2) + "\n", before);
+  return { switchedBack: id, daemonUrl: kept };
+}
+
+/** An error of herdrig's own code (a missing name, a wrong type, a bad size, an answer that doesn't parse), as opposed to a machine or an OpenRig that
+ *  failed. A catch that returns "nothing found" or says "not answering" must let these through or say them as what they are. */
+export const CODE_ERRORS = new Set(["TypeError", "ReferenceError", "RangeError", "SyntaxError"]);
+export const isCodeError = (e) => CODE_ERRORS.has(e?.name);
+/** What an error of herdrig's own says: one line, at most 160 characters (a JSON SyntaxError can quote the answer it choked on, with its newlines). */
+export const describeCodeError = (e) => {
+  const text = `${e?.name}: ${e?.message}`.replace(/[\x00-\x1f\x7f\s]+/g, " ").trim();
+  return text.length > 160 ? `${text.slice(0, 159)}…` : text;
+};
+export const codeErrorMessage = (e) => `herdrig couldn't read OpenRig: ${describeCodeError(e)}`;
+/** The next step after any message about an error of herdrig's own. */
+/** A refresh that failed because a connection over Herdr's connection needs its approval again (the machine, its account or the helper changed):
+ *  said as that, with the one way out it has, never as "couldn't refresh". Anything else gets `fallback`. */
+export const herdrReapprove = (offered = HERDR_CONNECTION_OFFERED) => offered
+  ? "To approve it, switch back to the tunnel in System › Connections, then choose \"Use Herdr's connection instead…\" again."
+  : "To keep using it, switch back to its tunnel in System › Connections, or put its tunnel address back in openrig/config.json.";
+export const HERDR_REAPPROVE = herdrReapprove();
+export function refreshFailureMessage(error, fallback) {
+  if (error?.needsConsent === true) return `${String(error.message ?? "").trim() || "This connection needs your approval before herdrig uses OpenRig there over Herdr's connection."} ${HERDR_REAPPROVE}`;
+  return fallback;
+}
+export const CODE_ERROR_NEXT = "If it keeps happening, restart Herdr and report this message.";
+/** The save-failure next step: a file problem the person can fix. */
+export const SAVE_NEXT = "Check that herdrig can write to its app folder.";
+
+const EXEC_TIMEOUT = /took longer than (\d+(?:\.\d+)?) ?s(?: on ([\w.-]+))? and was stopped/;
+const EXEC_PREFIX = /^[`'"]?herdr\.exec[`'"]?:\s*/;
+const loggedExecErrors = new WeakSet();
+
+/** Logs the technical `herdr.exec` failure once to Herdr's script log (`console.log`), keeping internal call names out of user-facing notices. */
+export function logExecError(error) {
+  if (error && typeof error === "object") {
+    if (loggedExecErrors.has(error)) return;
+    loggedExecErrors.add(error);
+  }
+  const raw = String(error?.message ?? error ?? "").replace(/[\r\n]+/g, " ").trim();
+  if (!raw) return;
+  try { globalThis.console?.log?.(`[herdrig] ${raw}`); } catch (_) {}
+}
+
+export function parseExecTimeout(error) {
+  const m = EXEC_TIMEOUT.exec(String(error?.message ?? error ?? ""));
+  return m ? { seconds: m[1], machine: m[2] ?? null } : null;
+}
+
+export function describeExecTimeout(error, { machine = null, kind = "remote", action = "save" } = {}) {
+  const parsed = parseExecTimeout(error);
+  if (!parsed) return null;
+  const seconds = parsed.seconds, unit = seconds === "1" ? "second" : "seconds";
+  const targetMachine = parsed.machine ?? (typeof machine === "string" && /^[\w.-]+$/.test(machine) ? machine : null);
+  if (targetMachine && kind === "remote-write") {
+    const what = action === "copy" ? "The copy may still have been made there" : "The save may still have happened there";
+    return `Stopped: ${targetMachine} took longer than ${seconds} ${unit} to answer. ${what}: check before trying again. If it keeps happening, check that Herdr still reaches it (hc machine ls).`;
+  }
+  if (targetMachine && (kind === "attach" || kind === "remote")) {
+    const lead = kind === "attach" ? "Attach stopped" : "Stopped";
+    return `${lead}: ${targetMachine} took longer than ${seconds} ${unit} to answer, so nothing more was started there. If ${targetMachine} is busy, try again in a moment. If it keeps happening, check that Herdr still reaches it (hc machine ls).`;
+  }
+  if (kind === "local-attach") {
+    return `OpenRig took longer than ${seconds} ${unit} to answer, so nothing was started. Try again in a moment.`;
+  }
+  if (kind === "write" || kind === "remote-write") {
+    return `OpenRig took longer than ${seconds} ${unit} to answer, so herdrig stopped waiting. It may still have done it: check before trying again.`;
+  }
+  return `OpenRig took longer than ${seconds} ${unit} to answer, so herdrig stopped waiting. Try again in a moment.`;
+}
+
+/** Plain user-facing sentence for a Herdr `exec` error, logging the technical `herdr.exec` detail when rewritten. */
+export function plainExecError(error, options = {}) {
+  const timeoutText = describeExecTimeout(error, options);
+  if (timeoutText) {
+    logExecError(error);
+    return timeoutText;
+  }
+  const raw = String(error?.message ?? error ?? "");
+  if (EXEC_PREFIX.test(raw)) {
+    logExecError(error);
+    return raw.replace(EXEC_PREFIX, "");
+  }
+  return raw;
 }

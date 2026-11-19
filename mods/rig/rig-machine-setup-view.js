@@ -3,15 +3,16 @@ import {v_flex,h_flex} from "gpui-base";
 import {reviewMachineSetup,approveMachineSetup,stopUsingMachine} from "./rig-machine-setup.js";
 
 export class MachineSetupPanel {
-  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,cancelHandle,primaryHandle,retryHandle,copyHandles={}}={}){
+  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,initialConfirmation=null,waitingForRig=null,cancelHandle,primaryHandle,retryHandle,copyHandles={}}={}){
     this.host=host;this.config=config;this.machine=machine;this.done=done;this.cancel=cancel;
     this.mono=mono;this.copyIcon=copyIcon;this.stop=stop;this.phase=stop?"ready":"checking";
+    this.initialConfirmation=initialConfirmation;this.waitingForRig=waitingForRig;
     this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;this.retryHandle=retryHandle;
     this.copyHandles=copyHandles;
   }
-  async check(cx){
+  async check(cx,useInitial=false){
     if(this.busy)return;this.phase="checking";this.error=null;cx.notify();
-    this.review=await reviewMachineSetup(this.host,this.config,this.machine);
+    this.review=await reviewMachineSetup(this.host,this.config,this.machine,useInitial?this.initialConfirmation:null);
     this.phase=this.review.ok?"ready":"error";this.error=this.review.ok?null:this.review.reason;cx.notify();
   }
   approve(cx){
@@ -25,12 +26,13 @@ export class MachineSetupPanel {
         });
         if(result.ok){
           this.result=result;this.phase="done";
-          await this.finishSaved(cx);
+          const savedOk=await this.finishSaved(cx);
+          if(savedOk&&this.waitingForRig){this.done?.(cx,result);return;}
         }
         else if(result.needsConsent){this.phase="error";this.error="The machine or helper changed. Check again and review its details.";}
         else {this.phase="error";this.error=result.reason;}
       }catch(error){this.phase="error";this.error=String(error?.message??error);}
-      finally{this.busy=false;cx.notify();const handle=this.phase==='done'?this.primaryHandle:this.stop&&this.phase==='error'?this.cancelHandle:null;if(handle)cx.timer.after(0,nextCx=>{handle.focus();nextCx.notify();});}
+      finally{this.busy=false;cx.notify();const handle=this.phase==='done'&&!(this.waitingForRig&&!this.warning)?this.primaryHandle:this.stop&&this.phase==='error'?this.cancelHandle:null;if(handle)cx.timer.after(0,nextCx=>{handle.focus();nextCx.notify();});}
     });
   }
   async finishSaved(cx){
@@ -43,10 +45,13 @@ export class MachineSetupPanel {
     if(this.busy||this.phase!=='done'||!this.warning)return;
     this.busy=true;this.retrying=true;this.followUpRecovered=false;cx.notify();
     cx.spawn(async cx=>{
-      try{this.followUpRecovered=await this.finishSaved(cx);}
+      try{
+        this.followUpRecovered=await this.finishSaved(cx);
+        if(this.followUpRecovered&&this.waitingForRig){this.done?.(cx,this.result);return;}
+      }
       finally{this.busy=false;this.retrying=false;cx.notify();
         // A successful retry removes its button. Hand keyboard ownership to the visible Done.
-        if(this.followUpRecovered&&this.primaryHandle)cx.timer.after(0,next=>{this.primaryHandle.focus();next.notify();});}
+        if(this.followUpRecovered&&!this.waitingForRig&&this.primaryHandle)cx.timer.after(0,next=>{this.primaryHandle.focus();next.notify();});}
     });
   }
   button(id,text,callback,{disabled=false,primary=false}={}){
@@ -96,6 +101,8 @@ export class MachineSetupPanel {
       .child(this.value("Command","rm ~/.local/share/herdr-openrig/rig-attach-relay.cjs",{copy:true}));
     else if(this.phase==="checking")body=body.child(div().text_color(t.muted).child("◌ Checking the Herdr machine, OpenRig identity and Attach helper…"));
     else if(c&&!done){
+      if(this.waitingForRig)body=body.child(div().id("machine-setup-waiting").px(10).py(8).rounded(6).bg(t.raised)
+        .child(`Waiting for you to approve the helper on ${c.machine} — opening ${this.waitingForRig} continues once you approve.`));
       body=body.child(div().child(update?`herdrig has a new Attach helper. Approve it to keep opening seats on ${c.machine}.`:`Herdr will open OpenRig's spaces, Attach and the Operator on ${c.machine}.`))
         .child(v_flex().gap(3).id("machine-setup-checks")
           .child(div().child(`✓ Connected through Herdr machine ${c.machine}`))

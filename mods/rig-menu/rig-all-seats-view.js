@@ -1,7 +1,7 @@
 import {div,svg} from 'gpui-kit';
 import {h_flex,v_flex} from 'gpui-base';
 import {allSeatsModel,allSeatsLayout} from './rig-all-seats.js';
-import {statusLook,statusMark,relativeTimeText,iconsAt,MOD_IDS} from './rig-lib.js';
+import {statusLook,statusMark,relativeTimeText,iconsAt,MOD_IDS,needsYouWord} from './rig-lib.js';
 import {assistantWord,assistantTarget} from './rig-connected-assistants.js';
 import {assistantEntry} from './rig-connected-assistants-view.js';
 import {pageBodyLayout} from './rig-page-layout.js';
@@ -15,9 +15,10 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
  const cell=(id,text,size=120,color=t.foreground)=>div().when(!!id,el=>el.id(id)).min_w(120).when(!!size,el=>el.w(size).flex_none()).when(!size,el=>el.flex_1())
   .truncate().text_size(12).text_color(color).tooltip(String(text??'')).child(text??'');
  const link=(id,rig)=>cell(id,rig.name,model.rigWidth,t.muted).cursor_pointer().hover(el=>el.underline()).on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,conn:rig.conn,name:rig.name});});
+ const hover=key=>(on,next)=>{if(on)page.hoveredAllSeat=key;else if(page.hoveredAllSeat===key)page.hoveredAllSeat=null;(next??cx)?.notify?.();};
  const row=r=>{
   if(r.assistant){
-   const m=r.assistant,target=assistantTarget(m,r.rig),entry=assistantEntry(m,r.rig),selected=page.pageSel===r.key,id=`${m.conn}-${m.seat}`,open=()=>navigate(entry);
+   const m=r.assistant,target=assistantTarget(m,r.rig),entry=assistantEntry(m,r.rig),selected=page.pageSel===r.key,active=selected||page.hoveredAllSeat===r.key,id=`${m.conn}-${m.seat}`,open=()=>navigate(entry);
    page.pageRows.push({key:r.key,entry,target,expandable:false,open});
    const last=m.lastCheckInAt?` · checked in ${page.time(m.lastCheckInAt)}`:'',cadence=m.expectedMinutes?` · every ${m.expectedMinutes} min`:'';
    const words=assistantWord(m.status)+last+cadence;
@@ -25,12 +26,12 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
     .child(cell(`all-assistant-name-${id}`,m.name,null));
    if(!layout.compact)line.child(link(`all-assistant-rig-${id}`,r.rig)).when(layout.runtime,el=>el.child(cell(null,'connected assistant',120,t.dim)))
     .child(cell(`all-assistant-status-${id}`,words,120,m.status==='check-in-overdue'?t.working:t.muted)).when(layout.runtime,el=>el.child(div().w(36).flex_none()));
-   line.child(h_flex().id(`all-assistant-actions-${id}`).w(layout.attach?110:20).flex_none().when(selected,el=>el.child(page.moreButton(t,`all-assistant-more-${id}`,()=>menu(target)))));
-   return v_flex().id(`all-assistant-row-${id}`).rounded(5).bg(selected?t.selection:t.background).hover(el=>el.bg(t.hover)).cursor_pointer()
+   line.child(h_flex().id(`all-assistant-actions-${id}`).w(layout.attach?110:20).flex_none().when(active,el=>el.child(page.moreButton(t,`all-assistant-more-${id}`,()=>menu(target)))));
+   return v_flex().id(`all-assistant-row-${id}`).rounded(5).bg(selected?t.selection:t.background).hover(el=>el.bg(t.hover)).on_hover(hover(r.key)).cursor_pointer()
     .on_click((e,cx)=>{if((e?.click_count??1)>=2)open();else page.selectPageRow(r.key,cx);}).on_mouse_down('right',()=>menu(target)).child(line)
     .when(layout.compact,el=>el.child(div().pl(26).text_size(11.5).text_color(t.muted).child(`${r.rig.name} · ${words}`)));
   }
-  const {seat,rig}=r,id=`${rig.id}-${seat.session??seat.logicalId}`,selected=page.pageSel===r.key;
+  const {seat,rig}=r,id=`${rig.id}-${seat.session??seat.logicalId}`,selected=page.pageSel===r.key,active=selected||page.hoveredAllSeat===r.key;
   const entry={section:'topology',kind:'seat',rig:rig.name,rigId:rig.id,conn:rig.conn,name:seat.logicalId,session:seat.session,pod:seat.pod};
   const target={kind:'seat',rig:rig.name,rigId:rig.id,conn:rig.conn,session:seat.session,logicalId:seat.logicalId,runtime:seat.runtime,model:seat.model,
    lifecycle:models.find(m=>m.rig.id===rig.id)?.lifecycle,terminal:seat.terminal,attachable:r.attachable,status:seat.status,
@@ -48,10 +49,10 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    .child(div().min_w(0).truncate().text_color(t.foreground).text_size(12.5).child(logical.slice(dot+1)));
   const mark=()=>page.dot(t,r.status,14,seat.session,r.needIds);
   const el=v_flex().id(`all-seat-row-${id}`).py(layout.compact?6:0).min_h(layout.compact?48:34).gap(4).rounded(5)
-   .bg(selected?(t.selection??t.selected):t.background).hover(el=>el.bg(t.hover)).cursor_pointer()
+   .bg(selected?(t.selection??t.selected):t.background).hover(el=>el.bg(t.hover)).on_hover(hover(r.key)).cursor_pointer()
    .on_click((e,cx)=>{if((e?.click_count??1)>=2)open();else page.selectPageRow(r.key,cx);})
    .on_mouse_down('right',()=>menu(target));
-  if(layout.compact)return el.child(h_flex().gap(6).px(6).items_center().child(mark()).child(name).when(selected,el=>el.child(actions())))
+  if(layout.compact)return el.child(h_flex().gap(6).px(6).items_center().child(mark()).child(name).when(active,el=>el.child(actions())))
    .child(h_flex().id(`all-seat-line2-${id}`).pl(26).pr(6).min_w(120).gap(6).items_center()
     .child(div().id(`all-seat-rig-${id}`).min_w(0).max_w(Math.max(40,width-50-words.length*6.5)).truncate().text_size(11.5).text_color(t.muted).tooltip(rig.name).cursor_pointer().hover(el=>el.underline())
       .on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,conn:rig.conn,name:rig.name});}).child(rig.name))
@@ -61,7 +62,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    .when(layout.runtime,el=>el.child(cell(`all-seat-runtime-${id}`,runtime,120,t.dim)))
    .child(cell(`all-seat-status-${id}`,words,120,t[statusMark(r.status).word]??t.muted))
    .when(layout.runtime,el=>el.child(div().w(36).flex_none().text_size(11.5).text_color(t.blocked).child(r.needIds.length?`◆ ${r.needIds.length}`:'')))
-   .child(selected?actions():div().w(layout.attach?110:20).flex_none()));
+   .child(active?actions():div().w(layout.attach?110:20).flex_none()));
  };
  const pulseName={idle:'idle',working:'working',blocked:'blocked',needs:'needs you',unreported:'not reported'}[page.pulseFilter]??page.pulseFilter;
  const noMatch=page.filter?`No seats match ‹${page.filter}›${pulseName?` in ${pulseName}`:''}.`:`No seats in ${pulseName??'the current filters'}.`;
@@ -74,7 +75,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    .on_click((_e,cx)=>open(cx)));
  };
  const group=g=>{
-  const countItems=[['working',g.counts.working,t.ansi2],['needs you',g.counts.needs,t.blocked],['blocked',g.counts.blocked,t.blocked],
+  const countItems=[['working',g.counts.working,t.ansi2],[needsYouWord(g.counts.needs),g.counts.needs,t.blocked],['blocked',g.counts.blocked,t.blocked],
     ['idle',g.counts.idle,t.muted],['not reported',g.counts.unreported,t.dim]].filter(([,n])=>n);
   const line=h_flex().id(`all-seats-group-${g.rig.id}`).px(6).py(6).gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted)
    .child(div().font_semibold().child(g.rig.name));

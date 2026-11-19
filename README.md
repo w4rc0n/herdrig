@@ -7,15 +7,15 @@
 
 # Herdrig
 
-Version: v0.5.1
+Version: v0.5.2
 
-**OpenRig Mod for Herdr**
+**[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
 > **EARLY DEVELOPMENT** — This mod is in early development. Contributions are welcome.
 
 ![Herdrig](preview.png)
 
-Herdrig puts [OpenRig](https://github.com/mvschwarz/openrig) inside the `herdr` window: your rigs, their seats and the
+Herdrig puts [OpenRig](https://github.com/mvschwarz/openrig) inside the [Herdr](https://github.com/herdrdev/herdr-app) window: your rigs, their seats and the
 decisions waiting for you, in a sidebar beside your own tabs. Select a row, then double-click or press Enter to open its page, and you can
 act from there (answer a request, message a seat, attach to it) without leaving Herdr.
 
@@ -73,7 +73,7 @@ In Herdr, tell your agent:
 Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/w4rc0n/herdrig
 ```
 
-Or give [`RECIPE.md`](RECIPE.md) to your `herdr` agent. It checks for OpenRig (and installs it with OpenRig's own guide
+Or give [`RECIPE.md`](RECIPE.md) to your agent in Herdr. It checks for OpenRig (and installs it with OpenRig's own guide
 only on your yes), copies the five mod folders (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`, `mods/rig-spaces`)
 into `<appHome>/mods/`, merges `ctrl-alt-r` into `keys.json`, and adds `{ "mod": "rig" }` to your layout after telling
 you.
@@ -113,7 +113,7 @@ Check the `Version:` line in the README you copied, or open System and read **He
   With a configured Herdr machine, `hc` also carries approved helper commands and spec content to that machine.
 - **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**); for Attach, `hc` starts `node` on the
   mod's own `rig-attach-relay.cjs`, which runs `tmux attach-session -t =<session>` directly, with no shell, for a
-  session name OpenRig makes; `hc` also opens the TUI tab. For the local spec editor, `printenv OPENRIG_HOME` and `realpath`.
+  session name OpenRig makes; `hc` also opens the TUI tab. For the local spec editor, `printenv OPENRIG_HOME` and `realpath`; for Add a machine, `test -d` to check whether a typed OpenRig home folder exists here.
   On a configured machine, pinned helpers run through `hc exec`; spec content travels on stdin, without staging
   a remote transfer file. Helper installation and verification use that machine's ordinary file and identity tools.
 - **Files:** it reads `<appHome>/openrig/config.json` (optional: your OpenRig name), `<appHome>/openrig/state.json`,
@@ -259,11 +259,11 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
 
 ## Contributing
 
-Issues and pull requests are welcome.
+Issues and pull requests are welcome. The shipped mods have no runtime dependencies; a development render check in the source repository uses one pinned QuickJS `devDependency` installed with `npm ci --ignore-scripts` and run with `npm run check:render`.
 
 ## Colors
 
-The Rig panes draw a working seat in your theme's green (`ansi2`). herdr's own lists (its Agents section and tab dots) use herdr's `working` color, yellow in the shipped themes. To make them match, add `"colors": { "working": "ansi2" }` to your layout's root node. It names a theme color, so it works in light and dark.
+The Rig panes draw a working seat in your theme's green (`ansi2`). Herdr's own lists (its Agents section and tab dots) use Herdr's `working` color, yellow in the shipped themes. To make them match, add `"colors": { "working": "ansi2" }` to your layout's root node. It names a theme color, so it works in light and dark.
 
 ## License
 

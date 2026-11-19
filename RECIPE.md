@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.1
+Version: v0.5.2
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
@@ -133,7 +133,7 @@ use the duration threshold. Working evidence survives an app restart; separate s
 Before you install it: this mod **reaches OpenRig's local address** (`127.0.0.1:7433` unless that OpenRig uses another
 port) over HTTP and SSE (reads live state and, when you click an action, posts to OpenRig: Decision Card acts, a usage
 refresh, spec validation and library sync), **runs programs** (`rig`, `tmux` started directly by the mod's relay, never through a shell,
-`hc`, `node`, and `printenv`/`realpath` for the spec editor's folders), **reads files outside its own folder**: `<appHome>/openrig/config.json` (optional: the person's OpenRig
+`hc`, `node`, `printenv`/`realpath` for the spec editor's folders, and `test -d` when checking a typed OpenRig home folder), **reads files outside its own folder**: `<appHome>/openrig/config.json` (optional: the person's OpenRig
 name), `state.json`, and the spec/slice files you open in its file viewer (`SPEC.md`, `PROGRESS.md` and similar, from
 the folders OpenRig reports), and **writes** `<appHome>/openrig/state.json` plus the user spec file you edit and save
 in its spec editor (local edits stay in this machine's spec folders, symlinks resolved: OpenRig's spec library
@@ -441,7 +441,7 @@ and, with your yes, **Start OpenRig** runs `rig daemon start`), `tmux` for Attac
 the `-L`/`-S` flag is only what OpenRig's recorded `tmuxAttachCommand` names, parsed and checked; nothing in that string
 is run. A daemon can still name a session on such a server, so Attach can open a session of yours by its exact name,
 with no command run. `hc` for attaching (`--label herdr-openrig.role=attach --label herdr-openrig.attach=<session>`) and for the
-TUI terminal (`--label herdr-openrig.role=tui`), and `node` to run that relay, which also reports the seat's state to herdr (OSC 7501). For the spec editor,
+TUI terminal (`--label herdr-openrig.role=tui`), and `node` to run that relay, which also reports the seat's state to Herdr (OSC 7501). For the spec editor,
 `printenv OPENRIG_HOME` (Herdr's own environment: a Herdr started from a desktop launcher may not have the variable
 your shell sets, so set `openrigHome` in `<appHome>/openrig/config.json` for a home outside `~/.openrig`) and
 `realpath`, which resolves each spec folder and file so a symlink can't lead the editor elsewhere.
