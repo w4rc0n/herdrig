@@ -21,6 +21,20 @@ act from there (answer a request, message a seat, attach to it) without leaving 
 
 Inside Herdr, use Herdrig’s views. To open OpenRig’s own terminal view there, use `rig terminal open --window`.
 
+## A closer look
+
+![The Rig graph](assets/screenshots/graph.png)
+
+See your team as a graph: who delegates to whom, who's working, and who needs you.
+
+![Answering a request](assets/screenshots/needs.png)
+
+Answer your agents' requests and approve their work without leaving Herdr.
+
+![The Rig palette](assets/screenshots/palette.png)
+
+The Rig palette: jump to any rig, seat or page from the keyboard.
+
 ## Features
 
 - **Box setup:** choose OpenRig's connected Herdr machine in one screen naming its account, helper and SHA-256.
