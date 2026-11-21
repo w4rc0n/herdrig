@@ -1,4 +1,7 @@
+import { errorDiagnostic } from "./rig-words.js";
+import {activationPair} from './rig-activation.js';
 import {div,svg} from "gpui-kit";
+import {errorBlock} from "./rig-error-view.js";
 import {v_flex,h_flex,InputState,Input} from "gpui-base";
 import {machineSetupGate,listAddableMachines} from "./rig-remote.js";
 import {connectionsOf,nextTunnelAddress,tunnelCommand,openrigHomeProblem,openrigHomeWarning,formatHostId,plainExecError} from "./rig-connections.js";
@@ -19,17 +22,17 @@ export class AddMachinePanel {
     this.homeInput=InputState.new({value:"",placeholder:"/path/to/this/connection's/openrig-home"});
     // Editing the address means what was checked is no longer what would be saved; editing either field re-draws the command and Save.
     this.addressInput.on("change",(_e,cx)=>{if(this.verified){this.verified=null;if(this.phase==="verified")this.phase="ready";}this.tunnelError=null;cx.notify();});
-    this.homeInput.on("change",(_e,cx)=>{this.homeProbeGen++;this.homeCheckedPath=null;this.homeExists=null;this.probeHome(cx);cx.notify();});
+    this.homeInput.on("change",(_e,cx)=>{this.homeProbeGen++;this.homeCheckedPath=null;this.homeExists=null;cx.spawn(async next=>{await this.probeHome(next);});cx.notify();});
     for(const state of [this.addressInput,this.homeInput]){
       state.on("focus",()=>{this.focusedField=state;});
       state.on("blur",()=>{if(this.focusedField===state)this.focusedField=null;});
       state.on("submit",(_e,cx)=>this.checkTunnel(cx)); // Enter checks; it never saves
     }
   }
-  expire(){this.gate.expire();}
+  expire(){this.gate.expire();this.pendingFocus=null;this.focusTask?.cancel?.();}
   /** Puts the keyboard in a field once it is drawn; a refused check keeps the person in the field it names. */
   focusField(state,cx,{select=false}={}){
-    cx.timer?.after?.(0,next=>{state.focus?.();if(select)state.set_selected_range?.({start:0,end:String(state.value()??"").length});next.notify?.();});
+    this.pendingFocus={state,select};
   }
   homeText(){return String(this.homeInput.value()??"").trim();}
   homeWarning(){
@@ -47,6 +50,9 @@ export class AddMachinePanel {
   probeHome(cx){
     if(this.homeProbeTask)return this.homeProbeTask;
     if(typeof this.host.localFolderExists!=="function"||openrigHomeProblem(this.homeText())||this.gate.expired())return Promise.resolve();
+    // A real completion barrier, not Promise.resolve(TaskHandle). Publish it before
+    // running so an immediate no-op cannot overwrite its own finally cleanup.
+    let finish,fail;const completion=new Promise((resolve,reject)=>{finish=resolve;fail=reject;});this.homeProbeTask=completion;
     const run=async nextCx=>{
       try{
         while(!this.gate.expired()){
@@ -58,10 +64,12 @@ export class AddMachinePanel {
           if(this.gate.expired())return;
           if(this.homeProbeGen===gen&&this.homeText()===target){this.homeCheckedPath=target;this.homeExists=exists;nextCx?.notify?.();break;}
         }
-      }finally{this.homeProbeTask=null;}
+      }finally{if(this.homeProbeTask===completion)this.homeProbeTask=null;}
     };
-    this.homeProbeTask=cx?.spawn?Promise.resolve(cx.spawn(run)):run(cx);
-    return this.homeProbeTask;
+    // All callers supply a task context: input changes spawn in their event, while
+    // check/checkTunnel already run in tasks. Do not spawn from their late continuations.
+    run(cx).then(finish,fail);
+    return completion;
   }
   /** The box side, then the suggested tunnel: the next unused loopback with the box's own port, and the command to make it. */
   async check(cx){
@@ -80,7 +88,7 @@ export class AddMachinePanel {
       // What the person typed stays: a second check (after a refusal or an expired screen) never overwrites the field.
       if(!String(this.addressInput.value()??"").trim())this.addressInput.set_value?.(address??"");
       this.boxPort=found.port;this.found=found;this.phase="ready";
-      this.probeHome(cx);
+      await this.probeHome(cx);
       this.focusField(this.addressInput,cx,{select:true});
     }catch(error){this.phase="error";this.error=plainExecError(error,{machine:this.machine,kind:"remote"});}
     cx.notify();
@@ -101,7 +109,7 @@ export class AddMachinePanel {
       }catch(error){
         await homeCheck;
         this.phase="ready";
-        if(String(this.addressInput.value()??"").trim()===checkedAddress){this.tunnelError=String(error?.message??error);this.focusField(this.addressInput,cx);}
+        if(String(this.addressInput.value()??"").trim()===checkedAddress){this.tunnelError=errorDiagnostic(error);this.focusField(this.addressInput,cx);}
       }
       finally{this.busy=false;cx.notify();}
     });
@@ -117,25 +125,29 @@ export class AddMachinePanel {
         this.saved=saved;this.phase="done";
         try{await this.host.saved?.(saved);}catch(error){this.warning="Herdr couldn't update its own saved state for this connection.";}
       }catch(error){
-        this.phase="verified";this.error=error?.code==="CONFIG_CHANGED"?`${error.message} Reopen it and check again.`:String(error?.message??error);this.homeTouched=true;
+        this.phase="verified";this.error=error?.code==="CONFIG_CHANGED"?`${error.message} Reopen it and check again.`:errorDiagnostic(error);this.homeTouched=true;
         this.focusField(openrigHomeProblem(this.homeText())?this.homeInput:this.addressInput,cx);
       }
       finally{this.busy=false;cx.notify();}
     });
   }
   button(id,text,callback,{disabled=false,primary=false}={}){
+    const activation=activationPair(this,id);
     const handle=id==="add-machine-cancel"?this.cancelHandle:["add-machine-add","add-machine-check-again","add-machine-done-button"].includes(id)?this.primaryHandle:null;
     return div().id(`${id}-focus`).p(2).border(2).border_color("#00000000").rounded(7).role("button").tab_stop(!disabled)
       .when(!disabled&&!!handle,el=>el.track_focus(handle))
       .focus(el=>el.border_color(this.theme.accent))
-      .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}})
+      .on_mouse_down('left',activation.pointer())
+      .on_key_down(activation.key((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}}))
       .child(div().id(id).px(10).py(6).rounded(5).text_size(12).bg(primary?this.theme.accent:this.theme.raised)
         .text_color(primary?this.theme.solid_foreground:this.theme.foreground)
         .when(disabled,el=>el.opacity(.45)).when(!disabled,el=>el.cursor_pointer())
-        .on_click((_e,cx)=>{if(!disabled)callback(cx);}).child(text));
+        .on_mouse_down('left',activation.pointer()).on_click(activation.click((_e,cx)=>{if(!disabled)callback(cx);})).child(text));
   }
   render(t,cx){
     this.theme=t;
+    if(this.pendingFocus){const {state,select}=this.pendingFocus;this.pendingFocus=null;this.focusTask?.cancel?.();
+      this.focusTask=cx.timer?.after?.(0,next=>{if(this.gate.expired())return;state.focus?.();if(select)state.set_selected_range?.({start:0,end:String(state.value()??"").length});next.notify?.();});}
     const ready=["ready","tunnel","verified","saving"].includes(this.phase),done=this.phase==="done";
     const addressText=String(this.addressInput.value()??"").trim(),homeProblem=openrigHomeProblem(this.homeText()),homeWarning=this.homeWarning();
     const command=ready?tunnelCommand(addressText,this.boxPort,this.machine,this.picked?.target):null;
@@ -158,7 +170,7 @@ export class AddMachinePanel {
       .child(div().text_size(15).font_semibold().child(`Add ${this.machine}`));
     let body=v_flex().flex_1().min_h(0).overflow_y_scrollbar().gap(8);
     if(this.phase==="checking")body=body.child(div().id("add-machine-checking").text_color(t.muted).child(`◌ Checking Herdr machine ${this.machine} for OpenRig…`));
-    if(retry)body=body.child(div().id("add-machine-error").text_color(t.blocked).child(`✗ ${this.error}`));
+    if(retry)body=body.child(div().id("add-machine-error").text_color(t.blocked).child(errorBlock(this,t,"add-machine-error-detail",this.error,{where:"this computer"})));
     if(ready||done){
       body=body.child(div().child(`OpenRig also runs on ${this.machine}. This shows its rigs here too.`))
         .child(v_flex().gap(3).id("add-machine-checks")
@@ -168,15 +180,16 @@ export class AddMachinePanel {
         .child(div().text_color(t.muted).child("Address"))
         .child(Input.new(this.addressInput).id("add-machine-address"))
         .when(this.phase==="tunnel",el=>el.child(div().id("add-machine-tunnel-progress").text_color(t.muted).child(`◌ Checking ${addressText}…`)))
-        .when(!!this.tunnelError,el=>el.child(div().id("add-machine-tunnel-error").text_color(t.blocked).child(`✗ ${this.tunnelError}`)))
+        .when(!!this.tunnelError,el=>el.child(div().id("add-machine-tunnel-error").text_color(t.blocked).child(errorBlock(this,t,"add-machine-tunnel-error-detail",this.tunnelError,{where:"this computer",prefix:"✗ "}))))
         .when(!!this.verified,el=>el.child(div().id("add-machine-tunnel-ok").tooltip(`Host ${this.verified.selfHostId}`).text_color(t.working).child(`✓ Reaches ${this.machine}'s OpenRig (host ${shortHost(this.verified.selfHostId)})`)))
         .child(div().text_color(t.muted).child(`A tunnel from this computer to ${this.machine}. Herdr never creates it. Create it with:`))
         .child(command?h_flex().gap(8).items_start()
           .child(div().id("add-machine-command").flex_1().min_w(0).font_family(this.mono).text_size(11).child(command))
           .child(div().id("add-machine-copy-command").role("button").tab_stop(true).size(20).flex_none().cursor_pointer().tooltip("Copy the command")
             .when(!!this.copyHandles.Command,el=>el.track_focus(this.copyHandles.Command)).focus(el=>el.border(1).border_color(t.accent))
-            .on_click((_e,cx)=>cx.write_to_clipboard(command))
-            .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(command);}})
+            .on_mouse_down('left',activationPair(this,'add-machine-copy-command').pointer())
+            .on_click(activationPair(this,'add-machine-copy-command').click((_e,cx)=>cx.write_to_clipboard(command)))
+            .on_key_down(activationPair(this,'add-machine-copy-command').key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(command);}}))
             .child(svg(this.copyIcon).size(12).text_color(t.muted))):div().id("add-machine-no-address").text_color(t.muted).child(this.suggested?"The command appears when the address is a loopback address such as http://127.0.0.2:7433.":"No free loopback address was found. Type one yourself."))
         .child(div().text_color(t.muted).child("OpenRig home on this computer"))
         .child(Input.new(this.homeInput).id("add-machine-home"))
@@ -186,7 +199,7 @@ export class AddMachinePanel {
         .child(this.button("add-machine-check","Check",cx=>this.checkTunnel(cx),{disabled:this.busy||done}));
     }
     if(this.phase==="saving")body=body.child(div().id("add-machine-progress").text_color(t.muted).child("Saving…"));
-    if(ready&&this.error&&this.error!==homeProblem)body=body.child(div().id("add-machine-save-error").text_color(t.blocked).child(`✗ ${this.error}`));
+    if(ready&&this.error&&this.error!==homeProblem)body=body.child(div().id("add-machine-save-error").text_color(t.blocked).child(errorBlock(this,t,"add-machine-save-error-detail",this.error,{where:"this computer"})));
     if(done)body=body.child(div().id("add-machine-done").child(`✓ Added ${this.machine}. Its first Attach asks you to approve the helper there.`))
       .when(!!this.warning,el=>el.child(div().id("add-machine-warning").text_color(t.working).child(this.warning)));
     const footer=h_flex().gap(8).justify_end().flex_none();
@@ -209,7 +222,17 @@ export class AddMachineChooser {
     this.host=host;this.liveConfig=liveConfig;this.makePanel=makePanel;this.cancel=cancel;this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
     this.phase="loading";this.rows=[];this.error=null;this.panel=null;
   }
-  expire(){this.expired=true;this.panel?.expire?.();for(const handle of this.rowHandles??[])handle?.release?.();this.rowHandles=[];}
+  expire(){this.expired=true;this.focusTask?.cancel?.();this.panel?.expire?.();for(const handle of this.rowHandles??[])handle?.release?.();this.rowHandles=[];}
+  cycleFocus(forward,cx){
+    cx.stop_propagation();
+    const handles=[...(this.phase==="choose"?this.rowHandles??[]:[]),this.cancelHandle].map(liveFocus).filter(Boolean);
+    if(this.expired||this.panel||!handles.length)return;
+    const index=handles.findIndex(handle=>handle.is_focused?.());
+    const next=handles[index<0?(forward?0:handles.length-1):(index+(forward?1:-1)+handles.length)%handles.length];
+    // Created by the key/action entry point, using existing owned handles. Correct native Tab traversal after it runs.
+    this.focusTask?.cancel?.();
+    this.focusTask=cx.timer.after(16,nextCx=>{if(!this.expired&&!this.panel&&liveFocus(next)){next.focus();nextCx.notify();}});
+  }
   async load(cx){
     try{
       const live=this.liveConfig?.()??{},taken=[live.daemonMachine,...(live.connections??[]).map(c=>c?.machine)];
@@ -243,25 +266,30 @@ export class AddMachineChooser {
     this.theme=t;
     if(this.phase==="choose")this.rowHandlesFor(cx);
     const root=v_flex().id("add-machine-choose").size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
-      .on_key_down((event,cx)=>{if(event.key==="escape"){cx.stop_propagation();this.expire();this.cancel?.(cx);}})
+      .key_context("RigDialog").on_action("rig-dialog-next",(_e,cx)=>this.cycleFocus(true,cx)).on_action("rig-dialog-prev",(_e,cx)=>this.cycleFocus(false,cx))
+      .on_key_down((event,cx)=>{if(event.key==="tab"&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt)this.cycleFocus(!event.modifiers?.shift,cx);else if(event.key==="escape"){cx.stop_propagation();this.expire();this.cancel?.(cx);}})
       .child(div().text_size(15).font_semibold().child("Add a machine"));
     let body=v_flex().flex_1().min_h(0).overflow_y_scrollbar().gap(6);
     if(this.phase==="loading")body=body.child(div().id("add-machine-loading").text_color(t.muted).child("◌ Reading Herdr's machines…"));
-    else if(this.phase==="error")body=body.child(div().id("add-machine-choose-error").text_color(t.blocked).child(`✗ ${this.error}`));
+    else if(this.phase==="error")body=body.child(div().id("add-machine-choose-error").text_color(t.blocked).child(errorBlock(this,t,"add-machine-choose-error-detail",this.error,{where:"this computer"})));
     else if(!this.rows.length)body=body.child(div().id("add-machine-none").child("Every connected Herdr machine already has a connection."));
     else{
       body=body.child(div().text_color(t.muted).child("Machine"));
       for(const [i,row] of this.rows.entries())body=body.child(div().id(`add-machine-pick-${row.name}`).role("button").tab_stop(true).px(8).py(5).rounded(5).bg(t.raised).cursor_pointer()
         .when(!!this.rowHandles?.[i],el=>el.track_focus(this.rowHandles[i]))
         .focus(el=>el.border_1().border_color(t.accent))
-        .on_click((_e,cx)=>cx.spawn(cx=>this.choose(row,cx)))
-        .on_key_down((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}}).child(row.name));
+        .on_mouse_down('left',activationPair(this,`pick-${row.name}`).pointer())
+        .on_click(activationPair(this,`pick-${row.name}`).click((_e,cx)=>cx.spawn(cx=>this.choose(row,cx))))
+        .on_key_down(activationPair(this,`pick-${row.name}`).key((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}})).child(row.name));
     }
     const closeLabel=this.phase==="choose"&&this.rows.length?"Cancel":"Close";
     const close=div().id("add-machine-choose-close-focus").p(2).border(2).border_color("#00000000").rounded(7).role("button").tab_stop(true)
       .when(!!this.cancelHandle,el=>el.track_focus(this.cancelHandle)).focus(el=>el.border_color(t.accent))
-      .on_key_down((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();this.expire();this.cancel?.(cx);}})
-      .child(div().id("add-machine-choose-close").px(10).py(6).rounded(5).text_size(12).bg(t.raised).cursor_pointer().on_click((_e,cx)=>{this.expire();this.cancel?.(cx);}).child(closeLabel));
+      .on_mouse_down('left',activationPair(this,'choose-close').pointer())
+      .on_key_down(activationPair(this,'choose-close').key((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();this.expire();this.cancel?.(cx);}}))
+      .child(div().id("add-machine-choose-close").px(10).py(6).rounded(5).text_size(12).bg(t.raised).cursor_pointer()
+        .on_mouse_down('left',activationPair(this,'choose-close').pointer())
+        .on_click(activationPair(this,'choose-close').click((_e,cx)=>{this.expire();this.cancel?.(cx);})).child(closeLabel));
     return root.child(body).child(h_flex().gap(8).justify_end().flex_none().child(close));
   }
 }

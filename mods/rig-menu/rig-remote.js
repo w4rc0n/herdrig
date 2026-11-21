@@ -1,3 +1,4 @@
+import { errorDiagnostic } from "./rig-words.js";
 // The person's configured Herdr machine is the only remote authority. Daemon data never selects it.
 import { isLoopbackDaemonUrl, parseDaemonStatusJson, differentDaemons } from "./rig-lib.js";
 import { gateConfigGeneration } from "./rig-gate.js";
@@ -92,7 +93,7 @@ const machineStateWords = (state, name) => {
 };
 const machineFix = (state, name) => `hc machine ${state === "needs_update" ? "update" : "login"} ${name}`;
 export function remoteFailure(error, machine, { attach = false } = {}) {
-  const reason = String(error?.message ?? error);
+  const reason = errorDiagnostic(error);
   if (error?.machineNotice) return { ok: false, reason, machineNotice: error.machineNotice };
   const timeout = parseExecTimeout(error);
   if (timeout) {
@@ -502,7 +503,7 @@ export function machineSetupGate(host, machineName, picked = null) {
       text = await response.text();
     } catch (error) {
       if (error?.code === "NO_ANSWER" || error?.message?.startsWith("Nothing answers at")) throw nothing();
-      throw new Error(`Herdr couldn't check ${origin.replace(/^https?:\/\//, "")}: ${String(error?.message ?? error)}`); // a real failure is shown as one, never as "nothing answers"
+      throw new Error(`Herdr couldn't check ${origin.replace(/^https?:\/\//, "")}: ${errorDiagnostic(error)}`); // a real failure is shown as one, never as "nothing answers"
     }
     if (utf8Length(text) > JSON_READ_CAP) throw new Error(`${origin.replace(/^https?:\/\//, "")} answered with more than OpenRig's health ever holds.`);
     try { return JSON.parse(text); } catch (_) { throw new Error(`${origin.replace(/^https?:\/\//, "")} answered, but not like an OpenRig.`); }

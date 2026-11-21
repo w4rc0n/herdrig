@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.2
+Version: v0.5.3
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
@@ -132,16 +132,22 @@ use the duration threshold. Working evidence survives an app restart; separate s
 
 Before you install it: this mod **reaches OpenRig's local address** (`127.0.0.1:7433` unless that OpenRig uses another
 port) over HTTP and SSE (reads live state and, when you click an action, posts to OpenRig: Decision Card acts, a usage
-refresh, spec validation and library sync), **runs programs** (`rig`, `tmux` started directly by the mod's relay, never through a shell,
+refresh, update dismissals after their Undo window, spec validation, library sync and copied-folder renaming), **runs programs** (`rig`, `tmux` started directly by the mod's relay, never through a shell,
 `hc`, `node`, `printenv`/`realpath` for the spec editor's folders, and `test -d` when checking a typed OpenRig home folder), **reads files outside its own folder**: `<appHome>/openrig/config.json` (optional: the person's OpenRig
 name), `state.json`, and the spec/slice files you open in its file viewer (`SPEC.md`, `PROGRESS.md` and similar, from
 the folders OpenRig reports), and **writes** `<appHome>/openrig/state.json` plus the user spec file you edit and save
 in its spec editor (local edits stay in this machine's spec folders, symlinks resolved: OpenRig's spec library
 `<OpenRig home>/specs`, where the home is `openrigHome` if set, else `OPENRIG_HOME` in Herdr's environment, else
 `~/.openrig`, and the local `rig`'s `workspace.specs_root`; never a link out of them or a path only the daemon names).
+Layout discovery also reads `<appHome>/layouts/<name>.json`; Spaces-list compatibility reads
+`<appHome>/mods/spaces/main.js`. Connection and layout actions read and write their configuration and consent
+records under `<appHome>/openrig/`, as listed under **Built from**.
 Configured remote edits use the separate permission and pinned helper described above, on that machine's own
 resolved folders. Connection and consent records stay under `<appHome>/openrig/`; drafts are kept in Herdr's
-shared state. The temporary local `spec-transfer.txt` is removed after use.
+shared state. The temporary local `spec-transfer.txt` is removed after use. Each transfer and digest is checked against
+the intended text's SHA-256 before its remote write, so a concurrent window cannot send its text to your target.
+An orphan at least two minutes past its last write can be reclaimed; this is not an operation lease. A transfer that
+has been replaced refuses with "The spec transfer changed; nothing was sent" and can be retried with the draft kept.
 **Copy & edit** of a built-in rig supplied as a folder copies that folder, including `rig.yaml`, culture and
 startup files, through that machine's `rig specs add`. The helper checks that the source belongs to that machine's
 installed OpenRig built-ins; remote paths are never opened on this computer. The copy's agent references point
@@ -367,16 +373,22 @@ while open and keeping your draft) and idempotent `operationId` retry (**Check a
 OpenRig `0.7.9+`; on `< 0.7.9`, the card displays a one-line note that `decisionRevision` is absent and omits
 `expectedRevision`.
 
+If a health finding disappears before you open it, Needs offers a link to **System → Health** on that same OpenRig.
+
 **What writes to OpenRig.** When you act on a **Needs** Decision Card
 (**Approve**, **Deny with this reason**, **Send answers**, **Send as my answer**, or **Resolve with these words**),
 the mod `POST`s your decision to `/api/mission-control/action` (with `actorSession: "<name>@external"` when `person`
 is set in `<appHome>/openrig/config.json`, or `actorSession: "human@host"` and `authority: "primary-user"` when
-unattributed; never with an `X-OpenRig-Session` header). Clicking **Refresh** on per-host usage `POST`s
+unattributed; never with an `X-OpenRig-Session` header). **Dismiss** and **Dismiss all** also use this endpoint
+for queue updates addressed to the configured person, after a 10-second Undo window: `verb: "approve"`,
+reason `"dismissed in herdrig"`, with the expected revision checked. Clicking **Refresh** on per-host usage `POST`s
 `/api/provider/usage/hosts/refresh`. In the spec editor, clicking **Save** on a user spec validates the YAML with
 `POST /api/agents/validate` or `POST /api/rigs/import/validate`, writes that user spec file in place (limited to this
 machine's spec folders after resolving symlinks, or the separately approved folders on OpenRig's configured machine; built-in
 specs are not editable), and calls `POST /api/specs/library/sync` (which also runs
-after **Copy to library**). System → Configuration saves or resets one setting through `POST` or `DELETE`
+after **Copy to library**). Whole-folder **Copy & edit** also calls `POST /api/specs/library/:id/rename` to
+name the new copy (`<spec>-copy`, then `-copy-2`, and so on), including when resuming an unfinished copy.
+System → Configuration saves or resets one setting through `POST` or `DELETE`
 on `/api/config/:key`; environment-sourced and withheld instructions stay read-only. A saved boot setting can
 need a later restart, and Herdrig never restarts the daemon. Other actions run a `rig` command you could have typed (`rig send`, `rig queue`,
 `rig gateway human quiet|mode …`, `rig specs add …`, `rig snapshot`, `rig seat …`, `rig terminal …`, or
@@ -384,8 +396,11 @@ need a later restart, and Herdrig never restarts the daemon. Other actions run a
 
 ## Built from
 
-**Blocks.** Four mods, each a folder in `mods/`, each self-contained (its own `main.js`, `mod.json`, `rig-lib.js`, `rig-attach-relay.cjs`
-and the 24 `rig-*.svg` icons it draws), and one more folder, `rig-spaces`, Herdr's own Spaces list with rig marks (below) — this repo ships exactly these, and nothing else:
+**Blocks.** Four self-contained mods, each a folder in `mods/` with its own `main.js`, `mod.json`, the shared
+helpers reachable from its imports, and 41 `rig-*.svg` icons. The packaged JavaScript/CommonJS file counts are
+49 for `rig`, 61 for `rig-view`, 36 for `rig-palette`, and 43 for `rig-menu`; shared files outside a mod's import
+closure are not copied there. The fifth folder, `rig-spaces`, contains three packaged JavaScript files and three SVGs,
+Herdr's own Spaces list with rig marks (below). This repository ships these five mods:
 
 | Mod | `place` | Role |
 |---|---|---|
@@ -430,8 +445,9 @@ sidebar reads `rig-cell-header`'s pane props (`seat`, `title`, `views`) when the
 keeps working when it does not.
 
 **Herdr functions and commands it calls.** `run` (`tab.new`, `tab.select`, `tab.rename`, `layout.select`, `layout.resize`,
-`pane.split`, `pane.focus`, `pane.zoom`, `mod.open`), `shared` / `setShared`, `layout()`, `spaces()`, `panes()`,
-`terminals()`, `theme()`, `openOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`.
+`layout.clone`, `layout.set`, `tab.close`, `pane.close`, `pane.split`, `pane.focus`, `pane.zoom`, `mod.open`),
+`shared` / `setShared`, `layout()`, `layouts()`, `spaces()`, `panes()`, `terminals()`, `machines()`, `settings()`,
+`window()`, `home()`, `theme()`, `openOverlay`, `closeOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`.
 
 **Programs it runs.** `rig` (the OpenRig CLI — `rig ps`, `rig queue`, `rig gateway human quiet|mode …`, `rig terminal …`,
 `rig snapshot`, `rig seat …`, `rig specs …`, the rest of the one-click actions; after a confirmation, `rig down` to
@@ -452,22 +468,29 @@ that OpenRig uses another port), read from `rig status --json`, for local HTTP r
 `/api/gateway/participants`, `/api/gateway/human/*`, `/api/health`, `/api/scopes*`, `/api/specs/library`,
 `/api/terminal/*`, `/api/views/execution`, `/api/provider/usage*`, `/api/telemetry/usage/cost`, `/api/usage*`, `/api/config*`), subscribes to
 `/api/activity/events` (SSE) for live state, and sends local HTTP `POST` requests only when you click an action
-(`POST /api/mission-control/action` for **Needs** Decision Card acts — `approve`, `deny`, `answer`, `resolve`;
+(`POST /api/mission-control/action` for **Needs** Decision Card acts — `approve`, `deny`, `answer`, `resolve` —
+and update dismissals after their 10-second Undo window;
 `POST /api/provider/usage/hosts/refresh` when refreshing per-host usage; `POST /api/agents/validate` or
 `POST /api/rigs/import/validate` when validating a user spec edit; and `POST /api/specs/library/sync` on **Save** and
-after **Copy to library**; `POST`/`DELETE /api/config/:key` save/reset a setting). It **runs** the programs above; `rig` uses the person's existing OpenRig setup (its home,
+after **Copy to library**; `POST /api/specs/library/:id/rename` names a whole-folder copy, including a resumed
+unfinished copy; `POST`/`DELETE /api/config/:key` save/reset a setting). It **runs** the programs above; `rig` uses the person's existing OpenRig setup (its home,
 port and sign-in), and the mod reads none of OpenRig's own files. With a click, **Start OpenRig** runs
 `rig daemon start`. It **reads** `<appHome>/openrig/config.json` (optional: the person's OpenRig name),
 `<appHome>/openrig/state.json` (your saved sidebar folds, sibling order, `needsView`, `lastSeenNeedsAt`, and mode
 application IDs), and the spec/slice files you open in its file viewer (`SPEC.md`, `PROGRESS.md` and similar, from the
 folders OpenRig reports). It **writes** `<appHome>/openrig/state.json` and the user spec files you edit and save
 in its spec editor (only local user spec folders or separately approved remote folders; built-in specs are not editable).
-It also keeps connection, consent, dismissal and navigation state under `<appHome>/openrig/`, drafts in Herdr's
+It also **reads** `<appHome>/layouts/<name>.json` to discover old provider views and
+`<appHome>/mods/spaces/main.js` to check Spaces-list compatibility. Connection and consent actions **read and write**
+`<appHome>/openrig/config.json`, `machine-consent.json` and `spec-consent.json`; System → Layout reads and writes
+`<appHome>/openrig/spaces-list.json`. The consent filenames are also under `<appHome>/openrig/`.
+It keeps dismissal and navigation state under that same folder, drafts in Herdr's
 shared state, and removes temporary local spec transfer data after use. Configured-machine helper installation
 and execution use Herdr's existing connection and ordinary file/identity tools; approved spec text travels on
 stdin. The remote helper independently resolves allowed roots and checks prior bytes before replacement.
 
-**Art.** 24 SVGs in each mod folder (`rig-*.svg`), drawn to match Herdr's own `workspace-chrome` weight: a 1.5 px stroke
+**Art.** 41 `rig-*.svg` icons in each of the four main mod folders, plus three SVGs in `rig-spaces`,
+drawn to match Herdr's own `workspace-chrome` weight: a 1.5 px stroke
 on a currentColor fill, 16 px nominal, so they dim and tint with the theme rather than carrying colour.
 
 ## Watch out
@@ -478,15 +501,14 @@ Herdr-app [v0.1.16](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.16) 
 group and filter, never Idle. Explicit idle remains idle. Absolute times honour UTC/Etc/UTC exactly; other
 configured zones fall back to this computer's local time with a note in System → Configuration. Exact times
 include the instant's numeric offset. Relative ages are unchanged.
-**Worker views (OpenRig 0.7.12 and later).** With a live provider window, worker-view open, Show in worker view,
-and saved-view previews use OpenRig's herdr-app provider on the same machine as OpenRig. Availability is checked,
-not assumed from a version number. Provider views still close through `rig terminal close <view-id>` or their
-Herdr tab; with a custom app home pass the same `--app-home`. An open can keep spinning after its view appears;
-inspect the opened view before retrying into a duplicate.
+**Worker views.** **Worker view** opens the rig's live seats in ordinary Herdr tabs in the rig's own space,
+one tab per page. Herdr's close controls close a tile or page; seats keep running. Choosing Worker view again
+selects the open pages and reattaches ended viewers. **Show in worker view** focuses the seat's tile, in its
+worker page or the Seats tab. This works for this computer's OpenRig and a configured machine's alike;
+configured machines use the approved helper. Open the Rig sidebar before using a standalone page or palette.
 
-With `daemonMachine` configured and no provider window, **Worker view** opens Herdrig's pages here through
-the approved helper on that machine. Saved page geometry and read-only seats are preserved; commands in the
-preview are never run. Follow adds seats without rebuilding existing viewers. Optional **herdrig prune**
+Saved page geometry and read-only seats are preserved; commands in the preview are never run. Follow keeps
+the pages to seats that are working or need you, adding seats without rebuilding existing viewers. Optional **herdrig prune**
 (off by default) removes only verified, unfocused inactive viewers after 5, 10 or 30 minutes. Seats keep running;
 personal panes, changed viewers and restored shells stay. Stop following keeps the tiles. Refresh failures
 pause following with Retry and no local fallback. A changed read-only mode on a retained tile needs an explicit
@@ -494,9 +516,11 @@ close and reopen; live viewers are never silently replaced or relabelled. Design
 
 API/CLI compatibility was also smoke-tested on OpenRig 0.7.13, which includes attach-command session quoting (#2971). Herdrig still refuses session names outside its own safe charset.
 
-**Provider limits.** Follow and auto-prune for herdr-app, custom worker-view grids (`--grid`/`--replace`), and
-cell editing (`close --cell`) are not supported on upstream main yet. They stay disabled until the required support
-is added; the provider release alone will not enable them. No release date is promised.
+**Older provider views.** Use **Close OpenRig's old views** in the sidebar's System section to close older
+worker views with a pill strip. Its confirmation discovers saved layouts without switching layouts. If no local
+OpenRig can close them, close their Herdr tabs; seats keep running. A focused worker tile stays untouched;
+rebuilding another may open an additional numbered page, which the result explains. Provider-only grid and cell
+editing remain separate from Herdrig's built-in Follow and prune controls.
 
 What tripped this build up, and what a fresh build would get wrong:
 
@@ -536,9 +560,10 @@ What tripped this build up, and what a fresh build would get wrong:
   dialog without changing `DESIGN_SQUARE_PX` makes the drag drift from the pointer.
 - **The Page and the TUI are tabs, not modes.** There is no mode setting. If you find a `surface` key in a config,
   it is a leftover from an older build and is ignored.
-- **Capabilities are read, not assumed.** The mods disable controls from the live CLI's `--help` text. Follow
-  requires both herdr-app provider support and `--follow` plus `--prune-after`. A generic `--follow` option for
-  another terminal provider does not enable it here.
+- **Capabilities are read, not assumed.** Worker pages, saved views and Follow use OpenRig's worker-view planning
+  API (`/api/terminal/preview`, available from OpenRig 0.7.12). The live capability probe decides availability,
+  not the version number or a provider's `--follow` flag. Without planning support, Worker view opens the Seats
+  tab, and saved views and Follow stay disabled with a reason.
 - **What this build does not do.** It does not ship a layout (a mod repo must not), so it never owns your tab tree;
   it does not start the OpenRig daemon unless you click **Start OpenRig**, and it does not install OpenRig or seats.
 
@@ -567,9 +592,9 @@ Each of these is something this build really does:
    onto a pod in another rig → nothing happens.
 7. On a live seat, **Attach** → a tab named after the seat, and that seat listed under Herdr's **Agents** with a
    live badge; attach again → the same tab is focused, no second one appears.
-8. `rig terminal open --help` on the installed OpenRig lists `--follow` but **not** `--prune-after` → the Follow
-   and prune controls are disabled with their one-line reason rather than failing when used. That is the live
-   behaviour the capability probe reads, as described under **Capabilities are read, not assumed** in **Watch out**.
+8. With worker-view planning available, **Worker view** opens ordinary Herdr tabs and **Follow** keeps the
+   working and needs-you seats in view; closing a tile leaves its seat running. Without planning support,
+   Worker view opens the Seats tab and Follow and saved views explain why they are unavailable.
 9. Under **Needs**, expanding a human request renders the **Decision Card** (tier strip, `Open seat` link, option pills
    or own-words box, record sentence, and `What OpenRig recorded` fold), and clicking **Approve** or **Send as my
    answer** `POST`s `/api/mission-control/action` and settles the row without flashing the page; opening **System →

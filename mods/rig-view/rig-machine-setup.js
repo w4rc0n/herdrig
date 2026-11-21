@@ -1,3 +1,4 @@
+import { errorDiagnostic } from "./rig-words.js";
 // One approval owns helper installation, verification and the final local routing choice.
 // Host file operations are injected only for the two fixed app-home files, never from remote metadata.
 import {RemoteMachine} from "./rig-remote.js";
@@ -19,7 +20,7 @@ const sameDaemonAddress=(a,b)=>{
 // does, in v0.5.0): they refuse instead of saving a root key that nothing reads and reporting success.
 export const MACHINE_SETUP_LIST="This OpenRig is set up with a connections list in its configuration. Choosing its machine here comes with the next version, so nothing was changed.";
 const hasList=raw=>raw?.connections!==undefined&&raw?.connections!==null; // the loader's own rule: any value but absent or null is a list it refuses
-const errorText=error=>String(error?.message??error);
+const errorText=error=>errorDiagnostic(error);
 // With a list, the machine lives in the connection's own record. That record is the choice: when it already names this machine and this address
 // the approval is consent-only (the helper and its consent), and nothing in the config is written. Any other list is refused as before.
 const listedMachine=(raw,config,machine)=>{

@@ -3,17 +3,18 @@
 // over Herdr's connection is kept in its own file (openrig-consent.json), apart from spec saving and Attach.
 import { HerdrTransport, parseHerdrUrl } from './rig-openrig-http.js';
 import { RemoteOpenRig } from './rig-openrig-remote.js';
-import { registerHerdrTransport } from './rig-gate.js';
+import { registerHerdrTransport, gateGeneration } from './rig-gate.js';
 import { configOfConnection, consentOf, consentText, LEGACY_CONNECTION_ID } from './rig-connections.js';
 
 /** `env`: `{ execFor(scope), hcFor(scope), machines, wait, appHome(), readTextFile, writeTextFile, bridgePath(), config() }`: the mod's own gated
  *  exec and hc for a connection's scope, and its current config (it lists the connections). Returns the registered transport; its `release()` ends the registration (a view calls it when it closes). */
 export function installHerdrTransport(env) {
   const transport = new HerdrTransport({
+    generation: (scope) => gateGeneration(scope), // a write stops if its connection's settings change while it is staged
     connection: (scope, parsed) => {
       const conn = configOfConnection(env.config(), scope);
       // Only the address the connection itself names: a request built for another OpenRig sends nothing.
-      if (!conn || conn.daemonUrl !== parsed.origin || conn.daemonMachine !== parsed.machine) throw Error("That address isn't the connection it was sent for. Nothing was sent.");
+      if (!conn || conn.daemonUrl !== parsed.origin || conn.daemonMachine !== parsed.machine) throw Object.assign(Error("That address isn't the connection it was sent for. Nothing was sent."), { notSent: true });
       const id = conn.connectionId ?? LEGACY_CONNECTION_ID, file = `${env.appHome()}/openrig/openrig-consent.json`;
       const host = {
         exec: env.execFor(scope), hc: env.hcFor(scope),

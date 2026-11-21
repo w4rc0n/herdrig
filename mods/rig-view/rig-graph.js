@@ -3,7 +3,8 @@ import {h_flex,v_flex} from "gpui-base";
 import {settings} from "herdr";
 import {routeGraph,graphSeatPath,nearestGraphSeat,graphHeaderChips} from "./rig-graph-layout.js";
 import {GraphMotion,GRAPH_FADE_MS} from "./rig-graph-state.js";
-import {statusMarkElement,seatStatus,statusLook} from "./rig-lib.js";
+import {statusMarkElement,seatStatus,statusLook,counted} from "./rig-lib.js";
+import {statusWord} from "./rig-words.js";
 
 export const GRAPH_EDGE_LOOK={
   delegates_to:{width:1.5,color:"muted",head:"fill",word:"delegates"},
@@ -17,7 +18,6 @@ const look=kind=>GRAPH_EDGE_LOOK[kind]??{width:1,color:"dim",head:"open",word:ki
 const placed=(x,y,w,h)=>div().absolute().left(x).top(y).w(w).h(h);
 const direction=([ax,ay],[bx,by])=>by>ay?"down":by<ay?"up":bx>ax?"right":"left";
 const distance=(a,b)=>Math.abs(a[0]-b[0])+Math.abs(a[1]-b[1]);
-const counted=(n,word)=>`${n} ${word}${n===1?"":"s"}`;
 
 /** Square joints overlap by half a stroke; thin boxes keep the extra pixel required by GPUI. */
 export function graphPathElements(points,kind,t,assets,override={}){
@@ -45,6 +45,13 @@ export function graphPathElements(points,kind,t,assets,override={}){
     out.push(placed(end[0]+ox,end[1]+oy,vertical?8:6,vertical?6:8).child(svg(`${assets}/rig-arrow-${head}-${dir}.svg`).w_full().h_full().text_color(color)));
   }
   return out;
+}
+
+/** "N s" under a minute, then "N min", then "N h": the status line changes once a minute after the first, not every second. */
+export function handoffAgo(seconds) {
+  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
+  return `${Math.floor(seconds / 3600)} h`;
 }
 
 export class RigGraph{
@@ -123,7 +130,7 @@ export class RigGraph{
         .id(id+"-pod-meta-"+p.id));
       for(const seat of p.seats){const s=layout.ent[seat.lid],status=running?(seat.status??seatStatus(seat.node??{})):null;
         const needs=["blocked","needs_input","attention_required"].includes(status),parts=seat.lid.split("."),model=String(seat.model??"").split("/").at(-1),profile=["default","none"].includes(seat.profile)?null:seat.profile;
-        const card=placed(s.x,s.y,s.w,s.h).id(id+"-seat-"+seat.lid).px(9).py(7).rounded(6).bg(t.background).border_1().border_color(needs?t.blocked:emphasis===seat.lid?t.input:t.border).cursor_pointer()
+        const card=placed(s.x,s.y,s.w,s.h).id(id+"-seat-"+seat.lid).tooltip(running ? `Double-click to open ${seat.lid}'s page; right-click for its actions` : "Highlight this seat's edges").px(9).py(7).rounded(6).bg(t.background).border_1().border_color(needs?t.blocked:emphasis===seat.lid?t.input:t.border).cursor_pointer()
           .on_hover((on,cx)=>{this.hovered=on?seat.lid:null;cx.notify();})
           .on_mouse_down("left",(_e,cx)=>{cx.stop_propagation?.();focus?.focus?.();})
           .on_mouse_down("right",(_e,cx)=>{cx.stop_propagation?.();if(running)menu?.(seat);})
@@ -132,7 +139,7 @@ export class RigGraph{
             .child(h_flex().min_w(0).flex_1().child(div().text_size(12.5).text_color(t.dim).child(parts.shift()+"."))
               .child(div().truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(parts.join("."))))
             .when(running,e=>e.child(statusMarkElement({div,svg},t,status,{iconOf:name=>`${assets}/${name}.svg`}))));
-        card.child(h_flex().h(18).mt(3).gap(6).items_center().child(div().px(5).h(16).rounded(3).bg(t.raised).text_size(10.5).font_family(mono).text_color(t.muted).child(seat.runtime??"?"))
+        card.child(h_flex().h(18).mt(3).gap(6).items_center().child(div().px(5).h(16).rounded(3).bg(t.raised).text_size(10.5).font_family(mono).text_color(t.muted).child(statusWord(seat.runtime??"?","runtime")))
           .when(Boolean(model),e=>e.child(div().flex_1().truncate().text_size(11).text_color(t.dim).child(model)))
           .when(Boolean(profile),e=>e.child(div().text_size(11).text_color(t.muted).child("· "+profile))));
         if(emphasis===seat.lid)card.child(div().absolute().left(1).top(1).right(1).bottom(1).rounded(5).border_1().border_color(t.input));
@@ -145,14 +152,18 @@ export class RigGraph{
       }
     }
     const count=[counted(graph.seatCount??graph.pods.reduce((n,p)=>n+p.seats.length,0),"seat"),counted(graph.pods.length,"pod"),counted(graph.edges.length,"edge")].join(" · ");
-    const last=running&&this.motion.last,note=last?`Last handoff ${Math.max(0,Math.floor((now-Number(new Date(last.at)))/1000))} s ago: ${last.source??last.from} → ${last.target??last.to}`:count;
+    const last=running&&this.motion.last,note=last?`Last handoff ${handoffAgo(Math.max(0,Math.floor((now-Number(new Date(last.at)))/1000)))} ago: ${last.source??last.from} → ${last.target??last.to}`:count;
     const seat=emphasis&&layout.ent[emphasis];
     const detail=this.detail??(seat?[seat.lid,seat.runtime,seat.model,seat.profile,running?statusLook(seat.status??seatStatus(seat.node??{})).word:null,
       ...["pendingWorkCount","inProgressWorkCount","blockedWorkCount"].filter(k=>running&&Number.isFinite(seat.node?.[k])).map(k=>`${seat.node[k]} ${k==="pendingWorkCount"?"pending":k==="inProgressWorkCount"?"in progress":"blocked"}`)].filter(Boolean).join(" · "):null);
-    const legend=h_flex().gap(12).flex_wrap().children([...new Set(graph.edges.map(e=>e.kind))].map(kind=>h_flex().gap(5).items_center()
+    // The legend shrinks and wraps inside its own box at narrow widths (its items are fixed, so the row's shape depends on the width alone).
+    const legend=h_flex().id(id+"-legend").flex_shrink(1).min_w(0).flex_wrap().gap(12).children([...new Set(graph.edges.map(e=>e.kind))].map(kind=>h_flex().gap(5).items_center()
       .child(div().relative().w(24).h(10).children(graphPathElements([[0,5],[22,5]],kind,t,assets))).child(div().text_size(11).text_color(t.muted).child(look(kind).word))));
     return v_flex().w_full().rounded(8).border_1().border_color(t.border)
-      .child(h_flex().px(16).py(7).gap(12).items_center().flex_wrap().child(div().text_size(11.5).text_color(t.dim).truncate().child(detail??note)).child(div().flex_1()).child(legend))
+      // The row never wraps: the status keeps at least 120 px, takes what the legend leaves and ends in an ellipsis, so its length (it changes every
+      // second) never moves the legend.
+      .child(h_flex().id(id+"-header").px(16).py(7).gap(12).items_center()
+        .child(div().id(id+"-status").flex_1().min_w(120).text_size(11.5).text_color(t.dim).truncate().child(detail??note)).child(legend))
       .when(layout.dense,e=>e.child(div().px(16).text_size(11).text_color(t.dim).child("Grouped by pod; hover a seat for its own edges.")))
       .child(root);
   }

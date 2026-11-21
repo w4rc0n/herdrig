@@ -16,7 +16,7 @@
 // applies: its payload is read with rig-relay-payload.js and judged by the token after the script (test/relay-payload-parity.test.mjs pins that reading to the real relay).
 //
 // A refused call THROWS `GateRefusal`: every caller already has a catch for a failed request, and its message is the sentence for the person.
-import { LEGACY_CONNECTION_ID, NO_CONNECTION, UNKNOWN_CONNECTION, UNREADABLE_FORM, addressParts, unreadableAddress } from "./rig-connections.js";
+import { LEGACY_CONNECTION_ID, NO_CONNECTION, UNKNOWN_CONNECTION, UNREADABLE_FORM, addressParts, unreadableAddress, isKnownUnsentError } from "./rig-connections.js";
 import { decodeRelayToken, relayDaemonOrigin } from "./rig-relay-payload.js";
 import { isHerdrUrl, parseHerdrUrl } from "./rig-openrig-http.js";
 
@@ -147,6 +147,8 @@ const scopeFor = (id) => {
 // After an await: the answer belongs to the config (the scope's identity) it was asked under.
 const stillCurrent = (s, started) => { if (!loaded) throw new GateRefusal(CONFIG_LOADING); if (invalid) throw new GateRefusal(invalid); if (!s.open) throw new GateRefusal(UNKNOWN_CONNECTION); if (started !== s.generation) throw new GateRefusal(CONFIG_CHANGED); };
 // The same check AFTER the thing was sent: its refusal says so (the outcome is unconfirmed, not "not sent").
+// A failure known to have sent nothing (isKnownUnsentError: notSent, a gate refusal before sending, an exec that never started) is checked with
+// stillCurrent instead, so its refusal stays known-unsent.
 const stillCurrentAfterSend = (s, started) => { try { stillCurrent(s, started); } catch (error) { if (error instanceof GateRefusal) error.dispatched = true; throw error; } };
 const before = (s, since) => { if (since !== undefined && since !== s.generation) throw new GateRefusal(CONFIG_CHANGED); return since ?? s.generation; };
 
@@ -179,7 +181,7 @@ export function registerHerdrTransport(transport, { bridgePath = null } = {}) {
   herdrRegistrations.push(entry);
   return () => { const at = herdrRegistrations.indexOf(entry); if (at >= 0) herdrRegistrations.splice(at, 1); };
 }
-const BRIDGE_MODES = ["inspect", "prepare", "remove", "install", "post", "rig"];
+const BRIDGE_MODES = ["inspect", "prepare", "remove", "install", "stat", "post", "rig"]; // stat: the read-only check of the installed helper before each read
 /** The local OpenRig bridge, exactly: a Node binary running THIS mod's registered bridge file in one of its fixed modes, with no OPENRIG_* in the argv.
  *  It names no OpenRig address of its own (it reaches the machine with hc exec and checks the machine, the pinned helper and the host id itself), so it is
  *  not judged as the rig CLI: its "rig" mode is the helper's fixed write verb, not the CLI, and a write's values (a rig named "rig", a message "rig") are
@@ -193,7 +195,7 @@ export const HERDR_NOT_READY = "This connection reaches OpenRig over Herdr's con
 /** Over Herdr's connection the rig CLI can't start a process here (a TUI tab, a terminal view): only the helper's writes are carried. */
 export const HERDR_PROCESS_REFUSED = "This isn't available over Herdr's connection yet. Nothing was sent.";
 const herdrCli = (value) => flatten(value).some((t) => t.startsWith("OPENRIG_URL=herdr://"));
-const herdrCliRun = async (command, args, scope) => { const transport = liveHerdr(scope)?.transport; if (!transport?.cli) throw new Error(HERDR_NOT_READY); return transport.cli(command, args, scope); };
+const herdrCliRun = async (command, args, scope) => { const transport = liveHerdr(scope)?.transport; if (!transport?.cli) throw Object.assign(new Error(HERDR_NOT_READY), { notSent: true }); return transport.cli(command, args, scope); };
 /** Two listed OpenRigs on one machine: v0.5.0 reaches each added machine's default OpenRig, so it can't tell them apart there. */
 export const TWO_ON_ONE_MACHINE = (machine) => `Two OpenRigs on ${machine} need a home for each; this version supports one per machine. Nothing was sent.`;
 /** A connection whose own address herdrig can't check (see `addressParts`): said as that, not as a request built for another OpenRig. */
@@ -331,10 +333,10 @@ export async function gatedFetch(url, init, since, scope) {
   let response;
   // A request that fails after the settings changed failed for the old settings: the caller gets the gate's refusal, never an ordinary error.
   try {
-    if (isHerdrUrl(String(url))) { const transport = liveHerdr(s.id, String(url))?.transport; if (!transport) throw new Error(HERDR_NOT_READY); response = await transport.fetch(String(url), init, s.id); }
+    if (isHerdrUrl(String(url))) { const transport = liveHerdr(s.id, String(url))?.transport; if (!transport) throw Object.assign(new Error(HERDR_NOT_READY), { notSent: true }); response = await transport.fetch(String(url), init, s.id); }
     else response = await globalThis.fetch(url, init);
   }
-  catch (error) { stillCurrentAfterSend(s, started); throw error; }
+  catch (error) { (isKnownUnsentError(error) ? stillCurrent : stillCurrentAfterSend)(s, started); throw error; }
   stillCurrentAfterSend(s, started);
   return wrapFetchResponse(response, s, started);
 }
@@ -351,13 +353,33 @@ export async function gatedLocalHealth(url, since, scope) {
   try { response = await globalThis.fetch(url); }
   catch (error) { stillCurrentAfterSend(s, started); throw error; }
   stillCurrentAfterSend(s, started);
+  if (response?.url !== url) throw new GateRefusal("That local health check redirected or did not confirm its final address, so its answer was not used.", { dispatched: true });
   return wrapFetchResponse(response, s, started);
 }
 
+const SPEC_BRIDGE_MODS = ["rig", "rig-view", "rig-palette", "rig-menu"];
+/** Local cleanup of the private spec-transfer scratch file (`node <appHome>/mods/<mod>/rig-spec-transport.cjs remove <appHome> [--if-empty]`):
+ *  talks to no daemon, starts nothing on a machine, and carries no OPENRIG_* env, so a refused, closed or changed scope
+ *  still removes the file a transfer created before the refusal. */
+const isLocalSpecTransferCleanup = (command, args, on, appHome) => {
+  if (!(on === undefined || on === null || on === "")) return false;
+  const cmd = String(command ?? "");
+  const nodeOk = cmd === "node" || (cmd.startsWith("/") && !cmd.includes("\0") && !cmd.split("/").some((s) => s === "." || s === "..") && /\/node$/.test(cmd));
+  if (!nodeOk || !Array.isArray(args)) return false;
+  if (!(args.length === 3 || (args.length === 4 && args[3] === "--if-empty")) || args[1] !== "remove") return false;
+  if (typeof appHome !== "string" || args[2] !== appHome) return false;
+  const home = typeof args[2] === "string" && args[2].startsWith("/") && !args[2].includes("\0") && !args[2].split("/").some((s) => s === "." || s === "..")
+    ? args[2].replace(/\/+$/, "")
+    : null;
+  if (!home || !SPEC_BRIDGE_MODS.some((m) => args[0] === `${home}/mods/${m}/rig-spec-transport.cjs`)) return false;
+  return !flatten([command, args]).some((t) => /^OPENRIG_[A-Z_]+=/.test(String(t)));
+};
+
 /** A process run for the mod (the OpenRig CLI is `env ... rig ...`). Local utilities pass; everything else names an OpenRig and is checked against the scope. */
-export async function gatedExec(rawExec, command, args, options, since, scope) {
+export async function gatedExec(rawExec, command, args, options, since, scope, appHome) {
   const on = options && typeof options === "object" ? options.on : undefined;
-  const local = (basename(command) !== "test" || !on) && NON_DAEMON_COMMANDS.includes(basename(command));
+  const local = ((basename(command) !== "test" || !on) && NON_DAEMON_COMMANDS.includes(basename(command)))
+    || isLocalSpecTransferCleanup(command, args, on, appHome);
   let s = null, started = 0;
   if (!local) {
     s = scopeFor(scope); started = before(s, since);
@@ -372,7 +394,7 @@ export async function gatedExec(rawExec, command, args, options, since, scope) {
   // read as "that command does not work, use the default".
   // A rig CLI aimed at an OpenRig over Herdr's connection never runs here: the transport carries it to the helper's rig verb on the machine.
   try { result = !local && herdrCli([command, args]) ? await herdrCliRun(command, args, s.id) : await rawExec(command, args, options); }
-  catch (error) { if (!local) stillCurrentAfterSend(s, started); throw error; }
+  catch (error) { if (!local) (isKnownUnsentError(error) ? stillCurrent : stillCurrentAfterSend)(s, started); throw error; }
   if (!local) stillCurrentAfterSend(s, started);
   return result;
 }

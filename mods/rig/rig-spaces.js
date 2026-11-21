@@ -1,3 +1,4 @@
+import { errorDiagnostic } from "./rig-words.js";
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
 import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8, rigSeatServers } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure, goodHome, herdrIdentityOf } from "./rig-remote.js";
@@ -244,7 +245,7 @@ export class RigSpaces {
       if(old&&kept.length)host.run("space.rename",{id:old.id,name:`${rig.name} · this computer`});
       const collision=get(host,"spaces").some(s=>s.id!==approved.source&&s.id!==result.space&&s.name===rig.name);
       host.run("space.rename",{id:result.space,name:collision?`${rig.name} · ${config.daemonMachine}`:rig.name});
-    }catch(error){namingError=String(error?.message??error);}
+    }catch(error){namingError=errorDiagnostic(error);}
     this.closed.add(`${origin(config)}||${rig.name}`); // Polling must never rebuild the retired Local grid.
     const personal=kept.filter(p=>!approved.tiles.some(t=>t.pane===p.pane));
     return {...result,relocated:true,oldSpace:approved.source,count:closed.length,changed,changedReasons,failed,
@@ -333,7 +334,7 @@ export class RigSpaces {
       const found = resolveRigSpace(host, config, [rig.id, rig.name], vouch);
       if (found) {
         try { await markRigSpace(host, config, [rig.id, rig.name], found, { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) }); }
-        catch (error) { return { ok: false, reason: String(error?.message ?? error) }; }
+        catch (error) { return { ok: false, reason: errorDiagnostic(error) }; }
         space = found;
       } else {
         // Several page-only spaces of this rig: ask, never guess which one is its space (nothing is built).
@@ -344,7 +345,7 @@ export class RigSpaces {
     if (space && machine && !adoption.space) {
       // Found across a different loopback spelling of the same daemon (confirmed by its own session list): label it with today's address.
       try { await markRigSpace(host, config, [rig.id, rig.name], space, { sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) }); }
-      catch (error) { return { ok: false, reason: String(error?.message ?? error) }; }
+      catch (error) { return { ok: false, reason: errorDiagnostic(error) }; }
     }
     if (!space && explicit && machine) {
       const other = unconfirmedRigSpace(host, config, [rig.id, rig.name], { markedOnly: true, strictOrigin: true, sessions: rigSessions(rig), servers: rigSeatServers(rig), hostId: daemonHostId(host) });
@@ -436,7 +437,7 @@ export class RigSpaces {
       }
       return { hc: hcTuple, list };
     };
-    let plan = null, remote = null, expectedMachine = { hc: null, list: null };
+    let plan = null, remote = null, expectedMachine = { hc: null, list: null }, fromFastPath = false;
     if (!rebuild && space && !this.needsVerify.has(key) && this.done.has(key) && this.doneMeta.has(key)) {
       currentStep = "checking existing grid";
       const cur = index();
@@ -496,6 +497,7 @@ export class RigSpaces {
           if (identityCurrent) {
             expectedMachine = meta.expectedMachine ?? { hc: null, list: null };
             plan = fastPlan;
+            fromFastPath = true;
           }
         }
       }
@@ -632,17 +634,22 @@ export class RigSpaces {
       // A grid this sidebar didn't build in this session (it was built before Herdr or the sidebar restarted) is taken as built when every pane in
       // its tab is a viewer this mod labelled and the viewers are exactly the plan's tiles. Otherwise each background sync rebuilt a healthy grid, or,
       // while the person had that grid in front of them, deferred the rebuild and forgot the grid again, so every refresh repeated the remote check.
+      // What the fast path needs to reuse this grid later: this sync's own machine details and the settings it ran under.
+      const recordBuilt = () => this.doneMeta.set(key, {
+        selfHostId: remote?.selfHostId ?? host.selfHostId?.(),
+        node: remote?.node ?? null,
+        relayPath: remote?.relayPath ?? null,
+        gateToken,
+        expectedMachine,
+      });
       if (!rebuild && tab && !this.done.has(key) && !stale.length && this.isPlannedGrid(plan, tabPanes(), index())) {
         this.done.set(key, stamp());
-        this.doneMeta.set(key, {
-          selfHostId: remote?.selfHostId ?? host.selfHostId?.(),
-          node: remote?.node ?? null,
-          relayPath: remote?.relayPath ?? null,
-          gateToken,
-          expectedMachine,
-        });
+        recordBuilt();
       }
       if (!rebuild && tab && this.done.get(key) === stamp()) {
+        // A reuse found by the slow path (after a settings change, or a machine check) records what it just checked, so the next sync can take the fast
+        // path again. The fast path checked nothing new and keeps the record it read.
+        if (!fromFastPath) recordBuilt();
         if (explicit && !machine) {
           step("checking tmux sessions", false);
           const preflight = await localGridPreflight(host, plan);

@@ -1,4 +1,6 @@
 import { div, svg } from "gpui-kit";
+import {activationPair} from './rig-activation.js';
+import { errorBlock } from "./rig-error-view.js";
 import { h_flex, v_flex, InputState, Input, Select, Popup } from "gpui-base";
 import { configRows, iconsAt, requestFailed } from "./rig-lib.js";
 import { ConfigEditor, PRESSURE_WARNING, PRESSURE_CRITICAL } from "./rig-config-editor.js";
@@ -22,7 +24,7 @@ export class ConfigPanel {
    *  panel then has no origin and sends nothing; it never falls back to another connection (the first one above all). */
   cfg() { return typeof this.page.activeConfig === "function" ? this.page.activeConfig() : this.page.config; }
   origin() { return this.cfg()?.daemonUrl ?? ""; }
-  identity() { const c=this.cfg();return JSON.stringify([this.origin(),c?.daemonMachine??null,c?.connectionId??null]); }
+  identity() { const c=this.cfg();return JSON.stringify([this.origin(),c?.daemonMachine??null,c?.connectionId??null,c?.expectedHostId??null]); } // a changed host id is another OpenRig: another identity, nothing sent under the old
   daemonNameOf(identity) { try { const [origin,machine]=JSON.parse(identity);return machine||`the OpenRig at ${String(origin??"").replace(/^https?:\/\//,"")}`; } catch (_) { return "the earlier OpenRig"; } }
   /** The gate scope the bound identity was taken under: every send of a save or a reconcile names it. */
   scopeOf(identity) {
@@ -163,7 +165,9 @@ export class ConfigPanel {
         token=beginConfigReconcile(identity,record,this.writeOwner);
         let result;
         if(token){
-          request=configOperationRequest(op.fetch,(ms,fn)=>next.timer.after(ms,fn));
+          // Reconciliation resumes after a raw write settles, outside this view's call.
+          // Its bounded deadline has no ambient view owner and is cancelled in finally.
+          request=configOperationRequest(op.fetch,(ms,fn)=>next.timer.after(ms,fn,{owner:null}));
           const data=await this.refresh(origin,request,model,identity);
           finishConfigReconcile(identity,record,token,data);result={ok:true,data};
         }else result=await configReconcileResult(record);
@@ -228,10 +232,12 @@ export class ConfigPanel {
           this.watchWrites(cx,{origin,model,identity,rejected,op});
         }
       }
-      if(request.expired()&&this.model===model&&!model.row){this.open(pending.changes[0][0],cx);if(model.row)model.row.error=CONFIG_SAVE_TIMEOUT;}
-      if(this.model===model){
-        if (!model.row) {this.releaseInputs();const key=this.nextKey;this.nextKey=null;if(key)this.open(key,cx);}
-        else {this.nextKey=null;this.focusField(model.row.key,cx);}
+      // After the save's awaits: what opens or takes focus next is made by the panel's next draw (afterSave), never here, where its inputs and
+      // focus handles would belong to whichever view drained the promise jobs.
+      if(request.expired()&&this.model===model&&!model.row)this.afterSave={model,open:pending.changes[0][0],error:CONFIG_SAVE_TIMEOUT};
+      else if(this.model===model){
+        if (!model.row) {this.releaseInputs();const key=this.nextKey;this.nextKey=null;if(key)this.afterSave={model,open:key};}
+        else {this.nextKey=null;this.afterSave={model,focus:model.row.key};}
       }
       cx.notify();
     });
@@ -284,18 +290,19 @@ export class ConfigPanel {
     if(event.is_held||this.keyboardLatches.get(id)===event.key)return;
     this.keyboardLatches.set(id,event.key);fn({},cx);
   }
-  focusControl(t,cx,id,child,fn,{disabled=false,handle,tabStop=true,onKey,writeActivation=true}={}){
+  focusControl(t,cx,id,child,fn,{disabled=false,handle,tabStop=true,onKey,writeActivation=true,tip}={}){
+    const paired=activationPair(this,id);
     handle??=this.focusHandle(id,cx);
     if(!disabled&&tabStop)this.controlOrder?.push(handle);
-    return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role('button')
+    return div().id(`${id}-focus`).when(!!tip,el=>el.tooltip(tip)).p(2).border(2).border_color('#00000000').rounded(7).role('button')
       .when(!!handle,el=>el.track_focus(handle)).tab_stop(!disabled&&tabStop).focus(el=>el.border_color(t.accent))
-      .on_key_down((event,ctx)=>{
+      .on_mouse_down('left',paired.pointer()).on_key_down(paired.key((event,ctx)=>{
         if(onKey?.(event,ctx))return;
         if(disabled)return;
         // Reversible navigation does not share the persistent write latch.
         if(!writeActivation){if(['enter','space',' '].includes(event.key)){ctx.stop_propagation();if(!event.is_held)fn({},ctx);}return;}
         this.keyboardAction(id,event,ctx,fn);
-      }).child(child);
+      })).child(child);
   }
   tabControl(backward,cx){
     this.keyboardLatches?.clear();
@@ -305,7 +312,9 @@ export class ConfigPanel {
     handles[next].focus();cx.notify();return true;
   }
   action(t,cx,id,label,fn,options={}) {
-    const child=this.page.button(t,id,label,(event,ctx)=>{this.keyboardLatches?.delete(id);fn(event,ctx);},{small:true,...options})
+    const paired=activationPair(this,id);
+    const child=this.page.button(t,id,label,paired.click((event,ctx)=>{this.keyboardLatches?.delete(id);fn(event,ctx);}),{small:true,...options})
+      .on_mouse_down('left',paired.pointer())
       .when(options.primary&&!options.disabled,el=>el.bg(t.accent).text_color(t.solid_foreground).hover(s=>s.bg(t.accent)));
     return options.keyboard===false?child:this.focusControl(t,cx,id,child,fn,options);
   }
@@ -315,7 +324,7 @@ export class ConfigPanel {
     const active=focused<0?Math.max(0,values.indexOf(value)):focused;
     return h_flex().id(`config-choices-${field}`).gap(4).flex_wrap().children(values.map((choice,index)=>
       this.action(t,cx,`config-choice-${field}-${choice||'unset'}`,choice||'unset',(_e,ctx)=>this.choose(field,choice,ctx),{
-        primary:value===choice,disabled,handle:handles[index],tabStop:index===active,
+        tip:`Set ${field} to ${choice||'unset'} and save`,primary:value===choice,disabled,handle:handles[index],tabStop:index===active,
         onKey:(event,ctx)=>{
           if(event.key!=='left'&&event.key!=='right')return false;
           ctx.stop_propagation();handles[Math.max(0,Math.min(values.length-1,index+(event.key==='right'?1:-1)))]?.focus();ctx.notify();return true;
@@ -327,15 +336,17 @@ export class ConfigPanel {
     return `${bounds}${def.unit?' '+def.unit:''} · default ${this.model.entry(field)?.defaultValue??'unset'}`;
   }
   cancelReview(cx){this.model.cancelConfirmation();this.focusField(this.model.row?.key,cx);cx.notify();}
-  reviewAction(t,id,label,fn,handle,{disabled=false,primary=false,destructive=false}={}){
+  reviewAction(t,id,label,fn,handle,{disabled=false,primary=false,destructive=false,tip}={}){
+    const paired=activationPair(this,id);
     if(!disabled)this.controlOrder?.push(handle);
     const model=this.model,review=model.confirmation,activation=key=>['enter','space',' '].includes(key);
-    return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role('button')
+    return div().id(`${id}-focus`).when(!!tip,el=>el.tooltip(tip)).p(2).border(2).border_color('#00000000').rounded(7).role('button')
       .when(!!handle&&!disabled,el=>el.track_focus(handle)).tab_stop(!disabled).focus(el=>el.border_color(t.accent))
       // Cancel-first is the repeat safety boundary. This release gate is secondary; explicit Tab navigation arms it too.
       .on_key_up((event,cx)=>{if((activation(event.key)||event.key==='tab')&&this.model===model&&model.confirmation===review){cx.stop_propagation();this.releasedReviews.add(review);}})
-      .on_key_down((event,cx)=>{if(activation(event.key)){cx.stop_propagation();if(!disabled&&!event.is_held&&this.model===model&&model.confirmation===review&&this.releasedReviews.has(review))fn({},cx);}})
-      .child(this.action(t,null,id,label,fn,{disabled,primary,keyboard:false}).when(destructive,el=>el.bg(t.blocked).text_color(t.solid_foreground).hover(s=>s.bg(t.blocked))));
+      .on_mouse_down('left',paired.pointer())
+      .on_key_down(paired.key((event,cx)=>{if(activation(event.key)){cx.stop_propagation();if(!disabled&&!event.is_held&&this.model===model&&model.confirmation===review&&this.releasedReviews.has(review))fn({},cx);}}))
+      .child(this.action(t,null,id,label,fn,{disabled,primary,keyboard:false,tip}).when(destructive,el=>el.bg(t.blocked).text_color(t.solid_foreground).hover(s=>s.bg(t.blocked))));
   }
 
   select(t,cx,field,def,value) {
@@ -343,7 +354,7 @@ export class ConfigPanel {
     this.controlOrder?.push(open?handles.list:handles.trigger);
     const choose=(choice,cx)=>{this.choose(field,choice,cx);cx.notify();};
     const trigger=h_flex().id(`config-select-trigger-${field}`).gap(8).px(8).h(28).items_center().rounded(5).border_1().border_color(t.border)
-      .cursor_pointer().on_click((_e,cx)=>{
+      .tooltip(`Choose a value for ${field}`).cursor_pointer().on_click((_e,cx)=>{
         this.dropdown=open?null:field;this.highlight=Math.max(0,def.choices.indexOf(value));
         if(!open)cx.timer.after(0,next=>{if(this.dropdown===field)handles.list.focus();next.notify();});
         else handles.trigger.focus();cx.notify();
@@ -353,7 +364,7 @@ export class ConfigPanel {
         if(event.key==="up"||event.key==="down"){
           cx.stop_propagation();this.highlight=((this.highlight??0)+(event.key==="down"?1:-1)+def.choices.length)%def.choices.length;cx.notify();
         }else if(event.key==="enter"){cx.stop_propagation();choose(def.choices[this.highlight??0],cx);}
-      }).children(def.choices.map((choice,index)=>this.action(t,cx,`config-option-${field}-${index}`,choice||"unset",(_e,cx)=>choose(choice,cx),{primary:this.highlight===index,keyboard:false})
+      }).children(def.choices.map((choice,index)=>this.action(t,cx,`config-option-${field}-${index}`,choice||"unset",(_e,cx)=>choose(choice,cx),{primary:this.highlight===index,keyboard:false,tip:`Set ${field} to ${choice||'unset'} and save`})
         .role("list_box_option").aria_selected(value===choice).when(this.highlight===index,el=>el.aria_active_descendant())));
     return Select.new(`config-select-${field}`).accessibility_label(field).open(open).track_focus(handles.trigger)
       .content_focus_handle(handles.list).on_open_change((next,cx)=>{
@@ -398,6 +409,17 @@ export class ConfigPanel {
 
   render(t,cx,browser,probe,scope={}) {
     this.controlOrder=[];
+    // What a save asked to open or focus next: made through a timer set from this draw, so its inputs and focus handles are the page's own.
+    if(this.afterSave&&!this.afterSaveTimer&&cx?.timer?.after){
+      this.afterSaveTimer=true;
+      cx.timer.after(0,next=>{
+        this.afterSaveTimer=false;const want=this.afterSave;this.afterSave=null;
+        if(!want||this.disposed||this.model!==want.model||!next)return;
+        if(want.open){this.open(want.open,next);if(want.error&&this.model.row)this.model.row.error=want.error;}
+        else if(want.focus&&this.model.row?.key===want.focus)this.focusField(want.focus,next);
+        next.notify?.();
+      });
+    }
     this.sync(this.origin(),browser,probe);
     const m=this.model, ownRows=configRows(browser,scope), filter=String(this.page.filter ?? "").toLowerCase();
     const pinned=new Set([...(m.row?.keys??[]),...(m.confirmation?.changes.map(([key])=>key)??[])]);
@@ -406,9 +428,9 @@ export class ConfigPanel {
     const editable=rows.filter(({entry})=>!this.definition(entry).readOnly).length;
     const out=[div().id("config-edit-summary").text_size(11.5).text_color(t.muted).child(`${editable} settable · ${rows.length-editable} read-only`)];
     const writePause=this.writePauseState();
-    if(writePause?.uncertain)out.push(div().id('config-write-paused').text_size(12).text_color(writePause.ownerClosed||writePause.failed?t.blocked:t.working).child(writePause.reason));
+    if(writePause?.uncertain)out.push(div().id('config-write-paused').text_size(12).text_color(writePause.ownerClosed||writePause.failed?t.blocked:t.working).child(errorBlock(this,t,"config-write-paused-detail",writePause.reason)));
     if (!this.detected) out.push(div().id("config-edit-unavailable").text_size(11.5).text_color(t.dim)
-      .child(probe?.status ? configWriteError(probe.status,probe.errorData)
+      .child(probe?.status ? errorBlock(this,t,"config-probe-error",configWriteError(probe.status,probe.errorData))
         : "This OpenRig hasn't confirmed support for editing settings from Herdr. Use rig config set on that machine."));
     if(this.frozenDraft){
       const d=this.frozenDraft,text=d.values.map(([k,v])=>`${k} = ${v}`).join("\n");
@@ -418,11 +440,11 @@ export class ConfigPanel {
         .child(h_flex().gap(8).items_center()
           .child(h_flex().id("config-connection-draft-copy").gap(4).items_center().child(this.page.copyButton(t,text,"config-connection-draft","my text")).child(div().text_size(12).text_color(t.muted).child("Copy my text")))
           .child(this.focusControl(t,cx,"config-connection-draft-dismiss",
-            div().id("config-connection-draft-dismiss").px(6).py(2).rounded(4).text_size(12).text_color(t.muted).cursor_pointer().hover(s=>s.bg(t.hover))
+            div().id("config-connection-draft-dismiss").tooltip('Hide this note; your copied text stays on the clipboard').px(6).py(2).rounded(4).text_size(12).text_color(t.muted).cursor_pointer().hover(s=>s.bg(t.hover))
               .on_click((_e,ctx)=>{this.keyboardLatches?.delete("config-connection-draft-dismiss");this.frozenDraft=null;ctx.notify();}).child("Dismiss"),
             (_e,ctx)=>{this.frozenDraft=null;ctx.notify();}))))
     }
-    if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(m.errorTone==='working'?t.working:t.blocked).child(m.error));
+    if(m.error&&!writePause?.uncertain)out.push(div().id("config-edit-error").text_size(12).text_color(m.errorTone==='working'?t.working:t.blocked).child(errorBlock(this,t,"config-edit-error-detail",m.error)));
     if(this.reconciledModel===m){
       const rejected=this.reconciledRejectedModel===m,message=rejected?(this.reconciledRejectedText??configRejectedSaveResidual()):'OpenRig’s current settings were checked. Review your draft before saving again.';
       out.push(div().id('config-write-recovered').text_size(11.5).text_color(rejected?t.working:t.muted).tooltip(message).child(message));
@@ -440,9 +462,10 @@ export class ConfigPanel {
       const row=v_flex().id(`config-row-${key}`).p(8).gap(5).rounded(6)
         .when(!!rowHandle,el=>el.track_focus(rowHandle)).tab_stop(false)
         .when(editing,el=>el.bg(t.raised)).when(selected,el=>el.border_l(2).border_color(t.accent))
-        .on_click((_event,ctx)=>{this.selectRow(key,ctx);ctx.notify();})
-        .on_key_down((event,ctx)=>{if(event.key==="escape"&&editing){ctx.stop_propagation();this.cancel(ctx);}
-          else if(['enter','space',' '].includes(event.key)&&selected&&this.hasSelection()&&!readOnly&&!editing){ctx.stop_propagation();this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>this.activate(entry,ctx));}});
+        .on_mouse_down('left',activationPair(this,`config-row-${key}`).pointer())
+        .on_click(activationPair(this,`config-row-${key}`).click((_event,ctx)=>{this.selectRow(key,ctx);ctx.notify();}))
+        .on_key_down(activationPair(this,`config-row-${key}`).key((event,ctx)=>{if(event.key==="escape"&&editing){ctx.stop_propagation();this.cancel(ctx);}
+          else if(['enter','space',' '].includes(event.key)&&selected&&this.hasSelection()&&!readOnly&&!editing){ctx.stop_propagation();this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>this.activate(entry,ctx));}}));
       const line=h_flex().gap(8).items_center()
         .child(div().flex_1().min_w(0).text_size(12).font_family("monospace").child(paired?"health.context_pressure · warning / critical":key))
         .child(this.page.copyButton(t,key,`config-key-${key}`,"setting key"))
@@ -452,11 +475,12 @@ export class ConfigPanel {
         if(def.type==="bool"&&!readOnly) {
           const on=entry.value===true||entry.value==="true";
           this.controlOrder.push(this.focusHandle(`config-toggle-${key}`,cx));
-          line.child(h_flex().id(`config-toggle-${key}`).p(2).border(2).border_color('#00000000').rounded(7)
+          line.child(h_flex().id(`config-toggle-${key}`).tooltip(`Turn ${key} ${on?'off':'on'} and save`).p(2).border(2).border_color('#00000000').rounded(7)
             .when(!!this.focusHandle(`config-toggle-${key}`,cx),el=>el.track_focus(this.controlHandles.get(`config-toggle-${key}`))).tab_stop(true).focus(el=>el.border_color(t.accent))
-            .on_key_down((event,ctx)=>this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>{if(this.detected&&!m.busy)this.toggle(entry,ctx);}))
+            .on_key_down(activationPair(this,`config-toggle-${key}`).key((event,ctx)=>this.keyboardAction(`config-toggle-${key}`,event,ctx,()=>{if(this.detected&&!m.busy)this.toggle(entry,ctx);})))
             .gap(5).items_center().cursor_pointer()
-            .on_click((_e,ctx)=>{ctx.stop_propagation();this.keyboardLatches?.delete(`config-toggle-${key}`);if(this.detected&&!m.busy)this.toggle(entry,ctx);})
+            .on_mouse_down('left',activationPair(this,`config-toggle-${key}`).pointer())
+            .on_click(activationPair(this,`config-toggle-${key}`).click((_e,ctx)=>{ctx.stop_propagation();this.keyboardLatches?.delete(`config-toggle-${key}`);if(this.detected&&!m.busy)this.toggle(entry,ctx);}))
             .child(div().size(13).rounded(3).border_1().border_color(on?t.accent:t.border).when(on,el=>el.bg(t.accent)
               .child(svg(icon("check")).size(10).text_color(t.solid_foreground))))
             .child(div().text_size(12).text_color(t.foreground).child(on?"On":"Off")));
@@ -464,13 +488,14 @@ export class ConfigPanel {
         else {
           const value=div().id(`config-value-${key}`).max_w(340).min_w(80).px(5).py(2).rounded(4).border_1().border_color('#00000000')
             .hover(s=>s.border_color(t.border)).cursor_text().truncate().text_size(12).text_color(t.foreground).tooltip(valueLabel)
-            .on_click((_e,ctx)=>{ctx.stop_propagation();this.selectRow(key,ctx);this.open(key,ctx);})
-            .on_key_down((event,ctx)=>{if(['enter','space',' '].includes(event.key)){ctx.stop_propagation();this.activate(entry,ctx);}}).child(valueLabel);
-          line.child(this.focusControl(t,cx,`config-value-${key}`,value,(_e,ctx)=>this.activate(entry,ctx)));
+            .on_mouse_down('left',activationPair(this,`config-value-${key}`).pointer())
+            .on_click(activationPair(this,`config-value-${key}`).click((_e,ctx)=>{ctx.stop_propagation();this.selectRow(key,ctx);this.open(key,ctx);}))
+            .on_key_down(activationPair(this,`config-value-${key}`).key((event,ctx)=>{if(['enter','space',' '].includes(event.key)){ctx.stop_propagation();this.activate(entry,ctx);}})).child(valueLabel);
+          line.child(this.focusControl(t,cx,`config-value-${key}`,value,(_e,ctx)=>this.activate(entry,ctx),{tip:valueLabel}));
         }
         if(readOnly)line.child(svg(icon("rig-lock")).size(12).text_color(t.dim));
       }else line.child(this.control(t,cx));
-      if(!readOnly)line.child(this.action(t,cx,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();},{writeActivation:false}));
+      if(!readOnly)line.child(this.action(t,cx,`config-more-${key}`,"⋯",(_e,ctx)=>{ctx.stop_propagation();this.more=this.more===key?null:key;ctx.notify();},{writeActivation:false,tip:'More for this setting: reset to default'}));
       row.child(line);
       if(writePause?.uncertain&&(editing||selected))row.child(div().id('config-row-write-paused').text_size(11.5).text_color(t.dim).child('Saving paused'));
       if(this.reconciledModel===m&&editing)row.child(div().id('config-reconciled-value').text_size(11.5).text_color(t.muted).child(`OpenRig currently reports: ${textValue(entry)} (${sourceName(entry)}).`));
@@ -486,7 +511,7 @@ export class ConfigPanel {
         .child(div().child("in a terminal on that machine."))
         :div().text_size(11).text_color(t.dim).child(help));
       const defaultLabel=hidden(entry)?'withheld':def.type==='bool'&&[true,false,'true','false'].includes(entry.defaultValue)?(String(entry.defaultValue)==='true'?'On':'Off'):String(entry.defaultValue??'unset');
-      if(this.more===key)row.child(this.action(t,cx,`config-reset-${key}`,`Reset to default (${defaultLabel})`,(_e,ctx)=>this.reset(entry,ctx),{disabled:!this.detected||m.busy}));
+      if(this.more===key)row.child(this.action(t,cx,`config-reset-${key}`,`Reset to default (${defaultLabel})`,(_e,ctx)=>this.reset(entry,ctx),{disabled:!this.detected||m.busy,tip:`Reset ${key} to its default (${defaultLabel}): asks first`}));
       if(editing){
         for(const field of m.row.keys){const fieldDef=configDefinition(m.entry(field)),value=m.row.values[field];
           if(fieldDef.type==="path")row.child(div().text_size(11).text_color(t.dim).child(`Herdr doesn't check this folder. OpenRig uses the path as given on ${this.daemonName()}.`));
@@ -494,7 +519,7 @@ export class ConfigPanel {
           const error=m.row.touched?.[field]?validateConfigValue(fieldDef,value):null;if(error)row.child(div().text_size(11.5).text_color(t.blocked).child(error));
         }
         if(m.row.error&&!writePause?.uncertain&&!m.row.keys.some(field=>m.row.touched?.[field]&&validateConfigValue(configDefinition(m.entry(field)),m.row.values[field])===m.row.error))
-          row.child(div().id("config-save-refusal").text_size(12).text_color(m.row.errorTone==='working'?t.working:t.blocked).child(m.row.error));
+          row.child(div().id("config-save-refusal").text_size(12).text_color(m.row.errorTone==='working'?t.working:t.blocked).child(errorBlock(this,t,"config-save-refusal-detail",m.row.error)));
       }
       const receipt=m.receipt(key);if(receipt){this.page.ticking=true;row.child(h_flex().gap(6).items_center()
         .child(div().id(`config-result-${key}`).text_size(11.5).text_color(t.muted).child(receipt.text))
@@ -506,8 +531,8 @@ export class ConfigPanel {
         row.child(this.page.card(t,`${confirmation.reset?"Reset":"Change"} ${confirmKey}${confirmation.reset?"":` to ${confirmation.changes[0][1]}`}?`,[
         div().text_size(12).text_color(t.foreground).child(confirmation.consequence),
         h_flex().gap(6).items_center()
-          .child(this.reviewAction(t,'config-confirm-cancel','Cancel',(_e,ctx)=>this.cancelReview(ctx),this.cancelHandle))
-          .child(this.reviewAction(t,'config-confirm-save',confirmation.destructive?'Delete older history':`Save ${confirmKey}`,(_e,ctx)=>this.execute(ctx,m.confirm()),this.confirmHandle,{disabled:m.busy||this.saving,primary:true,destructive:confirmation.destructive}))]).id('config-confirmation'));
+          .child(this.reviewAction(t,'config-confirm-cancel','Cancel',(_e,ctx)=>this.cancelReview(ctx),this.cancelHandle,{tip:'Cancel this change; nothing is saved'}))
+          .child(this.reviewAction(t,'config-confirm-save',confirmation.destructive?'Delete older history':`Save ${confirmKey}`,(_e,ctx)=>this.execute(ctx,m.confirm()),this.confirmHandle,{disabled:m.busy||this.saving,primary:true,destructive:confirmation.destructive,tip:`${confirmation.destructive?'Delete the older history':`Save ${confirmKey}`}: this is the change described above`}))]).id('config-confirmation'));
       }
       out.push(row);
     }

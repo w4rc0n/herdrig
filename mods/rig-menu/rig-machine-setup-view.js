@@ -1,4 +1,7 @@
+import { errorDiagnostic, plainError } from "./rig-words.js";
+import {activationPair} from './rig-activation.js';
 import {div,svg} from "gpui-kit";
+import {errorBlock} from "./rig-error-view.js";
 import {v_flex,h_flex} from "gpui-base";
 import {reviewMachineSetup,approveMachineSetup,stopUsingMachine} from "./rig-machine-setup.js";
 
@@ -31,14 +34,14 @@ export class MachineSetupPanel {
         }
         else if(result.needsConsent){this.phase="error";this.error="The machine or helper changed. Check again and review its details.";}
         else {this.phase="error";this.error=result.reason;}
-      }catch(error){this.phase="error";this.error=String(error?.message??error);}
-      finally{this.busy=false;cx.notify();const handle=this.phase==='done'&&!(this.waitingForRig&&!this.warning)?this.primaryHandle:this.stop&&this.phase==='error'?this.cancelHandle:null;if(handle)cx.timer.after(0,nextCx=>{handle.focus();nextCx.notify();});}
+      }catch(error){this.phase="error";this.error=errorDiagnostic(error);}
+      finally{this.busy=false;this.pendingFocus=this.phase==='done'&&!(this.waitingForRig&&!this.warning)?this.primaryHandle:this.stop&&this.phase==='error'?this.cancelHandle:null;cx.notify();}
     });
   }
   async finishSaved(cx){
     this.followUpBusy=true;this.warning=null;this.warningDetail=null;cx.notify();
     try{await this.host.saved?.(this.result,this.stop);return true;}
-    catch(error){this.warning="Herdr couldn't update its own saved state for this choice.";this.warningDetail=String(error?.message??error);return false;}
+    catch(error){this.warning="Herdr couldn't update its own saved state for this choice.";this.warningDetail=errorDiagnostic(error);return false;}
     finally{this.followUpBusy=false;cx.notify();}
   }
   retrySaved(cx){
@@ -51,20 +54,22 @@ export class MachineSetupPanel {
       }
       finally{this.busy=false;this.retrying=false;cx.notify();
         // A successful retry removes its button. Hand keyboard ownership to the visible Done.
-        if(this.followUpRecovered&&!this.waitingForRig&&this.primaryHandle)cx.timer.after(0,next=>{this.primaryHandle.focus();next.notify();});}
+        if(this.followUpRecovered&&!this.waitingForRig)this.pendingFocus=this.primaryHandle;}
     });
   }
   button(id,text,callback,{disabled=false,primary=false}={}){
+    const activation=activationPair(this,id);
     const handle=id==='machine-setup-cancel'?this.cancelHandle:id==='machine-setup-retry'?this.retryHandle:this.primaryHandle;
     return div().id(`${id}-focus`).p(2).border(2).border_color('#00000000').rounded(7).role("button").tab_stop(!disabled)
       .when(!disabled&&!!handle,el=>el.track_focus(handle))
       .focus(el=>el.border_color(this.theme.accent))
-      .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}})
+      .on_mouse_down('left',activation.pointer())
+      .on_key_down(activation.key((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}}))
       .child(div().id(id).px(10).py(6).rounded(5)
       .text_size(12).bg(primary?this.theme.accent:this.theme.raised).text_color(primary?this.theme.solid_foreground:this.theme.foreground)
       .when(disabled,el=>el.opacity(.45)).when(!disabled,el=>el.cursor_pointer().hover(el=>el.bg(primary?this.theme.accent:this.theme.hover)))
-      .on_click((_e,cx)=>{if(!disabled)callback(cx);})
-      .on_key_down((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}}).child(text));
+      .on_mouse_down('left',activation.pointer()).on_click(activation.click((_e,cx)=>{if(!disabled)callback(cx);}))
+      .on_key_down(activation.key((event,cx)=>{if(!disabled&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();callback(cx);}})).child(text));
   }
   value(label,value,{copy=false}={}){
     return h_flex().gap(8).items_start()
@@ -72,12 +77,14 @@ export class MachineSetupPanel {
       .child(div().flex_1().min_w(0).font_family(this.mono).text_size(11).child(value))
       .when(copy,el=>el.child(div().id(`machine-setup-copy-${label==="SHA-256"?"sha":label.toLowerCase()}`).role("button").tab_stop(true).size(20).flex_none().cursor_pointer().tooltip("Copy SHA-256")
         .when(!!this.copyHandles[label],el=>el.track_focus(this.copyHandles[label])).focus(el=>el.border(1).border_color(this.theme.accent))
-        .on_click((_e,cx)=>cx.write_to_clipboard(value))
-        .on_key_down((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(value);}})
+        .on_mouse_down('left',activationPair(this,`copy-${label}`).pointer())
+        .on_click(activationPair(this,`copy-${label}`).click((_e,cx)=>cx.write_to_clipboard(value)))
+        .on_key_down(activationPair(this,`copy-${label}`).key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(value);}}))
         .child(svg(this.copyIcon).size(12).text_color(this.theme.muted))));
   }
   render(t,cx){
     this.theme=t;
+    if(this.pendingFocus){const handle=this.pendingFocus;this.pendingFocus=null;this.focusTask?.cancel?.();this.focusTask=cx.timer.after(0,next=>{handle.focus();next.notify();});}
     const c=this.review?.confirmation,done=this.phase==="done",update=!!this.review?.alreadyConfigured&&c?.fileState==="older";
     const cycle=(forward,cx)=>{
       cx.stop_propagation();
@@ -121,11 +128,12 @@ export class MachineSetupPanel {
         .child(div().child("Herdr machine access gives programs on this computer, including Herdr mods, full shell access to that account: its commands, files and terminals. This setup installs and runs the Attach helper there, and reads seat names from OpenRig."))
         .child(div().text_color(t.muted).child("A changed helper checksum asks for approval again. Saving specs on that machine asks separately; this approval does not include it."));
     }
-    if(this.error)body=body.child(div().id("machine-setup-error").text_color(t.blocked).child(`✗ ${this.error}`));
+    if(this.error)body=body.child(div().id("machine-setup-error").text_color(t.blocked).child(errorBlock(this,t,"machine-setup-error-detail",this.error,{where:this.machine??"this computer",prefix:"✗ "})));
     if(done)body=body.child(div().id("machine-setup-done").child(this.stop?`✓ Stopped using ${this.machine}. Open box tiles and the helper were left in place.`
       :`✓ Using ${this.machine}. Attach helper ${this.result.installed?"installed and verified":"already installed, verified"}.`));
     if(done&&this.warning)body=body.child(h_flex().gap(6).items_center().flex_wrap()
-      .child(div().id("machine-setup-warning").text_color(t.working).tooltip(this.warningDetail).child(this.warning))
+      .child(div().id("machine-setup-warning").text_color(t.working).when(!!this.warningDetail,el=>el.tooltip(plainError(this.warningDetail,{where:"this computer"}).text)).child(this.warning))
+      .when(!!this.warningDetail,el=>el.child(errorBlock(this,t,"machine-setup-warning-detail",this.warningDetail,{where:"this computer"})))
       .child(this.button('machine-setup-retry','Try again',cx=>this.retrySaved(cx),{disabled:this.busy}).tooltip(this.stop?"Retries only Herdr's follow-up. OpenRig isn't stopped again.":"Retries only Herdr's follow-up. The machine setup isn't run again.")));
     if(done&&this.followUpRecovered)body=body.child(div().id('machine-setup-recovered').text_color(t.muted).child("✓ Herdr's saved state is up to date."));
     if(this.busy)body=body.child(div().id("machine-setup-progress").text_color(this.retrying?t.dim:t.muted).child(this.retrying?'Trying again...':this.followUpBusy?"Updating Herdr's saved state…":this.stop?"Saving…":this.progress==="install"?"Installing the Attach helper…":this.progress==="verify"?"Checking its SHA-256…":"Saving…"));

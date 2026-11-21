@@ -7,7 +7,7 @@ const {spawnSync}=require("node:child_process");
 const {invoke,profile,inspect}=require("./rig-spec-transport.cjs");
 const {absolute}=require("./rig-spec-files.cjs");
 const {checkPath,MAX_BODY}=require("./rig-openrig-helper.cjs");
-const OPENRIG_HELPER_SHA256="ba850b07f6fb3cd92eab71ad4fd39171a177a1a7acb0c7c1a2b90589ab43b1f1";
+const OPENRIG_HELPER_SHA256="074607f50d80f0b8076337692f8ccd8eeb99f7ca59a9691e2eb7e6d8626683da";
 const FOLDER=".local/share/herdr-openrig",FILE="rig-openrig-helper.cjs";
 const NAME=/^openrig-transfer-[a-f0-9]{16}\.txt$/;
 const WORDS={use:"Using OpenRig over Herdr's connection",grant:"permission to use OpenRig there"};
@@ -23,7 +23,15 @@ function folder(appHome){
 }
 function transferPath(appHome,name){if(typeof name!=="string"||!NAME.test(name))throw Error("Invalid transfer name.");return path.join(folder(appHome),name);}
 // One transfer file per write, so two writes never share one and a slow spec save never holds a send behind it.
+// A transfer left by a write whose cleanup failed holds that write's body: the next write's prepare removes ours that are older than STALE_MS
+// (never a fresh one another write is using; never a link or someone else's file).
+const STALE_MS=10*60*1000;
+function sweep(appHome){
+ let names=[];try{names=fs.readdirSync(folder(appHome));}catch(_){return;}
+ for(const n of names){if(!NAME.test(n))continue;try{const f=path.join(folder(appHome),n),s=fs.lstatSync(f);if(s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o777)===0o600&&Date.now()-s.mtimeMs>STALE_MS)fs.unlinkSync(f);}catch(_){}}
+}
 function prepare(appHome){
+ sweep(appHome);
  const name=`openrig-transfer-${crypto.randomBytes(8).toString("hex")}.txt`;
  fs.closeSync(fs.openSync(transferPath(appHome,name),fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600));
  return{ok:true,name};
@@ -36,6 +44,8 @@ function readTransfer(appHome,name){
   return b.subarray(0,used);
  }finally{fs.closeSync(fd);}
 }
+// After a write: removing the transfer must never replace the write's result or its "may have arrived" (a file left behind is private, 0600).
+function cleanup(appHome,name){try{remove(appHome,name);}catch(_){}}
 function remove(appHome,name){
  const f=transferPath(appHome,name);
  try{const s=fs.lstatSync(f);if(s.isSymbolicLink()||!s.isFile()||(s.mode&0o777)!==0o600||s.uid!==process.getuid())throw Error("Refused an unsafe transfer cleanup.");fs.unlinkSync(f);}
@@ -55,13 +65,42 @@ function install(machine,home,expected,run=spawnSync){
  const dest=path.posix.join(home,FOLDER,FILE);
  profile(run,machine,expected,WORDS);const bytes=shipped(),info=inspect(run,machine,home,FILE);
  if(info.path!==dest)throw Error("The OpenRig helper's destination changed.");
- if(info.sha256!==OPENRIG_HELPER_SHA256){
+ const fresh=info.sha256!==OPENRIG_HELPER_SHA256;
+ if(fresh){
   profile(run,machine,expected,WORDS);inspect(run,machine,home,FILE);
   const r=invoke(run,["file","write","--on",machine,"--json","--",dest],bytes);if(r.status!==0)throw Error(r.stderr||"Could not install the OpenRig helper.");
  }
+ // herdr-core writes a NEW file with the default mode (0666 & ~umask): under umask 002 the helper lands group-writable, and every read would refuse
+ // it. Remove group and other write from it and its folder after a fresh write, or when either is still writable by others: the read check
+ // looks only at the helper, and a folder others can write lets them swap the helper between that check and its run.
+ // Never otherwise: a chmod moves the file's ctime even when the mode stays, and every other view's read check would take that as a change.
+ if(fresh||(stat(machine,home,run).mode&0o022)!==0||folderWritableByOthers(machine,path.posix.dirname(dest),run)){
+  const secured=invoke(run,["exec","--on",machine,"--","chmod","--","go-w",dest,path.posix.dirname(dest)]);
+  if(secured.status!==0)throw Error(`Could not make the OpenRig helper on ${machine} writable by you alone. Nothing was sent.`);
+ }
  const verified=inspect(run,machine,home,FILE);
  if(verified.sha256!==OPENRIG_HELPER_SHA256)throw Error("The OpenRig helper didn't verify after install.");
- return{ok:true,path:dest,sha256:verified.sha256};
+ return{ok:true,path:dest,sha256:verified.sha256,stat:stat(machine,home,run)};
+}
+function folderWritableByOthers(machine,dir,run){
+ if(!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine??""))throw Error("Invalid configured Herdr machine.");
+ const r=invoke(run,["exec","--on",machine,"--","stat","-c","%f","--",dir]);
+ if(r.status!==0)throw Error("Could not check the OpenRig helper's folder on the machine.");
+ const m=/^([0-9a-f]{1,8})$/.exec(String(r.stdout).trim());
+ if(!m)throw Error("Invalid OpenRig helper folder check.");
+ return(parseInt(m[1],16)&0o022)!==0;
+}
+// The helper's file as it is now, without following a link: owner, mode, size, mtime, ctime, inode and type. Install records it; each read compares it.
+// Raw numbers only (the type's words follow the machine's language); ctime can't be set back without root, so an in-place rewrite shows.
+function stat(machine,home,run=spawnSync){
+ if(!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(machine??""))throw Error("Invalid configured Herdr machine.");
+ if(!absolute(home))throw Error("Invalid remote home.");
+ const p=path.posix.join(home,FOLDER,FILE),r=invoke(run,["exec","--on",machine,"--","stat","-c","%u %f %s %Y %Z %i","--",p]);
+ if(r.status!==0)throw Error("Could not check the OpenRig helper on the machine.");
+ const m=/^(\d+) ([0-9a-f]{1,8}) (\d+) (\d+) (\d+) (\d+)$/.exec(String(r.stdout).trim());
+ if(!m)throw Error("Invalid OpenRig helper check.");
+ const raw=parseInt(m[2],16);
+ return{ok:true,path:p,uid:Number(m[1]),mode:raw&0o7777,size:Number(m[3]),mtime:Number(m[4]),ctime:Number(m[5]),inode:Number(m[6]),type:(raw&0o170000)===0o100000?"regular file":"other"};
 }
 // hc exec --json carries the helper's stdout as base64. A timed-out write may still have arrived, so it is never reported as not sent.
 function envelope(r){
@@ -94,7 +133,7 @@ function post({appHome,name,machine,home,node,hostId,apiPath,type,record},run=sp
   // The helper hashes what it received: a different digest means the body that arrived isn't the one written here.
   if(result.ok&&result.sha256!==sent)throw Object.assign(Error("The machine received a different body than the one sent. Check before sending it again."),{outcomeUnknown:true});
   return result;
- }finally{remove(appHome,name);}
+ }finally{cleanup(appHome,name);}
 }
 // A write through the rig CLI on the machine (the helper's rig verb builds and checks the argv itself). The body of a queue row, when there is
 // one, goes on stdin from a private transfer file; everything else is the shape's own values. A launch or up can take minutes. Herdr ends an
@@ -120,7 +159,7 @@ function rig({appHome,name,machine,home,node,hostId,record,shape,person,values},
   catch(e){if(e?.outcomeUnknown)throw e;throw Object.assign(Error(`The write may still have arrived (${String(e?.message??e).replace(/[\r\n\x00-\x1f\x7f]+/g," ").slice(0,200)}). Check before sending it again.`),{outcomeUnknown:true});}
   if(body&&result.ok&&result.sha256!==sent)throw Object.assign(Error("The machine received a different body than the one sent. Check before sending it again."),{outcomeUnknown:true});
   return result;
- }finally{if(body)remove(appHome,name);}
+ }finally{if(body)cleanup(appHome,name);}
 }
 if(require.main===module){
  try{
@@ -128,6 +167,7 @@ if(require.main===module){
   if(mode==="inspect"){if(args.length)throw Error("Invalid inspect arguments.");result={ok:true,sha256:hash(shipped())};}
   else if(mode==="prepare"){if(args.length!==1)throw Error("Invalid transfer arguments.");result=prepare(args[0]);}
   else if(mode==="remove"){if(args.length!==2)throw Error("Invalid transfer arguments.");result=remove(args[0],args[1]);}
+  else if(mode==="stat"){if(args.length!==2)throw Error("Invalid check arguments.");result=stat(args[0],args[1]);}
   else if(mode==="install"){if(args.length!==3)throw Error("Invalid install arguments.");result=install(args[0],args[1],JSON.parse(args[2]));}
   else if(mode==="rig"){if(args.length<9)throw Error("Invalid write arguments.");const[appHome,name,machine,home,node,hostId,record,shape,person,...values]=args;result=rig({appHome,name,machine,home,node,hostId,record:JSON.parse(record),shape,person,values});}
   else if(mode==="post"){if(args.length!==9)throw Error("Invalid write arguments.");const[appHome,name,machine,home,node,hostId,apiPath,type,record]=args;result=post({appHome,name,machine,home,node,hostId,apiPath,type,record:JSON.parse(record)});}
@@ -135,4 +175,4 @@ if(require.main===module){
   console.log(JSON.stringify(result));if(result.error||result.ok===false)process.exitCode=1;
  }catch(e){console.log(JSON.stringify({ok:false,error:String(e.message??e).replace(/[\r\n\x00-\x1f\x7f]+/g," "),...(e?.outcomeUnknown?{outcomeUnknown:true}:{})}));process.exitCode=1;}
 }
-module.exports={OPENRIG_HELPER_SHA256,FILE,transferPath,prepare,readTransfer,remove,shipped,install,envelope,post,rig};
+module.exports={OPENRIG_HELPER_SHA256,FILE,transferPath,prepare,readTransfer,remove,shipped,install,stat,envelope,post,rig};

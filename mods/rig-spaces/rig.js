@@ -1,5 +1,5 @@
 // herdrig's changes to herdr's Spaces list. main.js is herdr's file; it calls the hooks below (the lines marked
-// "herdrig hook") and nothing else. Everything here only reads the shared key `herdrig.spaces`, which the Rig sidebar
+// "herdrig hook") and nothing else. The marks read the shared key `herdrig.spaces`, which the Rig sidebar
 // publishes from what it already knows (labels on terminals and its own record of the OpenRig home): space id ->
 // { home?: true, rig?: name, rigId?: id, status?: "working" | "needs" | "idle", needs?: count }. This file never talks to OpenRig.
 import { div, svg } from "gpui-kit";
@@ -58,6 +58,26 @@ const checkMachineFields = (machine) => {
 };
 
 export const rig = {
+  /** Idle git/layout checks need no 250ms wake-up. Keep that cadence only during a drag or reconnect. */
+  watchSpaces(view,cx) {
+    if(view.rigPollArmed)return true;
+    const arm=live=>{
+      if(view.closed)return;
+      view.rigPollArmed=true;
+      const active=view.pressed||view.over||Object.values(view.reconnecting??{}).some(state=>state?.busy);
+      live.timer.after(active?250:1000,next=>{
+        view.rigPollArmed=false;
+        if(view.closed)return;
+        const current=next??live;
+        try{view.checkNew(current);}finally{arm(current);}
+      });
+    };
+    arm(cx);return true;
+  },
+  /** Keep birth-time measurements only for spaces still in the current host snapshot. */
+  pruneBorn(born, at) {
+    for (const id of Object.keys(born)) if (!Object.hasOwn(at, id)) delete born[id];
+  },
   /** Sanitize persisted `machines.reconnecting` on init: persist `{ removed }` only and keep only `{ name }` in memory, stripping any persisted `target`/`session`/`via`. */
   reconnecting(raw) {
     const out = {};

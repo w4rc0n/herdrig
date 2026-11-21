@@ -3,15 +3,21 @@
 // folder works after a plain copy. Pure: no `herdr` import, so tests import it directly. Everything a mod
 // needs from the host (fetch, exec, terminals) is passed in.
 import { attachRemoteSeat } from "./rig-remote-attach.js";
+import {activationPair} from './rig-activation.js';
 import { formatAbsoluteTime } from './rig-time.js';
 import { routeOpen, homeKey } from "./rig-routing.js";
 import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publishedUnder, publishedConfigFor } from "./rig-gate.js";
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions, prepareRigSpaceAdoption, topologyRig } from "./rig-space-context.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError } from "./rig-connections.js";
+import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
+import { counted as countWords, plainError as errorWords, statusWord as stateWords, requestFailed as failedWords, requestWhat as requestWords } from './rig-words.js';
+// Local wrapper exports avoid indirect re-exports through the existing module cycles in QuickJS.
+export const counted = (n, one, many) => countWords(n, one, many);
+export const plainError = (error, options) => errorWords(error, options);
+export const statusWord = (token, kind) => stateWords(token, kind);
 import { cleanSidebarViews, cleanAwayStates, cleanNotifiedNeeds, cleanNotifiedNeedsMap } from './rig-sidebar-view-state.js';
 const SYSTEM_VIEW_LABELS = new Map(SYSTEM_PAGE_VIEWS);
 
@@ -493,8 +499,9 @@ export function parseDaemonStatusJson(stdout, host = "127.0.0.1") {
     message: msg
       ? msg
       : startable
-        ? `OpenRig daemon is not running (${state}). Run 'rig daemon start' or 'rig up'.`
-        : `OpenRig daemon is not reachable (${state}). Run 'rig status' to inspect.`,
+        ? `OpenRig isn't reachable: ${statusWord(state, "daemon")}. Run 'rig daemon start' or 'rig up'.`
+        : state === "unknown" ? "OpenRig isn't reachable; its state wasn't reported. Run 'rig status' to inspect."
+        : `OpenRig isn't reachable: ${statusWord(state, "daemon")}. Run 'rig status' to inspect.`,
   };
 }
 
@@ -934,7 +941,6 @@ export const LOCAL_COMMANDS = [
   { line: "open-page", hint: "Open in Page tab" },
   { line: "open-tui", hint: "Open Rig TUI tab" },
   { line: "tui", hint: "Open or switch to the Rig TUI" },
-  { line: "view-design", hint: "Design a worker view grid" },
   { line: "notifications", hint: "Toggle Needs-You desktop notifications (on/off)" },
   { line: "notifications on", hint: "Enable Needs-You desktop notifications" },
   { line: "notifications off", hint: "Disable Needs-You desktop notifications" },
@@ -1037,7 +1043,9 @@ export function sharedLoopbackDaemonUrl(config, published) {
 export const RIG_DATA_STAMP = "rig.dataStamp";
 export function publishRigData(setSharedFn, value) {
   setSharedFn("rig.data", value);
-  setSharedFn(RIG_DATA_STAMP, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
+  const stamp = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  setSharedFn(RIG_DATA_STAMP, stamp);
+  return stamp;
 }
 export function sharedRigData(config, shared) {
   // No config yet (a mod's first moments, before it has read config.json) cannot rule a refused list out, so it reads nothing either.
@@ -1635,12 +1643,6 @@ export function gridResizeShape(grid, numRows, numCols) {
   return grid;
 }
 
-/** The next weight in `steps` above (dir 1) or below (dir -1) `weight`; unchanged at an end. */
-export function stepWeight(weight, dir, steps = DESIGN_WEIGHTS) {
-  const w = Number(weight ?? 1);
-  return dir > 0 ? steps.find((x) => x > w) ?? w : [...steps].reverse().find((x) => x < w) ?? w;
-}
-
 /** A followed target as people read it: the rig's name without `rig:`. */
 export const followName = (view) => String(view ?? "").replace(/^rig:/, "");
 
@@ -1898,19 +1900,10 @@ export function actionArgs(target, action, text, home) {
       if (!isValidSessionName(plan.destinationSession)) return null;
       return ["queue", "create", "--destination", plan.destinationSession, "--summary", plan.summary, "--body", plan.body];
     }
-    case "open-view": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, ...(target.plan ? ["--expected-plan", target.plan] : []), "--", target.view];
-    case "open-seat": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--", `seat:${target.rig}/${target.logicalId}`];
+    case "open-view": case "open-seat": case "follow": case "unfollow": case "prune": case "open-designed-view": return null;
     case "keyboard": return ["terminal", "keyboard", ...appHomeArgs, "--", target.terminal];
     case "snapshot": return ["snapshot", "--", target.rig];
-    case "follow": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--follow", "--", target.view];
-    case "unfollow": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--no-follow", "--", target.view];
-    case "prune": return ["terminal", "open", "--provider", "herdr-app", ...appHomeArgs, "--follow", "--prune-after", target.prune, "--", target.view];
     case "close-view": return ["terminal", "close", ...appHomeArgs, "--", target.viewId];
-    case "close-cell": return ["terminal", "close", "--cell", cell, ...(home ? appHomeArgs : []), "--json", "--", target.viewId];
-    case "open-designed-view": return ["terminal", "open", "--provider", "herdr-app", ...(home ? appHomeArgs : []),
-      "--grid", typeof target.grid === "string" ? target.grid : JSON.stringify(exportGrid(target.grid)),
-      ...(target.save ? ["--save", target.save] : []), ...(target.name ? ["--name", target.name] : []), ...(target.replace ? ["--replace", target.replace] : []),
-      ...(target.follow ? ["--follow"] : target.noFollow ? ["--no-follow"] : []), "--json", "--", target.view ?? `rig:${target.rig}`];
     case "pause": return ["down", "--yes", "--", target.rig];
     case "resume": return ["up", "--existing", "--", target.rig];
     case "delete-rig": {
@@ -1934,19 +1927,30 @@ export function actionArgs(target, action, text, home) {
  *  words, not JSON (`rig snapshot`: "Snapshot created: <id>"), says what happened in its first line. */
 export function writeOutcome(r) {
   let json = null; try { json = JSON.parse(r?.stdout); } catch (_) { json = null; }
-  // OpenRig can record or retain a send and exit zero without delivering it. That receipt is authoritative,
+  // OpenRig can record or retain a send and exit zero without delivering it, or report in its own error receipt that nothing left
+  // (a stopped daemon, a refused connection before dispatch, or a create refused before writing). Those receipts are authoritative,
   // unlike a timeout: keep the draft and never show success or speculate that it may have been delivered.
-  const notSent = ["recorded", "retained"].includes(json?.outcome) && json?.sent === false
+  const undelivered = ["recorded", "retained"].includes(json?.outcome) && json?.sent === false
     || !json && /^(?:Recorded|Retained), not delivered to /u.test(String(r?.stdout ?? "").trimStart());
-  const failed = r?.code !== 0 || json?.ok === false || notSent;
+  const consequence = typeof json?.error?.consequence === "string" ? json.error.consequence.trim() : "";
+  const stderrText = String(r?.stderr ?? "");
+  const cliUnsent = /^(?:The message was not sent\.|The command was not delivered\.(?:\s|$)|This command needs a running daemon\.|(?:The (?:queue|coordination) command|rig [a-z -]+) did not run[;,] (?:the )?daemon was not contacted(?:, and nothing was persisted)?\.)$/i.test(consequence)
+    || (!json && /^Error: Daemon not running\.\s+This command needs a running daemon\./m.test(stderrText))
+    || /^No row was created:/m.test(stderrText);
+  const notSent = cliUnsent && !undelivered;
+  const failed = r?.code !== 0 || json?.ok === false || notSent || undelivered;
   const reason = json?.error?.fact ?? json?.error?.message ?? (typeof json?.error === "string" ? json.error : null) ?? json?.message;
-  const text = notSent ? (json ? [`${json.outcome === "retained" ? "Retained" : "Recorded"}, not delivered to ${json.sessionName ?? json.destinationStatus?.destinationSession ?? "the destination"}.`, json.destinationStatus?.message].filter(Boolean).join("\n") : r.stdout)
+  const text = undelivered ? (json ? [`${json.outcome === "retained" ? "Retained" : "Recorded"}, not delivered to ${json.sessionName ?? json.destinationStatus?.destinationSession ?? "the destination"}.`, json.destinationStatus?.message].filter(Boolean).join("\n") : r.stdout)
     : failed ? (reason ?? (json ? rigStoppedMaybeDone(r?.code) : (r?.stderr || r?.stdout || rigStoppedMaybeDone(r?.code)))) : (json ? json.message ?? "" : plainOutcome(r?.stdout));
   // Queue creation is successful when its row persists even if the destination cannot be nudged. Keep that success,
   // but show the daemon's destination advisory instead of implying the seat is available.
   const advisories = Array.isArray(json?.advisories) ? json.advisories : [];
   const warning = [json?.warning, ...advisories.filter(a => ["destination_status", "unmatched_destination_seat"].includes(a?.code)).map(a => a.message)].filter(v => typeof v === "string" && v.trim()).join("\n") || null;
-  return { ok: !failed, json, text: String(text).trim(), warning, ...(notSent ? { notSent: true } : {}) };
+  const line = String(text).trim();
+  // A CLI receipt that proves no request left says so in every result. Recorded/retained sends did contact OpenRig:
+  // their "not delivered" receipt must never acquire a "nothing was sent" claim.
+  const words = notSent && !/nothing was sent/i.test(line) ? `${line} Nothing was sent.` : line;
+  return { ok: !failed, json, text: words, warning, ...(notSent ? { notSent: true } : {}), ...(undelivered ? { undelivered: true } : {}) };
 }
 
 /** What a menu action is called in a title, a status line or a toast. */
@@ -2113,7 +2117,7 @@ export function statusLook(status) {
     case "detached": return { tone: "done", word: "detached" };
     case "stopped": return { tone: "done", word: "stopped" };
     case "exited": return { tone: "done", word: "exited" };
-    default: return { tone: "idle", word: status ?? "unknown" };
+    default: return { tone: "idle", word: statusWord(status, "seat") };
   }
 }
 
@@ -2748,6 +2752,14 @@ export function rigPageOnScreen(spaces, panes) {
     return Boolean(tab?.id && (panes?.() ?? []).some((p) => p?.mod === MOD_IDS.view && p.tab === tab.id));
   } catch (_) { return false; }
 }
+/** The id of the Rig tab on screen (the active space's active tab, when it holds a Rig page), else null. */
+export function onScreenRigTab(spaces, panes) {
+  try {
+    const space = (spaces?.() ?? []).find((s) => s?.active), tab = (space?.tabs ?? []).find((t) => t?.active);
+    // Exactly one Rig pane: a tab with Rig panes split in it keeps the shared history, so it has no tab history of its own.
+    return tab?.id && (panes?.() ?? []).filter((p) => p?.mod === MOD_IDS.view && p.tab === tab.id).length === 1 ? tab.id : null;
+  } catch (_) { return null; }
+}
 /** The Rig page on screen and the OpenRig(s) it shows, read now: null when no Rig page is on screen; `{ single: true }` with one OpenRig; else `{ conns }`, the
  *  OpenRigs the tab on screen draws (several when panes are split). A machine's space is that machine's OpenRig (the rule the page itself uses); any other space
  *  is what the Rig pages in the active tab say (`rig.pageOnScreen[tab].views`, each page writing only its own entry, trusted only for the space it names). */
@@ -2768,10 +2780,51 @@ export function onScreenRigPage(host, environment, read) {
     return { conns: record?.space === space?.id ? Object.values(record.views ?? {}).filter(Boolean) : [] };
   } catch (_) { return null; }
 }
+/** The OpenRig of a machine space with exactly one OpenRig there, else null (a space on this computer, or a machine with none or two). */
+export function machineSpaceConn(config, space) {
+  const connections = config?.connections ?? [];
+  if (connections.length <= 1 || !space || !spaceMachine(space)) return null;
+  const picked = followedConnection({ connections, space });
+  return picked.why === "space" ? picked.id : null;
+}
+/** Appends a page to one Rig tab's own history. A tab with no history yet starts from the page the router last sent it (so Back returns there).
+ *  A machine space with one OpenRig refuses another OpenRig's page. True when the page was added. */
+export function pushTabPage(host, tabId, entry, { spaceConn = null } = {}) {
+  if (!tabId || !entry) return false;
+  // A tab with two Rig panes split in it keeps the shared history (each pane draws its own OpenRig from rig.nav, which every open logs): no record is
+  // written for it, so none is waiting to make a pane jump when the tab is unsplit.
+  try {
+    const list = typeof host?.panes === "function" ? host.panes() : Array.isArray(host?.panes) ? host.panes : [];
+    if (list.filter((p) => p?.mod === MOD_IDS.view && p.tab === tabId).length > 1) {
+      if (!(spaceConn && entry.conn && entry.conn !== spaceConn)) host.setShared?.("rig.nav", navPush(host.shared?.("rig.nav"), entry)); // where its panes read
+      return false;
+    }
+  } catch (_) {}
+  const all = host.shared?.("rig.tabPages") ?? {};
+  const routed = host.shared?.("rig.pageRoutes")?.[tabId];
+  const base = all[tabId] || !routed ? all : { ...all, [tabId]: { stack: [routed], at: Date.now() } };
+  const next = tabPagesPush(base, tabId, entry, { spaceConn });
+  if (next === base) return false;
+  host.setShared?.("rig.tabPages", next);
+  return true;
+}
+/** The Rig tab in a space that an open with no source lands in: the active tab when it's a Rig tab, else the newest-changed unsettled one, else
+ *  the first unsettled, else a settled one. */
+export function pickRigTab(space, rigTabIds, tabPages = {}) {
+  const tabs = (space?.tabs ?? []).filter((t) => rigTabIds.includes(t?.id));
+  if (!tabs.length) return null;
+  const active = tabs.find((t) => t.active);
+  if (active) return active.id;
+  const unsettled = tabs.filter((t) => !t.settled);
+  const newest = [...unsettled].sort((a, b) => (tabPages?.[b.id]?.at ?? -1) - (tabPages?.[a.id]?.at ?? -1))[0];
+  return (newest && tabPages?.[newest.id] ? newest : unsettled[0] ?? tabs[0]).id;
+}
 export function openOrFocusRigTab(host = {}, entry = null) {
   const environment = routingEnvironment?.(entry?.conn) ?? {};
+  // The default page names its OpenRig when several are set up: an unstamped one names none there (activeConnId).
+  const defaultConfig = host.config ?? environment.config, defaultConn = (defaultConfig?.connections?.length ?? 0) > 1 ? defaultConfig?.connectionId ?? null : null;
   const current = entry ?? host.shared?.("rig.nav")?.stack?.at(-1) ?? environment.shared?.("rig.nav")?.stack?.at(-1)
-    ?? { section: host.section ?? "topology" };
+    ?? { section: host.section ?? "topology", ...(defaultConn ? { conn: defaultConn } : {}) };
   const publish = host.setShared ?? environment.setShared;
   const read = host.shared ?? environment.shared;
   // A page change made over a Rig page that is already on screen (the palette, a menu, the page's own links) is shown there. Routing it would open and select the
@@ -2786,8 +2839,15 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   // ...and a tab of the rig page on screen (Graph, Health, Recent) is that same page: it stays too, with no read of any space and no jump.
   const sameRig = Boolean(from) && Boolean(current?.rigId || current?.rig) && (current.rigId ? current.rigId === from.rigId : current.rig === from.rig);
   const stays = onTab && (sameRig || !current?.rigId && !current?.rig);
-  publish?.("rig.nav", navPush(read?.("rig.nav"), current));
-  if (stays) return Promise.resolve({ ok: true, stayed: true });
+  publish?.("rig.nav", navPush(read?.("rig.nav"), current)); // the log of the last page opened anywhere; tabs don't draw from it
+  // The tab the open came from: the clicking page's own tab, else the Rig tab on screen. A page that stays goes onto that tab only.
+  const sourceTab = host.sourceTab ?? onScreenRigTab(host.spaces ?? environment.spaces, host.panes ?? environment.panes);
+  if (stays) {
+    const config = host.currentConfig?.() ?? environment.currentConfig?.() ?? host.config ?? environment.config;
+    const space = (((host.spaces ?? environment.spaces)?.()) ?? []).find((s) => (s?.tabs ?? []).some((t) => t?.id === sourceTab));
+    pushTabPage({ shared: read, setShared: publish, panes: host.panes ?? environment.panes }, sourceTab, current, { spaceConn: machineSpaceConn(config, space) });
+    return Promise.resolve({ ok: true, stayed: true });
+  }
   const loading = routingNotReady(host, null);
   if (loading) {
     (host.notify ?? environment.notify)?.({ title: "OpenRig", body: loading, level: "warning" });
@@ -2795,7 +2855,7 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   }
   // A rig's page is routed to that rig's own space; a rig with none opens in the Rig tab on screen (stayIfNoSpace) rather than in the home space.
   // Only an explicit open (the sidebar, the palette, a menu, a need) may make a space; a page's own tab or link never does.
-  return routeRigOpen(host, null, { kind: "page", entry: current, ...(onTab ? { stayIfNoSpace: true } : {}), ...(host.mayCreate === true && !fromPage ? { mayCreate: true } : {}) }).then(result => {
+  return routeRigOpen(host, null, { kind: "page", entry: current, ...(onTab ? { stayIfNoSpace: true } : {}), ...(sourceTab ? { sourceTab } : {}), ...(host.mayCreate === true && !fromPage ? { mayCreate: true } : {}) }).then(result => {
     if (!result.ok || result.inPlace) {
       (host.notify ?? environment.notify)?.({ title: "OpenRig", body: result.note ?? result.reason, level: "warning" });
     }
@@ -2938,7 +2998,6 @@ export function seatClickTarget(stripProps, shownChild, session, panes = [], ter
   if (cells[0]) return { kind: "select-then-focus", view: cells[0].view, ...(cells[0].tab ? { tab: cells[0].tab } : {}), terminal: cells[0].terminal };
   return ambiguousReason ? { kind: "ambiguous", reason: ambiguousReason } : { kind: "card" };
 }
-export const seatPaneTarget = seatClickTarget;
 
 /** The open worker views that include any seat of a rig (for the sidebar's Views branch and badge). */
 export function viewsForRig(stripProps, sessions, rigName = null) {
@@ -3293,7 +3352,9 @@ export function needSummary(item) {
  *  hears one: this gives `el` its own handle (one per `id`, kept on `owner`; made outside a draw, since Herdr refuses to make one while a
  *  view renders), a Tab stop, a press that focuses it, and Enter, Space or " " that act only while it holds focus. `focusedStyle` draws the
  *  focus. The owner calls releaseFocusTargets(owner) in its close(). */
-export function focusTarget(owner, cx, id, el, act, focusedStyle = null) {
+// Owns BOTH activation handlers. Callers must not replace on_click afterward.
+export function focusTarget(owner, cx, id, el, act, focusedStyle = null, tip = null) {
+  const activation=activationPair(owner,id);
   const handles = (owner.focusTargets ??= new Map());
   let handle = handles.get(id);
   if (handle && !liveFocus(handle)) { handles.delete(id); handle = undefined; } // released elsewhere: made again below
@@ -3306,10 +3367,11 @@ export function focusTarget(owner, cx, id, el, act, focusedStyle = null) {
       handles.set(id, next.focus_handle()); next.notify?.();
     });
   }
-  return el.when(!!handle, e => e.track_focus(handle).tab_stop(true).tab_index(0))
+  return el.when(!!tip, e => e.tooltip(tip)).when(!!handle, e => e.track_focus(handle).tab_stop(true).tab_index(0))
     .when(Boolean(focusedStyle && handle?.is_focused?.()), e => focusedStyle(e))
-    .on_mouse_down("left", () => { handle?.focus?.(); })
-    .on_key_down((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); act(cx); } });
+    .on_mouse_down("left", activation.pointer(() => { liveFocus(handle)?.focus?.(); }))
+    .on_click(activation.click((_event,cx)=>act(cx)))
+    .on_key_down(activation.key((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); act(cx); } }));
 }
 /** The handle when it can still be used, else null. Herdr releases a handle together with the view that owns it, and is_focused() on a released
  *  one throws ("this focus handle has been released"): a draw that finds one released drops it and makes a new one. */
@@ -3535,16 +3597,18 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
  * - Sets `shared("rig.focusNeed", id)`
  * - Pushes `{ section: "needs", id, name }` onto `shared("rig.nav")` and selects `rig-page` in `rig-work`
  * - If `id` is absent (summary toast), opens `:needs` without expanding a specific row
- * - If `Array.isArray(items)` is passed and `id` is no longer present, opens `:needs` with `notice: "This request was already answered"`
+ * - If `Array.isArray(items)` is passed and a non-health `id` is no longer present, opens `:needs` with `notice: "This request was already answered"`
+ * - Missing `health:` ids keep the item route and connection so the page can offer its System → Health fallback
  */
-export function openNeed(id, { shared, setShared, run, items = null, layout = undefined, spaces = undefined, panes = undefined, conn = null, stay = false } = {}) {
+export function openNeed(id, { shared, setShared, run, items = null, layout = undefined, spaces = undefined, panes = undefined, conn = null, stay = false, tabId = null } = {}) {
   const rawId = typeof id === "object" && id !== null ? (id.id ?? null) : id;
   const targetId = typeof rawId === "string" && rawId.trim() ? rawId.trim() : null;
   const nav = shared?.("rig.nav") ?? { stack: [] };
   const activateRigPage = entry => {
-    if (stay) return; // asked from a Rig page that is on screen: it shows the page in its own tab, in its own space
+    // Asked from a Rig page that is on screen: it shows the page in its own tab, in its own space.
+    if (stay) { if (tabId) pushTabPage({ shared, setShared, panes }, tabId, entry); return; }
     if (layout !== undefined) {
-      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, section: "needs", mayCreate: true }, entry);
+      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, section: "needs", mayCreate: true, ...(tabId ? { sourceTab: tabId } : {}) }, entry);
     } else {
       run?.("layout.select", { stack: "rig-work", child: "rig-page" });
     }
@@ -3556,7 +3620,7 @@ export function openNeed(id, { shared, setShared, run, items = null, layout = un
     activateRigPage(entry);
     return { opened: "needs", id: null, expired: false };
   }
-  if (Array.isArray(items) && !items.some((x) => String(x?.id ?? "") === targetId)) {
+  if (Array.isArray(items) && !isHealthAttention({ id: targetId }) && !items.some((x) => String(x?.id ?? "") === targetId)) {
     setShared?.("rig.focusNeed", null);
     const entry={ section: "needs", expiredId: targetId, notice: "This request was already answered", ...(conn?{conn}:{}) };
     setShared?.("rig.nav", navPush(nav, entry));
@@ -3906,10 +3970,31 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
           return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, unconfirmed: true, unconfirmedStep: stepNum, conflict: false, tokenProtected: false, partial: idx > 0,
             operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
         }
-        const went = idx > 0 ? ` ${earlierParts(idx, steps.length)} recorded; the rest was not sent.` : " Nothing was sent.";
-        const message = `${line}${went}`;
-        return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, conflict: false, tokenProtected: false, partial: idx > 0,
+        const baseLine = idx > 0 ? line.replace(/\s*Nothing was sent\.?$/i, "") : line;
+        const went = idx > 0 ? ` ${earlierParts(idx, steps.length)} recorded; the rest was not sent.` : (/nothing was sent/i.test(baseLine) ? "" : " Nothing was sent.");
+        const message = `${baseLine}${went}`;
+        return { ok: false, status: 0, code: "settings_changed", settingsChanged: true, ...(idx === 0 ? { notSent: true } : { stepNotSent: true }), conflict: false, tokenProtected: false, partial: idx > 0,
           operationHashPrefix: hashPrefix, message, text: message, committedQuestionIds, stepsCompleted: idx };
+      }
+      if (isKnownUnsentError(error)) {
+        const rawLine = unsentErrorMessage(error).trimEnd();
+        const baseLine = idx > 0 ? rawLine.replace(/\s*Nothing was sent\.?$/i, "") : rawLine;
+        const went = idx > 0 ? ` ${earlierParts(idx, steps.length)} recorded; the rest was not sent.` : (/nothing was sent/i.test(baseLine) ? "" : " Nothing was sent.");
+        const message = `${baseLine}${went}`;
+        return {
+          ok: false,
+          status: 0,
+          code: "not_sent",
+          ...(idx === 0 ? { notSent: true } : { stepNotSent: true }),
+          conflict: false,
+          tokenProtected: false,
+          partial: idx > 0,
+          operationHashPrefix: hashPrefix,
+          message,
+          text: message,
+          committedQuestionIds,
+          stepsCompleted: idx,
+        };
       }
       return {
         ok: false,
@@ -3966,7 +4051,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
       }
       if (status === 409 && errCode === "qitem_already_terminal") {
         const settledState = String(data?.state ?? data?.currentState ?? "done");
-        const message = withEarlierParts(`This request was already settled: ${settledState}.`, idx, steps.length); // parts recorded before it was settled are named too
+        const message = withEarlierParts(`This request was already settled: ${settledState === "handed-off" ? "it was " : ""}${statusWord(settledState, "queue")}.`, idx, steps.length); // parts recorded before it was settled are named too
         return {
           ok: false,
           status: 409,
@@ -3988,6 +4073,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         status,
         code: errCode,
         conflict: status === 409,
+        ...(status >= 400 && status < 500 && status !== 409 ? { daemonRefused: true } : {}),
         tokenProtected: false,
         operationHashPrefix: hashPrefix,
         message,
@@ -4562,6 +4648,53 @@ export function navBack(nav, conn = null, { fallback = null, primaryConn = null 
   return parent ? { stack: [parent] } : { stack };
 }
 
+/** Each Rig tab's own page history, `{ [tabId]: { stack, at } }`: a tab draws the last entry of its own stack, and nothing here
+ *  changes another tab's record. `at` is when the record last changed. Each function returns the same object when nothing changes. */
+export function tabPagesPush(all, tabId, entry, { spaceConn = null, at = Date.now() } = {}) {
+  if (!tabId || !entry) return all ?? {};
+  // A machine space with one OpenRig shows only that OpenRig's pages.
+  if (spaceConn && entry.conn && entry.conn !== spaceConn) return all ?? {};
+  return { ...(all ?? {}), [tabId]: { stack: navPush(all?.[tabId], entry).stack, at } };
+}
+
+/** Back on one tab: its own visit order (never another tab's), else its page's breadcrumb parent. */
+export function tabPagesBack(all, tabId, { fallback = null, at = Date.now() } = {}) {
+  if (!tabId) return all ?? {};
+  const before = all?.[tabId]?.stack ?? [];
+  const { stack } = navBack({ stack: before }, null, { fallback });
+  if (stack === before || (stack.length === before.length && stack.every((e, i) => e === before[i]))) return all ?? {};
+  return { ...(all ?? {}), [tabId]: { stack, at } };
+}
+
+/** Escape or ×: this tab's history goes; other tabs keep theirs. */
+export function tabPagesClose(all, tabId) {
+  if (!tabId || !all || !Object.hasOwn(all, tabId)) return all ?? {};
+  const { [tabId]: _closed, ...rest } = all;
+  return rest;
+}
+
+/** Only the tabs that still exist keep a record. */
+export function tabPagesPrune(all, liveIds) {
+  const live = new Set(liveIds ?? []);
+  const kept = Object.entries(all ?? {}).filter(([id]) => live.has(id));
+  return kept.length === Object.keys(all ?? {}).length ? all ?? {} : Object.fromEntries(kept);
+}
+
+/** Removes the entries `drop` matches (an archived or deleted rig's pages) from every tab. A stack left empty shows Topology:
+ *  stamped with `conn` when it's known; with several OpenRigs and no `conn`, nothing at all, never a page that names no OpenRig. */
+export function tabPagesScrub(all, drop, { conn = null, several = false, at = Date.now() } = {}) {
+  let changed = false;
+  const out = {};
+  for (const [id, rec] of Object.entries(all ?? {})) {
+    const before = rec?.stack ?? [];
+    const stack = before.filter((entry) => !drop(entry));
+    if (stack.length === before.length) { out[id] = rec; continue; }
+    changed = true;
+    out[id] = { stack: stack.length ? stack : conn ? [{ section: "topology", conn }] : several ? [] : [{ section: "topology" }], at };
+  }
+  return changed ? out : all ?? {};
+}
+
 /** Icon paths for `svg(...)` from one mod folder (`base` = e.g. `mods/${MOD_IDS.view}`): the Rig icons that folder
  *  ships (`rig-*`, and `bell`), else herdr's own (`workspace-chrome`). Per folder, so a renamed folder still finds them. */
 export function iconsAt(base) {
@@ -4968,7 +5101,7 @@ export function recentTransitionRows(data, topologyOrOpts = [], extraOpts = {}) 
     const opts=Array.isArray(topologyOrOpts)?extraOpts:topologyOrOpts;
     const ts = rawTs.includes("T") ? formatAbsoluteTime(rawTs,{timezone:opts?.timezone,seconds:true}) : (rawTs || "—");
     const actor = singleLineText(tr?.actorSession ?? tr?.actor ?? "—");
-    const change = singleLineText(tr?.change ?? (tr?.fromState && tr?.toState ? `${tr.fromState} → ${tr.toState}` : (tr?.toState ?? tr?.state ?? "")));
+    const change = singleLineText(tr?.change ? String(tr.change).split(/\s*→\s*/).map(value => statusWord(value, "queue")).join(" → ") : tr?.fromState && tr?.toState ? `${statusWord(tr.fromState, "queue")} → ${statusWord(tr.toState, "queue")}` : statusWord(tr?.toState ?? tr?.state ?? "", "queue"));
     const bodyLine = String(tr?.bodyPreview ?? "").split(/\r\n|[\n\r\u2028\u2029]/).map(singleLineText).find(Boolean);
     const label = singleLineText(tr?.summary) || bodyLine || singleLineText(tr?.qitemId || tr?.transitionId || "—");
     return {
@@ -5132,9 +5265,7 @@ export function resolveTuiLineFallback(line) {
   const pages = { terminals: "terminals", attention: "needs", system: "system" };
   if (!rest && Object.hasOwn(pages, verb)) return { kind: "nav", line: s, area: pages[verb], action: { type: "jump" } };
   if (verb === "config" && !rest) return { kind: "nav", line: s, area: "system", action: { type: "config-open" } };
-  if ((verb === "view-design" || verb === "design-view")) {
-    return { kind: "action", line: s, action: { type: "design-view", rig: rest || null } };
-  }
+  if (verb === "view-design" || verb === "design-view") return null;
   if (verb === "open-page" && !rest) {
     return { kind: "action", line: s, action: { type: "open-page" } };
   }
@@ -5250,7 +5381,7 @@ export function paletteRoute(res, top, topology = []) {
   const rawLine = typeof res === "string" ? res : String(resolved?.line ?? res?.line ?? "");
   const [typedRaw, typedRig] = rawLine.trim().split(/\s+/);
   const typed = (typedRaw ?? "").toLowerCase();
-  if (typed === "view-design" || typed === "design-view") return { act: "design-view", rig: typedRig ?? null };
+  if (typed === "view-design" || typed === "design-view") return null;
   if (typed === "open-page" || a.type === "open-page") return { act: "open-page" };
   if (typed === "open-tui" || a.type === "open-tui") return { act: "open-tui" };
   if (typed === "operator" || a.type === "operator") return { act: "operator" };
@@ -5600,6 +5731,9 @@ export const GRID_GEOMETRY_REASON = "Custom worker-view grids and cell editing a
 
 /** Compact copy shared by page notes and popup footers; original reasons remain available in tooltips. */
 export function workerCapabilityText(reason = "", caps = null) {
+  if (caps && ([STOCK_PROVIDER_REASON,FOLLOW_PRUNE_REASON,GRID_GEOMETRY_REASON,HERDR_APP_UNAVAILABLE_REASON,HERDR_APP_UNCONFIRMED_REASON].some(value=>reason.includes(value))
+    || typeof caps.herdrAppAvailabilityReason==='string' && caps.herdrAppAvailabilityReason.length>0 && reason.includes(caps.herdrAppAvailabilityReason)))
+    return caps.hostWorkerViews ? "" : "Saved views and Follow need an OpenRig that can plan worker views.";
   if (reason.includes(STOCK_PROVIDER_REASON)) return "Worker views need a newer OpenRig.";
   if (caps?.herdrAppProvider && (reason.includes(FOLLOW_PRUNE_REASON) || reason.includes(GRID_GEOMETRY_REASON))) {
     const names = [!caps.followPrune && "Follow", (!caps.gridGeometry || !caps.cellClose) && "Design view"].filter(Boolean);
@@ -5628,10 +5762,18 @@ export const DEFAULT_CAPABILITIES = Object.freeze({
 });
 
 const capabilitiesCache = new Map();
+const confirmedCapabilities = new Map();
+const capabilityVersions = new Map();
+const capabilityFailures = new Map();
+const CAPABILITY_VERSION_TTL_MS = 60_000;
+const CAPABILITY_RETRY_TTL_MS = 20_000;
 
 /** Clear cached CLI capability probe results (used on manual refresh, daemon reconnect, and tests). */
 export function clearCapabilitiesCache() {
   capabilitiesCache.clear();
+  confirmedCapabilities.clear();
+  capabilityVersions.clear();
+  capabilityFailures.clear();
 }
 
 /** Public `terminal status --provider herdr-app` reply. Plain status omits this provider even when available. */
@@ -5697,10 +5839,10 @@ export function rigCapabilities({
 }
 
 /**
- * Probe and cache capabilities per resolved CLI binary + daemon endpoint.
- * Refreshes when `force: true` is passed (e.g. on `rig.refresh` or daemon reconnect).
+ * Cache measured help per connection and CLI version answer. Versions identify a cache entry;
+ * capability flags still come from help, never a version threshold. Failed probes are retried.
  */
-export async function probeCapabilities(config, { exec, terminals = [], hasNativeSeatsEndpoint = null, nativeSeatsSupported = null, force = false, providerAppHome = null } = {}) {
+export async function probeCapabilities(config, { exec, terminals = [], hasNativeSeatsEndpoint = null, nativeSeatsSupported = null, force = false, providerAppHome = null, cliVersion = undefined } = {}) {
   // Help capabilities are cached; provider availability is live and must recover when the window starts/stops.
   const availableNow = async caps => {
     if (!caps.herdrAppProvider || typeof providerAppHome !== "string" || !providerAppHome) return caps;
@@ -5718,17 +5860,68 @@ export async function probeCapabilities(config, { exec, terminals = [], hasNativ
     const merged = { ...DEFAULT_CAPABILITIES, ...config.capabilities };
     return availableNow(merged.herdrAppProvider && hasLiveSeat && !merged.nativeSeats ? { ...merged, nativeSeats: true } : merged);
   }
-  const rigCmd = Array.isArray(config?.rig) && config.rig.length ? config.rig.join("\0") : "rig";
-  const key = `${rigCmd}::${config?.daemonUrl ?? ""}`;
-  if (!force && capabilitiesCache.has(key)) {
-    const cached = capabilitiesCache.get(key);
+  const key = JSON.stringify([config?.rig ?? ["rig"], config?.connectionId ?? null, config?.daemonUrl ?? null, config?.daemonMachine ?? null, config?.openrigHome ?? null]);
+  if (typeof exec !== "function") return availableNow({ ...DEFAULT_CAPABILITIES });
+  const unconfirmed = () => {
+    const previous = confirmedCapabilities.get(key);
+    const identity = capabilityVersions.get(key);
+    if (identity?.version && identity.until > Date.now() && previous?.version === identity.version) {
+      const cached = previous.value;
+      const hasLiveSeat = (terminals ?? []).some(t => t?.labels?.["openrig.role"] === "seat");
+      return availableNow({ ...cached, usingLastConfirmed: true, nativeSeats: Boolean(cached.herdrAppProvider && (cached.nativeSeats || hasLiveSeat || endpointFlag)) });
+    }
+    return availableNow({ ...DEFAULT_CAPABILITIES, probed: false });
+  };
+  if (force) { capabilitiesCache.delete(key); capabilityVersions.delete(key); capabilityFailures.delete(key); }
+  const failureUntil = capabilityFailures.get(key) ?? 0;
+  const failedIdentity = capabilityVersions.get(key);
+  // Keep the help retry window, but revalidate a known version at its own expiry: falling back to
+  // permissive defaults here would otherwise make unsupported controls flap during a slow outage.
+  if (failureUntil > Date.now() && (!failedIdentity?.version || failedIdentity.until > Date.now())) return unconfirmed();
+  if (failureUntil <= Date.now()) capabilityFailures.delete(key);
+  if (cliVersion === null) {
+    capabilitiesCache.delete(key); capabilityVersions.delete(key);
+    capabilityFailures.set(key, Date.now() + CAPABILITY_RETRY_TTL_MS);
+    return unconfirmed(); // the current state probe could not identify this CLI; do not fan out into help
+  }
+  // A minute bounds additional CLI processes while noticing upgrades. Failed/unconfirmed reads retry after
+  // twenty seconds (not every refresh); explicit Refresh/Retry bypasses both limits. Existing state probes stay fresh.
+  let identity = capabilityVersions.get(key);
+  if ((cliVersion !== undefined && cliVersion !== identity?.version) || !identity || identity.until <= Date.now()) {
+    let version = cliVersion, failed = false;
+    if (version === undefined) {
+      try {
+        const cmd = readCommand(config, ["--version"]), result = await exec(cmd.command, cmd.args, { timeout: 15000 });
+        failed = !result || result.code !== 0;
+        version = failed ? null : String(result.stdout ?? "").trim();
+      } catch (error) {
+        capabilitiesCache.delete(key); capabilityVersions.delete(key);
+        if (error?.code === "GATE_REFUSED") throw error;
+        failed = true;
+      }
+    }
+    if (failed) {
+      capabilitiesCache.delete(key); capabilityVersions.delete(key);
+      capabilityFailures.set(key, Date.now() + CAPABILITY_RETRY_TTL_MS);
+      return unconfirmed(); // no seven-command fan-out when the CLI version itself could not answer
+    }
+    version = typeof version === "string" && version.trim() && version.trim() !== "{}" ? version.trim() : null;
+    if (!version) capabilitiesCache.delete(key); // an unknown identity is reused only inside its short window
+    identity = { version, until: Date.now() + (version ? CAPABILITY_VERSION_TTL_MS : CAPABILITY_RETRY_TTL_MS) };
+    capabilityVersions.set(key, identity);
+  }
+  const version = identity.version;
+  if (!version || confirmedCapabilities.get(key)?.version !== version) confirmedCapabilities.delete(key);
+  if (failureUntil > Date.now()) return unconfirmed(); // version only; never fan out into help before its retry boundary
+  if (!force && capabilitiesCache.has(key) && capabilitiesCache.get(key).version === version) {
+    const cached = capabilitiesCache.get(key).value;
     const hasLiveSeat = (terminals ?? []).some((t) => t?.labels?.["openrig.role"] === "seat");
     return availableNow({
       ...cached,
       nativeSeats: Boolean(cached.herdrAppProvider && (cached.nativeSeats || hasLiveSeat || endpointFlag)),
     });
   }
-  if (typeof exec !== "function") return availableNow({ ...DEFAULT_CAPABILITIES });
+  capabilitiesCache.delete(key); // a new version or a failed help read must not expose an older entry
   const probeExec = (cmd) => Promise.resolve(exec(cmd.command, cmd.args, { timeout: 15000 })).catch(rethrowGate(null)); // a refusal is not "nothing available": it must not be cached
   const openCmd = readCommand(config, ["terminal", "open", "--help"]);
   const closeCmd = readCommand(config, ["terminal", "close", "--help"]);
@@ -5746,13 +5939,23 @@ export async function probeCapabilities(config, { exec, terminals = [], hasNativ
   const openHelp = `${openRes?.stdout ?? ""}\n${openRes?.stderr ?? ""}`.trim();
   const closeHelp = `${closeRes?.stdout ?? ""}\n${closeRes?.stderr ?? ""}`.trim();
   const tuiHelp = `${tuiRes?.stdout ?? ""}\n${tuiRes?.stderr ?? ""}`.trim();
+  const replies = [openRes, closeRes, tuiRes, downRes, archiveRes, createRes, rigRes];
+  const answered = res => res && helpOf(res) && (res.code === 0 || /\bunknown command\b/i.test(helpOf(res)));
+  if (replies.some(res => !answered(res))) {
+    capabilityFailures.set(key, Date.now() + CAPABILITY_RETRY_TTL_MS);
+    return unconfirmed();
+  }
   // In unit tests with an unconfigured fake exec (`stdout: "{}"`), keep full capabilities unless `/api/native-seats` was absent.
   if ((!openHelp || openHelp === "{}") && (!closeHelp || closeHelp === "{}") && endpointFlag !== false) {
+    if (!version) capabilitiesCache.set(key, { version, value: { ...DEFAULT_CAPABILITIES } });
     return availableNow({ ...DEFAULT_CAPABILITIES });
   }
   const caps = rigCapabilities({ openHelp, closeHelp, tuiHelp, hasNativeSeatsEndpoint: endpointFlag, terminals,
     downHelp: helpOf(downRes), archiveHelp: helpOf(archiveRes), rigHelp: helpOf(rigRes), createHelp: helpOf(createRes) });
-  capabilitiesCache.set(key, caps);
+  if (replies.every(res => helpOf(res) && helpOf(res) !== "{}")) {
+    capabilitiesCache.set(key, { version, value: caps });
+    if (version) confirmedCapabilities.set(key, { version, value: caps });
+  }
   return availableNow(caps);
 }
 
@@ -5804,6 +6007,8 @@ export function connectionCapabilities(sharedFn, config, connId, terms = []) {
  */
 export function capabilityDisableReason(action, caps = DEFAULT_CAPABILITIES) {
   const c = caps ?? DEFAULT_CAPABILITIES;
+  if(["open-view","open-seat"].includes(action))return null; // Seats is always the fallback.
+  if(["follow","unfollow","prune"].includes(action))return c.hostWorkerViews?null:"Saved views and Follow need an OpenRig that can plan worker views.";
   if(c.hostWorkerViews===true&&c.herdrAppAvailable===false&&["open-view","follow","unfollow","prune"].includes(action))return null;
   if(c.hostWorkerViews===true&&c.herdrAppAvailable===false&&["design-view","open-designed-view"].includes(action))return "Design view needs a Herdr window on OpenRig's machine.";
   if(c.hostWorkerViews===true&&c.herdrAppAvailable===false&&action==="close-view")return "Close these worker pages with Herdr's tab close controls; their seats keep running.";
@@ -5849,7 +6054,7 @@ export function capabilitiesSummaryDetail(caps = DEFAULT_CAPABILITIES) {
   }
   const c = caps ?? DEFAULT_CAPABILITIES;
   const mark = (ok) => (ok ? "✓" : "—");
-  const line = [
+  const line = c.usingLastConfirmed === true ? "Using the last answer from OpenRig (it didn't answer just now)" : [
     `herdr-app provider ${mark(c.herdrAppProvider)}`,
     `follow/prune ${mark(c.followPrune)}`,
     `custom grids ${mark(c.gridGeometry && c.cellClose)}`,
@@ -6335,26 +6540,6 @@ export function mapSeatStateToOsc7501(nodeOrStatus) {
   if (s === "needs_input" || s === "attention_required" || s === "blocked" || s === "failed" || s === "needs you") return "blocked";
   if (s === "done" || s === "completed") return "done";
   return "idle";
-}
-
-/**
- * Format an OSC 7501 escape sequence (`\x1b]7501;state=<state>[:kind=<kind>][:app=<app>][:title=<base64>]\x07`)
- * matching `herdr-core`'s `program_status.zig` (`ValueIterator` colon separator + base64 `title=`).
- */
-export function formatOsc7501Sequence({ state = "idle", kind = "", app = "openrig", title = "" } = {}) {
-  const cleanField = (v) => String(v ?? "").replace(/[^A-Za-z0-9_.+\-,/=]/g, "").slice(0, 32);
-  const st = cleanField(state) || "idle";
-  if (st === "clear") return "\x1b]7501;state=clear\x07";
-  const parts = [`state=${st}`];
-  const k = cleanField(kind);
-  if (st === "blocked" && (k === "permission" || k === "question" || k === "auth")) {
-    parts.push(`kind=${k}`);
-  }
-  const cleanApp = cleanField(app);
-  if (cleanApp) parts.push(`app=${cleanApp}`);
-  const rawTitle = String(title ?? "").replace(/[\x00-\x1f\x7f]/g, " ").trim();
-  if (rawTitle) parts.push(`title=${base64EncodeUtf8(rawTitle)}`);
-  return `\x1b]7501;${parts.join(":")}\x07`;
 }
 
 /**
@@ -6996,15 +7181,10 @@ export function stateSaveReason(error) {
 }
 
 /** A request to OpenRig that was refused or failed with only a status: said in words (what could not be done and the error number), never the method and path. */
-export const requestFailed = (what, status) => `OpenRig couldn't send ${what} (error ${status}).`;
+export const requestFailed = (what, status) => failedWords(what, status);
 /** The words for a daemon path, for requestFailed. */
 export function requestWhat(path) {
-  const p = String(path ?? "").split("?")[0];
-  if (p === "/api/slices") return "the slice list";
-  if (p.startsWith("/api/specs/library/")) return "that spec";
-  if (p === "/api/queue/list") return "the queue list";
-  if (p === "/api/scopes") return "the scopes list";
-  return "that list";
+  return requestWords(path);
 }
 /** A rig command that stopped with no message. A read-only probe has nothing to warn about. */
 export const rigStoppedBare = (code) => `OpenRig's command stopped without saying why (exit ${code}).`;

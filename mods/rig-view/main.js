@@ -1,7 +1,7 @@
-import {rigOrigin, syncRetainedOrigins} from "./rig-space-context.js";
-import { readInPlaceOpen, withoutInPlaceOpen, inPlaceFallbackNote } from "./rig-routing.js";
+import { openRigSpaceContext, rigOrigin, sameDaemonOrigin, syncRetainedOrigins } from "./rig-space-context.js";
+import { readInPlaceOpen, withoutInPlaceOpen, inPlaceFallbackNote, homeKey } from "./rig-routing.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { stampConnection, spaceStatusKey, adoptConnection, qualifyKey, connectionConfig, configOfConnection, targetConnection, UNKNOWN_CONNECTION, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, isCodeError, describeCodeError, connectionBoxLabel, formatHostId, commandFor, plainExecError } from "./rig-connections.js";
+import { stampConnection, spaceStatusKey, adoptConnection, qualifyKey, connectionConfig, configOfConnection, targetConnection, UNKNOWN_CONNECTION, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, isCodeError, describeCodeError, connectionBoxLabel, formatHostId, commandFor, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import {workerViewDetails,workerMissingReason} from "./rig-worker-views.js";
 import { machineSetupReceiptLabel } from "./rig-machine-setup.js";
 import { connectionBlocks } from "./rig-connections-view.js";
@@ -25,12 +25,16 @@ import { cleanAwayStates, readAwayState, restoreAwayStateMap, writeAwayState } f
 import { View, div, svg } from "gpui-kit";
 import { sharedLoopbackDaemonUrl, sharedRigData, stampRows, rowsIdentityOf, RIG_DATA_STAMP } from "./rig-lib.js";
 import { relativeTimeText, specRealpathAvailable, sameDaemon, listAddedMachine, requestFailed } from "./rig-lib.js";
+import { counted, plainError, statusWord, errorDiagnostic } from "./rig-words.js";
+import {activationPair} from './rig-activation.js';
+import { errorBlock, errorNotice } from "./rig-error-view.js";
 
 import { currentHealthRecords, healthCounts, healthForRig, groupHealthRecords, healthScopeTarget, healthQueueId, healthAge, validHealthQitemId, healthContextPercentage, classifyHealth, mergeHealthHistory } from "./rig-health.js";
 
 import { filterAttentionHealth, isHealthAttention, saveStateFile, stateSaveFailure } from "./rig-lib.js";
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, shared, setShared as rawSetShared, settings, openOverlay as rawOpenOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify, machines } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, shared, setShared as rawSetShared, settings, openOverlay as rawOpenOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify as rawNotify, machines } from "herdr";
+const notify = value => errorNotice(rawNotify, value);
 import { installHerdrTransport } from "./rig-openrig-wire.js";
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal, numberedConfigReads } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
@@ -38,14 +42,14 @@ import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, 
 const fetchFor = (config) => (url, init) => gatedFetch(url, init, undefined, config?.connectionId);
 // ONE counter for every page of this mod copy, like the gate it feeds (rig-gate.js is one per mod copy): a counter per page would let one page's older read re-open a connection another page's newer read removed.
 const configReads = numberedConfigReads();
-const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options, undefined, undefined, appHome());
 const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
 // A Rig sidebar command (`rig.<command>`) is sent only while the Rig sidebar is in the layout (rig-lib sidebarRun): without it,
 // herdr would answer with a raw "unknown command" toast, so a person is told plainly and a background refresh is skipped.
 const run = (name, args) => sidebarRun({ layout, notify }, (n, a) => gatedRun(rawRun, n, a), name, args);
 const refreshSidebar = () => { if (layoutHasMod(layout(), MOD_IDS.sidebar)) run("rig.refresh"); };
 // A send for a CONNECTION names its gate scope (several OpenRigs: a bare sink refuses). `config` is that connection's own config: a page acts for the connection it shows.
-const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId);
+const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId, appHome());
 const hcFor = (config) => (args, bytes) => gatedHc(rawHc, args, bytes, undefined, config?.connectionId);
 const runFor = (config) => (name, args) => sidebarRun({ layout, notify }, (n, a) => gatedRun(rawRun, n, a, config?.connectionId), name, args);
 
@@ -65,7 +69,7 @@ import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetail
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { dismissible, dismissalSnapshot, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { HERDRIG_VERSION } from "./rig-version.js";
-import { registerRigRouting, workerCapabilityText } from "./rig-lib.js";
+import { registerRigRouting, workerCapabilityText, tabPagesPush, tabPagesBack, tabPagesClose, tabPagesPrune } from "./rig-lib.js";
 import { NowTailCache, nowTailPresentation } from "./rig-now.js";
 import { RigGraph, GRAPH_EDGE_LOOK } from "./rig-graph.js";
 import { pageBodyLayout } from "./rig-page-layout.js";
@@ -89,14 +93,16 @@ const icon = iconsAt(ASSETS);
 const STACK = "rig-work", PAGE = "rig-page";
 // herdr gives a mod's render a fixed time budget; a Needs list draws one page of rows at a time, so its render stays the same size at any count.
 const NEEDS_PAGE_ROWS = 50;
-/** How long the page reuses its copy of rig.data while the publish stamp stays the same (rawRigData). */
-const RIG_DATA_KEEP_MS = 5_000;
+/** How recently the page must have seen its connection's sidebar refresh (rig.refreshed) for its own 5 s timer to leave re-reading to it. */
+const SIDEBAR_FRESH_MS = 75_000;
+/** Answers that land within this long of the last re-render share the next one (one frame at 60 Hz). */
+const ANSWER_COALESCE_MS = 16;
 const CONFIG = () => `${appHome()}/openrig/config.json`;
 
 const nav = () => shared("rig.nav") ?? { stack: [] };
 // With several OpenRigs each Rig tab shows only its OWN connection's pages (see RigView.shownEntry). A link clicked on a page belongs to the page
 // that tab shows (`from`, the clicking view's own shown entry, via RigView.push), which may not be the shared stack's top.
-function push(entry, from = null) {
+function push(entry, from = null, sourceTab = null) {
   const shownTop = () => from ?? nav().stack?.at(-1);
   const shownBefore = shownTop(); // read before this push changes the stack: the page the link or tab was clicked on
   // One-way sync (Sidebar → Page, never Page → Sidebar). In-Page navigation only updates `shared("rig.nav")`
@@ -111,7 +117,7 @@ function push(entry, from = null) {
   setShared("rig.nav", navPush(nav(), entry));
   // A page that names no rig on this page's OpenRig, and a tab of the rig page on screen, are shown here (see openOrFocusRigTab); another rig's page
   // goes to that rig's own space if it has one. A page's own link or tab never makes a space.
-  openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology", fromPage: true, fromEntry: shownBefore ?? null }, entry);
+  openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology", fromPage: true, fromEntry: shownBefore ?? null, ...(sourceTab ? { sourceTab } : {}) }, entry);
 }
 const rigPageOnScreen = () => rigPageOnScreenIn(spaces, panes);
 /** Closes the inspection: closes or leaves the Rig tab or selects main on legacy rig-work stack. */
@@ -204,11 +210,14 @@ export default class RigView extends View {
     this.statusMotion = new StatusMotion();
     this.pageViewMemory = {}; // Session only; never persisted with folds or navigation.
     this.pulseFilter = null; // Page-session only: never restore the legacy persisted shared filter.
-    this.initialEntry = p?.entry ?? null;
+    const hostProps = typeof props === "function" ? props() : null;
+    const initProps = p && Object.keys(p).length > 0 ? p : (hostProps ?? p ?? null);
+    this.initialEntry = initProps?.entry ?? null;
+    this.initialConn = this.initialEntry?.conn ?? null;
     // The space this tab lives in. Herdrig names it in the tab's props when it makes the tab (`space`), and Herdr restores a tab with its
-    // props, so it holds after a restart. A tab made before that has no `space`: it takes the active space when it is DRAWN (render), never
-    // only at init, because after a restart Herdr makes every restored tab's view while some other space is active.
-    this.propsSpaceId = typeof p?.space === "string" && p.space ? p.space : null;
+    // props (delivered through `herdr.props()`), so it holds after a restart. A tab made before that (or whose props space no longer exists)
+    // takes the active space when it is DRAWN (render), never at init, because after a restart Herdr makes every restored tab's view while some other space is active.
+    this.propsSpaceId = typeof initProps?.space === "string" && initProps.space ? initProps.space : null;
     try { this.ownSpace = this.propsSpaceId ? null : (spaces?.() ?? []).find((s) => s?.active) ?? null; } catch (_) { this.ownSpace = null; }
     this.config = null;
     this.resetNowTails(cx);
@@ -247,27 +256,17 @@ export default class RigView extends View {
     cx.timer.every(5000, (cx) => {
       if (this.closed) return;
       this.loadConfig(cx);
-      // A page can be open without the sidebar, and lifecycle changes need not emit SSE.
+      // A page can be open without the sidebar, and lifecycle changes need not emit SSE. While the sidebar is in the layout and this page saw its
+      // connection's refresh in the last SIDEBAR_FRESH_MS, the sidebar supplies freshness and content versions: only changed content invalidates
+      // the page. A second invalidation here would fetch unchanged lists and redraw an idle page.
+      this.observeSidebarRefresh();
+      const seen = this.refreshSeen;
+      if (layoutHasMod(layout(), MOD_IDS.sidebar) && seen?.conn === this.activeConnId() && Date.now() - seen.at <= SIDEBAR_FRESH_MS) { this.refreshUnmirrored(cx); return; }
       this.invalidateLiveReads();
       cx.notify();
     });
     // The header's status line and a reply's confirmation come and go by time: redraw while one shows or a new one arrives.
     cx.timer.every(1000, (cx) => { if (this.ticking || shared("rig.status")?.at !== this.statusAt) cx.notify(); });
-    cx.timer.every(250, (cx) => this.pollSpacesDecision(cx));
-    cx.timer.every(250, (cx) => {
-      const pending=this.specPermission;if(!pending)return;
-      const decisions=shared("rig.specWriteDecisions")??{},decision=decisions[pending.token];
-      if(!decision&&Date.now()<pending.expires)return;
-      this.specPermission=null;const rest={...decisions};delete rest[pending.token];setShared("rig.specWriteDecisions",rest);
-      pending.box.awaitingPermission=false;
-      if(decision==="allow"){
-        // The answer continues the write the dialog was opened for, on ITS connection as the settings say now (a removed one sends nothing), never the
-        // connection the tab happens to show when the answer comes back.
-        const again=pending.began?this.specOperation(configOfConnection(this.config,pending.began.config.connectionId),pending.began.fromConn):null;
-        if(pending.began&&!again){pending.box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one.";cx.notify();return;}
-        if(pending.request?.verb==="copy-folder")this.copyFolder(cx,pending.spec,pending.confirmation,again);else this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation,again);}
-      else {pending.box.note="Nothing was saved on the box.";cx.notify();}
-    });
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -282,10 +281,10 @@ export default class RigView extends View {
   async forgetInPlaceOpen() {
     let rigId = this.shownInPlace?.rigId ?? null;
     let conn = this.shownInPlace?.conn ?? null;
-    const ownSpaceId = this.propsSpaceId ?? this.ownSpace?.id ?? null;
+    const ownSpaceId = this.tabSpace()?.id ?? this.propsSpaceId ?? this.ownSpace?.id ?? null;
     if (!rigId) {
       try {
-        const entry = this.shownEntry() ?? this.initialEntry;
+        const entry = this.shownEntry() ?? this.openingEntry();
         rigId = entry?.rigId ?? (entry?.kind === "rig" ? entry.id : null) ?? null;
         conn = this.activeConnId();
       } catch (_) {}
@@ -295,6 +294,7 @@ export default class RigView extends View {
     const rec = readInPlaceOpen(spaceState, rigId, conn);
     if (!rec) return;
     if (rec.space && ownSpaceId && rec.space !== ownSpaceId) return;
+    if (rec.tab && this.tabId && rec.tab !== this.tabId) return; // another Rig tab in this space holds the record: closing this one leaves it
     const nextInPlace = withoutInPlaceOpen(spaceState, rigId, conn);
     const nextState = { ...(spaceState ?? {}) };
     if (nextInPlace === undefined) delete nextState.inPlaceOpen; else nextState.inPlaceOpen = nextInPlace;
@@ -318,7 +318,7 @@ export default class RigView extends View {
       const all = shared("rig.pageOnScreen");
       if (!all || typeof all !== "object" || !Object.values(all).some((rec) => rec?.views && this.viewToken in rec.views)) return;
       const next = {};
-      for (const [id, rec] of Object.entries(all)) { const views = { ...(rec?.views ?? {}) }; delete views[this.viewToken]; if (Object.keys(views).length) next[id] = { ...rec, views }; }
+      for (const [id, rec] of Object.entries(all)) { const views = { ...(rec?.views ?? {}) },healthViews={...(rec?.healthViews??{})}; delete views[this.viewToken];delete healthViews[this.viewToken]; if (Object.keys(views).length) next[id] = { ...rec, views,healthViews }; }
       setShared("rig.pageOnScreen", next);
     } catch (_) {}
   }
@@ -328,7 +328,7 @@ export default class RigView extends View {
     const cfg = this.activeConfig();
     if (!cfg) return null;
     if (!cfg.daemonUrl && cfg === this.config) {
-      const fromShared = sharedLoopbackDaemonUrl(cfg, shared("rig.data"));
+      const fromShared = sharedLoopbackDaemonUrl(cfg, this.rawRigData()); // the kept copy: a fresh one is a megabyte at scale
       if (fromShared) return { ...cfg, daemonUrl: fromShared };
     }
     return cfg;
@@ -359,7 +359,7 @@ export default class RigView extends View {
       .child(div().flex_1().truncate().text_size(12).text_color(t.muted).tooltip(String((receipt.keys.length === 1
         ? `✓ Dismissed: ${receipt.summary ?? "update"}` : `✓ Dismissed ${receipt.keys.length} updates`)??"")).child(receipt.keys.length === 1
         ? `✓ Dismissed: ${receipt.summary ?? "update"}` : `✓ Dismissed ${receipt.keys.length} updates`))
-      .child(div().id(`undo-${receipt.id}`).text_size(12).text_color(t.accent).cursor_pointer()
+      .child(div().id(`undo-${receipt.id}`).tooltip("Bring back the update you just dismissed").text_size(12).text_color(t.accent).cursor_pointer()
         .on_click(() => this.updateAction("undo", receipt.id)).child("Undo"));
   }
 
@@ -452,8 +452,12 @@ export default class RigView extends View {
         const saved=consentConfig?consentOf(text,consentConfig.connectionId??LEGACY_CONNECTION_ID):null,key=JSON.parse(saved?.key??"null");
         consentMachine=key?.sha256===SPEC_SHA256?key.machine:null;
       }catch{consentMachine=null;}
+      // Approval is a separate file: it can change while connection settings stay identical. Refresh its display snapshot on the watcher/poll,
+      // under this load's newest-read guard, rather than only when the Connections health probes restart.
+      const connectionConsent = await readTextFile(`${appHome()}/openrig/machine-consent.json`).catch(() => null);
       if (this.latestRead !== next) return; // a newer read installed while the consent file was read: it sets its own config
       this.specConsentMachine=consentMachine;
+      if (this.connConsent !== connectionConsent) { this.connConsent = connectionConsent; cx.notify(); }
       // Only the newest load publishes consent/folders; an identical retry still
       // finishes folders when the prior load was overtaken during those checks.
       if (!needsFolders) return;
@@ -481,7 +485,7 @@ export default class RigView extends View {
   hostWorkerEntry(view,cfg=this.activeConfig()){
     const entry=cfg&&Object.values(shared("rig.workerViews")??{}).find(e=>e.view===view&&e.config?.daemonMachine===cfg.daemonMachine
       &&rigOrigin(e.config?.daemonUrl)===rigOrigin(cfg.daemonUrl)&&(e.config?.connectionId??LEGACY_CONNECTION_ID)===(cfg.connectionId??LEGACY_CONNECTION_ID));
-    return entry&&entry.pages?.some(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)))?entry:null;
+    return entry&&entry.pages?.some(page=>this.drawSpaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)))?entry:null;
   }
   hostWorkerLine(t,rig,view=`rig:${rig.name}`){
     // The ROW's connection (another box's rig shows its own view, never the first connection's); a connection no longer set up shows none.
@@ -492,7 +496,7 @@ export default class RigView extends View {
       return div().id(`host-worker-progress-${rig.id}`).text_size(11.5).text_color(t.muted)
         .child(`Updating ${view.startsWith("rig:")?`Workers · ${view.slice(4)}`:this.hostWorkerEntry(view,cfg)?.name??"worker view"}…`);
     const entry=this.hostWorkerEntry(view,cfg);if(!entry)return null;
-    const pages=entry.pages.filter(page=>spaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)));
+    const pages=entry.pages.filter(page=>this.drawSpaces().some(space=>space.tabs?.some(tab=>tab.id===page.tab)));
     const where=(this.config?.connections?.length??0)>1&&cfg.daemonMachine?` Tiles run on ${cfg.daemonMachine}.`:""; // with several OpenRigs, which machine
     const details=workerViewDetails(entry);
     const missing=entry.missing?.map(m=>`${m.label} (${workerMissingReason(m.reason)})`).join(", ");
@@ -500,10 +504,10 @@ export default class RigView extends View {
     return v_flex().id(`host-worker-${rig.id}`).gap(4)
       .child(div().text_size(11.5).text_color(t.dim).child(message))
       .when(!!entry.paused,el=>el.child(div().text_size(11.5).text_color(t.working??t.muted).child("Couldn't refresh this view; tiles kept.")
-        .child(div().text_color(t.accent).cursor_pointer().child("Retry").on_click(()=>this.oneClick({kind:"open-view",view:entry.view,rig:rig.name,rigId:rig.id,conn:rig.conn},"open-view")))))
-      .child(h_flex().gap(8).flex_wrap().children(pages.map((page,index)=>div().id(`host-worker-page-${rig.id}-${index}`).text_size(11.5).text_color(t.accent).cursor_pointer()
+        .child(div().text_color(t.accent).cursor_pointer().tooltip("Try opening this rig's worker view again").child("Retry").on_click(()=>this.oneClick({kind:"open-view",view:entry.view,rig:rig.name,rigId:rig.id,conn:rig.conn},"open-view")))))
+      .child(h_flex().gap(8).flex_wrap().children(pages.map((page,index)=>div().id(`host-worker-page-${rig.id}-${index}`).tooltip(`Go to page ${index+1} of this rig's worker view`).text_size(11.5).text_color(t.accent).cursor_pointer()
         .child(`Show page ${index+1}`).on_click(()=>{if(spaces().some(s=>s.id===entry.space&&s.tabs?.some(tab=>tab.id===page.tab))){run("space.select",{id:entry.space});run("tab.select",{id:page.tab});}}))))
-      .child(div().text_size(11.5).text_color(t.accent).cursor_pointer().child(`herdrig prune: ${entry.pruneMs?Math.round(entry.pruneMs/60000)+"m":"off"}…`)
+      .child(div().text_size(11.5).text_color(t.accent).cursor_pointer().tooltip("Change how long a quiet tile stays before herdrig prunes it").child(`herdrig prune: ${entry.pruneMs?Math.round(entry.pruneMs/60000)+"m":"off"}…`)
         .on_click(()=>this.menu({kind:"following",target:entry.view,name:entry.name,rig:rig.name,rigId:rig.id,conn:rig.conn,enabled:entry.following,pruneAfterMs:entry.pruneMs||null})));
   }
   caps() {
@@ -545,13 +549,36 @@ export default class RigView extends View {
 
   /** Back to where `backTarget` says; with nowhere to go it does nothing (Esc and × close the page). */
   back() {
-    const raw = nav(), own = this.ownConn(), opts = { fallback: this.initialEntry, primaryConn: this.config?.connectionId };
+    this.syncSplitTab();
+    if (this.perTab()) {
+      // This tab's own visit order, never another tab's; at its bottom, the page's breadcrumb parent.
+      const id = this.tabId;
+      const all = this.tabPagesWithSeed(), fallback = this.shownEntry();
+      if (!backTarget({ stack: all[id]?.stack ?? [] }, null, { fallback })) return;
+      const next = tabPagesBack(all, id, { fallback });
+      if (next !== all) setShared("rig.tabPages", next);
+      return;
+    }
+    const raw = nav(), own = this.ownConn(), opts = { fallback: this.openingEntry(), primaryConn: this.config?.connectionId };
     if (!backTarget(raw, own, opts)) return;
     setShared("rig.nav", navBack(raw, own, opts));
   }
 
   closePage() {
+    this.syncSplitTab();
+    if (this.perTab()) {
+      // Escape or ×: this tab's history goes (it shows "Nothing open"); other tabs keep theirs, and Herdr's own × closes the tab.
+      const id = this.tabId, all = shared("rig.tabPages") ?? {};
+      setShared("rig.tabPages", { ...tabPagesClose(all, id), [id]: { stack: [], at: Date.now() } });
+      // ...and the router's older record for it, so nothing that still reads it falls back to the page this tab showed.
+      const routes = shared("rig.pageRoutes");
+      if (routes && id in routes) { const { [id]: _gone, ...rest } = routes; setShared("rig.pageRoutes", rest); }
+      if (rigStack()) run("layout.select", { stack: STACK, child: "main" });
+      return;
+    }
     const own = this.ownConn();
+    if (this.initialEntry?.conn) this.initialConn ??= this.initialEntry.conn;
+    this.initialEntry = null;
     if (!own) { closeInspection(); return; }
     const stack = nav().stack ?? [];
     const primary = this.config?.connectionId;
@@ -568,17 +595,17 @@ export default class RigView extends View {
 
   navigationMenu(choices, title = "Sections") {
     // The popup has its own runtime: carry this page's connection in each destination instead of relying on the shared nav stack.
-    const conn=(this.config?.connections?.length??0)>1?this.activeConnId():null;
+    const conn=(this.config?.connections?.length??0)>1?this.awayConnId():null; // a page that names no OpenRig stamps nothing
     if(conn)choices=choices.map(choice=>choice.entry&&!('conn' in choice.entry)?{...choice,entry:{...choice.entry,conn}}:choice);
     this.open({ mod: MOD_IDS.menu, kind: "popup", width: 260, height: Math.min(360, 42 + choices.length * 30),
-      props: { target: { kind: "page-navigation", name: title, choices, from: this.shownEntry() ?? null } } }); // a choice is a click on this page (see rig-menu page())
+      props: { target: { kind: "page-navigation", name: title, choices, from: this.shownEntry() ?? null, ...(this.perTab() ? { sourceTab: this.tabId } : {}) } } }); // a choice is a click on this page (see rig-menu page())
   }
 
   sectionMenu() {
     const data = this.pageRigData() ?? {}, topology = data.topology ?? [];
     const items = this.attentionRead(null).items;
     const health=data.health?.records??this.cache?.["/api/health"]?.data?.records;
-    this.navigationMenu(pageSectionChoices({ topology: `${topology.length} rigs`, specs: data.specs?.length??this.cache?.["/api/specs/library"]?.data?.length,
+    this.navigationMenu(pageSectionChoices({ topology: counted(topology.length, "rig"), specs: data.specs?.length??this.cache?.["/api/specs/library"]?.data?.length,
       terminals: (data.ps ?? []).length, needs: needsRequestCount(topology, items),
       system: Array.isArray(health)?healthCounts(health).problems||"ok":null }));
   }
@@ -596,22 +623,21 @@ export default class RigView extends View {
     const choose = view => this.push(entryWithPageView(entry, view));
     const bar=h_flex().id(`${prefix}-object-tabs`).px(14).gap(16).h(34).items_center().border_b(1).border_color(t.border).flex_none()
       .when((this.pageWidth??960)<320,el=>el.h(68).flex_wrap().gap(8))
-      .children(tabs.map(([id, label]) => focusTarget(this, cx, `${prefix}-tab-${id}`, div().id(`${prefix}-tab-${id}`).h(34).flex_none().flex().items_center().cursor_pointer()
+      .children(tabs.map(([id, label]) => focusTarget(this, cx, `${prefix}-tab-${id}`, div().id(`${prefix}-tab-${id}`).tooltip(`Show this page as ${label}`).h(34).flex_none().flex().items_center().cursor_pointer()
         .border_b(active === id ? 2 : 0).border_color(t.accent).text_size(12.5).text_color(active === id ? t.foreground : t.muted), () => choose(id), el => el.text_color(t.foreground).underline())
-        .on_click(() => choose(id)).child(label)))
+        .child(label)))
       .when(more.length > 0, el => {
         const openMore = () => this.navigationMenu(more.map(([id,label]) => ({ label, entry:entryWithPageView(entry,id) })), "Views");
         return el.child(focusTarget(this, cx, `${prefix}-tabs-more`, div().id(`${prefix}-tabs-more`).cursor_pointer().text_size(12.5).text_color(t.muted)
           .h(34).flex_none().flex().items_center().border_b(more.some(([id])=>id===active)?2:0).border_color(t.accent)
           .tooltip(more.find(([id])=>id===active)?.[1]??"More views"), openMore, e => e.text_color(t.foreground).underline())
-          .on_click(openMore)
           .child(`${more.find(([id])=>id===active)?.[1]??"More"} ▾`));
       });
     if(pageViewKind(entry)==='topology'&&active==='seats'){
       const choices=[['rig','By rig'],['status','By status']].map(([id,label])=>({label,entry:{...entry,topologyTab:'seats',seatsOrder:id}}));
       bar.child(div().flex_1());
       if((this.pageWidth??960)-28<460)bar.child(this.moreButton(t,'all-seats-order-menu',()=>this.navigationMenu(choices,'Seat order')));
-      else bar.child(h_flex().id('all-seats-order').gap(8).items_center().children(choices.map(({label,entry:e})=>div().id(`all-seats-order-${e.seatsOrder}`)
+      else bar.child(h_flex().id('all-seats-order').gap(8).items_center().children(choices.map(({label,entry:e})=>div().id(`all-seats-order-${e.seatsOrder}`).tooltip(`Order the seats by ${e.seatsOrder === "status" ? "status" : "rig"}`)
         .text_size(12).text_color((this.allSeatsOrder??'rig')===e.seatsOrder?t.foreground:t.muted).cursor_pointer().on_click(()=>this.push(e)).child(label))));
     }
     return bar;
@@ -619,21 +645,73 @@ export default class RigView extends View {
 
   /** The connection the page is showing: the shown entry's own `conn` (a request's, from the merged Needs; an older entry with none reads as the
    *  only connection), else the first. Overview pages have none and show the first connection. */
-  /** This tab's own OpenRig, from the entry it was opened with (Herdr restores a tab with its props). Only with several connections: one
-   *  connection's page is exactly as before. */
+  /** This tab's own OpenRig: its machine space's, else the entry it was opened with (Herdr restores a tab with its props), else the single-owner
+   *  local OpenRig home or rig space it lives in (`localSpaceConn`; a home shared by two connections with the same `homeKey` `[origin, machine]`
+   *  stays unowned). Only with several connections: one connection's page is exactly as before. */
   ownConn() {
     if ((this.config?.connections?.length ?? 0) <= 1) return null;
-    return this.spaceConn() ?? this.initialEntry?.conn ?? null;
+    if (this.renderMemo && "ownConn" in this.renderMemo) return this.renderMemo.ownConn;
+    const resolved = this.spaceConn() ?? this.initialEntry?.conn ?? this.initialConn ?? this.localSpaceConn() ?? null;
+    if (this.renderMemo) this.renderMemo.ownConn = resolved;
+    return resolved;
   }
   /** The OpenRig of the MACHINE space this tab lives in, when that machine has exactly one (one rig == one space, and each machine has its
    *  own home space: a Rig tab in box2's space is box2's, whatever entry it was first opened with: an unstamped one, or another box's page routed
-   *  there). Null for a space on this computer (its home page can show any connection's page) or a machine with none or two OpenRigs: then the
-   *  entry it was opened with decides, as before. */
+   *  there). Null for a space on this computer or a machine with none or two OpenRigs: then `initialEntry` or `localSpaceConn` decides. */
   spaceConn() {
     const space = this.tabSpace();
     if (!space || !spaceMachine(space)) return null;
     const picked = followedConnection({ connections: this.config?.connections ?? [], space });
     return picked.why === "space" ? picked.id : null;
+  }
+  /** A single-owner OpenRig home or rig space on this computer (`herdrig.spaces` mark or `openRigSpaceContext`) whose Rig tab has no `entry.conn`
+   *  (opened while one OpenRig was set up, restored from v0.5.1, or split in place): it belongs to that local OpenRig. A plain unmarked space, a
+   *  home shared by two connections with the same `homeKey` `[origin, machine]`, or a space whose terminal links name another OpenRig stays unowned. */
+  localSpaceConn() {
+    const space = this.tabSpace();
+    if (!space || spaceMachine(space) !== null) return null;
+    const connections = this.config?.connections ?? [];
+    const urlOf = (cfg) => cfg?.daemonUrl || sharedLoopbackDaemonUrl(cfg, this.rawRigData());
+    const keyOf = (id) => { const cfg = configOfConnection(this.config, id); return homeKey({ ...cfg, daemonUrl: urlOf(cfg) }); };
+    const sharedHome = (id) => { const k = keyOf(id); return connections.filter((c) => keyOf(c.id) === k).length > 1; };
+    const mark = shared("herdrig.spaces")?.[space.id], markConn = mark?.conn ?? mark?.spaceConn ?? null;
+    if (markConn) return !connections.some((c) => c.id === markConn) || (mark?.home && sharedHome(markConn)) ? null : markConn;
+    const spaceState = shared("rig.spaceState") ?? {};
+    const ctx = openRigSpaceContext([space], terminals?.() ?? [], this.drawPanes(), spaceState, MOD_IDS.view)[0];
+    if (!ctx?.home && !(ctx?.rigs?.length > 0)) return null;
+    const tuiLinks = (ctx?.tuis ?? []).map((t) => ({ origin: t.labels?.["herdr-openrig.origin"] })).filter((l) => l.origin);
+    const links = [...(ctx?.rigLinks ?? []), ...tuiLinks];
+    const picked = followedConnection({ connections, space, links });
+    if (picked.why !== "space") return null;
+    const own = configOfConnection(this.config, picked.id), ownUrl = urlOf(own);
+    if (ctx.home && !(ctx?.rigs?.length > 0)) {
+      if (sharedHome(picked.id)) return null;
+      const homes = spaceState.homeSpaces ?? {};
+      const recordedKeys = Object.entries(homes).filter(([, id]) => id === space.id).map(([k]) => k);
+      if (recordedKeys.length > 0) {
+        const siblingKeys = new Set(connections.filter((c) => c.id !== picked.id).map((c) => keyOf(c.id)));
+        siblingKeys.delete(keyOf(picked.id));
+        const matchesOwn = recordedKeys.some((k) => {
+          if (siblingKeys.has(k)) return false;
+          if (!ownUrl) return picked.id === LEGACY_CONNECTION_ID;
+          try {
+            const [recOrigin] = JSON.parse(k);
+            return (!recOrigin && picked.id === LEGACY_CONNECTION_ID) || Boolean(recOrigin && sameDaemonOrigin(recOrigin, ownUrl, null));
+          } catch (_) { return false; }
+        });
+        if (!matchesOwn) return null;
+      } else if (spaceState.homeSpace === space.id && picked.id !== LEGACY_CONNECTION_ID
+        && connections.some((c) => c.id === LEGACY_CONNECTION_ID && keyOf(c.id) !== keyOf(picked.id))) {
+        return null;
+      }
+    }
+    return links.some((l) => l.origin && !sameDaemonOrigin(l.origin, ownUrl, null)) ? null : picked.id;
+  }
+  openingEntry() {
+    const entry = this.initialEntry;
+    if (!entry) return null;
+    const own = this.ownConn();
+    return own && entry.conn && entry.conn !== own ? null : entry;
   }
   /** The entry this tab shows: the global back stack's top when it is this tab's own connection's (or names none), else this tab's most recent own
    *  page in the stack, else the page it was opened with. Never another box's page inside this box's rig space (one rig == one space). */
@@ -651,11 +729,111 @@ export default class RigView extends View {
     for (let i = stack.length - 1; i >= 0; i--) if (stack[i]?.conn === own) return i;
     return -1;
   }
+  /** Native tabs (Herdr has spaces, or this tab names its own): each Rig tab draws its own history, `rig.tabPages[tabId]`. Without them (a legacy
+   *  rig-work layout) the page keeps the one shared history, `rig.nav`, as before. */
+  /** Herdr's spaces and panes, read once per draw (the render's memo) and fresh outside one: the per-tab checks ask for them many times a frame. */
+  drawSpaces() { const read = () => { try { return spaces?.() ?? []; } catch (_) { return []; } }, memo = this.renderMemo; return memo ? (memo.spaces ??= read()) : read(); }
+  drawPanes() { const read = () => { try { return panes?.() ?? []; } catch (_) { return []; } }, memo = this.renderMemo; return memo ? (memo.panes ??= read()) : read(); }
+  nativeTabs() {
+    if (this.propsSpaceId) return true;
+    return this.drawSpaces().length > 0;
+  }
+  /** Per-tab pages apply once this tab knows its Herdr id; until its first draw it behaves as before. */
+  perTab() { return Boolean(this.tabId) && this.nativeTabs(); }
+  /** A latched tab that has been split (a second Rig pane in it) goes back to the shared history, where every open lands for split panes: its
+   *  record goes, and the page it showed is carried into the shared history so it doesn't jump. Strictly more than one pane, so a list still
+   *  being restored (none) never unlatches it. */
+  syncSplitTab() {
+    if (!this.tabId || this.syncingSplit) return;
+    let split = false;
+    split = this.drawPanes().filter((p) => p?.mod === MOD_IDS.view && p.tab === this.tabId).length > 1;
+    if (!split) return;
+    this.syncingSplit = true;
+    try {
+      const pages = shared("rig.tabPages") ?? {}, held = pages[this.tabId]?.stack?.at(-1) ?? null, id = this.tabId;
+      if (pages[id]) setShared("rig.tabPages", tabPagesClose(pages, id));
+      this.tabId = null;
+      if (held && navKey(this.shownEntry()) !== navKey(held)) setShared("rig.nav", navPush(nav(), held));
+    } finally { this.syncingSplit = false; }
+  }
+  /** This tab's Herdr id, learned once from its own render while its space and tab are active (only the active tab's view renders), never changed.
+   *  Called only from render: a background tab's timer runs while another tab is active, and would take that tab's id. */
+  latchTab() {
+    if (this.tabId) return this.tabId;
+    try {
+      const space = this.drawSpaces().find((s) => s?.active), tab = (space?.tabs ?? []).find((t) => t?.active);
+      const ownSpaceId = this.propsSpaceId ?? this.ownSpace?.id ?? null;
+      // The tab must hold exactly one Rig page: this page is drawn inside its own tab, never in a tab of terminals. Two Rig pages split in one tab
+      // can't tell their histories apart (a page can't learn its pane), so such a tab keeps the shared history, where each pane draws its own OpenRig.
+      const rigPanes = this.drawPanes().filter((p) => p?.mod === MOD_IDS.view && p.tab === tab?.id).length;
+      if (space && tab?.id && rigPanes === 1 && (ownSpaceId === null || ownSpaceId === space.id)) this.tabId = tab.id;
+    } catch (_) {}
+    return this.tabId ?? null;
+  }
+  /** The page a tab with no history yet starts from, and whether it may be saved: the router's record for the tab, else the entry the tab was
+   *  opened with, else (one OpenRig) the last page opened anywhere. With several OpenRigs a page that names none is given one only when it can be
+   *  told: the machine space's own OpenRig, or the one OpenRig whose data holds its rig or request, once every connection has answered. Until
+   *  then it is drawn but not saved, and never as the first connection's. Nothing is saved before the settings load. */
+  tabSeed(drawn = undefined) {
+    const several = (this.config?.connections?.length ?? 0) > 1;
+    // A tab from before each tab kept its own history starts from the shared one: with several OpenRigs, a tab with its own OpenRig takes that OpenRig's
+    // newest page, any other its top (an unstamped top stays unsaved and draws the "names no OpenRig" notice, below). From then on it keeps its own.
+    const own = this.config && several ? this.ownConn() : null;
+    // An unstamped entry from before several OpenRigs were set up is the first connection's (pages then named none).
+    const ownsEntry = (e) => (e?.conn ? e.conn === own : own === this.config?.connectionId);
+    const logged = !this.config ? null : own ? [...(nav().stack ?? [])].reverse().find(ownsEntry) ?? null : nav().stack?.at(-1) ?? null;
+    const entry = drawn ?? (this.tabId ? shared("rig.pageRoutes")?.[this.tabId] : null) ?? this.openingEntry() ?? logged;
+    if (!entry || !this.config) return { entry, persist: false };
+    if (!several || entry.conn || entry.section === "file" || entry.section === "system" && !entry.subview) return { entry, persist: true };
+    const space = this.spaceConn();
+    if (space) return { entry: { ...entry, conn: space }, persist: true };
+    const held = this.dataStamp(entry);
+    if (held) return { entry: { ...entry, conn: held }, persist: true };
+    // A tab with its own OpenRig (its space belongs to one, or the router opened it for one) gives that OpenRig to the page it starts from.
+    return own ? { entry: { ...entry, conn: own }, persist: true } : { entry, persist: false };
+  }
+  /** The one OpenRig whose published data holds this page's rig or request, read only once every connection has answered (a box that is down
+   *  might hold it too); null otherwise. */
+  dataStamp(entry) {
+    const rigId = entry.rigId ?? null, needId = entry.section === "needs" ? entry.id ?? null : null;
+    if (!rigId && !needId) return null;
+    const published = this.rigData(), conns = this.config?.connections ?? [];
+    const answered = conns.every((c) => { const e = published?.byConnection?.[c.id];
+      return e?.answering === true && (!needId || e.attentionAnswered === true || Array.isArray(e.attentionItems)); });
+    if (!answered) return null;
+    const holders = new Set([...(rigId ? (published?.topology ?? []).filter((r) => r?.id === rigId) : []),
+      ...(needId ? (published?.attentionItems ?? []).filter((i) => i?.id === needId) : [])].map((row) => row?.conn).filter(Boolean));
+    return holders.size === 1 ? [...holders][0] : null;
+  }
+  /** Edits the history this page draws: its own tab's (seeded when new) on native tabs, else the shared one. `edit` returns the new stack, or null
+   *  to leave it. */
+  editShownStack(edit) {
+    this.syncSplitTab();
+    if (this.perTab()) {
+      const id = this.tabId, all = this.tabPagesWithSeed(), next = edit(all[id]?.stack ?? []);
+      if (next) setShared("rig.tabPages", { ...all, [id]: { stack: next.slice(-30), at: Date.now() } });
+      return;
+    }
+    const next = edit(nav().stack ?? []);
+    if (next) setShared("rig.nav", { stack: next });
+  }
+  /** `rig.tabPages` with this tab's seed in place when it has no history yet (so Back and a rewrite start from the page it shows). */
+  tabPagesWithSeed() {
+    const all = shared("rig.tabPages") ?? {}, id = this.tabId;
+    if (!id || all[id]) return all;
+    const seed = this.tabSeed();
+    return seed.entry ? { ...all, [id]: { stack: [seed.entry], at: Date.now() } } : all;
+  }
   shownEntry() {
+    if (this.perTab()) {
+      const id = this.tabId;
+      const record = shared("rig.tabPages")?.[id];
+      return record ? record.stack?.at(-1) ?? null : this.tabSeed().entry;
+    }
     const rawNav = shared("rig.nav"), stack = rawNav?.stack ?? [];
-    if (rawNav == null) return this.initialEntry;
+    if (rawNav == null) return this.openingEntry();
     const at = this.shownIndex(stack, rawNav);
-    return at < 0 ? this.initialEntry : stack[at];
+    return at < 0 ? this.openingEntry() : stack[at];
   }
   /** The shown page without its filter (the control is drawn on the page it acts for, which may sit below the stack top). */
   clearFilter() { this.rewriteShownPage({ filter: "" }); }
@@ -663,28 +841,44 @@ export default class RigView extends View {
   clearConfigScope() { this.rewriteShownPage({ category: null, settingKey: null }); }
   /** Rewrite the page this tab shows, locating it by INDEX within a single `shared("rig.nav")` read. */
   rewriteShownPage(patch) {
+    this.syncSplitTab();
+    if (this.perTab()) {
+      const id = this.tabId, all = this.tabPagesWithSeed(), stack = all[id]?.stack ?? [];
+      if (!stack.length) return;
+      const next = stack.slice(); next[next.length - 1] = { ...stack.at(-1), ...patch };
+      setShared("rig.tabPages", { ...all, [id]: { stack: next, at: Date.now() } });
+      return;
+    }
     const rawNav = shared("rig.nav"), stack = rawNav?.stack ?? [];
     const at = stack.length ? this.shownIndex(stack, rawNav) : -1;
     if (at < 0) {
       // The tab shows the page it was OPENED with (the stack holds only another connection's pages, or nothing): put the cleared page on top as this tab's own, only when the tab would show it there;
       // the other connections' entries stay as they are.
-      if (!this.initialEntry) return;
-      const next = [...stack, { ...this.initialEntry, ...patch }];
+      const base = this.openingEntry();
+      if (!base) return;
+      const next = [...stack, { ...base, ...patch }];
       if (this.shownIndex(next, rawNav) === next.length - 1) setShared("rig.nav", { stack: next });
       return;
     }
     const next = stack.slice(); next[at] = { ...stack[at], ...patch };
     setShared("rig.nav", { stack: next });
   }
-  /** A link on this tab belongs to the page this tab shows: it lends this view's own shown entry, never another tab's. */
-  push(entry) { return push(entry, this.shownEntry()); }
+  /** A link on this tab belongs to the page this tab shows (or this tab's own connection when an older shown entry is unstamped): never another tab's. */
+  push(entry) {
+    this.syncSplitTab();
+    const from = this.shownEntry(), own = !from?.conn ? this.ownConn() : null;
+    return push(entry, own ? { ...(from ?? {}), conn: own } : from, this.perTab() ? this.tabId : null);
+  }
   activeConnId() {
     const entry = this.shownEntry();
     let id = entry?.conn;
     if (!id && entry?.section === "needs" && entry.id) id = (this.rawRigData()?.attentionItems ?? []).find((i) => i?.id === entry.id)?.conn;
+    if (!id) id = this.ownConn();
     const adopted = adoptConnection(this.config, id);
     // Several OpenRigs and a page that names none: it belongs to no box, so it reads and sends nothing (the System page lists them all and needs none).
-    if (!adopted && entry && (this.config?.connections ?? []).length > 1 && entry.section !== "system" && entry.section !== "file") return NO_PAGE_CONNECTION;
+    // A System page lists every OpenRig and needs none, except its per-OpenRig views (settings, health).
+    const listsAll = entry?.section === "file" || entry?.section === "system" && !["config", "health"].includes(entry.subview);
+    if (!adopted && entry && (this.config?.connections ?? []).length > 1 && !listsAll) return NO_PAGE_CONNECTION;
     return adopted ?? this.config?.connectionId ?? null;
   }
   /** The config for the shown connection: this page's own for the first, that connection's own address and home for another, null when it is
@@ -744,25 +938,42 @@ export default class RigView extends View {
   }
   /** The connection a row or menu target on this page names: the page entry's own (passed as is: the menu dispatcher judges it, a stale one is
    *  refused there), else the page's config. Never adopted to a live connection here, which would hide a stale claim. */
-  shownConnId() { const conn = this.shownEntry()?.conn; return conn ?? this.config?.connectionId; }
+  shownConnId() { const conn = this.shownEntry()?.conn; return conn ?? ((this.config?.connections?.length ?? 0) > 1 ? null : this.config?.connectionId); }
   /** One focus handle per connection block, created after the first render as the SDK requires and kept on the view. */
   connectionHandles(cx) {
-    const need = (this.config?.connections ?? []).length + 1; // one per connection's Remove…, and one for Add a machine…
+    const need = (this.config?.connections ?? []).length * 4 + 1; // Remove and three connection actions per block, plus Add a machine
     this.connHandles ??= [];
     if (this.connHandles.length < need && !this.connHandleTask) this.connHandleTask = cx.timer.after(0, (next) => {
+      if(this.closed){this.connHandleTask=null;return;}
       while (this.connHandles.length < need) this.connHandles.push(next.focus_handle());
       this.connHandleTask = null; next.notify();
     });
     return this.connHandles;
   }
-  /** Each connection's state for System > Connections: ONE read of its /healthz (under its own gate scope) per settings change, never a loop, and the
-   *  machine-consent file once. Drawn only with two or more connections. */
+  connectionActionHandles(cx){
+    const connections=this.config?.connections??[],handles=this.connectionHandles(cx),out={};
+    connections.forEach((connection,i)=>['switch','approve','switch-back'].forEach((action,j)=>{
+      out[`connection-${action}-${connection.id}`]=handles[connections.length+1+i*3+j];
+    }));
+    return out;
+  }
+  /** Each connection's state for System > Connections: ONE read of its /healthz (under its own gate scope) per settings change, never a loop.
+   *  Consent display is refreshed independently by loadConfig. Drawn only with two or more connections. */
   connectionStates(cx) {
     const config = this.config, list = config?.connections ?? [];
-    if (list.length < 2 || this.connStatesFor === config) return this.connStates ?? {};
+    const current = () => Object.fromEntries(list.map(c => {
+      const checked = this.connStates?.[c.id] ?? { status: "checking" };
+      const published = sharedRigData(configOfConnection(config, c.id), this.sharedOnce)?.byConnection?.[c.id];
+      // The sidebar's latest refresh is authoritative; the one-time health read remains a fallback when no matching feed is published.
+      const state = checked.status === "error" || typeof published?.answering !== "boolean" ? checked : published.answering
+        ? { ...checked, status: "connected", hostId: published.healthz?.selfHostId ?? checked.hostId }
+        : { ...checked, status: "down" };
+      // The sidebar's read said this herdr:// connection's helper approval is missing or stale: its block offers "Approve helper…".
+      return [c.id, published?.needsApproval === true ? { ...state, needsApproval: true } : state];
+    }));
+    if (list.length < 2 || this.connStatesFor === config) return current();
     this.connStatesFor = config; this.connStates = Object.fromEntries(list.map((c) => [c.id, { status: "checking" }]));
     cx.timer.after(0, (next) => next.spawn(async (cx) => {
-      this.connConsent = await readTextFile(`${appHome()}/openrig/machine-consent.json`).catch(() => null);
       await Promise.all(list.map(async (c) => {
         let state = { status: "down" };
         try {
@@ -773,7 +984,7 @@ export default class RigView extends View {
       }));
       cx.notify();
     }));
-    return this.connStates;
+    return current();
   }
   /** A write operation for `cfg`: with several connections it is scoped to that connection; with one, exactly as before (the gate's only scope). */
   writeOperation(cfg) { return gatedOperation((this.config?.connections ?? []).length > 1 ? cfg?.connectionId : undefined); }
@@ -815,12 +1026,16 @@ export default class RigView extends View {
   /** A cached GET: returns what's known now and fetches in the background when missing, stale or asked again. What it
    *  had stays drawn until the new answer replaces it (the sidebar's `list` does the same). */
   read(cx, path, force = false, onData = null, as = null) {
+    if(path==='/api/health'&&this.renderMemo)this.renderMemo.healthRead=true;
     // `as`: a spec operation's own connection (its library re-read after a write), never the page shown when the write ends.
     const conn = as ? as.connectionId : this.activeConnId(), cache = this.cacheFor(conn), cfg = as ?? this.activeConfig();
     this.reading?.add(path);
+    // The whole attention list is slow on a large OpenRig: while this connection's sidebar is running and holds it, the page uses its copy.
+    const served = path === "/api/attention" && !force && !as && conn && this.attentionFromSidebar === conn ? this.sidebarAttention(conn, cache[path]) : null;
+    if (served) cache[path] = served;
     const hit = cache[path];
     const lost = Boolean(hit?.loading) && Number.isFinite(hit.startedAt) && Date.now() - hit.startedAt > READ_LOST_MS;
-    if ((!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost)) {
+    if (!served && (!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost)) {
       const published = sharedRigData(cfg, this.sharedOnce);
       const sharedAt = (this.config?.connections?.length ?? 0) > 1 ? published?.byConnection?.[cfg?.connectionId]?.at : published?.at;
       // The read belongs to the daemon and connection it started against: a late answer, after the configuration moved, is dropped.
@@ -866,8 +1081,8 @@ export default class RigView extends View {
           finish(r.ok
             ? { ok: true, data, status: r.status }
             : { ok: false, error: `GET ${path} → ${r.status}${data?.error ? `: ${data.error}` : ""}`, status: r.status, errorData: data });
-        } catch (e) { if (epoch === (this.cacheEpoch ?? 0)) finish({ ok: false, error: String(e?.message ?? e) }); }
-        cx.notify();
+        } catch (e) { if (epoch === (this.cacheEpoch ?? 0)) { const failure = plainError(e); finish({ ok: false, error: failure.text, errorDetail: failure.detail }); } }
+        this.noteAnswer(cx);
       });
     }
     // A stored page can name a connection that is not configured any more: say so, instead of a skeleton that never ends. (No config yet is
@@ -878,6 +1093,35 @@ export default class RigView extends View {
       return { ...result, data: { ...result.data, items: filterAttentionItemsFor(this, result.data.items, records) } };
     }
     return result;
+  }
+
+  /** Observe a small successful-read heartbeat without invalidating content or requesting a draw. */
+  observeSidebarRefresh(published=null){
+    const refreshed=shared("rig.refreshed"),conn=this.activeConnId(),several=(this.config?.connections?.length??0)>1;
+    const at=(several?refreshed?.byConnection?.[conn]:refreshed?.at)??(several?published?.byConnection?.[conn]?.at:published?.at);
+    // The heartbeat is throttled to one minute. Its successful-read time, including the first one seen, expires after 75 s;
+    // observing an unchanged leftover value never renews it. A missing sidebar still takes the immediate fallback above.
+    const readAt=Date.parse(at),now=Date.now();
+    if(Number.isFinite(readAt)&&readAt<=now&&now-readAt<=SIDEBAR_FRESH_MS)this.refreshSeen={conn,at:readAt};
+    if(at&&(at!==this.dataAt||conn!==this.dataAtConn)){this.dataAt=at;this.dataAtConn=conn;}
+    return {refreshed,conn,several};
+  }
+
+  /** The sidebar's whole attention list for this page's connection, as a read's cache entry, or null: only while that sidebar is running
+   *  (`attentionFromSidebar`, set once per render) and its list holds every kind of item. The same list keeps the same entry, so memos stay warm. */
+  sidebarAttention(conn, prev) {
+    if (!conn || this.attentionFromSidebar !== conn) return null;
+    const own = this.pageRigData();
+    if (own?.attentionComplete !== true || !Array.isArray(own.attentionItems)) return null;
+    // As of: this connection's successful-read heartbeat, independent of its content version.
+    const readAt = this.dataAtConn === conn && this.dataAt ? this.dataAt : own.at ?? null;
+    // The page's own read (one it forced after an answer) is kept while it runs and until the sidebar has refreshed after it: the answered request
+    // must not come back from an older list.
+    const sidebarAt = Date.parse(readAt) || 0;
+    if (prev && !prev.fromSidebar && (prev.loading || (Number.isFinite(prev.at) && prev.at > sidebarAt))) return null;
+    if (prev?.fromSidebar && prev.data?.items === own.attentionItems && prev.data?.sources === own.attentionSources && prev.data?.readAt === readAt) return prev;
+    return { data: { items: own.attentionItems, sources: own.attentionSources ?? [], perspective: own.attentionPerspective ?? null, readAt }, status: 200,
+      at: sidebarAt || Date.now(), sharedAt: own.at, fromSidebar: true };
   }
 
   filterAttentionItems(rawItems, healthRecords = undefined) {
@@ -914,9 +1158,9 @@ export default class RigView extends View {
     const escaped = String(text ?? "—").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/\n/g, "<br>");
     return TextView.html(id ?? `rig-text-${this.textSeq = (this.textSeq ?? 0) + 1}`, escaped).selectable(true).scrollable(false).text_size(12.5).text_color(t.foreground);
   }
-  copyButton(t, text, id, label = "value") {
+  copyButton(t, text, id, label = "value", { tip = null } = {}) {
     return div().id(`copy-${id}`).size(20).flex_none().rounded(4).cursor_pointer().hover((el) => el.bg(t.hover))
-      .tooltip(`Copy ${label}`).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .tooltip(tip ?? `Copy ${label}`).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(String(text ?? ""));
         this.copied = id; cx.notify(); cx.timer?.after(1500, (cx) => { if (this.copied === id) this.copied = null; cx.notify(); }); })
       .child(svg(icon(this.copied === id ? "check" : "rig-copy")).size(12).text_color(t.dim));
@@ -930,10 +1174,8 @@ export default class RigView extends View {
   dim(t, text) { return this.plain(t, text).text_size(12).text_color(t.dim); }
   workerCapabilityMessage() { const caps=this.caps(); return workerCapabilityText(capabilitiesSummaryDetail(caps).reason ?? "",caps); }
   workerCapabilityNote(t, reason, id = null) {
-    if(this.caps().hostWorkerViews)return div().when(!!id,el=>el.id(id)).text_size(11.5).text_color(t.dim).child(reason);
-    return div().when(!!id, el => el.id(id)).text_size(11.5).text_color(t.dim)
-      .tooltip(`${reason}\nProvider: https://github.com/mvschwarz/openrig/pull/2744\nFollow and custom grids need additional upstream support; see the README's Worker views section.`)
-      .child(this.workerCapabilityMessage());
+    const words=workerCapabilityText(reason,this.caps());
+    return div().when(!!id,el=>el.id(id)).text_size(11.5).text_color(t.dim).tooltip(words).child(words);
   }
   card(t, title, children, meta = null) {
     const { compact, tight } = pageBodyLayout(this.pageWidth);
@@ -942,7 +1184,8 @@ export default class RigView extends View {
         .when(!!meta, (h) => h.child(typeof meta === "string" ? div().text_size(11.5).text_color(t.dim).child(meta) : meta))))
       .children(children);
   }
-  button(t, id, label, onClick, { primary = false, iconName = null, small = false, disabled = false, tooltip = null, actionKey = null, conn = this.shownConnId() } = {}) {
+  button(t, id, label, onClick, { primary = false, iconName = null, small = false, disabled = false, tooltip = null, tip = null, actionKey = null, conn = this.shownConnId() } = {}) {
+    tooltip ??= tip;
     if(this.inPageActions&&(this.pageWidth??960)<480&&iconName&&!primary){tooltip??=label;label="";}
     const busyKey = shared("rig.busyAction");
     const busy = Boolean(busyKey && (busyKey === qualifyBusyKey(conn, id) || (actionKey && busyKey === qualifyBusyKey(conn, actionKey))));
@@ -974,10 +1217,11 @@ export default class RigView extends View {
     const group = this.textSeq = (this.textSeq ?? 0) + 1;
     const exact = (key, value) => value != null && !["", "—", "not a file on disk"].includes(String(value))
       && ["session", "attach:", "attach command", "queue item", "target", "rig id", "request id", "slice", "mission", "view", "terminal", "address", "sender", "recipient", "cwd", "file", "path"].includes(String(key).toLowerCase());
-    return v_flex().gap(compact ? 6 : 4).children(rows.filter(Boolean).map(([k, v, mono], i) => (compact ? v_flex() : h_flex()).id(`kv-row-${group}-${i}`).gap(compact ? 2 : 10).items_start()
+    return v_flex().gap(compact ? 6 : 4).children(rows.filter(Boolean).map(([k, v, mono, tip], i) => (compact ? v_flex() : h_flex()).id(`kv-row-${group}-${i}`).gap(compact ? 2 : 10).items_start()
       .child(div().when(!compact, el => el.w(120).flex_none()).text_size(compact ? 11 : 12).text_color(t.dim).child(k))
       .child(div().when(compact, el => el.w_full()).when(!compact, el => el.flex_1()).min_w(0).when(!!mono, (el) => el.font_family(settings()?.font_family ?? "monospace"))
-        .child(exact(k, v) ? this.copyValue(t, String(v), `field-${group}-${i}`, k) : this.plain(t, v, `field-${group}-${i}`)))));
+        .child(tip ? div().id(`field-${group}-${i}`).min_w(0).truncate().tooltip(tip).text_size(12.5).text_color(t.foreground).child(String(v))
+          : exact(k, v) ? this.copyValue(t, String(v), `field-${group}-${i}`, k) : this.plain(t, v, `field-${group}-${i}`)))));
   }
   skeleton(t) { return v_flex().gap(6).children([0, 1, 2].map((i) => div().h(12).w(220 - i * 40).rounded(3).bg(t.raised))); }
   /** What a read looks like while loading or failed; null when there is data (a failed refresh of drawn data is the
@@ -985,8 +1229,8 @@ export default class RigView extends View {
   status(t, cx, path, got) {
     if (got.error && got.data === undefined) {
       return v_flex().rounded(10).border_1().border_color(t.blocked).p(12).gap(8)
-        .child(div().text_size(12).text_color(t.blocked).child(got.error))
-        .child(h_flex().gap(8).items_center().child(this.button(t, `retry-${path}`, "Retry", (_e, cx) => { this.read(cx, path, true); cx.notify(); }))
+        .child(this.errorText(t, `read-${path}`, got.errorDetail ?? got.error))
+        .child(h_flex().gap(8).items_center().child(this.button(t, `retry-${path}`, "Retry", (_e, cx) => { this.read(cx, path, true); cx.notify(); }, { tip: "Read this again from OpenRig" }))
           .when(!!got.at, (el) => el.child(this.dim(t, `as of ${this.time(got.at)}`))));
     }
     if (got.data === undefined) return this.skeleton(t);
@@ -1003,14 +1247,15 @@ export default class RigView extends View {
     if (!rigId) return null;
     const inPlace = readInPlaceOpen(shared("rig.spaceState"), rigId, conn);
     if (!inPlace) return null;
-    const ownSpaceId = this.propsSpaceId ?? this.ownSpace?.id ?? null;
+    const ownSpaceId = this.tabSpace()?.id ?? this.propsSpaceId ?? this.ownSpace?.id ?? null;
     if (inPlace.space && ownSpaceId && inPlace.space !== ownSpaceId) return null;
+    if (inPlace.tab && this.tabId && inPlace.tab !== this.tabId) return null; // the record is another Rig tab's
     this.shownInPlace = { rigId, conn, space: inPlace.space ?? ownSpaceId };
     const rigName = inPlace.rigName ?? entry.rig ?? (entry.kind === "rig" ? entry.name : null) ?? rigId;
     return h_flex().id("rig-inplace-notice").gap(8).items_center().px(10).py(6).rounded(8).border_1().border_color(t.border).bg(t.raised)
       .child(svg(icon("rig-alert")).size(12).flex_none().text_color(t.ansi3 ?? t.accent))
       .child(div().flex_1().min_w(0).text_size(12).text_color(t.muted)
-        .child(inPlaceFallbackNote(rigName, inPlace.reason)));
+        .child(this.errorText(t,"inplace-fallback-note",inPlaceFallbackNote(rigName, inPlace.reason))));
   }
   staleReadSummary() {
     const failed = [...(this.reading ?? [])].filter((p) => this.cache[p]?.error && this.cache[p].data !== undefined);
@@ -1030,8 +1275,12 @@ export default class RigView extends View {
     return h_flex().id("rig-refresh-error").gap(8).items_center().px(10).py(6).rounded(8).border_1().border_color(t.blocked)
       .child(svg(icon("rig-alert")).size(12).flex_none().text_color(t.blocked))
       .child(div().flex_1().min_w(0).text_size(12).text_color(t.blocked)
-        .child(`Couldn't refresh: ${first.error}${failed.length > 1 ? ` (and ${failed.length - 1} more)` : ""}. Showing stale data (${ageText}${asOf ? `, ${asOf}` : ""}).`))
-      .child(this.button(t, "rig-refresh-retry", "Retry", (_e, cx) => { for (const p of failed) this.read(cx, p, true); cx.notify(); }, { small: true }));
+        .child(this.errorText(t, "rig-refresh-error", first.errorDetail ?? first.error,
+          { prefix: "Couldn't refresh: ", suffix: `${failed.length > 1 ? ` (and ${failed.length - 1} more)` : ""} Showing stale data (${ageText}${asOf ? `, ${asOf}` : ""}).` })))
+      .child(this.button(t, "rig-refresh-retry", "Retry", (_e, cx) => { for (const p of failed) this.read(cx, p, true); cx.notify(); }, { small: true, tip: "Read everything that failed again from OpenRig" }));
+  }
+  errorText(t, id, error, { where = "OpenRig's machine", prefix = "", suffix = "" } = {}) {
+    return errorBlock(this, t, id, error, { where, prefix, suffix });
   }
   /** A table: `cols` are [label, width?, "right"?]; the first without a width takes the rest. A row with onClick shows
    *  a chevron. A palette filter (`/codex`) narrows it, as the TUI's does. */
@@ -1053,14 +1302,15 @@ export default class RigView extends View {
         this.pageRows?.push({ key, open: r.onClick ? () => r.onClick() : null });
         let el = h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(10).items_center().rounded(6).hover((s) => s.bg(t.hover))
           .when(this.pageSel === key, row => row.bg(t.selection ?? `${t.accent}1f`))
+          .when(!!r.tip, el => el.tooltip(r.tip))
           .on_click(r.onClick ?? ((_e, cx) => this.selectPageRow(key, cx)));
         if (r.onRight) el = el.on_mouse_down("right", r.onRight);
         return el.children(r.cells.map((c, j) => cell(c, j, false, i)))
           .child(r.onClick ? svg(icon("chevron-right")).size(12).flex_none().text_color(t.dim) : div().w(12));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : emptyText)]);
   }
-  fileRow(t, id, path, label) {
-    return h_flex().id(id).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover)).on_click(() => this.push(fileEntry(path, label)))
+  fileRow(t, id, path, label, tip = `Open ${path.split(/[\\/]/).pop()} here`) {
+    return h_flex().id(id).tooltip(tip).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover)).on_click(() => this.push(fileEntry(path, label)))
       .child(svg(icon("file-text")).size(14).flex_none().text_color(t.muted))
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).tooltip(String(path.split(/[\\/]/).pop()??"")).child(path.split(/[\\/]/).pop()))
       .child(this.copyButton(t, path, `path-${id}`, "path"))
@@ -1117,27 +1367,27 @@ export default class RigView extends View {
     return v_flex().id("rig-file").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_key_down(()=>{this.typing=true;})
-      .child(f.state ? Editor.new(f.state).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(f.error || "Loading file…"));
+      .child(f.state ? Editor.new(f.state).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(f.error ? this.errorText(t,"file-read-error",f.error,{where:"this computer"}) : "Loading file…"));
   }
 
   /** A file page's one header, as herdr's Files draws it: Back, "Files", reload, the path, and ×. */
   fileHeader(t, entry) {
     const path = entry.path;
     return h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-      .child(div().id("rig-back").cursor_pointer().on_click(() => this.back()).child(svg(icon("chevron-left")).size(14).text_color(t.muted)))
+      .child(div().id("rig-back").tooltip("Back to the page you came from (Backspace)").cursor_pointer().on_click(() => this.back()).child(svg(icon("chevron-left")).size(14).text_color(t.muted)))
       .child(div().font_semibold().text_size(13).child("Files"))
-      .child(div().id("rig-file-reload").cursor_pointer().on_click((_e, cx) => { this.files[path]?.state?.release?.(); delete this.files[path]; cx.notify(); })
+      .child(div().id("rig-file-reload").tooltip("Read the file again from disk").cursor_pointer().on_click((_e, cx) => { this.files[path]?.state?.release?.(); delete this.files[path]; cx.notify(); })
         .child(svg(icon("rig-refresh")).size(12).text_color(t.dim)))
       .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).tooltip(String(path??"")).child(path))
       .child(this.copyButton(t, path, "file-path", "path"))
-      .child(div().id("rig-close").cursor_pointer().on_click(() => closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)));
+      .child(div().id("rig-close").tooltip(this.perTab() ? "Close" : "Close the file").cursor_pointer().on_click(() => this.perTab() ? this.closePage() : closeInspection()).child(svg(icon("x")).size(14).text_color(t.muted)));
   }
 
   /** herdr's lists a seat row needs (worker views, the shown view, panes, terminals and their index). Native herdr copies each list into the mod
    *  on every call, and a page draws a chip per seat: within one render they are read once; outside a render (a click) they are read now. */
   hostLists() {
     const read = () => {
-      const pn = panes?.() ?? [], tm = terminals?.() ?? [];
+      const pn = this.drawPanes(), tm = terminals?.() ?? [];
       return { strip: stripProps(), activeView: activeRigViewId(), panes: pn, terminals: tm, index: seatTerminalIndex(pn, tm) };
     };
     const memo = this.renderMemo;
@@ -1150,16 +1400,16 @@ export default class RigView extends View {
       seatSharedOf(this.config, this.sharedOnce)?.(session) === true, h.index);
   }
   /** shared("rig.data"): every connection's rigs, seats and attention, copied whole on each read. The page keeps the copy it read and reads it
-   *  again when the sidebar's publish stamp (RIG_DATA_STAMP) changes, or once the copy is RIG_DATA_KEEP_MS old (a writer that sets rig.data
-   *  without a stamp is still seen), so most renders read only the small stamp. Within one render the stamp is read once; with no stamp (no
+   *  again only when the sidebar's publish stamp (RIG_DATA_STAMP) changes: every writer (publishRigData) sets a new stamp with the data, and
+   *  each fresh copy is about a megabyte at scale and resets every memo keyed on it, so most renders read only the small stamp. Within one render the stamp is read once; with no stamp (no
    *  sidebar publishes one), every read is current. The kept copy is shared, so nothing may change it in place. */
   rawRigData() {
     const memo = this.renderMemo;
     if (memo && "rigData" in memo) return memo.rigData;
-    const stamp = shared(RIG_DATA_STAMP), kept = this.rigDataKept, now = Date.now();
-    const reuse = stamp !== undefined && kept?.stamp === stamp && now - kept.at < RIG_DATA_KEEP_MS;
+    const stamp = shared(RIG_DATA_STAMP), kept = this.rigDataKept;
+    const reuse = stamp !== undefined && kept?.stamp === stamp;
     const value = reuse ? kept.value : shared("rig.data");
-    this.rigDataKept = stamp === undefined ? null : reuse ? kept : { stamp, value, at: now };
+    this.rigDataKept = stamp === undefined ? null : reuse ? kept : { stamp, value };
     if (memo) memo.rigData = value;
     return value;
   }
@@ -1236,7 +1486,7 @@ export default class RigView extends View {
         }finally{
           // A read that was dropped (the page moved to another connection) or failed never leaves its marker: it would block every later read.
           if(cache[key]?.loading)delete cache[key];
-          task.notify();
+          this.noteAnswer(task);
         }});
     }
     const got=cache[key]?.data;
@@ -1253,8 +1503,8 @@ export default class RigView extends View {
     const target=assistantTarget(member,{id:entry.rigId}),last=member.lastCheckInAt?this.time(member.lastCheckInAt):null,word=assistantWord(member.status);
     this.pageHeading={title:member.name,icon:'rig-queue',status:`Connected assistant · ${member.rig}`};
     this.pageActions=h_flex().gap(8).items_center().flex_wrap()
-      .child(this.button(t,'assistant-queue','Queue work…',()=>this.open({mod:MOD_IDS.menu,kind:'dialog',width:460,height:300,props:{target,step:{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true}}}),{iconName:'rig-queue'}))
-      .child(this.button(t,'assistant-open-rig','Open rig page',()=>this.push({section:'topology',kind:'rig',conn:member.conn,rigId:entry.rigId,name:member.rig}),{small:true}));
+      .child(this.button(t,'assistant-queue','Queue work…',()=>this.open({mod:MOD_IDS.menu,kind:'dialog',width:460,height:300,props:{target,step:{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true}}}),{ tip: "Give this assistant a task: opens Queue work",iconName:'rig-queue'}))
+      .child(this.button(t,'assistant-open-rig','Open rig page',()=>this.push({section:'topology',kind:'rig',conn:member.conn,rigId:entry.rigId,name:member.rig}),{ tip: "Open the rig this assistant belongs to",small:true}));
     const path=seatQueuePaths(member.seat).open,got=this.read(cx,path),queue=seatQueueDetails(got.data,null);
     const records=[...queue.current,...queue.pending,...queue.blocked];
     const sentence=assistantSentence(member,value=>this.time(value));
@@ -1263,7 +1513,7 @@ export default class RigView extends View {
         ['Expected cadence',member.expectedMinutes?`Every ${member.expectedMinutes} min`:member.onRequest?'On request':'Not reported'],['Evidence',member.reporter==='openrig-observed'?'Observed by OpenRig':['openrig-adapter','outside-adapter'].includes(member.reporter)?'Reported by an adapter':'Not reported'],...(member.reason?[['Reason',member.reason]]:[])])]))
       .child(this.card(t,'Queued to it',got.error?[this.dim(t,'Queue unavailable.')]:!got.data?[this.dim(t,'Reading queue…')]:records.length?records.map(item=>
         v_flex().id(`assistant-queue-${item.qitemId??item.id}`).gap(3).child(div().text_size(12).text_color(t.foreground).child(item.summary??item.body??'Queue item'))
-          .child(this.dim(t,item.state??'not reported'))):[this.dim(t,'No open queue items.')]));
+          .child(this.dim(t,statusWord(item.state??'not reported',"queue")))):[this.dim(t,'No open queue items.')]));
   }
 
   topology(t, cx, entry) {
@@ -1272,22 +1522,25 @@ export default class RigView extends View {
     if (entry.kind === "host") return this.hostCard(t, cx, entry);
     if (entry.kind === "pod") return this.podCard(t, cx, entry);
     const summary = this.read(cx, "/api/rigs/summary");
-    const { got: att } = this.attentionRead(cx);
-    const pageAttn = this.drawAttention(cx), attentionItems = pageAttn.targets();
+    // The attention model (filtered and mapped over every request and update: hundreds) is made only for a page that draws it, never for the
+    // skeleton shown while the rig list loads.
+    const attention = () => { const { got } = this.attentionRead(cx), pageAttn = this.drawAttention(cx); return { att: got, pageAttn, attentionItems: pageAttn.targets() }; };
     // One rig (`Topology › factory`): the same block, alone. It reads its own seats at once.
     if (entry.kind === "rig" && entry.rigId) {
+      const { pageAttn, attentionItems } = attention();
       const one = (summary.data ?? []).find((r) => r.id === entry.rigId) ?? { id: entry.rigId, name: entry.name, ...(entry.conn ? { conn: entry.conn } : {}) };
       return this.rigBlock(t, cx, one, { entry, rigCount: summary.data?.length ?? 1, attentionItems, pageAttention: pageAttn });
     }
     const wait = this.status(t, cx, "/api/rigs/summary", summary);
     if (wait) return wait;
+    const { att, pageAttn, attentionItems } = attention();
     const rigs = summary.data.filter((r) => !r.archivedAt);
     if (entry.kind === "rig") {
       const one = rigs.find((r) => r.name === entry.name);
       return one ? this.rigBlock(t, cx, one, { entry, rigCount: rigs.length, attentionItems, pageAttention: pageAttn }) : this.dim(t, `No rig ${entry.name} on this daemon.`);
     }
     const focusTarget = entry.focusRig ?? shared("rig.focusRig") ?? shared("rig.focus") ?? entry.focus ?? null;
-    const loadedModels=rigs.map((r)=>{const nodesState=this.nodesOf(cx,r.id);return {rig:r,...rigModel(r,nodesState.data,[],this.activeConnId()),nodesState};});
+    const loadedModels=rigs.map((r)=>{const nodesState=this.nodesOf(cx,r.id);return {rig:r,...this.rigModelOf(r,nodesState.data),nodesState};});
     const modelList = orderRigs(loadedModels, focusTarget);
     const allSeats = modelList.flatMap((m) => m.seats);
     const models = modelList.map((m) => m.rig);
@@ -1319,7 +1572,7 @@ export default class RigView extends View {
       .child(h_flex().child(this.button(t, "topology-new-rig", "New rig…", () => {
         if(!this.activeConfig()){notify({title:"New rig",body:"This page's connection isn't set up any more. Open Topology from the sidebar before creating a rig.",level:"warning"});return;}
         this.open(newRigOverlay(this.activeConnId()));
-      }, { small: true, iconName: "plus" })));
+      }, { tip: "Start a new rig from a spec", small: true, iconName: "plus" })));
   }
 
   /** TUI parity: bounded recorded queue chronology, never a synthetic log of activity-change notifications. */
@@ -1352,7 +1605,7 @@ export default class RigView extends View {
           const key = String(row.transitionId), summary = String(row.summary || row.bodyPreview || "No work served").replace(/\s+/g, " ").slice(0, 240);
           const selected = this.recentSelected?.transitionId === row.transitionId;
           return v_flex().gap(4)
-            .child(h_flex().id(`topology-recent-event-${key}`).gap(8).px(6).py(4).rounded(6).items_center().cursor_pointer().hover((el) => el.bg(t.hover))
+            .child(h_flex().id(`topology-recent-event-${key}`).tooltip("Show or hide this event's details").gap(8).px(6).py(4).rounded(6).items_center().cursor_pointer().hover((el) => el.bg(t.hover))
               .on_click((_e, cx) => { this.recentSelected = selected ? null : { ...row }; cx.notify(); })
               .child(svg(icon(selected ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
               .child(div().min_w(70).flex_none().text_size(11).text_color(t.dim).child(this.time(row.ts,{seconds:true})))
@@ -1367,7 +1620,7 @@ export default class RigView extends View {
             ])));
         }))
         .when(!rows.length, (el) => el.child(this.dim(t, "No recorded transitions in the current window.")))
-        .when(all.length > 5, (el) => el.child(this.button(t, "topology-recent-expand", this.recentExpanded ? "Show latest 5" : `Show ${all.length}`, (_e, cx) => { this.recentExpanded = !this.recentExpanded; cx.notify(); }, { small: true })));
+        .when(all.length > 5, (el) => el.child(this.button(t, "topology-recent-expand", this.recentExpanded ? "Show latest 5" : `Show ${all.length}`, (_e, cx) => { this.recentExpanded = !this.recentExpanded; cx.notify(); }, { tip: this.recentExpanded ? "Show only the latest 5 events" : `Show all ${all.length} events`, small: true })));
     }
     return div().id("topology-recent").child(this.card(t, "Recent activity", [content]));
   }
@@ -1386,7 +1639,7 @@ export default class RigView extends View {
     const hostRigs = [];
     let seatCount = 0;
     for (const r of rigs) {
-      const m = rigModel(r, this.nodesOf(cx, r.id).data, [], this.activeConnId());
+      const m = this.rigModelOf(r, this.nodesOf(cx, r.id).data);
       const seatsOnHost = m.seats.filter((s) => (s.host ?? "local") === hostId);
       if (seatsOnHost.length || (m.seats.length === 0 && (r.host ?? "local") === hostId)) {
         hostRigs.push({ rig: r, model: m, seatsOnHost });
@@ -1397,7 +1650,7 @@ export default class RigView extends View {
       .child(this.title(t, `Host ${hostId}`))
       .child(this.card(t, "Host", [this.kv(t, [
         ["Host", hostId],
-        ["Status", hostRec?.status ?? hostRec?.state ?? "online"],
+        ["Status", statusWord(hostRec?.status ?? hostRec?.state ?? "online", "daemon")],
         ["Rigs on host", String(hostRigs.length)],
         ["Seats on host", String(seatCount)],
       ])]))
@@ -1406,7 +1659,7 @@ export default class RigView extends View {
         `host-rigs-${hostId}`,
         [["Rig"], ["Lifecycle", 110], ["Seats", 80, "right"]],
         hostRigs.map(({ rig, model, seatsOnHost }) => ({
-          cells: [rig.name, model.lifecycle ?? "running", String(seatsOnHost.length)],
+          cells: [rig.name, model.lifecycle ?? "running", String(seatsOnHost.length)], tip: `Open ${rig.name}'s page`,
           onClick: () => this.push({ section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name }),
         })),
         `No rigs on host ${hostId}.`,
@@ -1428,13 +1681,15 @@ export default class RigView extends View {
     const nodes = this.nodesOf(cx, entry.rigId);
     const wait = this.status(t, cx, nodesPath, nodes);
     if (wait) return wait;
-    const rigObj = { id: entry.rigId, name: entry.rig, ...(entry.conn ? { conn: entry.conn } : {}), lifecycleState: entry.lifecycle ?? "running" };
-    const model = rigModel(rigObj, nodes.data, [], this.activeConnId());
+    // The same rig row while the page names the same rig, so its model is reused across re-renders (rigModelOf keys on the row).
+    const rigKey = JSON.stringify([entry.rigId, entry.rig, entry.conn ?? null, entry.lifecycle ?? "running"]);
+    if (this.podRig?.key !== rigKey) this.podRig = { key: rigKey, rig: { id: entry.rigId, name: entry.rig, ...(entry.conn ? { conn: entry.conn } : {}), lifecycleState: entry.lifecycle ?? "running" } };
+    const model = this.rigModelOf(this.podRig.rig, nodes.data);
     const podSeats = model.seats.filter((s) => s.pod === podName);
     const nativeSeats = this.read(cx, `/api/native-seats?rig=${encodeURIComponent(entry.rig)}`).data?.seats ?? [];
     const nativeBySession = new Map(nativeSeats.map((ns) => [ns.sessionName, ns]));
     const pageAttention = this.drawAttention(cx), attentionItems = pageAttention.targets();
-    const counts = computePulseCounts([{rig:rigObj,...model,countSeats:podSeats}],attentionItems);
+    const counts = computePulseCounts([{rig:this.podRig.rig,...model,countSeats:podSeats}],attentionItems);
     return v_flex().id(`pod-page-${entry.rigId ?? entry.rig}-${podName}`).gap(12)
       .child(this.title(t, `Pod ${podName} · ${entry.rig}`))
       .child(this.card(t, "Pod", [this.kv(t, [
@@ -1446,7 +1701,7 @@ export default class RigView extends View {
         ? podSeats.map((s) => {
             const ns = nativeBySession.get(s.session);
             const seatNeed = pageAttention.seatNeed(s.session, entry.rig, s.logicalId);
-            return this.seatChip(t, rigObj, s, model.lifecycle, { nativeSeat: ns, seatNeed });
+            return this.seatChip(t, this.podRig.rig, s, model.lifecycle, { nativeSeat: ns, seatNeed });
           })
         : [this.dim(t, `No seats in pod ${podName}.`)]));
   }
@@ -1471,7 +1726,7 @@ export default class RigView extends View {
         .bg(active ? t.accent : t.raised)
         .hover((s) => s.bg(active ? t.accent : t.hover))
         .on_click((_e, cx) => { if (key === null) this.pulseFilter = null; else toggleFilter(key); cx?.notify?.(); })
-        .when(key === "idle", el => el.tooltip("Idle, done or stopped"))
+        .tooltip(key === null ? "Show every seat again" : key === "needs" ? "Show only the seats waiting on you (click again for all)" : key === "idle" ? "Show only the idle, done or stopped seats (click again for all)" : key === "unreported" ? "Show only the seats that haven't reported a status (click again for all)" : `Show only the seats that are ${key} (click again for all)`)
         .when(!!mark, (el) => el.child(this.dot(t, mark, 12)))
         .child(div().text_size(11.5).text_color(active ? (t.solid_foreground ?? t.background) : color).font_medium().child(label));
     };
@@ -1487,11 +1742,11 @@ export default class RigView extends View {
         .child(seg("pulse-filter-idle", "idle", `${counts.idle} idle`, t.muted, "idle"))
         .when(counts.unreported>0,el=>el.child(seg("pulse-filter-unreported","unreported",`${counts.unreported} not reported`,t.dim,"unknown"))))
       .child(div().flex_1())
-      .when(!seatsTab,el=>el.child(h_flex().id("topology-expand-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
+      .when(!seatsTab,el=>el.child(h_flex().id("topology-expand-all").tooltip("Open every rig and pod").px(8).h(22).items_center().rounded(6).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
         .on_click(() => setShared("rig.open.page", expandAllTopology(shared("rig.open.page"), topoForFold)))
         .child(div().text_size(11.5).text_color(t.foreground).child("Expand all"))))
-      .when(!seatsTab,el=>el.child(h_flex().id("topology-collapse-all").px(8).h(22).items_center().rounded(6).cursor_pointer()
+      .when(!seatsTab,el=>el.child(h_flex().id("topology-collapse-all").tooltip("Close every rig and pod").px(8).h(22).items_center().rounded(6).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
         .on_click(() => setShared("rig.open.page", collapseAllTopology(shared("rig.open.page"), topoForFold)))
         .child(div().text_size(11.5).text_color(t.foreground).child("Collapse all"))))
@@ -1506,7 +1761,7 @@ export default class RigView extends View {
     const label = { idle: "Idle", working: "Working", blocked: "Blocked", needs: "Needs you", unreported:"Not reported" }[filter] ?? filter;
     return h_flex().id("pulse-filter-notice").gap(8).items_center().text_size(12).text_color(t.muted)
       .child(`Showing ${label} · ${hidden} hidden`)
-      .child(div().id("pulse-show-all").text_color(t.accent).cursor_pointer()
+      .child(div().id("pulse-show-all").tooltip("Clear the filter and show every seat").text_color(t.accent).cursor_pointer()
         .on_click((_e, cx) => { this.pulseFilter = null; cx.notify(); }).child("Show all"));
   }
 
@@ -1526,6 +1781,18 @@ export default class RigView extends View {
   pageRigData() {
     const published = this.rigData();
     return (this.config?.connections?.length??0)>1?published?.byConnection?.[this.activeConnId()]:published;
+  }
+  /** A rig's model, built once per data change and shared by every block that draws the rig: kept per rig row and reused while the same nodes array
+   *  and connection come back. Unchanged reads and the sidebar's snapshot keep their identity, so an idle re-render rebuilds nothing; a new read or
+   *  snapshot is a new array and builds the model again. rigModel reads nothing else (no clock, no shared state).
+   *  The model is shared by every block that draws the rig: a rig row, its nodes array and the returned model are never changed in place. */
+  rigModelOf(rig, nodes, conn = this.activeConnId()) {
+    if (!rig || typeof rig !== "object") return rigModel(rig, nodes, [], conn);
+    const memo = this.rigModels ??= new WeakMap(), hit = memo.get(rig);
+    if (hit && hit.nodes === nodes && hit.conn === conn) return hit.model;
+    const model = rigModel(rig, nodes, [], conn);
+    memo.set(rig, { nodes, conn, model });
+    return model;
   }
   /** A rig's nodes: this page's read, else what the sidebar already holds (so a block isn't empty while its own read lands). */
   nodesOf(cx, rigId) {
@@ -1548,7 +1815,7 @@ export default class RigView extends View {
       if (!origin) return { ok: false, error: "OpenRig daemon is unavailable." };
       const response = await op.fetch(`${origin}/api/transcripts/${encodeURIComponent(seat.session)}/tail?lines=40`);
       const data = await response.json(); return { ok: response.ok, status: response.status, data };
-    }, () => { if (!this.closed) cx.notify(); });
+    }, () => this.noteAnswer(cx));
   }
   refreshNowTails(cx) {
     if (!this.nowTails || this.closed || !this.config || this.config.missing) return;
@@ -1585,14 +1852,14 @@ export default class RigView extends View {
     if (rowWorking) line.child(div().flex_none().text_color(t.ansi2 ?? t.working).child(rowWorking));
     // The existing HoverCard below reveals the full line and transcript; keep one hover channel.
     line.child(div().flex_1().min_w(0).truncate().text_color(state.stale ? t.dim : t.muted).child(rowWorking ? rowText.slice(rowWorking.length) : rowText));
-    const link = (id, label, act) => div().id(id).text_size(12).text_color(act ? t.accent : t.dim)
+    const link = (id, label, act, tip) => div().id(id).tooltip(tip).text_size(12).text_color(act ? t.accent : t.dim)
       .when(!!act, el => el.cursor_pointer()).on_click((_e, cx) => { cx.stop_propagation(); act?.(); }).child(label);
     const hover = v_flex().w(420).p(12).gap(8).rounded(8).bg(t.background).border_1().border_color(t.border)
       .child(div().text_size(12).text_color(t.muted).child(`${seat.logicalId} · ${state.state} · as of ${state.asOf}`))
       .child(div().text_size(12).text_color(state.stale ? t.dim : t.foreground).child(`${state.prefix}${state.line}`))
       .child(this.nowLines(t, state, `hover-${seat.session}`))
-      .child(h_flex().gap(12).child(link(`now-seat-${seat.session}`, "Open seat", openSeat))
-        .child(link(`now-transcript-${seat.session}`, "Open transcript", openTranscript)));
+      .child(h_flex().gap(12).child(link(`now-seat-${seat.session}`, "Open seat", openSeat, `Open ${seat.logicalId}'s page`))
+        .child(link(`now-transcript-${seat.session}`, "Open transcript", openTranscript, `Open ${seat.logicalId}'s transcript`)));
     return div().id(`seat-now-${seat.session}`).flex_1().min_w(0)
       .on_size_change((size, cx) => {
         const visible = size.width >= 160;
@@ -1606,9 +1873,10 @@ export default class RigView extends View {
     return this.card(t, "Now", [
       (compact ? v_flex() : h_flex()).id("seat-now-meta").w_full().gap(8).when(!compact, el => el.items_center()).child(div().when(!compact, el => el.flex_1()).min_w(0)
         .child(this.plain(t, `as of ${state.asOf} · ${state.state}${state.stale || state.state === "withheld" ? ` · ${state.reason}` : ""}`, "seat-now-state").text_size(11.5).text_color(t.muted)))
-        .child(div().flex_none().id("seat-now-open-transcript").text_size(12).text_color(t.accent).cursor_pointer().on_click(openTranscript).child("Open transcript")),
+        .child(div().flex_none().id("seat-now-open-transcript").tooltip("Open this seat's transcript").text_size(12).text_color(t.accent).cursor_pointer().on_click(openTranscript).child("Open transcript")),
       div().id("seat-now-summary").text_size(12.5).text_color(state.stale ? t.dim : t.foreground)
         .child(state.line ? `${state.prefix}${state.line}` : "No recent screen text from OpenRig."),
+      ...(state.errorDetail ? [this.errorText(t,`seat-now-error-${seat.session}`,state.errorDetail)] : []),
       ...(state.lines.length ? [this.nowLines(t, state, `page-${seat.session}`)] : []),
     ]);
   }
@@ -1616,6 +1884,21 @@ export default class RigView extends View {
   invalidateLiveReads() {
     this.nowDue = true;
     markStale(this.cache, (path) => path==='/api/config/ui.timezone' || path.startsWith('/api/views/execution?') || path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
+  }
+
+  /** The sidebar doesn't mirror handoff history, workflow execution or request detail. Keep those shown-page reads live without polling full attention. */
+  refreshUnmirrored(cx) {
+    if(this.closed)return;
+    const live=this.drawSpaces(),space=live.find(s=>s?.active),own=this.propsSpaceId??this.ownSpace?.id;
+    if(live.length&&(!space||(own&&space.id!==own)))return;
+    if(this.tabId&&!(space?.tabs??[]).some(t=>t.id===this.tabId&&(t.active===true||space.tabs.length===1)))return;
+    const conn=this.activeConnId(),now=Date.now(),last=(this.unmirroredAt??={})[conn];
+    if(last===undefined){this.unmirroredAt[conn]=now;return;}
+    if(now>=last&&now-last<60000)return;
+    this.unmirroredAt[conn]=now;
+    const matches=path=>path==='/api/health'||path==='/api/health?status=cleared'||/^\/api\/rigs\/[^/]+\/graph$/.test(path)||path.startsWith('/api/views/execution?')||path.startsWith('/api/queue/recent-transitions?')||path.startsWith('/api/queue/hosted-members:')||(/^\/api\/queue\/[^/?]+$/.test(path)&&path!=='/api/queue/attention-aggregate');
+    if(!Object.keys(this.cache).some(matches))return;
+    markStale(this.cache,matches);cx.notify();
   }
 
   /** One rig as a block: header with status counts, action bar, health banner, Edges, then pods as lines of seat chips.
@@ -1626,7 +1909,7 @@ export default class RigView extends View {
     attentionItems = attentionItems ?? pageAttn.targets();
     const nodesPath = `/api/rigs/${encodeURIComponent(rig.id)}/nodes`;
     const nodes = this.nodesOf(cx, rig.id);
-    const model = rigModel(rig, nodes.data, [], this.activeConnId());
+    const model = this.rigModelOf(rig, nodes.data);
     const lifecycle = model.lifecycle;
     const stoppedRig = isRigStopped(lifecycle, model.seats);
     const focusRig = entry.focusRig ?? shared("rig.focusRig");
@@ -1669,22 +1952,22 @@ export default class RigView extends View {
     const rigEntry = { section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name };
     this.pageRows?.push({ key: rigRowKey, foldKey: rigRowKey, expandable: true, isOpen: expanded, entry: rigEntry, target, seats: model.seats });
     const rigSelected = this.pageSel === rigRowKey;
-    const resume = () => this.button(t, `rig-resume-${rig.id}`, "Resume…", () => dialog({ action: "resume", confirm: true }, 380), { small: true, iconName: "rig-play" });
+    const resume = () => this.button(t, `rig-resume-${rig.id}`, "Resume…", () => dialog({ action: "resume", confirm: true }, 380), { tip: `Resume ${rig.name}: asks before starting its seats`, small: true, iconName: "rig-play" });
     // A count filters the page to seats in that state.
-    const count = (n, word, color, key, shown = word) => n ? h_flex().id(`rig-count-${key}-${rig.name}`).gap(4).items_center().cursor_pointer().on_click(() => { this.push({ ...(entry.section ? entry : { section: "topology" }), filter: word }); })
+    const count = (n, word, color, key, shown = word) => n ? h_flex().id(`rig-count-${key}-${rig.name}`).tooltip(key === "needs" ? `Show only ${rig.name}'s seats that need you` : key === "unreported" ? `Show only ${rig.name}'s seats that haven't reported a status` : `Show only ${rig.name}'s seats that are ${word}`).gap(4).items_center().cursor_pointer().on_click(() => { this.push({ ...(entry.section ? entry : { section: "topology" }), filter: word }); })
       .child(div().text_size(11.5).text_color(color === "working" ? (t.ansi2 ?? t.working) : color === "blocked" ? t.blocked : color==="dim"?t.dim:t.muted).child(`${n} ${shown}`)) : null;
-    const lifecycleText = stoppedRig && lifecycle === "recoverable" ? "stopped (recoverable)" : (lifecycle ?? "unknown");
-    if(dedicated)this.pageHeading={title:rig.name,tone,status:`${lifecycleText} · ${model.seats.length} seats · ${counts.working} working · ${needsYouText(counts.needs)} · ${counts.idle} idle${counts.unreported?` · ${counts.unreported} not reported`:""}`};
-    const head = h_flex().id(`rig-head-${rig.id}`).px(4).when(!compact, el => el.h(30)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
+    const lifecycleText = statusWord(lifecycle, "rig");
+    if(dedicated)this.pageHeading={title:rig.name,tone,status:`${lifecycleText} · ${counted(model.seats.length, "seat")} · ${counts.working} working · ${needsYouText(counts.needs)} · ${counts.idle} idle${counts.unreported?` · ${counts.unreported} not reported`:""}`};
+    const head = h_flex().id(`rig-head-${rig.id}`).tooltip(`Double-click to open ${rig.name}'s page; right-click for its actions`).px(4).when(!compact, el => el.h(30)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
       .when(rigSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
       .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) this.push(rigEntry); else this.selectPageRow(rigRowKey, cx); })
       .on_mouse_down("right", () => this.menu(target))
-      .child(div().id(`rig-fold-${rig.id}`).w(14).flex_none().text_color(t.dim).on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(rigKey(rig.id), expanded, model.seats); })
+      .child(div().id(`rig-fold-${rig.id}`).tooltip(`${expanded ? "Close" : "Open"} ${rig.name}`).w(14).flex_none().text_color(t.dim).on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(rigKey(rig.id), expanded, model.seats); })
         .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(12)))
       .child(this.dot(t, tone))
       .child(div().id(`rig-name-${rig.id}`).text_size(13).font_semibold().text_color(t.foreground).cursor_pointer().hover(el=>el.underline())
         .tooltip(`Open ${rig.name}`).on_click((_e,cx)=>{cx.stop_propagation();this.push({...rigEntry,tab:"table"});}).child(rig.name))
-      .when(!tight, el => el.child(div().text_size(12).text_color(t.muted).child(`${lifecycleText} · ${model.seats.length} seat${model.seats.length === 1 ? "" : "s"}`)))
+      .when(!tight, el => el.child(div().text_size(12).text_color(t.muted).child(`${lifecycleText} · ${counted(model.seats.length, "seat")}`)))
       .child(h_flex().id(`rig-counts-${rig.id}`).gap(8).when(compact, el => el.w_full().flex_wrap())
         .children([count(counts.working, "working", "working", "working"), count(counts.blocked, "blocked", "blocked", "blocked"), count(counts.needs, "needs you", "blocked", "needs", needsYouWord(counts.needs)), count(counts.idle, "idle", "idle", "idle"),count(counts.unreported,"not reported","dim","unreported")].filter(Boolean)))
       .when(noMatch, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("no matching seats")))
@@ -1693,19 +1976,19 @@ export default class RigView extends View {
       .when(!showBody, (el) => el.child(more()));
     const body = [];
     if (showBody) {
+      const rigConnCfg = rig.conn ? configOfConnection(this.config, rig.conn) : this.activeConfig();
       const followed = (this.hostLists().strip?.views ?? []).find((v) => v.following?.target === `rig:${rig.name}`);
       const on = this.hostWorkerEntry(`rig:${rig.name}`, rig.conn ? configOfConnection(this.config, rig.conn) : this.config)?.following??!!followed?.following?.enabled;
       const caps = this.caps();
       const workerReason = capabilityDisableReason("open-view", caps);
-      const designReason = capabilityDisableReason("design-view", caps);
+      const workerMachine = rigConnCfg?.daemonMachine || (isLoopbackDaemonUrl(rigConnCfg?.daemonUrl) ? "this computer" : "OpenRig's machine");
       const followReason = capabilityDisableReason(on ? "unfollow" : "follow", caps);
       this.inPageActions=dedicated;
       const actionBar=h_flex().gap(6).items_center().flex_wrap()
-        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => this.oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens here; tiles run on ${(rig.conn?configOfConnection(this.config,rig.conn):this.config)?.daemonMachine}.`:null), actionKey: "open-view", conn: rig.conn ?? this.shownConnId() }))
-        .child(this.button(t, `rig-act-design-${rig.name}`, "Design view…", () => this.open({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 680, height: 460, props: { target, step: { action: "design-view" } } }), { small: true, iconName: "rig-view", disabled: !!designReason, tooltip: designReason }))
-        .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => this.oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow", conn: rig.conn ?? this.shownConnId() }))
-        .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => this.oneClick({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn }, "snapshot", `rig-snapshot-${rig.id}`), { small: true, iconName: "rig-snapshot", actionKey: "snapshot", conn: rig.conn ?? this.shownConnId() }))
-        .when(!stoppedRig && lifecycle !== "stopped", (el) => el.child(this.button(t, `rig-pause-${rig.id}`, "Pause…", () => dialog({ action: "pause", load: "pause" }, 360), { small: true, iconName: "rig-pause" })))
+        .child(this.button(t, `rig-worker-view-${rig.id}`, "Worker view", () => this.oneClick(viewTarget, "open-view", `rig-worker-view-${rig.id}`), { small: true, iconName: "rig-view", disabled: !!workerReason, tooltip: workerReason??(caps.hostWorkerViews?`Opens ${rig.name}'s seats as tiles in Herdr tabs. Tiles run on ${workerMachine}.`:null), tip: `Open ${rig.name}'s seats as tiles in a worker view`, actionKey: "open-view", conn: rig.conn ?? this.shownConnId() }))
+        .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => this.oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { tip: on ? `Stop updating ${rig.name}'s worker view; the view stays open as it is` : `Keep a worker view of ${rig.name} open and up to date`, small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow", conn: rig.conn ?? this.shownConnId() }))
+        .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => this.oneClick({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn }, "snapshot", `rig-snapshot-${rig.id}`), { tip: `Take a snapshot of ${rig.name} now, to restore later`, small: true, iconName: "rig-snapshot", actionKey: "snapshot", conn: rig.conn ?? this.shownConnId() }))
+        .when(!stoppedRig && lifecycle !== "stopped", (el) => el.child(this.button(t, `rig-pause-${rig.id}`, "Pause…", () => dialog({ action: "pause", load: "pause" }, 360), { tip: `Pause ${rig.name}: asks before stopping its seats`, small: true, iconName: "rig-pause" })))
         .when(stoppedRig || lifecycle !== "running", (el) => el.child(resume()))
         .child(div().flex_1()).child(more());
       this.inPageActions=false;
@@ -1713,7 +1996,6 @@ export default class RigView extends View {
       const rigStatusKey = spaceStatusKey(rig.conn ?? this.activeConnId(), rig.id, (this.config?.connections ?? []).length > 1);
       const rigSpaceOpening = shared("rig.spaceOpening")?.[rigStatusKey];
       const rigSpaceStatus = shared("rig.spaceStatus")?.[rigStatusKey];
-      const rigConnCfg = rig.conn ? configOfConnection(this.config, rig.conn) : this.activeConfig();
       if (rigSpaceOpening) {
         body.push(h_flex().id(`opening-rig-space-${rig.id}`).px(10).py(8).gap(10).rounded(6).bg(t.raised).items_center().flex_wrap()
           .child(div().flex_1().min_w(180).text_size(12).text_color(t.muted).child(String(rigSpaceOpening))));
@@ -1721,10 +2003,10 @@ export default class RigView extends View {
         const waitingMachine = rigSpaceStatus.confirmation?.machine ?? rigConnCfg.daemonMachine ?? "the machine";
         body.push(h_flex().id(`waiting-helper-${rig.id}`).px(10).py(8).gap(10).rounded(6).bg(t.raised).items_center().flex_wrap()
           .child(div().flex_1().min_w(180).text_size(12).text_color(t.foreground).child(`Waiting for you to approve the helper on ${waitingMachine}`))
-          .child(this.button(t, `approve-helper-${rig.id}`, "Approve helper…", () => runFor(rigConnCfg)(commandFor("rig.approve-helper", rigConnCfg, rig.id)), { small: true })));
+          .child(this.button(t, `approve-helper-${rig.id}`, "Approve helper…", () => runFor(rigConnCfg)(commandFor("rig.approve-helper", rigConnCfg, rig.id)), { tip: `Approve herdrig's helper on ${waitingMachine} so this rig's actions can run there`, small: true })));
       }
       const workerLine=this.hostWorkerLine(t,rig);if(workerLine)body.push(workerLine);
-      const capReasons = [...new Set([workerReason, followReason, designReason].filter(Boolean))];
+      const capReasons = [...new Set([workerReason, followReason].filter(Boolean))];
       if (capReasons.length) {
         body.push(this.workerCapabilityNote(t, capReasons.join(" · "), `rig-cap-note-${rig.id}`));
       }
@@ -1764,7 +2046,7 @@ export default class RigView extends View {
       else if(!dedicated||entry.tab==="table")body.push(this.rigPods(t, cx, rig, model, seats, { lifecycle, open, preserveHidden: Boolean(pulseFilter), pageAttention: pageAttn, attentionItems }));
       if(!dedicated||entry.tab==='table'){
         const group=assistantGroup(t,cx,this.hostedMembers(cx),{...rig,conn:rig.conn??this.activeConnId()},{prefix:'page',icon,rows:this.pageRows,folds:shared('rig.open.page')??{},
-          fold:(key,open)=>{setShared('rig.open.page',{...(shared('rig.open.page')??{}),[key]:open});this.persistStatePatch(cx);},
+          fold:(key,open,cx)=>{setShared('rig.open.page',{...(shared('rig.open.page')??{}),[key]:open});this.persistStatePatch(cx);},
           select:(key,_entry,cx)=>this.selectPageRow(key,cx),open:entry=>this.push(entry),menu:(t)=>this.menu(t)});
         if(group)body.push(group);
       }
@@ -1786,7 +2068,7 @@ export default class RigView extends View {
     const recentKey = `rig-recent:${rig.name}`;
     const recentOpen = here&&entry.tab==="recent" || (open[recentKey] ?? open[`rig-recent:${rig.id}`] ??
       (entry.openRecent === rig.name || entry.openRecent === rig.id));
-    const row = (id, text, on, key, color) => h_flex().id(id).gap(4).items_center().cursor_pointer().on_click(() => toggleOpen(key, on))
+    const row = (id, text, on, key, color) => h_flex().id(id).tooltip(`Show or hide ${rig.name}'s edges as text you can copy`).gap(4).items_center().cursor_pointer().on_click(() => toggleOpen(key, on))
       .child(svg(icon(on ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
       .child(div().text_size(12).text_color(color).child(text));
     const toggleRecent = () => {
@@ -1803,13 +2085,13 @@ export default class RigView extends View {
       const counts = healthCounts(findings);
       const text = counts.problems ? `${counts.problems} problem${counts.problems === 1 ? "" : "s"}` : counts.notes ? `${counts.notes} note${counts.notes === 1 ? "" : "s"}` : "Health";
       out.push(v_flex().id(`rig-health-group-${rig.id}`).gap(4)
-        .child(h_flex().id(`rig-health-toggle-${rig.id}`).gap(6).items_center().cursor_pointer()
+        .child(h_flex().id(`rig-health-toggle-${rig.id}`).tooltip(`Open System › Health for ${rig.name}'s ${text}`).gap(6).items_center().cursor_pointer()
           .on_click(() => this.push({ section: "system", subview: "health", healthRigId: rig.id, healthRigName: rig.name }))
           .child(svg(icon(counts.worst === 2 ? "rig-diamond" : counts.problems ? "rig-warning" : "rig-info")).size(12).text_color(counts.worst === 2 ? t.blocked : counts.worst === 1 ? t.working : t.muted))
           .child(div().text_size(12).text_color(counts.worst === 2 ? t.blocked : counts.worst === 1 ? t.working : t.muted).child(`${text} in System → Health`))));
     }
     const recentGroup = v_flex().id(`rig-recent-group-${rig.name}`).gap(4)
-      .child(h_flex().id(`rig-recent-toggle-${rig.name}`).gap(4).items_center().cursor_pointer().on_click(toggleRecent)
+      .child(h_flex().id(`rig-recent-toggle-${rig.name}`).tooltip(`Show or hide ${rig.name}'s recent activity`).gap(4).items_center().cursor_pointer().on_click(toggleRecent)
         .child(svg(icon(recentOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
         .child(div().text_size(12).text_color(t.muted).child("Recent activity")));
     if (recentOpen) {
@@ -1825,7 +2107,7 @@ export default class RigView extends View {
       const edges = graph.data?.edges ?? [];
       const names=new Map((graph.data?.nodes??[]).map(n=>[n.id,n.data?.logicalId??n.logicalId??n.id]));
       const openGraph=()=>this.push({section:"topology",kind:"rig",rigId:rig.id,conn:rig.conn,name:rig.name,tab:"graph"});
-      edgesGroup.child(this.inlineLink(t, cx, `rig-open-graph-${rig.id}`, "Open the graph", openGraph));
+      edgesGroup.child(this.inlineLink(t, cx, `rig-open-graph-${rig.id}`, "Open the graph", openGraph, `Open ${rig.name}'s graph`));
       edgesGroup.child(this.status(t, cx, graphPath, graph) ?? (edges.length
         ? v_flex().gap(pageBodyLayout(this.pageWidth).compact ? 10 : 2).children(edges.map((e, i) => (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id(`edge-${rig.id}-${i}`).gap(pageBodyLayout(this.pageWidth).compact ? 2 : 8).px(4).text_size(12).text_color(t.muted)
           .child(this.copyValue(t, `${names.get(e.source)??e.source} → ${names.get(e.target)??e.target}`, `edge-${rig.id}-${i}`, "edge addresses"))
@@ -1869,7 +2151,7 @@ export default class RigView extends View {
     return v_flex().id(`${idPrefix}-list`).gap(2).children(rows.map((r, i) => {
       let el = h_flex().id(`${idPrefix}-row-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).text_size(12);
       if (r.navEntry) {
-        el = el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => this.push(r.navEntry));
+        el = el.tooltip("Open what this change was about").cursor_pointer().hover((s) => s.bg(t.hover)).on_click(() => this.push(r.navEntry));
       }
       return el
         .child(div().min_w(70).flex_none().text_color(t.dim).child(r.ts))
@@ -1913,7 +2195,7 @@ export default class RigView extends View {
           .map(([n, word, tone, shown = word]) => div().id(`pod-count-${word.replaceAll(" ", "-")}-${podId}`).text_size(11.5)
             .text_color(tone === "working" ? (t.ansi2 ?? t.working) : tone === "blocked" ? t.blocked : tone==="dim"?t.dim:t.muted).child(`${n} ${shown}`));
         if (!podOpen && podSeats.length) {
-          return h_flex().id(`pod-summary-${podId}`).pl(compact ? 0 : 8).pr(compact ? 0 : 8).when(!compact, el => el.h(26)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+          return h_flex().id(`pod-summary-${podId}`).tooltip(`Open the ${label} pod`).pl(compact ? 0 : 8).pr(compact ? 0 : 8).when(!compact, el => el.h(26)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .when(podSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
             .on_click(() => toggleOpen(key, false, all))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim))
@@ -1922,7 +2204,7 @@ export default class RigView extends View {
             .child(div().flex_1()).child(div().text_size(11.5).text_color(t.accent).child("Show all"));
         }
         return v_flex().id(`pod-tree-${podId}`).gap(2)
-          .child(h_flex().id(`topo-pod-${podId}`).pl(compact ? 0 : 8).pr(compact ? 0 : 8).when(!compact, el => el.h(26)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+          .child(h_flex().id(`topo-pod-${podId}`).tooltip(`${podOpen ? "Close" : "Open"} the ${label} pod`).pl(compact ? 0 : 8).pr(compact ? 0 : 8).when(!compact, el => el.h(26)).when(compact, el => el.flex_wrap().py(4)).gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .when(podSelected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
             .on_click(() => toggleOpen(key, podOpen, all))
             .child(svg(icon(podOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
@@ -1930,7 +2212,7 @@ export default class RigView extends View {
             .when(!tight, el => el.child(div().text_size(11.5).text_color(t.dim).child(`· ${countText}`)))
             .child(h_flex().id(`pod-counts-${podId}`).gap(8).when(compact, el => el.w_full().flex_wrap()).children(countPills))
             .child(div().flex_1())
-            .when(all.length > 12, (el) => el.child(div().id(`pod-collapse-${podId}`).text_size(11.5).text_color(t.dim).cursor_pointer()
+            .when(all.length > 12, (el) => el.child(div().id(`pod-collapse-${podId}`).tooltip(`Close the ${label} pod`).text_size(11.5).text_color(t.dim).cursor_pointer()
               .on_click((_e, cx) => { cx?.stop_propagation?.(); toggleOpen(key, true, all); }).child("Collapse"))))
           .when(!podSeats.length && preserveHidden, el => el.child(div().text_size(12).text_color(t.dim).child(`${all.length === 1 ? "The seat is" : `All ${all.length} seats`} hidden by the filter`)))
           .child(v_flex().gap(2).children(podSeats.map((s) => {
@@ -2002,60 +2284,60 @@ export default class RigView extends View {
     const send = () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 260, props: { target: seatTarget, step: { input: true, placeholder: `Message to ${s.session}`, action: "send", multiLine: true } } });
     const queue = () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 300, props: { target: seatTarget, step: { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true } } });
     const answer = () => quickBtn(`seat-answer-${s.session}`, "Answer", () => {
-      openNeed(seatNeed.id, { shared, setShared, run, spaces, panes, layout, items: [seatNeed], conn: seatNeed.conn ?? this.activeConnId(), stay: rigPageOnScreen() });
-    }, { primary: true });
+      openNeed(seatNeed.id, { shared, setShared, run, spaces, panes, layout, items: [seatNeed], conn: seatNeed.conn ?? this.activeConnId(), stay: rigPageOnScreen(), ...(this.perTab() ? { tabId: this.tabId } : {}) });
+    }, { primary: true, tooltip: `Answer ${s.logicalId}'s open request` });
     this.seatActions[rowKey] = { send: s.terminal || sendReason ? null : send, queue: s.terminal || queueReason ? null : queue };
     return v_flex().id(`topo-seat-${s.session}`).gap(2)
       // One pattern per row: quiet unless selected; a click on the body selects, a double-click or the
       // name opens; the selected row shows Send… and Queue…; ⋯ is the right-click menu.
-      .child(h_flex().id(`topo-seat-row-${s.session}`).pl(compact ? 0 : 12).pr(compact ? 0 : 8).h(28).gap(compact ? 4 : 6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
+      .child(h_flex().id(`topo-seat-row-${s.session}`).tooltip(`Double-click to open ${s.logicalId}; right-click for its actions`).pl(compact ? 0 : 12).pr(compact ? 0 : 8).h(28).gap(compact ? 4 : 6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
         .when(selected, (e) => e.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
         .on_click((e, cx) => { if ((e?.click_count ?? 1) >= 2) go(); else this.selectPageRow(rowKey, cx); })
         .on_mouse_down("right", () => this.menu(seatTarget))
         .child(helpers.length
-          ? div().id(`topo-seat-fold-${s.session}`).w(12).flex_none().text_color(t.dim)
+          ? div().id(`topo-seat-fold-${s.session}`).tooltip(`Show or hide ${s.logicalId}'s helper terminals`).w(12).flex_none().text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); setOpen(hKey, !openHelpers); })
             .child(svg(icon(openHelpers ? "chevron-down" : "chevron-right")).size(12))
           : div().w(compact ? 0 : 12).flex_none())
         .child(h_flex().id(`seat-chip-${s.session}`).flex_1().min_w(0).h(24).gap(6).items_center()
           .child(this.dot(t, rowStatus,14,s.session,this.statusMotion.seatNeeds(s.session,rig.name,s.logicalId)))
-          .child(div().id(`seat-name-${s.session}`).text_size(12.5).text_color(t.foreground).hover((e) => e.text_color(t.accent))
-            .when(compact, el => el.flex_1().min_w(0).truncate().tooltip(s.logicalId))
+          .child(div().id(`seat-name-${s.session}`).tooltip(`Open ${s.logicalId}'s page`).text_size(12.5).text_color(t.foreground).hover((e) => e.text_color(t.accent))
+            .when(compact, el => el.flex_1().min_w(0).truncate())
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); })
             .child(tight ? s.logicalId?.split(".").at(-1) ?? s.logicalId : s.logicalId))
           .when(!tight, el => el.child(div().id(`seat-status-${s.session}`).text_size(11.5).text_color(t[statusMark(rowStatus).word] ?? t.muted).child(seatNeed ? "needs you" : s.word)))
           .when(!!runtimeBadge && !compact, (el) => el.child(div().id(`seat-runtime-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .font_family(settings().font_family).text_size(11).text_color(t.dim).child(runtimeBadge)))
-          .when(!!s.slice && !compact, (el) => el.child(div().id(`seat-slice-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
+          .when(!!s.slice && !compact, (el) => el.child(div().id(`seat-slice-${s.session}`).tooltip(`Open slice ${s.slice} in Scopes`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .text_size(11).text_color(t.accent).cursor_pointer()
             .on_click((_e, cx) => { cx?.stop_propagation?.(); this.push({ section: "scopes", slice: s.slice }); })
             .child(String(s.slice))))
           .when(!s.terminal && !compact, el => el.child(this.nowRow(t, { ...s, rig: rig.name }, () => this.push(seatEntry))))
-          .when(click.kind === "card" && !tight, (el) => el.child(div().id(`seat-go-${s.session}`).text_size(12).text_color(t.dim)
+          .when(click.kind === "card" && !tight, (el) => el.child(div().id(`seat-go-${s.session}`).tooltip(`Open ${s.logicalId}'s page`).text_size(12).text_color(t.dim)
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); }).child("›"))))
         .child(h_flex().gap(4).items_center().flex_none()
           // Answer can't wait: it stays on the row whenever the seat has an open request.
           .when(!!seatNeed && !compact, (el) => el.child(answer()))
           // A terminal seat is a person's shell, not an agent: no message or work to give it.
           .when(selected && !s.terminal && !compact, (el) => el
-            .child(quickBtn(`seat-send-${s.session}`, "Send…", send, { disabled: !!sendReason, tooltip: sendReason }))
-            .child(quickBtn(`seat-queue-${s.session}`, "Queue…", queue, { disabled: !!queueReason, tooltip: queueReason })))
+            .child(quickBtn(`seat-send-${s.session}`, "Send…", send, { disabled: !!sendReason, tooltip: sendReason ?? `Send ${s.logicalId} a message` }))
+            .child(quickBtn(`seat-queue-${s.session}`, "Queue…", queue, { disabled: !!queueReason, tooltip: queueReason ?? `Queue a task for ${s.logicalId}` })))
           .child(this.moreButton(t, `seat-more-${s.session}`, () => this.menu(seatTarget)))))
       .when(!!seatNeed && compact, el => el.child(h_flex().id(`seat-answer-line-${s.session}`).pl(18).pb(4).child(answer())))
       .children(openHelpers ? helpers.map((child, idx) =>
-        h_flex().id(`topo-helper-${s.session}-${idx}`).pl(36).pr(8).h(24).gap(6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
+        h_flex().id(`topo-helper-${s.session}-${idx}`).tooltip("Peek at this helper terminal (read only)").pl(36).pr(8).h(24).gap(6).items_center().rounded(6).cursor_pointer().hover((e) => e.bg(t.hover))
           .on_click(() => run("terminal.peek", { terminal: child.address }))
           .child(div().w(12).flex_none())
           .child(svg(icon("rig-helper")).size(12).flex_none().text_color(t.dim))
           .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).tooltip(String((child.name || (Array.isArray(child.argv) ? child.argv.join(" ") : "") || child.address)??"")).child(child.name || (Array.isArray(child.argv) ? child.argv.join(" ") : "") || child.address))
-          .child(div().text_size(11).text_color(t.dim).child(child.status ?? ""))) : []);
+          .child(div().text_size(11).text_color(t.dim).child(statusWord(child.status ?? "","seat")))) : []);
   }
 
   /** The quiet ⋯ icon button: the row's menu (the right-click and the Menu key open the same). */
-  moreButton(t, id, onClick) {
+  moreButton(t, id, onClick, { tip = "More actions" } = {}) {
     return h_flex().id(id).size(20).rounded(5).items_center().justify_center().flex_none().cursor_pointer().text_color(t.dim)
       .hover((e) => e.bg(t.hover).text_color(t.foreground))
-      .tooltip("More actions")
+      .tooltip(tip)
       .on_click((_e, cx) => { cx?.stop_propagation?.(); onClick(); })
       .child(svg(icon("rig-more")).size(14));
   }
@@ -2097,6 +2379,11 @@ export default class RigView extends View {
     if (wait) return wait;
     const n = nodes.data.find((x) => x.logicalId === entry.name || x.canonicalSessionName === entry.session);
     if (!n) return this.dim(t, `${entry.name} isn't in ${entry.rig} any more.`);
+    const account=typeof n.configuredAccount==='string'?n.configuredAccount.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g,'').trim():'';
+    const accountConfig=this.activeConfig();
+    const accountMachine=accountConfig?.daemonMachine||(isLoopbackDaemonUrl(accountConfig?.daemonUrl)?'this machine':"OpenRig's machine");
+    const accountLabel=account==='login'?`Claude login on ${accountMachine}`:account;
+    const accountTip=`${account==='login'?'':account+'\n\n'}The Claude account this seat is set to launch with. It isn't a check of who is signed in now.`;
     const rawStatus = seatStatus(n);
     if (!isTerminalSeat(n)) { const seat = this.nowSeat({ session: n.canonicalSessionName, runtime: n.runtime, status: rawStatus, open: true }); this.nowSeats?.set(seat.key, seat); }
     const look = statusLook(rawStatus);
@@ -2205,13 +2492,13 @@ export default class RigView extends View {
     this.pageActions=h_flex().gap(6).items_center().flex_none()
         .when((this.pageWidth??960)<320,el=>el.flex_wrap().max_w(Math.max(100,this.pageWidth-28)))
         .child(live.kind !== "card"
-          ? this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { primary: true, small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason })
-          : this.button(t, "seat-attach", "Attach", doAttach, { primary: !stoppedSeat, small: true, iconName: "terminal", disabled: stoppedSeat, tooltip: attachReason }))
+          ? this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { tip: "Show this seat's pane in Herdr", primary: true, small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason })
+          : this.button(t, "seat-attach", "Attach", doAttach, { tip: "Attach to this seat's terminal in a new tab", primary: !stoppedSeat, small: true, iconName: "terminal", disabled: stoppedSeat, tooltip: attachReason }))
         // A terminal seat is a person's shell, not an agent: no message, work or model to give it.
         .when(!isTerminalSeat(n), (el) => el
-          .child(this.button(t, "seat-act-send", "Send…", () => dialog({ input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }, 260), { small: true, iconName: "rig-send", disabled: !!sendReason, tooltip: sendReason }))
-          .child(this.button(t, "seat-act-queue", "Queue…", () => dialog({ input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), { small: true, iconName: "rig-queue", disabled: !!queueReason, tooltip: queueReason })))
-        .child(this.button(t, "seat-act-more", "⋯", () => this.menu(target), { small: true }));
+          .child(this.button(t, "seat-act-send", "Send…", () => dialog({ input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }, 260), { tip: "Send this seat a message", small: true, iconName: "rig-send", disabled: !!sendReason, tooltip: sendReason }))
+          .child(this.button(t, "seat-act-queue", "Queue…", () => dialog({ input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), { tip: "Queue a task for this seat", small: true, iconName: "rig-queue", disabled: !!queueReason, tooltip: queueReason })))
+        .child(this.button(t, "seat-act-more", "⋯", () => this.menu(target), { tip: "More actions for this seat", small: true }));
     this.inPageActions=false;
     return v_flex().id(`seat-page-${entry.name}`).gap(12)
       .when(tab === "activity" && !isTerminalSeat(n), el => el.child(this.nowBlock(t, { session: n.canonicalSessionName, logicalId: n.logicalId }, () => transcript && this.push(fileEntry(transcript, `${entry.name} transcript`)))))
@@ -2229,7 +2516,8 @@ export default class RigView extends View {
                 .when(contextWindow != null, (el) => el.child(div().id("seat-context-tokens").when(pageBodyLayout(this.pageWidth).compact, e => e.w_full()).text_size(12).text_color(t.muted).child(
                   `${fmtTok(contextWindow)} token window${inputTokens != null ? ` · ${fmtTok(inputTokens)} input` : ""}${outputTokens != null ? ` · ${fmtTok(outputTokens)} output` : ""}`)))),
         this.kv(t, [
-          ["Runtime", n.runtime],
+          ["Runtime", statusWord(n.runtime, "runtime")],
+          ...(account.trim()?[["Account",accountLabel,false,accountTip]]:[]),
           ["Model", n.model ?? n.resolvedModel ?? "default"],
           ["Session", n.canonicalSessionName, true],
           ["Effort", effortText],
@@ -2239,7 +2527,7 @@ export default class RigView extends View {
           ? div().id("seat-open-terminal-link").text_size(12).text_color(t.dim)
             .tooltip(seatViewReason ?? "")
             .child("This seat has no running terminal to attach.")
-          : (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("seat-open-terminal-link").gap(6).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center()).cursor_pointer()
+          : (pageBodyLayout(this.pageWidth).compact ? v_flex() : h_flex()).id("seat-open-terminal-link").tooltip("Open this seat's terminal").gap(6).when(!pageBodyLayout(this.pageWidth).compact, el => el.items_center()).cursor_pointer()
               .on_click(() => this.oneClick(target, "open-seat", "seat-open-terminal"))
               .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.w(120)).text_size(12).text_color(t.dim).child("Terminal"))
               .child(div().text_size(12.5).text_color(t.accent).child("Open terminal ▸"))]),
@@ -2248,7 +2536,7 @@ export default class RigView extends View {
       .when(tab === "activity", el => el.child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
         div().text_size(12.5).child(activityWords.line),
         ...[activityWords.note, activityWords.changed, activityWords.stale].filter(Boolean).map(text => this.dim(t, text)),
-        h_flex().id("seat-evidence-fold").gap(5).items_center().cursor_pointer().text_color(t.muted)
+        h_flex().id("seat-evidence-fold").tooltip("Show or hide how OpenRig knows this seat's activity").gap(5).items_center().cursor_pointer().text_color(t.muted)
           .on_click((_e, cx) => { this.activityEvidenceOpen = !this.activityEvidenceOpen; cx.notify(); })
           .child(svg(icon(this.activityEvidenceOpen ? "chevron-down" : "chevron-right")).size(11))
           .child(div().text_size(12).child("How OpenRig knows")),
@@ -2264,11 +2552,11 @@ export default class RigView extends View {
       ]))))
       // 3. HEALTH section
       .when(tab === "activity", el => el.child(v_flex().id("seat-section-health").child(this.card(t, "HEALTH", seatFindings.length
-        ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+        ? seatFindings.map((f, i) => h_flex().id(`seat-health-finding-${i}`).tooltip("Open this finding in System › Health").px(6).h(26).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => this.push({ section: "system", subview: "health" }))
-            .child(div().text_size(12).text_color(t.blocked).child(`[${f.severity ?? "warn"}]`))
+            .child(div().text_size(12).text_color(t.blocked).child(statusWord(f.severity ?? "warning", "severity")))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(singleLineText(f.summary ?? f.id ?? "finding")??"")).child(singleLineText(f.summary ?? f.id ?? "finding")))
-            .child(div().text_size(11.5).text_color(t.dim).child(f.status ?? "open"))
+            .child(div().text_size(11.5).text_color(t.dim).child(statusWord(f.status ?? "open", "health")))
             .child(svg(icon("chevron-right")).size(11).flex_none().text_color(t.dim)))
         : [this.dim(t, "No health findings for this seat.")]))))
       // 4. CURRENT WORK section
@@ -2307,7 +2595,7 @@ export default class RigView extends View {
           .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(`NEEDS YOU · ${seatNeeds.length}`))
           .children(seatNeeds.length
             ? [
-                ...seatNeeds.slice(0, 3).map((it, i) => h_flex().id(`seat-need-item-${i}`).px(6).h(24).overflow_hidden().gap(8).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+                ...seatNeeds.slice(0, 3).map((it, i) => h_flex().id(`seat-need-item-${i}`).tooltip("Open this request in Needs").px(6).h(24).overflow_hidden().gap(8).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
                   .on_click(() => this.push({ section: "needs", id: it.id, name: it.summary }))
                   .child(div().text_size(11.5).text_color(t.blocked).child(`[${it.urgency ?? "normal"}]`))
                   .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.foreground).tooltip(String(singleLineText(it.summary ?? it.id)??"")).child(singleLineText(it.summary ?? it.id)))),
@@ -2331,13 +2619,13 @@ export default class RigView extends View {
           ["cwd", cwdText, true],
         ]),
         h_flex().gap(8).items_center().flex_wrap()
-          .child(h_flex().id("seat-link-host").px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
+          .child(h_flex().id("seat-link-host").tooltip(`Open host ${hostOf(n) ?? "local"}'s page`).px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => this.push({ section: "topology", kind: "host", host: hostOf(n) ?? "local", name: hostOf(n) ?? "local" }))
             .child(div().text_size(11.5).text_color(t.accent).child(`host ${hostOf(n) ?? "local"} ▸`)))
-          .child(h_flex().id("seat-link-rig").px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
+          .child(h_flex().id("seat-link-rig").tooltip(`Open rig ${entry.rig}'s page`).px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => this.push({ section: "topology", kind: "rig", rigId: entry.rigId, conn: entry.conn, name: entry.rig }))
             .child(div().text_size(11.5).text_color(t.accent).child(`rig ${entry.rig} ▸`)))
-          .child(h_flex().id("seat-link-pod").px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
+          .child(h_flex().id("seat-link-pod").tooltip(`Open pod ${podName}'s page`).px(8).h(22).rounded(5).bg(t.raised).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click(() => this.push({ section: "topology", kind: "pod", rig: entry.rig, rigId: entry.rigId, conn: entry.conn, pod: podName, name: podName }))
             .child(div().text_size(11.5).text_color(t.accent).child(`pod ${podName} ▸`))),
         this.nativePart(t, cx, entry.rig, n.canonicalSessionName),
@@ -2345,7 +2633,7 @@ export default class RigView extends View {
       // 7. SPEC section (linked spec or (not in library), profile, version, source hash, basis)
       .when(tab === "files", el => el.child(v_flex().id("seat-section-spec").child(this.card(t, "SPEC", [
         n.resolvedSpecName
-          ? h_flex().id("seat-spec").gap(8).items_center().cursor_pointer()
+          ? h_flex().id("seat-spec").tooltip("Open this seat's spec in Specs").gap(8).items_center().cursor_pointer()
               .on_click(() => this.push({ section: "specs", specOf: n.logicalId, name: `spec of ${n.logicalId}` }))
               .child(svg(icon("file-text")).size(13).text_color(t.muted))
               .child(div().text_size(12.5).text_color(t.accent).child(`${n.resolvedSpecName}${n.resolvedSpecVersion ? ` · ${n.resolvedSpecVersion}` : ""}`))
@@ -2359,7 +2647,7 @@ export default class RigView extends View {
         ]),
       ]))))
       .when(tab === "activity", el => el.child(this.helpersPart(t, cx, entry.rig, n.canonicalSessionName)))
-      .when(tab === "files" && !!transcript, (el) => el.child(this.card(t, "Files", [this.fileRow(t, "seat-transcript", transcript, `Transcript · ${entry.name}`)])));
+      .when(tab === "files" && !!transcript, (el) => el.child(this.card(t, "Files", [this.fileRow(t, "seat-transcript", transcript, `Transcript · ${entry.name}`, "Open this seat's transcript")])));
   }
 
   /** Placement: a native seat's terminal and how it ends. */
@@ -2381,11 +2669,11 @@ export default class RigView extends View {
     if (!seat) return this.card(t, "Helpers", [this.dim(t, "Sub-agents started with hc run appear here when the seat runs natively in herdr-app; this seat runs in tmux.")]);
     const kids = seat.children ?? [];
     return this.card(t, "Helpers", [kids.length
-      ? v_flex().children(kids.map((c, i) => h_flex().id(`native-child-${i}`).px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
+      ? v_flex().children(kids.map((c, i) => h_flex().id(`native-child-${i}`).tooltip("Peek at this helper terminal (read only)").px(8).h(28).gap(8).items_center().rounded(6).hover((s) => s.bg(t.hover))
         .on_click(() => run("terminal.peek", { terminal: c.address }))
         .child(svg(icon("rig-helper")).size(13).flex_none().text_color(t.dim))
         .child(div().flex_1().truncate().text_size(12.5).tooltip(String((c.name || c.argv.join(" ") || c.address)??"")).child(c.name || c.argv.join(" ") || c.address))
-        .child(div().text_size(11.5).text_color(t.dim).child(c.status ?? ""))
+        .child(div().text_size(11.5).text_color(t.dim).child(statusWord(c.status ?? "","seat")))
         .child(div().text_size(11.5).text_color(t.dim).font_family(settings().font_family).child(c.address))
         .child(this.copyButton(t, c.address, `helper-${c.address}`, "terminal address"))))
       : this.dim(t, seat.live ? "No hc run sub-agents running." : "None: the seat isn't running.")]);
@@ -2415,7 +2703,7 @@ export default class RigView extends View {
       if (hits.length === 1) return this.specs(t, cx, { ...entry, id: hits[0].id });
       return this.card(t, entry.name, [hits.length ? this.table(t, "spec-hits", [["Spec"], ["Kind", 90], ["Version", 80], ["Source", 80]], hits.map((s) => ({ cells: [s.name, s.kind, s.version,
         div().text_size(11).text_color(t.dim).child(s.sourceType === "builtin" || !s.sourcePath ? "Built-in" : "Yours")],
-        onClick: () => this.push({ section: "specs", id: s.id, name: s.name }) }))) : this.dim(t, `No spec named ${entry.name} in the library.`)]);
+        tip: "Open this spec", onClick: () => this.push({ section: "specs", id: s.id, name: s.name }) }))) : this.dim(t, `No spec named ${entry.name} in the library.`)]);
     }
     if (entry.id) {
       // One spec, opened by id (sidebar, palette, `spec-of`): the same expanded body the list shows in place.
@@ -2447,7 +2735,7 @@ export default class RigView extends View {
         this.pageRows?.push({ key, foldKey: key, expandable: true, isOpen: expanded, open: toggleKind,
           setOpen: value => { if (!f) setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [key]: value }); } });
         return v_flex().id(`spec-kind-group-${g.kind}`)
-          .child(h_flex().id(key).px(8).h(30).gap(6).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover(x => x.bg(t.hover))
+          .child(h_flex().id(key).tooltip(`Show or hide the ${g.kind} specs`).px(8).h(30).gap(6).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover(x => x.bg(t.hover))
             .on_click(toggleKind)
             .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(12).text_color(t.dim))
             .child(div().text_size(12.5).font_semibold().text_color(t.muted).child(g.title))
@@ -2459,7 +2747,7 @@ export default class RigView extends View {
         this.pageRows?.push({ key, foldKey: key, parentKey: `spec-kind:${g.kind}`, expandable: true, isOpen: shown, open: () => toggle(s.id) });
         return v_flex()
           .when(builtin && i === g.yours && i > 0, el => el.child(div().id(`spec-divider-${g.kind}`).mx(8).h(1).bg(t.border)))
-          .child(h_flex().id(`specs-${lib.data.indexOf(s)}`).pl(24).pr(8).h(30).gap(10).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover((x) => x.bg(t.hover))
+          .child(h_flex().id(`specs-${lib.data.indexOf(s)}`).tooltip(`${shown ? "Close" : "Open"} ${s.name}; right-click for its actions`).pl(24).pr(8).h(30).gap(10).items_center().rounded(6).when(this.pageSel === key, el => el.bg(t.selection)).hover((x) => x.bg(t.hover))
             .on_click(() => { this.pageSel = key; toggle(s.id); }).on_mouse_down("right", () => this.menu({ kind: "spec", conn: this.shownConnId(), id: s.id, name: s.name, sourcePath: s.sourcePath, specKind: s.kind }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(s.name??"")).child(s.name))
@@ -2519,6 +2807,7 @@ export default class RigView extends View {
       box = this.specBoxes[this.specBoxKey(s.id)] = { loading: true, editing: startEditing };
       this.loadSpec(cx, s, isBuiltin, box);
     }
+    this.ensureSpecEditor(cx, box);
     const mac = window()?.platform === "macos";
     const dirty = this.specDirty(box);
     const editing = Boolean(box.editing) && !isBuiltin;
@@ -2537,38 +2826,38 @@ export default class RigView extends View {
     const openDisabled = !s.sourcePath || Boolean(config.daemonMachine);
     const toolbar = h_flex().gap(8).items_center().flex_wrap()
       .when(rigSpec&&!single,el=>el.child(h_flex().rounded(6).border_1().border_color(t.border).children(["graph","yaml"].map(view=>
-        this.button(t,`spec-view-${view}-${s.id}`,view==="graph"?"Graph":"YAML",(_e,cx)=>{box.view=view;cx.notify();},{small:true})
+        this.button(t,`spec-view-${view}-${s.id}`,view==="graph"?"Graph":"YAML",(_e,cx)=>{box.view=view;cx.notify();},{ tip: view === "graph" ? "Show this spec as a graph" : "Show this spec as YAML",small:true})
           .when((view==="graph")===graphView,el=>el.bg(t.accent).text_color(t.solid_foreground)
             .hover(st=>st.bg(t.accent)))))))
-      .child(this.button(t, sfx(isBuiltin ? "spec-copy" : "spec-edit", true), editLabel, (_e, cx) => this.toggleEditSpec(cx, s, isBuiltin), {
+      .child(this.button(t, sfx(isBuiltin ? "spec-copy" : "spec-edit", true), editLabel, (_e, cx) => this.toggleEditSpec(cx, s, isBuiltin), { tip: isBuiltin ? (box.copying ? "Making your copy…" : "Make your own copy of this built-in spec to edit") : editing ? "Stop editing and discard your edits (asks first if you changed anything)" : "Edit this spec here",
         primary: !editing && !copyReason,
         iconName: editing ? "x" : "layers",
         disabled: Boolean(box.loading || box.copying || box.saving || box.awaitingPermission || copyReason),
         tooltip: remoteEdit ? `Edit on ${config.daemonMachine}` : copyReason,
       }))
-      .when(!graphView,el=>el.child(this.button(t, sfx("spec-save", true), box.saving ? "Saving…" : `Save ${mac ? "⌘↵" : "Ctrl+↵"}`, (_e, cx) => this.saveSpec(cx, s), {
+      .when(!graphView,el=>el.child(this.button(t, sfx("spec-save", true), box.saving ? "Saving…" : `Save ${mac ? "⌘↵" : "Ctrl+↵"}`, (_e, cx) => this.saveSpec(cx, s), { tip: `Save your edits${config.daemonMachine ? ` on ${config.daemonMachine}` : ""} (⌘↵ / Ctrl+↵)`,
         primary: editing && dirty,
         iconName: "check",
         disabled: saveDisabled,
       })))
       .child(this.button(t, sfx("spec-open", true), "Open file", () => {
         if (s.sourcePath && !config.daemonMachine) this.push(fileEntry(s.sourcePath, `${s.name} · spec`));
-      }, {
+      }, { tip: "Open the spec file here, read only",
         iconName: "file-text",
         disabled: openDisabled,
         tooltip: config.daemonMachine ? `This file is on ${config.daemonMachine}.` : openDisabled ? "Built-in spec has no file path on disk" : null,
       }))
-      .children(pills.map((r) => h_flex().id(`spec-rig-pill-${s.id}-${r.name}`).px(8).h(24).gap(5).items_center().rounded(12).text_size(12).cursor_pointer()
+      .children(pills.map((r) => h_flex().id(`spec-rig-pill-${s.id}-${r.name}`).tooltip(`Open ${r.name}, running from this spec`).px(8).h(24).gap(5).items_center().rounded(12).text_size(12).cursor_pointer()
         .bg(t.raised).border_1().border_color(t.border).hover((e) => e.bg(t.hover)).on_click(() => this.openRigFromSpec(r))
         .child(div().text_color(t.working).child("●")).child(r.name)))
       .when(isBuiltin, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Built-in specs can't be edited; copy one to make your own.")))
       .when(!isBuiltin && !editing, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Read-only")))
       .when(dirty, (el) => el.child(div().text_size(11.5).text_color(t.working).child("● Unsaved changes")))
       .when(rigSpec,el=>el.child(div().flex_1()).child(this.button(t,`spec-launch-${s.id}`,"Launch…",()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:460,height:LAUNCH_DIALOG_HEIGHT,
-        props:{target:{kind:"spec",id:s.id,conn:config.connectionId,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{primary:true,iconName:"rig-play"})))
+        props:{target:{kind:"spec",id:s.id,conn:config.connectionId,name:s.name,sourcePath:s.sourcePath??null,specKind:"rig"},step:{action:"launch-spec"}}}),{ tip: "Start a rig from this spec: asks where and on which host first",primary:true,iconName:"rig-play"})))
       .when(!!box.restoredDraft && dirty, (el) => el.child(h_flex().gap(6).items_center().flex_wrap().child(div().text_size(11.5).text_color(t.muted).child(config.daemonMachine
         ? `Restored your unsaved edits from ${this.time(box.draftAt??Date.now())}.` : "Restored unsaved edits"))
-        .child(this.button(t, `spec-discard-draft-${s.id}`, config.daemonMachine?"Discard edits":"Discard", (_e, cx) => this.discardDraft(cx, s), { small: true }))));
+        .child(this.button(t, `spec-discard-draft-${s.id}`, config.daemonMachine?"Discard edits":"Discard", (_e, cx) => this.discardDraft(cx, s), { tip: "Throw away the unsaved edits you had left here", small: true }))));
     const errors = box.errors ?? [];
     if(single){this.pageActions=toolbar;this.pageHeading={title:s.name,status:`${s.kind??"spec"}${s.version?` · ${s.version}`:""}`};}
     return v_flex().gap(8)
@@ -2578,31 +2867,56 @@ export default class RigView extends View {
       .when(Boolean(box.confirmDiscardEdit || box.confirmRevert), (el) => el.child(
         h_flex().id(`spec-discard-bar-${s.id}`).gap(8).items_center()
           .child(div().text_size(12).text_color(t.blocked).child("Discard edits?"))
-          .child(this.button(t, `spec-discard-confirm-${s.id}`, "Discard", (_e, cx) => this.confirmDiscardEditSpec(cx, s, isBuiltin), { small: true }))
-          .child(this.button(t, `spec-keep-edit-${s.id}`, "Keep editing", (_e, cx) => { box.confirmDiscardEdit = false; box.confirmRevert = false; cx.notify(); }, { small: true })),
+          .child(this.button(t, `spec-discard-confirm-${s.id}`, "Discard", (_e, cx) => this.confirmDiscardEditSpec(cx, s, isBuiltin), { tip: "Throw away your edits and show the saved spec", small: true }))
+          .child(this.button(t, `spec-keep-edit-${s.id}`, "Keep editing", (_e, cx) => { box.confirmDiscardEdit = false; box.confirmRevert = false; cx.notify(); }, { tip: "Keep your edits and go on editing", small: true })),
       ))
       .when(!!box.savedText && !dirty, (el) => el.child(this.dim(t, box.savedText)))
       .when(!!guidance, (el) => el.child(this.specNoteView(t, guidance, s.id)))
       .when(!!copyNote, (el) => el.child(this.specNoteView(t, copyNote, s.id, /^(?:An earlier copy|You already have a copy)/.test(copyNote))))
       .when(!!box.conflict, (el) => el.child(v_flex().gap(6).min_w(0).child(div().text_size(12).text_color(t.blocked).child(box.conflict))
         .child(h_flex().gap(8).items_center().flex_wrap()
-        .child(this.button(t, `spec-reload-${s.id}`, box.confirmReload ? "Click Reload again to discard edits" : "Reload", (_e, cx) => this.reloadSpec(cx, s, isBuiltin)))
-        .child(this.button(t, `spec-keep-editing-${s.id}`, "Keep editing", (_e, cx) => this.keepEditing(cx, s))))))
-      .children(errors.map((e, i) => div().id(`spec-error-${s.id}-${i}`).text_size(12).text_color(t.blocked).child(String(e))))
+        .child(this.button(t, `spec-reload-${s.id}`, box.confirmReload ? "Click Reload again to discard edits" : "Reload", (_e, cx) => this.reloadSpec(cx, s, isBuiltin), { tip: `Read the spec again from disk${box.confirmReload ? "; click again to throw away your edits" : ""}` }))
+        .child(this.button(t, `spec-keep-editing-${s.id}`, "Keep editing", (_e, cx) => this.keepEditing(cx, s), { tip: "Keep your edits; the next Save replaces the file as it is now" })))))
+      .children(errors.map((e, i) => div().id(`spec-error-${s.id}-${i}`).text_size(12).text_color(t.blocked).child(this.errorText(t,`spec-error-detail-${s.id}-${i}`,e,{where:config.daemonMachine??"this computer"}))))
       .when(graphView&&dirty,el=>el.child(this.dim(t,"Showing the saved spec. Save to update the graph.")))
       .child(graphView ? (box.graph?this.graphFor(`spec:${this.specBoxKey(s.id)}`).render(t,cx,box.graph,{id:`spec-graph-${s.id}`,assets:ASSETS})
-        :box.graphError?v_flex().gap(6).child(div().text_size(12).text_color(t.blocked).child(box.graphError))
-          .child(this.button(t,`spec-graph-retry-${s.id}`,"Retry",(_e,cx)=>this.loadSpecGraph(cx,s,box),{small:true})):this.skeleton(t)) : box.state
+        :box.graphError?v_flex().gap(6).child(this.errorText(t,`spec-graph-error-${s.id}`,box.graphError))
+          .child(this.button(t,`spec-graph-retry-${s.id}`,"Retry",(_e,cx)=>this.loadSpecGraph(cx,s,box),{small:true,tip:"Try drawing the graph again"})):this.skeleton(t)) : box.state
         ? div().id(`spec-editor-${s.id}`).h(320).border_1().border_color(editing ? t.accent : t.border).rounded(6)
           // Clicks and keys typed in the YAML are the editor's: stop left-mouse-down from bubbling to rig-view-root's handle.focus().
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_key_down(() => { this.typing = true; }).child(Editor.new(box.state))
-        : box.error ? div().text_size(12).text_color(t.blocked).child(box.error) : this.skeleton(t))
+        : box.error ? this.errorText(t,`spec-read-error-${s.id}`,box.error) : this.skeleton(t))
       .when(!isBuiltin, (el) => el.child(this.dim(t, "Applies to future launches; running rigs keep their current topology.")));
   }
 
   /** Creates and wires an EditorState for a spec box with the requested `readonly` state. */
+  /** After an await, an editor state made right there would belong to whichever view drained the promise jobs, and go when that view closes.
+   *  The continuation queues what it wants; the spec's next draw makes it (ensureSpecEditor). */
+  queueSpecEditorState(s, box, value, readonly, config = this.specConfig()) {
+    box.pendingEditor = { s, value, readonly, config };
+    // New text: the old editor must not stay live under the new base until the draw (a Save would write its text, a draft would keep it). It is
+    // released and dropped now (releasing allocates nothing); every handler bails without a state. The same text (a save's read-only swap) keeps it.
+    if (box.state && box.state.value() !== value) {
+      box.secondaryEnterTask?.cancel?.(); box.secondaryEnterBase = null;
+      try { box.state.release?.(); } catch (_) {}
+      box.state = null;
+    }
+  }
+  /** From the spec's draw (the page's own call): one timer that makes the queued editor state. */
+  ensureSpecEditor(cx, box) {
+    if (!box?.pendingEditor || box.pendingEditorTimer || !cx?.timer?.after) return;
+    box.pendingEditorTimer = true;
+    cx.timer.after(0, (next) => {
+      box.pendingEditorTimer = false;
+      const want = box.pendingEditor;
+      if (!want || this.closed) return;
+      this.makeSpecEditorState(want.s, box, want.value, want.readonly, want.config);
+      next?.notify?.();
+    });
+  }
   makeSpecEditorState(s, box, value, readonly, config = this.specConfig()) {
+    box.pendingEditor = null; // a state made now replaces one still queued
     const key = specDraftKey(s.id,config); // an operation that awaited passes the connection it began on: the editor's drafts are that connection's
     box.secondaryEnterTask?.cancel?.();box.secondaryEnterBase=null;
     box.state?.release?.();
@@ -2698,7 +3012,7 @@ export default class RigView extends View {
     const marker = "daemonMachine";
     const guidance = note === this.specRefusal() || note === this.remoteSpecGuidance();
     const tone = guidance || information ? t.muted : /^(?:Your copy of .*Copy & edit didn't overwrite it\.|The copied spec at .*Your copy was kept;)/.test(note) ? t.working : t.blocked;
-    if (!guidance || !note.includes(marker)) return div().text_size(12).text_color(tone).child(note);
+    if (!guidance || !note.includes(marker)) return information || tone === t.working ? div().text_size(12).text_color(tone).child(note) : this.errorText(t,`spec-note-error-${id}`,note,{where:this.activeConfig()?.daemonMachine??"this computer"}).text_size(12).text_color(tone);
     const [before, after] = note.split(marker);
     return h_flex().gap(4).items_center().flex_wrap().text_size(12).text_color(tone)
       .child(div().child(before)).child(div().id(`spec-config-key-${id}`).font_family(settings()?.font_family ?? "monospace").child(marker))
@@ -2791,9 +3105,9 @@ export default class RigView extends View {
         }
         box.editing = Boolean(box.editing) && !isBuiltin;
         box.lastText = box.prevText = initial;
-        this.makeSpecEditorState(s, box, initial, isBuiltin || !box.editing, spec.config);
+        this.queueSpecEditorState(s, box, initial, isBuiltin || !box.editing, spec.config);
         box.loading = false; box.error = null;
-      } catch (e) { box.loading = false; box.error = String(e?.message ?? e); }
+      } catch (e) { box.loading = false; box.error = errorDiagnostic(e); }
       cx.notify();
     });
   }
@@ -2859,7 +3173,7 @@ export default class RigView extends View {
     if (!this.config) { box.note = "The daemon address isn't known yet."; cx.notify(); return; }
     // One operation, begun here with the connection captured: the address and the validation belong to the config this save began under. If the
     // settings change in between (a list installed, an address edited), the save was NOT validated: nothing is written, and the person is told why.
-    let op; try { op = this.writeOperation(shown); } catch (e) { box.note = String(e?.message ?? e); cx.notify(); return; }
+    let op; try { op = this.writeOperation(shown); } catch (e) { box.note = errorDiagnostic(e); cx.notify(); return; }
     box.saving = true; cx.notify();
     const conflict = (onDisk) => { box.conflict = "The file changed on disk since you opened it."; if (onDisk != null) box.diskText = onDisk; };
     cx.spawn(async (cx) => {
@@ -2883,7 +3197,7 @@ export default class RigView extends View {
         try { await writeTextFile(file, edited, box.loaded); } catch (e) {
           // A changed file is a conflict; any other failure (permissions, I/O) says what it was.
           const now = await readTextFile(file).catch(() => null);
-          if (now != null && now !== box.loaded) conflict(now); else box.errors = [String(e?.message ?? e)];
+          if (now != null && now !== box.loaded) conflict(now); else box.errors = [errorDiagnostic(e)];
           return;
         }
         const synced = await this.syncLibrary(op, daemonUrl);
@@ -2892,11 +3206,13 @@ export default class RigView extends View {
         delete this.specCopyNotes?.[spec.boxKey(s.id)];
         if(synced?.ok&&s.kind==="rig")this.loadSpecGraph(cx,s,box,spec);
         // Keys typed while it saved stay: their draft is kept, now against what was written.
-        const key = spec.draftKey(s.id), now = box.state.value();
-        setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
-        if (now === edited) {
-          box.editing = false;
-          this.makeSpecEditorState(s, box, edited, true, shown);
+        if(box.state){
+          const key = spec.draftKey(s.id), now = box.state.value();
+          setDraft(key, now === edited ? null : { text: now, baseText: edited, baseHash: simpleHash(edited) });
+          if (now === edited) {
+            box.editing = false;
+            this.queueSpecEditorState(s, box, edited, true, shown);
+          }
         }
         spec.read(cx, "/api/specs/library", true);
         refreshSidebar();
@@ -3007,7 +3323,7 @@ export default class RigView extends View {
       this.remoteSpecWrite(cx,s,{verb:"copy",name:s.name});return;
     }
     // Begun with the captured connection, before the task: the library re-read below belongs to the connection and config this copy began under.
-    let op; try { op = this.writeOperation(shown); } catch (e) { box.note = String(e?.message ?? e); cx.notify(); return; }
+    let op; try { op = this.writeOperation(shown); } catch (e) { box.note = errorDiagnostic(e); cx.notify(); return; }
     box.copying = true; box.note = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -3049,9 +3365,9 @@ export default class RigView extends View {
         if (!spec.onPage()) return; // the tab shows another page by now: the copy is made and marked, and that page is left alone
         setOpen(`spec:${made}`, true);
         // On the one-spec page the page itself moves to the copy.
-        const stack = nav().stack ?? [], top = stack.at(-1);
-        if (copy && top?.section === "specs" && top.id === s.id && (top.conn ?? null) === fromConn)
-          setShared("rig.nav", { stack: [...stack.slice(0, -1), { section: "specs", id: made, name: copy.name ?? s.name, ...(fromConn ? { conn: fromConn } : {}) }] });
+        this.editShownStack((stack) => { const top = stack.at(-1);
+          return copy && top?.section === "specs" && top.id === s.id && (top.conn ?? null) === fromConn
+            ? [...stack.slice(0, -1), { section: "specs", id: made, name: copy.name ?? s.name, ...(fromConn ? { conn: fromConn } : {}) }] : null; });
       } catch (e) { box.note = plainExecError(e, { kind: "write" }); }
       finally { box.copying = false; cx.notify(); }
     });
@@ -3084,10 +3400,39 @@ export default class RigView extends View {
     if (!plan.ok) { info.note = plan.reason; cx.notify(); return; }
     const token = `spaces-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.spacesPending = { token, target, shown: { layout: name, tree: JSON.parse(JSON.stringify(tree)) }, expires: Date.now() + 300000 };
+    this.armDecisionPoll(cx);
     info.note = null;
     this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 540,
       props: { target: { kind: "spaces-list" }, step: { action: "spaces-list", token, copy: describeChange({ layout: name, shipped: isShippedLayout(name), copy: isShippedLayout(name) ? freeCopyName(name, layouts()) : null, from: plan.from, to: target, lines: plan.lines }) } } });
     cx.notify();
+  }
+
+  armDecisionPoll(cx) {
+    if((!this.spacesPending&&!this.specPermission)||this.closed)return;
+    if(this.decisionPollPending&&Date.now()<this.decisionPollPending.until)return;
+    const ticket={until:Date.now()+1000};
+    this.decisionPollPending=ticket;
+    cx.timer.after(250,next=>{
+      if(this.decisionPollPending!==ticket)return;
+      this.decisionPollPending=null;
+      if(this.closed)return;
+      const live=next??cx;
+      this.pollSpacesDecision(live);this.pollSpecDecision(live);
+      this.armDecisionPoll(live);
+    });
+  }
+
+  pollSpecDecision(cx) {
+    const pending=this.specPermission;if(!pending)return;
+    const decisions=shared("rig.specWriteDecisions")??{},decision=decisions[pending.token];
+    if(!decision&&Date.now()<pending.expires)return;
+    this.specPermission=null;const rest={...decisions};delete rest[pending.token];setShared("rig.specWriteDecisions",rest);
+    pending.box.awaitingPermission=false;
+    if(decision==="allow"){
+      const again=pending.began?this.specOperation(configOfConnection(this.config,pending.began.config.connectionId),pending.began.fromConn):null;
+      if(pending.began&&!again){pending.box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one.";cx.notify();return;}
+      if(pending.request?.verb==="copy-folder")this.copyFolder(cx,pending.spec,pending.confirmation,again);else this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation,again);
+    }else {pending.box.note="Nothing was saved on the box.";cx.notify();}
   }
 
   pollSpacesDecision(cx) {
@@ -3110,7 +3455,7 @@ export default class RigView extends View {
     };
     let result;
     try { result = await applySpacesMode(host, pending.shown, pending.target); }
-    catch (error) { result = { ok: false, reason: String(error?.message ?? error) }; }
+    catch (error) { result = { ok: false, reason: errorDiagnostic(error) }; }
     info.busy = false; info.at = 0; info.noteLayout = result.layout ?? pending.shown.layout;
     info.note = result.ok
       ? (pending.target === "herdr" ? `✓ ${result.layout} uses Herdr's Spaces list again.` : `✓ ${result.layout} now shows ${pending.target === "both" ? "Herdr's list and the Rig spaces block" : "herdrig's Spaces list"}. The way back is on this row.`)
@@ -3133,7 +3478,7 @@ export default class RigView extends View {
           .child(div().text_size(12).child('Spaces list'))
           .child(h_flex().gap(2).p(2).rounded(8).bg(t.raised).children(MODES.map(m=>{
             const blocked=!!why||!!info.busy||!!this.spacesPending,selected=m===mode;
-            return div().id(`spaces-list-${m}`).px(10).h(24).flex().items_center().rounded(6).text_size(12)
+            return div().id(`spaces-list-${m}`).tooltip(`Use ${m === "herdr" ? "Herdr's" : m === "herdrig" ? "herdrig's" : "both"} Spaces list in the layout`).px(10).h(24).flex().items_center().rounded(6).text_size(12)
               .bg(selected?t.accent:t.raised).text_color(selected?t.solid_foreground:t.foreground)
               .when(blocked,el=>el.opacity(.45)).when(!blocked,el=>el.cursor_pointer())
               .hover(el=>el.bg(selected?t.accent:blocked?t.raised:t.hover))
@@ -3143,12 +3488,12 @@ export default class RigView extends View {
         .when(mode === "herdrig" || mode === "both", (el) => el.child(div().id("spaces-list-where").text_size(11.5).text_color(t.muted)
           .child(`herdrig's copy of Herdr's list, in layout ${name} · based on Herdr ${BASE_HERDR}`)))
         .when(!!info.busy, (el) => el.child(div().text_size(11.5).text_color(t.muted).child("Changing the layout…")))
-        .when(!!info.note && (!info.noteLayout || info.noteLayout === name), (el) => el.child(div().id("spaces-list-note").text_size(11.5).text_color(/^✓/.test(info.note) ? t.muted : t.blocked).child(info.note)))
+        .when(!!info.note && (!info.noteLayout || info.noteLayout === name), (el) => el.child(div().id("spaces-list-note").text_size(11.5).text_color(/^✓/.test(info.note) ? t.muted : t.blocked).child(/^✓/.test(info.note) ? info.note : this.errorText(t,"spaces-list-note-detail",info.note,{where:"this computer"}))))
         .when((mode === "herdrig" || mode === "both") && info.reveal === true && !kept, (el) => el.child(v_flex().id("spaces-list-upstream").gap(6).p(8).rounded(6).bg(t.raised)
           .child(div().text_size(11.5).child("Herdr now keeps the active space in view itself. herdrig's list adds rig marks and actions; keep it, or switch back to Herdr's."))
           .child(h_flex().gap(8)
-            .child(this.button(t, "spaces-list-keep", "Keep", (_e, ctx) => this.keepSpacesList(ctx ?? cx), { small: true }))
-            .child(this.button(t, "spaces-list-switch-back", "Switch back", (_e, ctx) => this.chooseSpacesMode(ctx ?? cx, "herdr"), { small: true }))))),
+            .child(this.button(t, "spaces-list-keep", "Keep", (_e, ctx) => this.keepSpacesList(ctx ?? cx), { tip: "Keep herdrig's Spaces list and hide this note", small: true }))
+            .child(this.button(t, "spaces-list-switch-back", "Switch back", (_e, ctx) => this.chooseSpacesMode(ctx ?? cx, "herdr"), { tip: "Go back to Herdr's own Spaces list", small: true }))))),
     ];
     return this.card(t, "Layout", card);
   }
@@ -3162,7 +3507,7 @@ export default class RigView extends View {
         const next = { ...(previous ? JSON.parse(previous) : {}), keep: true };
         await writeTextFile(path, JSON.stringify(next), previous ?? null);
         info.state = next;
-      } catch (error) { info.note = String(error?.message ?? error); }
+      } catch (error) { info.note = errorDiagnostic(error); }
       cx.notify();
     });
   }
@@ -3272,7 +3617,7 @@ export default class RigView extends View {
     const config = { ...shown };
     // The operation begins where the config is captured, synchronously: a settings change while the address is resolved (a CLI discovery on a default
     // install) must not pair this config's machine and home with the new address.
-    let op; try { op = this.writeOperation(config); } catch (error) { box.note = String(error?.message ?? error); cx.notify(); return; }
+    let op; try { op = this.writeOperation(config); } catch (error) { box.note = errorDiagnostic(error); cx.notify(); return; }
     box.copying = true; box.note = null; box.errors = null; cx.notify();
     cx.spawn(async (cx) => {
       try {
@@ -3340,7 +3685,9 @@ export default class RigView extends View {
     // With the write's operation, every helper call first checks it: once the settings it began under are gone it refuses to START (each call otherwise takes the generation current at its own start).
     const cfg=config; // the write's own connection (the page's when none is passed): its own gate scope for the helper calls
     if(!cfg){const refuse=async()=>{throw Error(UNKNOWN_CONNECTION);};return{perform:refuse,hashText:refuse,checked:refuse};} // a removed connection: nothing runs, never another connection's
-    return new RemoteSpecs({exec:op?async(c,a,o)=>{op.check();return execFor(cfg)(c,a,o);}:execFor(cfg),hc:op?async(a,b)=>{op.check();return hcFor(cfg)(a,b);}:hcFor(cfg),machines,wait:waitWith(cx),appHome:appHome(),specBridgePath:bridge,
+    const isTransferRemove = (a, o) => !o?.on && Array.isArray(a) && a[0] === bridge && a[1] === "remove" && a[2] === appHome()
+      && (a.length === 3 || (a.length === 4 && a[3] === "--if-empty"));
+    return new RemoteSpecs({exec:op?async(c,a,o)=>{if(!isTransferRemove(a,o))op.check();return execFor(cfg)(c,a,o);}:execFor(cfg),hc:op?async(a,b)=>{op.check();return hcFor(cfg)(a,b);}:hcFor(cfg),machines,wait:waitWith(cx),appHome:appHome(),specBridgePath:bridge,
       health:async url=>{const r=await this.writeOperation(cfg).fetch(`${url}/healthz`);if(!r.ok)throw Error("OpenRig isn't answering.");return JSON.parse(await r.text());},
       currentConfig:async()=>preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())),this.config),
       // The connection the write began for, as the file says it NOW: another connection's own view; a removed one reads as none, so the write's identity check refuses.
@@ -3363,7 +3710,7 @@ export default class RigView extends View {
     const refused=cliRefusal(shown);if(refused){box.note=refused;cx.notify();return;} // a connection without its own OpenRig home: HOME_NEEDED, nothing sent
     const config={...shown},fromConn=spec.fromConn;
     // Begun with the captured connection, before the task: the validation below is only good for the connection and config this write began under.
-    let op;try{op=this.writeOperation(config);}catch(e){box.note=String(e?.message??e);cx.notify();return;}
+    let op;try{op=this.writeOperation(config);}catch(e){box.note=errorDiagnostic(e);cx.notify();return;}
     box[request.verb==="copy"?"copying":"saving"]=true;box.note=null;cx.notify();
     cx.spawn(async cx=>{
       try{
@@ -3395,8 +3742,10 @@ export default class RigView extends View {
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
           box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:synced?.refused?`Saved on ${config.daemonMachine}; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
           delete this.specCopyNotes?.[spec.boxKey(s.id)];
-          const now=box.state.value();setDraft(spec.draftKey(s.id),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
-          if(now===content){box.editing=false;this.makeSpecEditorState(s,box,content,true,spec.config);}
+          if(box.state){
+            const now=box.state.value();setDraft(spec.draftKey(s.id),now===content?null:{text:now,baseText:content,baseHash:simpleHash(content)});
+            if(now===content){box.editing=false;this.queueSpecEditorState(s,box,content,true,spec.config);}
+          }
         }else{
           if(!synced?.ok)throw Error(synced?.refused?`The copy was saved on ${config.daemonMachine}, but OpenRig's settings changed before the library could be updated. Refresh the library before copying again.`:`The copy was saved on ${config.daemonMachine}, but library re-index failed. Refresh the library before copying again.`);
           const response=await op.fetch(`${daemonUrl}/api/specs/library`);if(!response.ok)throw Error("The copy was saved, but the library couldn't be read. Refresh before copying again.");
@@ -3450,7 +3799,7 @@ export default class RigView extends View {
           .child(div().text_size(11.5).text_color(t.muted).child("Scopes ▸ project:"))
           .children(projList.map((p) => {
             const on = p.id === selectedProjId;
-            return h_flex().id(`scopes-project-${p.id}`).px(8).h(24).gap(5).rounded(6).items_center().cursor_pointer()
+            return h_flex().id(`scopes-project-${p.id}`).px(8).h(24).gap(5).rounded(6).items_center().cursor_pointer().tooltip(`Show ${p.name ?? p.id}'s missions in Scopes`)
               .bg(on ? t.accent : t.raised).border_1().border_color(on ? t.accent : t.border).hover((s) => s.bg(on ? t.accent : t.hover))
               .text_size(11.5).font_semibold().text_color(p.error ? t.blocked : on ? (t.solid_foreground ?? t.background) : t.muted)
               .on_click((_e, ctx) => {
@@ -3458,14 +3807,13 @@ export default class RigView extends View {
                 // connection; another connection's Scopes pages (another tab's) stay as they are.
                 const conn = entry?.conn ?? this.shownEntry()?.conn ?? null;
                 writeScopeProject({ shared, setShared }, this.config, conn ?? pageConn, p.id);
-                const kept = (nav().stack ?? []).filter((e) => e?.section !== "scopes" || (e.conn ?? null) !== conn);
-                setShared("rig.nav", { stack: [...kept, { section: "scopes", project: p.id, ...(conn ? { conn } : {}) }] });
+                this.editShownStack((stack) => [...stack.filter((e) => e?.section !== "scopes" || (e.conn ?? null) !== conn), { section: "scopes", project: p.id, ...(conn ? { conn } : {}) }]);
                 this.read(ctx ?? cx, `/api/scopes?detail=1&project=${encodeURIComponent(p.id)}`, true); // the click's own cx: this render's is gone by then
               })
               .child(p.name ?? p.id)
               .when(!!p.error, (el) => el.child(div().text_size(11).text_color(t.blocked).child("⚠")));
           })))
-        .when(!!selectedProj?.error, (el) => el.child(div().id("scopes-project-error").px(10).py(6).rounded(6).border_1().border_color(t.blocked).text_size(12).text_color(t.blocked).child(selectedProj.error)))
+        .when(!!selectedProj?.error, (el) => el.child(div().id("scopes-project-error").px(10).py(6).rounded(6).border_1().border_color(t.blocked).text_size(12).text_color(t.blocked).child(this.errorText(t,"scopes-project-error-detail",selectedProj.error))))
       : null;
     const paths = this.slicePaths(cx, activeProject);
     const wait = this.status(t, cx, scopePath, scopes);
@@ -3558,7 +3906,7 @@ export default class RigView extends View {
       }
       const headerMeta = h_flex().gap(6).items_center().flex_wrap()
         .children(missionFiles.map(([name, filePath]) =>
-          h_flex().id(`mission-file-${mKey}-${name}`).px(7).h(20).gap(4).items_center().rounded(5).cursor_pointer()
+          h_flex().id(`mission-file-${mKey}-${name}`).px(7).h(20).gap(4).items_center().rounded(5).cursor_pointer().tooltip(`Open ${name}`)
             .bg(t.raised).border_1().border_color(t.border).hover((x) => x.bg(t.hover))
             .on_click((_e, cx) => { cx?.stop_propagation?.(); this.push(fileEntry(filePath, `${name} · ${mTitle}`)); })
             .child(svg(icon("file-text")).size(11).flex_none().text_color(t.muted))
@@ -3601,16 +3949,16 @@ export default class RigView extends View {
         };
         return v_flex().id(`slices-${mi}-${si}`).when(sliceFocused, (el) => el.rounded(6).border_1().border_color(t.accent))
           .child(h_flex().id(`slice-row-${mKey}-${sKey}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((x) => x.bg(t.hover))
-            .on_click(toggleSlice)
+            .tooltip(`${shown ? "Close" : "Open"} slice ${sName}; right-click for its actions`).on_click(toggleSlice)
             .on_mouse_down("right", () => this.menu(sliceTarget(m, s)))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(sName??"")).child(sName))
             .child(this.copyButton(t, sKey, `slice-id-${sKey}`, "slice id"))
-            .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(String(s.status ?? ""??"")).child(s.status ?? ""))
+            .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(statusWord(s.status ?? "","startup")).child(statusWord(s.status ?? "","startup")))
             .child(div().w(100).flex_none().truncate().text_size(12.5).text_color(t.muted).tooltip(String(s.stage ?? ""??"")).child(s.stage ?? "")))
           .when(shown, (el) => el.child(v_flex().id(`slice-expand-${sKey}`).ml(22).pl(10).py(8).gap(8).border_l(1).border_color(sliceFocused ? t.accent : t.border)
             .on_click((_e, cx) => cx?.stop_propagation?.())
-            .child(h_flex().gap(10).items_center().child(div().text_size(11.5).font_semibold().text_color(t.muted).child("Readiness")).child(div().text_size(12.5).font_semibold().child(s.status ?? "—")).child(this.dim(t, s.stage ?? "")))
+            .child(h_flex().gap(10).items_center().child(div().text_size(11.5).font_semibold().text_color(t.muted).child("Readiness")).child(div().text_size(12.5).font_semibold().child(statusWord(s.status ?? "—","startup"))).child(this.dim(t, statusWord(s.stage ?? "","startup"))))
             .when(!!s.intent, (c) => c.child(this.plain(t, s.intent).text_color(t.muted)))
             .when(!!s.miniRequirements?.length, (c) => c.child(v_flex().gap(4).child(div().text_size(11.5).text_color(t.dim).child("Mini-requirements")).child(checklist(s.miniRequirements))))
             .when(!!s.proofContract?.length, (c) => c.child(v_flex().gap(4).child(div().text_size(11.5).text_color(t.dim).child("Proof contract")).child(checklist(s.proofContract))))
@@ -3618,10 +3966,10 @@ export default class RigView extends View {
               ? h_flex().gap(6).items_center().flex_wrap().children(knownFiles.map(([name, filePath], fi) => {
                   const openFile = (_e, cx) => { cx?.stop_propagation?.(); this.push(fileEntry(filePath, `${name} · ${sName}`)); };
                   const compatFileId = isFirstExpanded ? `file-${fi}-${name}` : `file-${sKey}-${fi}-${name}`;
-                  return div().id(`slice-file-${sKey}-${name}`).on_click(openFile).child(
+                  return div().id(`slice-file-${sKey}-${name}`).tooltip(`Open ${name}`).on_click(openFile).child(
                     h_flex().id(compatFileId).px(8).h(24).gap(5).items_center().rounded(6).cursor_pointer()
                       .bg(t.raised).border_1().border_color(t.border).hover((x) => x.bg(t.hover))
-                      .on_click(openFile)
+                      .tooltip(`Open ${name}`).on_click(openFile)
                       .child(svg(icon("file-text")).size(12).flex_none().text_color(t.muted))
                       .child(div().text_size(11.5).text_color(t.foreground).child(name))
                       .child(this.copyButton(t, filePath, `slice-file-${sKey}-${fi}`, "path")),
@@ -3629,8 +3977,8 @@ export default class RigView extends View {
                 }))
               : this.dim(t, !folder ? "OpenRig doesn't say where this slice is on disk." : readingFiles ? "Looking…" : "None of the files are on disk."))
             .child(h_flex().gap(8).items_center()
-              .child(div().id(isFirstExpanded ? "follow-slice" : `follow-slice-${sKey}`).on_click((_e, cx) => { if (!followReason) doFollow(_e, cx); }).child(
-                this.button(t, `slice-follow-${sKey}`, "Follow this slice", doFollow, { primary: true, small: true, iconName: "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: "follow" }),
+              .child(div().id(isFirstExpanded ? "follow-slice" : `follow-slice-${sKey}`).tooltip(followReason ?? "Keep a worker view of this slice open and up to date").on_click((_e, cx) => { if (!followReason) doFollow(_e, cx); }).child(
+                this.button(t, `slice-follow-${sKey}`, "Follow this slice", doFollow, { primary: true, small: true, iconName: "rig-follow", disabled: !!followReason, tooltip: followReason, tip: "Keep a worker view of this slice open and up to date", actionKey: "follow" }),
               ))
               .when(!!followReason, (c) => c.child(this.workerCapabilityNote(t, followReason))))));
       });
@@ -3640,7 +3988,7 @@ export default class RigView extends View {
             .tooltip("Open mission").on_click(()=>this.push({section:"scopes",...(workflowProject?{project:workflowProject}:{}),mission:mTitle,missionTab:hasWorkflows?"workflows":"slices"})).child(mTitle))
           .child(this.copyButton(t, mKey, `mission-${mKey}`, "mission id"))
           .child(headerMeta))
-        .when(!!m.error, (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(m.error)))
+        .when(!!m.error, (el) => el.child(this.errorText(t,"scope-mission-error",m.error)))
         .child(v_flex()
           .child(h_flex().px(8).h(24).gap(10).items_center().border_b(1).border_color(t.border).text_size(11).text_color(t.dim)
             .child(div().w(12)).child(div().flex_1().child("Slice")).child(div().w(100).flex_none().child("Status")).child(div().w(100).flex_none().child("Stage")))
@@ -3655,9 +4003,9 @@ export default class RigView extends View {
   terminalPreviewBody(t, cx, viewKey, isFirstExpanded = true) {
     const caps = this.caps();
     if (caps.probed === false) return this.dim(t, "Checking OpenRig's view-preview support…");
-    const capReason = capabilityDisableReason("open-view", caps);
+    const capReason = caps.hostWorkerViews ? null : "Saved views and Follow need an OpenRig that can plan worker views.";
     if (capReason) return this.workerCapabilityNote(t, capReason);
-    const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app${caps.hostWorkerViews||listAddedMachine(this.activeConfig())?"&viewportColumns=160":`&appHome=${encodeURIComponent(appHome())}`}`; // never this computer's app home to a list-added machine's daemon
+    const fullPath = `/api/terminal/preview?view=${encodeURIComponent(viewKey)}&provider=herdr-app&viewportColumns=160`;
     const preview = this.read(cx, fullPath);
     if (preview.status === 401 || /\b401\b/.test(String(preview.error ?? ""))) {
       return this.dim(t, TERMINAL_TOKEN_PROTECTED);
@@ -3702,10 +4050,10 @@ export default class RigView extends View {
         .child(this.dim(t, `${opened.length} attachable · ${absent.length} absent${degraded.length ? ` · ${degraded.length} degraded` : ""} · ${pages.length} page${pages.length===1?"":"s"}`))
         .child(div().flex_1())
         .when(opened.length === 0 && Boolean(rigName) && Boolean(normalized.rigStopped), (el) => el.child(
-          this.button(t, `resume-terminal-rig-${rigName}`, "Rig is stopped · Resume…", doResume, { primary: true, small: true, iconName: "rig-play" }),
+          this.button(t, `resume-terminal-rig-${rigName}`, "Rig is stopped · Resume…", doResume, { primary: true, small: true, iconName: "rig-play", tip: `Resume ${rigName} so this view can open: asks first` }),
         ))
-        .child(div().id(openWrapperId).on_click((_e, cx) => { if (!openReason) doOpen(_e, cx); }).child(
-          this.button(t, `open-view-${viewKey}`, caps.hostWorkerViews?"Worker view":"Open", doOpen, { primary: opened.length > 0, small: true, iconName: "rig-view", disabled: !!openReason, tooltip: openReason, actionKey: "open-view", conn: rigEntry?.conn ?? this.activeConnId() }),
+        .child(div().id(openWrapperId).tooltip(openReason ?? "Open this worker view").on_click((_e, cx) => { if (!openReason) doOpen(_e, cx); }).child(
+          this.button(t, `open-view-${viewKey}`, caps.hostWorkerViews?"Worker view":"Open", doOpen, { primary: opened.length > 0, small: true, iconName: "rig-view", disabled: !!openReason, tooltip: openReason, tip: "Open this worker view", actionKey: "open-view", conn: rigEntry?.conn ?? this.activeConnId() }),
         )))
       .when(!!openReason, (el) => el.child(this.dim(t, openReason)))
       .when(absent.length > 0, (el) => el.child(this.card(t, `Absent seats (${absent.length})`, [
@@ -3767,7 +4115,7 @@ export default class RigView extends View {
         const toggleRow = (_e, cx) => { cx?.stop_propagation?.(); toggle(r.view); };
         return v_flex().id(`views-${i}`)
           .child(h_flex().id(`term-row-${r.view}`).px(8).h(30).gap(10).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
-            .on_click(toggleRow)
+            .tooltip(`${shown ? "Close" : "Open"} ${r.name}; right-click for its actions`).on_click(toggleRow)
             .on_mouse_down("right", () => this.menu({ kind: "terminal", conn: this.shownConnId(), view: r.view, name: r.name, ...(r.kind === "rig" ? { rig: r.name } : {}) }))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
             .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(r.name??"")).child(r.name))
@@ -3783,15 +4131,9 @@ export default class RigView extends View {
     const fromShared = this.config?.configInvalid ? null : this.rigData()?.topology; // a refused list shows no rows another mod left behind
     if (Array.isArray(fromShared) && fromShared.length > 0) return fromShared;
     const summaryCfg = this.activeConfig();
-    const summary = this.cache["/api/rigs/summary"]?.data ?? this.read(cx, "/api/rigs/summary", false, (sData) => {
-      const rereadCfg = summaryCfg ? configOfConnection(this.config, summaryCfg.connectionId) : null;
-      if (rereadCfg && Array.isArray(sData)) {
-        for (const r of sData) {
-          if (r?.id && !r.archivedAt) this.read(cx, `/api/rigs/${encodeURIComponent(r.id)}/nodes`, false, null, rereadCfg);
-        }
-      }
-    }, summaryCfg).data ?? [];
-    return (Array.isArray(summary) ? summary : []).filter((r) => r && !r.archivedAt).map((r) => rigModel(r, this.nodesOf(cx, r.id).data, [], this.activeConnId()));
+    // Consume completed reads on the next draw, whose context owns the node reads.
+    const summary = this.cache["/api/rigs/summary"]?.data ?? this.read(cx, "/api/rigs/summary", false, null, summaryCfg).data ?? [];
+    return (Array.isArray(summary) ? summary : []).filter((r) => r && !r.archivedAt).map((r) => this.rigModelOf(r, this.nodesOf(cx, r.id).data));
   }
 
   openAskerSeat(cx, n) {
@@ -3827,7 +4169,11 @@ export default class RigView extends View {
     // An ownerless task (herdr drops a closed view's tasks): the read-then-write lands even when the tab is closed right after the change. It waits for the write before it by itself,
     // inside the task and with the task's own cx: a second change made while the first still writes must not start its task from this handler's cx, which is gone by then.
     const before = this.statePersist ?? Promise.resolve();
-    this.statePersist = cx.spawn(async (cx) => {
+    // spawn returns a TaskHandle, not a Promise. Keep the serialization barrier separate.
+    let finish;
+    this.statePersist = new Promise(resolve => { finish = resolve; });
+    try { return cx.spawn(async (cx) => {
+      try {
         await before.catch(() => {});
         const error = await saveStateFile({ path: statePath, read: readTextFile, write: writeTextFile, build: (prev) => {
           const parsed = parseSidebarState(prev ?? "{}");
@@ -3848,8 +4194,9 @@ export default class RigView extends View {
         } });
         this.sayStateSave(error);
         try { cx.notify(); } catch (_) { /* no view left to redraw */ }
+      } finally { finish(); }
     }, { owner: null });
-    return this.statePersist;
+    } catch (error) { finish(); throw error; }
   }
 
   /** A state save that could not be done is said once per distinct message (the same failure on every later save is not said again), and a save that works clears it. */
@@ -3865,20 +4212,20 @@ export default class RigView extends View {
     const whose = whoseQueueSummary(perspective, this.config, item);
     if (!whose) return null;
     const curView = shared("rig.needsView") ?? (whose.basis === "all" ? "all" : whose.basis === "default" ? "default" : (whose.personId ?? "default"));
-    const setView = (nextView) => {
+    const setView = (nextView, cx) => {
       setShared("rig.needsView", nextView);
       this.persistStatePatch(cx, { needsView: nextView });
       const path = nextView ? `/api/attention?view=${encodeURIComponent(nextView)}` : "/api/attention";
       this.read(cx, path, true);
       cx.notify();
     };
-    const pill = (id, key, label, disabled = false) => {
+    const pill = (id, key, label, disabled = false, tip = null) => {
       const on = curView === key || (!shared("rig.needsView") && key === "default" && whose.basis === "default");
-      return h_flex().id(id).px(7).h(20).rounded(5).items_center().cursor_pointer()
+      return h_flex().id(id).px(7).h(20).rounded(5).items_center().cursor_pointer().tooltip(tip)
         .bg(on ? t.accent : t.raised).border_1().border_color(on ? t.accent : t.border)
         .hover((s) => s.bg(on ? t.accent : disabled ? t.raised : t.hover))
         .text_size(11).text_color(disabled ? t.dim : on ? (t.solid_foreground ?? t.background) : t.muted)
-        .on_click(() => { if (!disabled) setView(key); })
+        .on_click((_e, cx) => { if (!disabled) setView(key, cx); })
         .child(label);
     };
     return h_flex().id("needs-whose-queue").px(10).h(26).gap(8).items_center().rounded(6).bg(t.background).border_1().border_color(t.border)
@@ -3886,9 +4233,9 @@ export default class RigView extends View {
         whose.onSomeoneElsesAsk ? `${whose.headline} · ${whose.onSomeoneElsesAsk}` : whose.headline
       ))
       .child(h_flex().gap(4).items_center()
-        .child(pill("needs-view-mine", whose.personId ?? "mine", "Mine", !whose.personId))
-        .child(pill("needs-view-default", "default", "Default"))
-        .child(pill("needs-view-all", "all", "Everyone")));
+        .child(pill("needs-view-mine", whose.personId ?? "mine", "Mine", !whose.personId, "Show only requests addressed to you"))
+        .child(pill("needs-view-default", "default", "Default", false, "Show the requests herdrig thinks you'll care about"))
+        .child(pill("needs-view-all", "all", "Everyone", false, "Show every request, whoever it is for")));
   }
 
   warmPersonAwayData(cx, awayConn = this.awayConnId(), cfg = this.activeConfig()) {
@@ -3917,17 +4264,10 @@ export default class RigView extends View {
         }
       }
     };
-    const modeRes = this.read(cx, `/api/gateway/human/${encodeURIComponent(personId)}/mode`, false, (mData) => {
-      syncModeAppState(mData);
-      const appId = (Array.isArray(mData?.recentApplications) ? mData.recentApplications.find((a) => a?.status === "ended")?.applicationId : null)
-        ?? (!mData?.current ? (this.awayState("rig.lastEndedModeApplicationId", awayConn) ?? null) : null);
-      warmEndedApp(appId);
-    }, cfg);
+    // Follow-up work starts during a draw, never from a read's late callback.
+    const modeRes = this.read(cx, `/api/gateway/human/${encodeURIComponent(personId)}/mode`, false, null, cfg);
     if (modeRes?.data) syncModeAppState(modeRes.data);
-    const roomRes = this.read(cx, `/api/gateway/human/${encodeURIComponent(personId)}/decision-room`, false, (rData) => {
-      const appId = rData?.latestEndedApplication?.applicationId ?? rData?.latestEndedApplication?.id ?? null;
-      warmEndedApp(appId);
-    }, cfg);
+    const roomRes = this.read(cx, `/api/gateway/human/${encodeURIComponent(personId)}/decision-room`, false, null, cfg);
     const endedAppId = roomRes?.data?.latestEndedApplication?.applicationId
       ?? roomRes?.data?.latestEndedApplication?.id
       ?? (Array.isArray(modeRes?.data?.recentApplications) ? modeRes.data.recentApplications.find((a) => a?.status === "ended")?.applicationId : null)
@@ -3970,7 +4310,7 @@ export default class RigView extends View {
     return v_flex().id("needs-since-away-card").rounded(10).bg(t.background).border_1().border_color(t.accent).p(12).gap(8)
       .child(h_flex().gap(8).items_center()
         .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child(digest.header))
-        .child(this.button(t, "needs-mark-seen", "Mark seen", markSeen, { small: true })))
+        .child(this.button(t, "needs-mark-seen", "Mark seen", markSeen, { small: true, tip: "Mark these as seen; the card comes back with new ones" })))
       .children(tierOrder.filter(([k]) => (digest.groups[k] ?? []).length > 0).map(([k, label, color]) =>
         h_flex().id(`needs-away-group-${k}`).gap(8).items_center().text_size(12)
           .child(div().w(95).flex_none().font_semibold().text_color(color).child(`${label} (${digest.groups[k].length})`))
@@ -3979,7 +4319,7 @@ export default class RigView extends View {
       .when(digest.decisions.length > 0, (el) => el.child(v_flex().id("needs-coming-back-account").gap(6).pt(6).border_t(1).border_color(t.border)
         .child(div().text_size(12).font_semibold().text_color(t.foreground).child(digest.modeHeading ?? "Decided for you while away"))
         .children(digest.decisions.map((d, i) =>
-          v_flex().id(`needs-away-decision-${i}`).rounded(6).bg(t.raised).p(8).gap(3).cursor_pointer()
+          v_flex().id(`needs-away-decision-${i}`).rounded(6).bg(t.raised).p(8).gap(3).cursor_pointer().tooltip("Open this decision's request in Needs")
             .on_click(() => { if (d.qitemId) this.push({ section: "needs", id: `queue:${d.qitemId}`, name: d.summary ?? d.qitemId, ...((this.config?.connections?.length ?? 0) > 1 ? { conn: awayConn } : {}) }); })
             .child(h_flex().gap(8).items_center()
               .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.foreground).tooltip(String(d.summary ?? d.qitemId??"")).child(d.summary ?? d.qitemId))
@@ -4046,13 +4386,14 @@ export default class RigView extends View {
       // One item (sidebar or toast click): the full Decision Card, here; no menu or dialog between.
       const n = items.find((x) => x.id === entry.id);
       if (!n) {
-        if (isHealthAttention({ id: entry.id })) return this.dim(t, "Health findings are in System → Health.")
-          .on_click(() => this.push({ section: "system", subview: "health" }));
+        if (isHealthAttention({ id: entry.id })) return div().id("need-health-fallback").tooltip("Open System › Health")
+          .on_click(() => this.push({ section: "system", subview: "health" }))
+          .child(this.dim(t, "Health findings are in System → Health."));
         const receipt = dismissals.receiptRows().find((r) => r.keys.some((key) => dismissals.records.find((v) => v.key === key)?.item.id === entry.id));
         if (receipt) return this.updateReceipt(t, receipt);
         const hidden = dismissals.hidden().find((r) => r.item.id === entry.id);
         if (hidden) return v_flex().gap(8).child(this.dim(t, hidden.note ?? "Dismissed here."))
-          .child(this.button(t, "restore-open-update", "Restore", () => this.updateAction("restore", hidden.key), { small: true }));
+          .child(this.button(t, "restore-open-update", "Restore", () => this.updateAction("restore", hidden.key), { small: true, tip: "Bring this update back to the Updates list" }));
         const entryConn = entry.conn ?? ((this.config?.connections?.length ?? 0) > 1 ? this.awayConnId() : null);
         const answered = this.answered[this.replyKey(entryConn ? { ...entry, conn: entryConn } : entry)]; // the page's request: its id on its own OpenRig
         if (answered?.text) return v_flex().gap(10).child(this.title(t, answered.summary))
@@ -4104,19 +4445,20 @@ export default class RigView extends View {
           ...(entry.showDismissed ? [...dismissedRows, ...activeRows] : [...activeRows, ...dismissedRows]),
           ...(shared("rig.dismissSaveError") ? [this.dim(t, shared("rig.dismissSaveError"))] : []),
         ], h_flex().gap(8).items_center()
-          .when(updateItems.length > 0, (el) => el.child(this.updateButton(t, "dismiss-all-updates", updateItems.length === 1 ? "Dismiss" : `Dismiss all ${updateItems.length}`, () => this.updateAction("dismiss", updateItems))))
+          .when(updateItems.length > 0, (el) => el.child(this.updateButton(t, "dismiss-all-updates", updateItems.length === 1 ? "Dismiss" : `Dismiss all ${updateItems.length}`, () => this.updateAction("dismiss", updateItems)).tooltip(`Dismiss ${updateItems.length === 1 ? "the update" : `all ${updateItems.length} updates`}; you can bring them back from Show dismissed`)))
           .when(dismissals.hidden().length > 0, (el) => el.child(div().id("show-dismissed-updates").text_size(12).text_color(t.accent).cursor_pointer()
-            .on_click(() => this.updateAction("show")).child(`${dismissals.show ? "Hide" : "Show"} dismissed (${dismissals.hidden().length})`)))));
+            .tooltip(`${dismissals.show ? "Hide" : "Show"} the ${dismissals.hidden().length} updates you dismissed`).on_click(() => this.updateAction("show")).child(`${dismissals.show ? "Hide" : "Show"} dismissed (${dismissals.hidden().length})`)))));
       })
-      .children(coverage.errors.map((s, i) => div().id(`need-source-${i}`).text_size(11.5).text_color(t.blocked).child(`${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`)))
+      .children(coverage.errors.map((s, i) => div().id(`need-source-${i}`).text_size(11.5).text_color(t.blocked).child(s.detail ? this.errorText(t,`need-source-error-${i}`,s.detail,{prefix:`${s.source}: ${statusWord(s.state,"health")} · `}) : `${s.source}: ${statusWord(s.state,"health")}`)))
       .when(coverage.incomplete, (el) => el.child(v_flex().gap(4)
         .child(h_flex().id("need-coverage-toggle").gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
-          .on_click(() => setOpen("needs:coverage", !(shared("rig.open.page") ?? {})["needs:coverage"]))
+          .tooltip("Show or hide which sources couldn't be read").on_click(() => setOpen("needs:coverage", !(shared("rig.open.page") ?? {})["needs:coverage"]))
           .child(svg(icon((shared("rig.open.page") ?? {})["needs:coverage"] ? "chevron-down" : "chevron-right")).size(11).flex_none())
           .child("Coverage · results may be incomplete"))
         .when(Boolean((shared("rig.open.page") ?? {})["needs:coverage"]), (fold) => fold.children(coverage.partial.map((s, i) =>
           this.plain(t, `${s.source}: ${s.state}${s.detail ? ` · ${s.detail}` : ""}`, `need-coverage-${i}`).text_color(t.dim))))))
-      .child(this.dim(t, `Read ${relativeTimeText(att.data.readAt)}. Viewing is not approval.`).id("needs-read-time").tooltip(this.time(att.data.readAt,{exact:true})));
+      .child(div().id("needs-read-time").tooltip(this.time(att.data.readAt,{exact:true}))
+        .child(this.dim(t, `Read ${relativeTimeText(att.data.readAt)}. Viewing is not approval.`)));
   }
 
   pagerFocusHandle(id, cx) {
@@ -4168,16 +4510,17 @@ export default class RigView extends View {
       }
       const handle = isPrev ? prevHandle : nextHandle;
       const focused = Boolean(handle?.is_focused?.());
+      const paired=activationPair(this,id);
       return div().id(id).px(6).py(2).rounded(6).border(2).border_color(focused ? t.accent : "#00000000")
-        .role("button")
+        .role("button").tooltip(isPrev ? "Previous page" : "Next page")
         .when(!!handle, (el) => el.track_focus(handle))
         .tab_stop(true).tab_index(0)
         .focus((el) => el.border_color(t.accent))
         .hover((el) => el.bg(t.hover))
         .text_size(12).text_color(t.accent).cursor_pointer()
-        .on_mouse_down("left", (_e, ctx) => { ctx?.stop_propagation?.(); handle?.focus?.(); })
-        .on_click((_e, ctx) => activate(to, isPrev, ctx))
-        .on_key_down((e, ctx) => {
+        .on_mouse_down("left", paired.pointer((_e, ctx) => { ctx?.stop_propagation?.(); liveFocus(handle)?.focus?.(); }))
+        .on_click(paired.click((_e, ctx) => activate(to, isPrev, ctx)))
+        .on_key_down(paired.key((e, ctx) => {
           if (e.modifiers?.alt || e.modifiers?.control || e.modifiers?.platform) return;
           const k = String(e.key ?? "").toLowerCase();
           if (k === "enter" || k === "space" || e.key === " ") {
@@ -4188,7 +4531,7 @@ export default class RigView extends View {
             if (k === "left" && !isPrev && pageNo - 1 >= 0) { prevHandle?.focus?.(); ctx?.notify?.(); }
             else if (k === "right" && isPrev && pageNo + 1 < pages) { nextHandle?.focus?.(); ctx?.notify?.(); }
           }
-        })
+        }))
         .child(label);
     };
     const pager = h_flex().id(`${listKey}-pager`).px(8).h(28).gap(6).items_center()
@@ -4249,7 +4592,7 @@ export default class RigView extends View {
           .child(h_flex().id(`${idPrefix}-${i}`).px(8).h(30).overflow_hidden().gap(rowGap).items_center().rounded(6).hover((s) => s.bg(t.hover))
             .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.bg(t.selection ?? t.raised))
             .when(isEscalation, (el) => el.border_l(2).border_color(t.blocked))
-            .on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
+            .tooltip(`${shown ? "Close" : "Open"} this update; right-click for its actions`).on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(rowTheme.dim))
             .when(isEscalation, (el) => el.child(div().px(5).h(16).rounded(4).flex().items_center().bg(t.blocked + "26").text_color(t.blocked).text_size(10).font_semibold().child("ESCALATION")))
             .when(!isEscalation && tier !== "update", (el) => el.child(this.plainDot(t, isAlert ? "blocked" : "accent")))
@@ -4258,8 +4601,8 @@ export default class RigView extends View {
             .when(showInlineCopy, (el) => el.child(this.copyButton(rowTheme, n.qitemId ?? n.id, `need-id-${n.id}`, "request id")))
             .when(dismissible(n) && this.selectedUpdate?.id === n.id, (el) => el.child(this.updateButton(t, `dismiss-${idPrefix}-${i}`, n.dismissed ? "Restore" : "Dismiss", (_e, cx) => {
               cx.stop_propagation(); this.updateAction(n.dismissed ? "restore" : "dismiss", n.dismissed ? updateKey(n) : n);
-            })))
-            .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); }))
+            }).tooltip(n.dismissed ? "Bring this update back" : "Dismiss this update")))
+            .child(this.updateButton(rowTheme, `need-menu-${idPrefix}-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); }).tooltip("More actions for this update"))
             .when(showSince, (el) => el.child(div().w(sinceWidth).flex_none().truncate().text_size(12.5).text_color(rowTheme.muted).tooltip(this.time(n.at,{exact:true})).child(relativeTimeText(n.at)))))
           .when(shown, (el) => el.child(v_flex().ml(22).pl(10).py(6).border_l(1).border_color(focused ? t.accent : t.border).child(n.dismissed ? this.dim(t, n.dismissalNote ?? "Hidden here only.") : this.needBody(t, cx, n, perspective))));
       }) : [div().p(10).text_size(12).text_color(t.dim).child(f ? `No matches for /${this.filter}.` : idPrefix === "updates" ? "No recent updates." : "No pending Needs-You requests.")])
@@ -4294,12 +4637,12 @@ export default class RigView extends View {
       const shown = Boolean(open[`needs:${n.id}`]);
       return v_flex().min_w(0).child(h_flex().id(`needs-${i}`).px(8).h(34).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
         .when(this.selectedNeed === this.replyKey(n), el => el.bg(t.selection ?? t.raised))
-        .on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
+        .tooltip(`${shown ? "Close" : "Open"} this request; right-click for its actions`).on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
         .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(text.headline))
         .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip(String(String(owner ?? "")??"")).child(String(owner ?? "")))
         .child(div().text_size(11).text_color(t.dim).tooltip(this.time(n.at,{exact:true})).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))
-        .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); })))
+        .child(this.updateButton(t, `need-menu-needs-${i}`, "⋯", (_e, cx) => { cx.stop_propagation(); this.menu(n); }).tooltip("More actions for this request")))
         .when(shown, el => el.child(this.decisionCard(t, cx, n, { perspective })));
     }) : [this.dim(t, filter ? "No matching requests." : "No pending Needs-You requests.")])
       .when(!!pager, (el) => el.child(pager));
@@ -4313,7 +4656,7 @@ export default class RigView extends View {
     const started = Date.parse(n.healthFinding?.startedAt ?? "");
     const minutes = Number.isFinite(started) ? Math.max(0, Math.floor((Date.now() - started) / 60000)) : null;
     return h_flex().id(`critical-health-${n.id}`).px(8).h(34).gap(8).items_center().text_size(12.5).cursor_pointer().hover(el => el.bg(t.hover))
-      .on_click(() => this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) })) // the finding's own OpenRig (the Needs page lists every box)
+      .tooltip("Open this critical finding in System › Health").on_click(() => this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) })) // the finding's own OpenRig (the Needs page lists every box)
       .child(div().w(12).text_color(t.blocked).child("◆"))
       .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(String(n.summary??"")).child(n.summary))
       .child(div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip("health · critical").child("health · critical"))
@@ -4387,17 +4730,18 @@ export default class RigView extends View {
     this.prepareNeedFocus(cx, box, ["card", "approve", "deny", "resolve", "answer", "reply", "details", "resume", ...optionKeys]);
     const action = (key, label, click, { primary = false, recommended = false } = {}) => {
       const handle = liveFocus(box?.cardHandles?.[key]);
+      const activation=activationPair(this,`need-${key}-${id}`);
       return h_flex().id(`need-${key}-${id}`).h(32).px(12).gap(8).items_center().justify_center().rounded(6)
-        .when(Boolean(whose?.onSomeoneElsesAsk), el => el.tooltip(whose.onSomeoneElsesAsk))
+        .tooltip(whose?.onSomeoneElsesAsk ?? (key === "resume" ? `Answer and let ${logical} go on` : key.startsWith("option:") ? "Answer with this option" : key === "approve" ? `Approve what ${logical} asked for` : key === "deny" ? `Say no: ${logical} reads your reason` : `${key === "resolve" ? "Send your decision" : "Send your answer"} to ${logical}`))
         .when(narrow, el => el.w_full()).when(!narrow, el => el.flex_none())
         .bg(primary ? (t.solid ?? t.accent) : t.raised).text_color(primary ? (t.solid_foreground ?? t.background) : t.foreground)
         .border_1().border_color(primary ? (t.solid ?? t.accent) : t.border).text_size(13)
         .when(!busy, el => el.cursor_pointer().hover(s => s.bg(primary ? t.accent : t.hover)))
         .when(!!handle, el => el.track_focus(handle).tab_stop(true).tab_index(0))
         .when(Boolean(handle?.is_focused?.()), el => el.border_color(t.accent).border_2())
-        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); handle?.focus(); })
-        .on_key_down((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); if (!busy) click(cx); } })
-        .on_click((_e, cx) => { cx.stop_propagation(); if (!busy) click(cx); })
+        .on_mouse_down("left", activation.pointer((_e, cx) => { cx.stop_propagation(); liveFocus(handle)?.focus?.(); }))
+        .on_key_down(activation.key((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); if (!busy) click(cx); } }))
+        .on_click(activation.click((_e, cx) => { cx.stop_propagation(); if (!busy) click(cx); }))
         .child(label).when(recommended, el => el.child(div().text_size(10.5).child("Recommended")));
     };
     const actions = [];
@@ -4425,7 +4769,7 @@ export default class RigView extends View {
       if (e.modifiers?.control || e.modifiers?.platform || e.modifiers?.alt) return;
       if (String(e.key).toLowerCase() === "r") { cx.stop_propagation(); openComposer(cx); }
       else if (String(e.key).toLowerCase() === "d") { cx.stop_propagation(); setOpen(detailsKey, !detailsOpen); }
-      else if (e.key === "escape") { cx.stop_propagation(); this.typing = false; if (box?.composerOpen) { box.composerOpen = false; box.confirmResolve = false; this.keepDraft(box); } else if (standalone) this.goSection("needs", n?.conn ?? null); else setOpen(`needs:${id}`, false); cx.notify(); }
+      else if (e.key === "escape") { cx.stop_propagation(); this.typing = false; if (box?.composerOpen) this.closeReply(cx, box, n); else if (standalone) this.goSection("needs", n?.conn ?? null); else setOpen(`needs:${id}`, false); cx.notify(); }
     };
     if (box) box.cardKey = cardKey;
     const connectedAsker=assistantForNeed({...n,asker:owner},this.hostedMembers(cx));
@@ -4447,25 +4791,27 @@ export default class RigView extends View {
       .child(h_flex().id(`need-context-${id}`).gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted)
         .child(svg(icon(connectedAsker?'rig-queue':"rig-seat")).size(12).flex_none()).child(connectedAsker?assistantOwner(connectedAsker):`${logical}${rig ? ` · ${rig}` : ""}`)
         .child(div().tooltip(this.time(at,{exact:true})).child(`· waiting ${age}`))
-        .when(Boolean(owner), el => el.child(div().id(`need-open-asker-${id}`).text_color(t.accent).cursor_pointer().on_click((_e, cx) => { cx.stop_propagation(); this.openAskerSeat(cx, { ...n, asker: owner }); }).child(connectedAsker?'Open assistant page':"Open seat")))
+        .when(Boolean(owner), el => el.child(focusTarget(this,cx,`need-open-asker-${id}`,div().id(`need-open-asker-${id}`).tooltip(`Open ${logical}'s page`).text_color(t.accent).cursor_pointer().child(connectedAsker?'Open assistant page':"Open seat"),cx=>{cx.stop_propagation();this.openAskerSeat(cx,{...n,asker:owner});},el=>el.border_1().border_color(t.accent))
+          .on_mouse_down('left',activationPair(this,`need-open-asker-${id}`).pointer((_e,cx)=>{cx.stop_propagation();liveFocus(this.focusTargets?.get(`need-open-asker-${id}`))?.focus?.();}))))
         .when(Boolean(project), el => el.child(`· ${project}`)))
       .when(Boolean(this.askerNotes[this.replyKey(n)]), el => el.child(div().id(`need-asker-note-${id}`).text_size(11.5).text_color(t.muted).child(this.askerNotes[this.replyKey(n)])))
       .when(Boolean(whose?.onSomeoneElsesAsk), el => el.child(this.dim(t, whose.onSomeoneElsesAsk)))
       .when(Boolean(box?.result), el => el.child(h_flex().id(`need-result-${id}`).gap(6).items_start()
         .child(svg(icon(box.result.ok ? "check" : "rig-alert")).size(12).text_color(box.result.ok ? t.working : t.blocked))
-        .child(div().flex_1().text_size(12).text_color(box.result.ok ? t.muted : t.blocked).child(box.result.text))))
+        .child(div().flex_1().text_size(12).text_color(box.result.ok ? t.muted : t.blocked).child(box.result.ok ? box.result.text : this.errorText(t,`need-result-error-${id}`,box.result.text)))))
       .when(Boolean(box?.result?.networkError && box.result.retryAct), el => el.child(this.button(t, `need-check-and-finish-${id}`, "Check and finish",
-        (_e, cx) => { if (!busy) this.submitCardDecision(cx, box.target ?? n, detailItem, queueRow, box.result.retryAct); }, { small: true, disabled: busy })))
+        (_e, cx) => { if (!busy) this.submitCardDecision(cx, box.target ?? n, detailItem, queueRow, box.result.retryAct); }, { small: true, disabled: busy, tip: "The send may not have arrived: check and finish it without sending twice" })))
       .when(!receipt && !box?.result?.networkError, el => el.children(actions)
-        .when(!n.native && (qState.totalCount > 0 || verb === "approve"), el => el.child(div().id(`need-reply-link-${id}`).text_size(12).text_color(t.accent).cursor_pointer()
-          .on_click((_e, cx) => { cx.stop_propagation(); openComposer(cx); }).child("Reply in your own words")))
+        .when(!n.native && (qState.totalCount > 0 || verb === "approve"), el => el.child(focusTarget(this,cx,`need-reply-link-${id}`,div().id(`need-reply-link-${id}`).tooltip("Answer in your own words").text_size(12).text_color(t.accent).cursor_pointer()
+          .child("Reply in your own words"),cx=>{cx.stop_propagation();openComposer(cx);},el=>el.border_1().border_color(t.accent))
+          .on_mouse_down('left',activationPair(this,`need-reply-link-${id}`).pointer((_e,cx)=>{cx.stop_propagation();liveFocus(this.focusTargets?.get(`need-reply-link-${id}`))?.focus?.();}))))
         .when(Boolean(box?.composerOpen), el => el.child(this.replyBox(t, cx, n, { detailItem, queueRow, onSomeoneAskText: whose?.onSomeoneElsesAsk }))
           .child(this.dim(t, "A response is not approval. What you send is recorded as your words; the asking seat reads it and decides."))))
       .when(!n.native && !n.decisionRevision, el => el.child(div().id(`need-no-revision-note-${id}`).text_size(11).text_color(t.dim)
         .child("OpenRig < 0.7.9 (no decisionRevision): a changed request won't be caught before sending.")))
       .child(v_flex().pt(10).border_t(1).border_color(t.border).gap(8)
         .child(h_flex().id(`need-details-toggle-${id}`).gap(6).items_center().cursor_pointer()
-          .on_click((_e, cx) => { cx.stop_propagation(); setOpen(detailsKey, !detailsOpen); })
+          .tooltip("Show or hide the request's details (D)").on_click((_e, cx) => { cx.stop_propagation(); setOpen(detailsKey, !detailsOpen); })
           .child(svg(icon(detailsOpen ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
           .child(div().text_size(12).text_color(t.muted).child("Details"))
           .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).tooltip(String(text.detailHint??"")).child(text.detailHint)))
@@ -4475,13 +4821,13 @@ export default class RigView extends View {
           .when(Boolean(n.unblocks), el => el.child(this.dim(t, `Unblocks: ${n.unblocks}`)))
           .children(evidenceFiles.map((file, i) => {
             const path = typeof file === "string" ? file : file.path ?? "";
-            return h_flex().gap(6).child(div().id(`need-evidence-${id}-${i}`).flex_1().text_size(12).text_color(t.accent).cursor_pointer()
+            return h_flex().gap(6).child(div().id(`need-evidence-${id}-${i}`).flex_1().text_size(12).text_color(t.accent).cursor_pointer().tooltip(`Open ${typeof file === "object" ? file.label ?? path : path}`)
               // The request's own OpenRig names the file (the Needs page lends no connection): a file of a box's request is never read here.
               .on_click(() => this.push({ ...fileEntry(path, typeof file === "object" ? file.label : path.split("/").pop()), ...((this.config?.connections ?? []).length > 1 && n.conn ? { conn: n.conn } : {}) })).child(path))
               .child(this.copyButton(t, path, `need-evidence-path-${id}-${i}`, "evidence path"));
           }))
           .child(v_flex().gap(4).child(h_flex().id(`need-recorded-toggle-${id}`).gap(6).items_center().text_size(11.5).text_color(t.dim).cursor_pointer()
-            .on_click(() => setOpen(recordedKey, !recordedOpen))
+            .tooltip("Show or hide what OpenRig recorded for this request").on_click(() => setOpen(recordedKey, !recordedOpen))
             .child(svg(icon(recordedOpen ? "chevron-down" : "chevron-right")).size(11)).child("What OpenRig recorded"))
             .when(recordedOpen, el => el.children(recordedLines.map((line, i) => this.plain(t, line, `need-recorded-${id}-${i}`)))
               .child(this.copyValue(t, `Inspect: rig queue show ${n.qitemId ?? id} --full`, `need-inspect-${id}`, "inspect command")))))));
@@ -4552,8 +4898,8 @@ export default class RigView extends View {
     return v_flex().id(`decision-card-${n.id}`).gap(8).pl(10).py(4).border_l(2).border_color(t.dim)
       .when(standalone, el => el.child(this.title(t, n.summary)).child(this.dim(t, "Update")))
       .child(h_flex().gap(6).items_center().flex_wrap().text_size(11.5).text_color(t.muted)
-        .when(Boolean(asker), el => el.child(div().id(`need-open-asker-${n.id}`).text_color(t.accent).cursor_pointer()
-          .on_click((_e, cx) => { cx.stop_propagation(); this.openAskerSeat(cx, { ...mergedItem, asker }); }).child(`From ${asker}`)))
+        .when(Boolean(asker), el => el.child(focusTarget(this,cx,`need-open-asker-${n.id}`,div().id(`need-open-asker-${n.id}`).tooltip(`Open ${asker}'s page`).text_color(t.accent).cursor_pointer()
+          .child(`From ${asker}`),cx=>{cx.stop_propagation();this.openAskerSeat(cx,{...mergedItem,asker});},el=>el.border_1().border_color(t.accent))))
         .when(Boolean(recipient), el => el.child(`· to ${recipient}`))
         .when(Boolean(scope), el => el.child(`· ${scope}`)).when(Boolean(since), el => el.child(`· since ${since}`)))
       .when(Boolean(askerNote), el => el.child(this.dim(t, askerNote)))
@@ -4561,10 +4907,10 @@ export default class RigView extends View {
         .map((line, i) => this.plain(t, line, `need-body-line-${n.id}-${i}`))))
       .when(Boolean(unblocks), el => el.child(this.dim(t, `Unblocks: ${unblocks}`)))
       .child(div().id(`need-update-note-${n.id}`).text_size(12).text_color(t.dim).child("No action needed. Viewing isn't approval or proof of delivery."))
-      .when(dismissible(n), el => el.child(h_flex().child(this.updateButton(t, `dismiss-open-${n.id}`, "Dismiss", () => this.updateAction("dismiss", n)))))
+      .when(dismissible(n), el => el.child(h_flex().child(this.updateButton(t, `dismiss-open-${n.id}`, "Dismiss", () => this.updateAction("dismiss", n)).tooltip("Dismiss this update; you can bring it back from Show dismissed"))))
       .when(Boolean(this.updateModel().records.find(r => r.key === updateKey(n) && r.restored && r.status === "closed")), el => el.child(this.dim(t, "Restored here; OpenRig still has it closed.")))
       .child(v_flex().gap(4).child(h_flex().id(`need-recorded-toggle-${n.id}`).gap(6).items_center().cursor_pointer()
-        .on_click(() => setOpen(`need-recorded:${n.id}`, !recordedOpen))
+        .tooltip("Show or hide what OpenRig recorded for this update").on_click(() => setOpen(`need-recorded:${n.id}`, !recordedOpen))
         .child(svg(icon(recordedOpen ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
         .child(this.dim(t, "What OpenRig recorded")))
         .when(recordedOpen, el => el.children(recordedLines.map((line, i) => this.plain(t, line, `need-recorded-line-${n.id}-${i}`)))
@@ -4579,18 +4925,27 @@ export default class RigView extends View {
     if (want) this.focusSeen = f.at;
     if ((!this.replies[this.replyKey(n)] && !this.making?.has(this.replyKey(n))) || want) {
       (this.making ??= new Set()).add(this.replyKey(n));
-      cx.spawn(async (cx) => {
-        await Promise.resolve();
+      // A timer set from this draw: the box's input is this page's own (after an await it would be whichever view drained the promise jobs).
+      cx.timer.after(0, (next) => {
         try {
           const box = this.replies[this.replyKey(n)] ??= this.makeReply(n);
           if (want && !box.busy) box.composerOpen = true;
           if (want && !box.busy) { box.input.set_value((shared("rig.drafts") ?? {})[box.key] ?? ""); box.result = null; box.input.focus(); }
         } finally { this.making.delete(this.replyKey(n)); } // a box that failed to be made is tried again on the next render, never stuck
-        cx.notify();
+        next?.notify?.();
       });
     }
     const box = this.replies[this.replyKey(n)];
     if (box) box.target = n;
+    // A placeholder change asked for after an await (a denial that was sent) is made here, from the draw, never in that continuation.
+    if (box?.pendingPlaceholder && !box.rebindTimer && cx?.timer?.after) {
+      box.rebindTimer = true;
+      cx.timer.after(0, (next) => {
+        box.rebindTimer = false;
+        const placeholder = box.pendingPlaceholder; box.pendingPlaceholder = null;
+        if (placeholder && !this.closed) { this.bindReplyInput(box, placeholder); next?.notify?.(); }
+      });
+    }
     return box ?? null;
   }
 
@@ -4598,8 +4953,11 @@ export default class RigView extends View {
     const val = box.input ? box.input.value() : ((shared("rig.drafts") ?? {})[box.key] ?? "");
     try { box.input?.release?.(); } catch (_) {}
     const input = TextareaState.new({ placeholder, rows: 3, value: val });
+    box.discardDraftVisible = Boolean(val);
     // The draft is kept as it is typed (300 ms after the last change), as the reply dialog keeps it.
     input.on("change", (_e, cx) => {
+      if (box.discardDraftVisible !== Boolean(input.value())) { box.discardDraftVisible = Boolean(input.value()); cx.notify?.(); }
+      if (box.discardDraftUntil) { box.discardDraftUntil = 0; cx.notify?.(); }
       if (box.confirmResolve) { box.confirmResolve = false; cx.notify?.(); }
       if (box.saving) return;
       box.saving = true;
@@ -4630,10 +4988,47 @@ export default class RigView extends View {
     setShared("rig.drafts", all);
   }
 
+  closeReply(cx, box, n) {
+    if (box.busy) return;
+    box.discardDraftUntil = 0;
+    this.keepDraft(box);
+    if (box.cardMode) {
+      box.composerOpen = false; box.confirmResolve = false; box.denying = false;
+    } else if (box.denying) {
+      box.denying = false; box.result = null;
+      this.bindReplyInput(box, n.reply === "resolve" || n.verb === "resolve" ? "Your decision, in your own words" : "Your answer, in your own words");
+    } else {
+      if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
+      box.composerOpen = false; box.confirmResolve = false; box.result = null;
+      setOpen(`needs:${n.id}`, false);
+    }
+    this.typing = false;
+    cx.notify();
+  }
+
+  discardReply(cx, box, n) {
+    if (box.busy || !box.input.value()) return;
+    const text = box.input.value();
+    if (!(box.discardDraftUntil > Date.now() && box.discardDraftText === text)) {
+      const until = Date.now() + 4000;
+      box.discardDraftUntil = until; box.discardDraftText = text;
+      cx.timer.after(4000, (cx) => {
+        if (box.discardDraftUntil !== until) return;
+        box.discardDraftUntil = 0; cx.notify();
+      });
+      cx.notify();
+      return;
+    }
+    box.input.set_value("");
+    this.keepDraft(box);
+    box.denying = false;
+    this.closeReply(cx, box, n);
+  }
+
   /** What the card says when the decision's flow threw. Every POST and its own refusals are worded inside `submitMissionActions`; a gate refusal that escapes BEFORE the POST callback started (the operation,
    *  the address, the revision read, which is a GET) sent nothing. After it started a POST may have been recorded whatever the error says, so that is unconfirmed (with Retry), and so is any error that is not a gate refusal. */
   cardFailure(error, act, posted) {
-    if (error?.code === "GATE_REFUSED" && !posted) return this.notSentResult(error.message);
+    if (!posted && (error?.code === "GATE_REFUSED" || isKnownUnsentError(error))) return this.notSentResult(unsentErrorMessage(error));
     return { ok: false, networkError: true, retryAct: { ...act }, text: NETWORK_UNCONFIRMED_MESSAGE };
   }
   /** A decision result for a refusal that happened before anything left: says so once (a sentence that already does is left as it is) and carries `notSent` so the card adds no "may still have arrived". */
@@ -4737,7 +5132,8 @@ export default class RigView extends View {
             box.input.set_value("");
             if (box.denying) {
               box.denying = false;
-              this.bindReplyInput(box, (n.reply === "resolve" || n.verb === "resolve") ? "Your decision, in your own words" : "Your answer, in your own words");
+              // After the POST's await: the next draw makes the new input (replyFor), never this continuation.
+              box.pendingPlaceholder = (n.reply === "resolve" || n.verb === "resolve") ? "Your decision, in your own words" : "Your answer, in your own words";
             }
             box.confirmResolve = false;
             delete this.questionChoices[this.replyKey(n)];
@@ -4759,7 +5155,7 @@ export default class RigView extends View {
             if (qid) this.read(cx, `/api/queue/${encodeURIComponent(qid)}`, true, null, rereadCfg);
           }
         } else {
-          if (outcome.conflict || outcome.settingsChanged) { // a settings change mid-answer also leaves recorded steps: the card drops them and re-reads the item
+          if (outcome.conflict || outcome.settingsChanged || outcome.partial) { // a settings change or partial stop mid-answer also leaves recorded steps: the card drops them and re-reads the item
             if (Array.isArray(outcome.committedQuestionIds) && outcome.committedQuestionIds.length > 0) {
               const nextChoices = { ...(this.questionChoices[this.replyKey(n)] ?? {}) };
               for (const qId of outcome.committedQuestionIds) delete nextChoices[qId];
@@ -4783,7 +5179,9 @@ export default class RigView extends View {
               ok: false,
               conflict: Boolean(outcome.conflict),
               tokenProtected: Boolean(outcome.tokenProtected),
-              notSent: Boolean(outcome.settingsChanged && !outcome.unconfirmed), // refused before the step left: the text already says what was and was not sent
+              daemonRefused: Boolean(outcome.daemonRefused),
+              unconfirmed: Boolean(outcome.unconfirmed),
+              notSent: Boolean(outcome.notSent || outcome.stepNotSent || (outcome.settingsChanged && !outcome.unconfirmed)), // refused before the step left: the text already says what was and was not sent
               text: outcome.text || "It didn't work, and the daemon gave no reason.",
             };
           }
@@ -4848,7 +5246,10 @@ export default class RigView extends View {
     return v_flex().id(`need-reply-${n.id}`).gap(6)
       // Clicks and keys typed here are the reply's: stop left-mouse-down from bubbling to rig-view-root's handle.focus().
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_key_down(() => { this.typing = true; })
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") { cx.stop_propagation(); this.closeReply(cx, box, n); }
+        else this.typing = true;
+      })
       .when(isDenying, (el) => el.child(div().text_size(11.5).font_semibold().text_color(t.blocked).child(`Deny closes this request as denied. ${askerLabel} gets your reason.`)))
       .child(div().border_1().border_color(isDenying ? t.blocked : t.border).rounded(6).p(6).child(Textarea.new(box.input).h(72)))
       .child(h_flex().gap(8).items_center().flex_wrap()
@@ -4861,27 +5262,20 @@ export default class RigView extends View {
           }
           box.confirmResolve = false;
           this.sendReply(cx, box);
-        }, { primary: true, iconName: "rig-reply", disabled: box.busy || (isDenying && !hasReasonText), tooltip: onSomeoneAskText }))
+        }, { primary: true, iconName: "rig-reply", disabled: box.busy || (isDenying && !hasReasonText), tooltip: onSomeoneAskText, tip: `${isDenying ? "Send the no" : "Send"} to ${askerLabel}` }))
         .child(this.button(t, `need-cancel-${n.id}`, isDenying ? "Back" : "Cancel", (_e, cx) => {
-          if (box.cardMode) { this.keepDraft(box); box.composerOpen = false; box.confirmResolve = false; box.denying = false; cx.notify(); return; }
-          if (isDenying) {
-            box.denying = false;
-            box.result = null;
-            this.bindReplyInput(box, isResolve ? "Your decision, in your own words" : "Your answer, in your own words");
-            cx.notify();
-            return;
-          }
-          const all = { ...(shared("rig.drafts") ?? {}) }; delete all[box.key]; setShared("rig.drafts", all);
-          if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
-          box.input.set_value(""); box.confirmResolve = false; box.result = null;
-          setOpen(`needs:${n.id}`, false);
-          cx.notify();
-        }, { disabled: box.busy }))
-        .child(this.dim(t, `${mac ? "⌘ Return" : "Ctrl+Enter"} sends · the text is kept until sent`)))
+          this.closeReply(cx, box, n);
+        }, { disabled: box.busy, tip: isDenying ? "Back to the answer choices; nothing is sent" : "Close the reply box; your text is kept as a draft" }))
+        .when(!isDenying && Boolean(box.input.value()), el => el.child(this.button(t, `need-discard-${n.id}`,
+          box.discardDraftUntil > Date.now() && box.discardDraftText === box.input.value() ? "Click again to discard" : "Discard draft",
+          (_e, cx) => this.discardReply(cx, box, n),
+          { disabled: box.busy, tip: "Throw away your reply; asks you to click again first" })
+          .bg("#00000000").border_color("#00000000").text_color(box.busy ? t.dim : t.muted)))
+        .child(this.dim(t, `${mac ? "⌘ Return" : "Ctrl+Enter"} sends · the text is kept until you send or discard it`)))
       .when(!!r, (el) => el.child(v_flex().gap(4)
         .child(h_flex().gap(6).items_center().child(svg(icon(r.ok ? "check" : "rig-alert")).size(12).flex_none().text_color(r.ok ? t.working : t.blocked))
-          .child(div().flex_1().text_size(12).text_color(r.ok ? t.muted : t.blocked).child(r.text)))
-        .when(!r.ok && !r.conflict && !r.tokenProtected && !r.networkError && !r.notSent, (c) => c.child(this.dim(t, "It may still have arrived: check the request before answering again.")))
+          .child(div().flex_1().text_size(12).text_color(r.ok ? t.muted : t.blocked).child(r.ok ? r.text : this.errorText(t,`reply-result-error-${n.id}`,r.text))))
+        .when(!r.ok && !r.conflict && !r.tokenProtected && !r.daemonRefused && !r.unconfirmed && !r.networkError && !r.notSent, (c) => c.child(this.dim(t, "It may still have arrived: check the request before answering again.")))
         .when(!r.ok && Boolean(r.networkError && r.retryAct), (c) => c.child(
           h_flex().child(this.button(
             t,
@@ -4890,7 +5284,7 @@ export default class RigView extends View {
             (_e, cx) => {
               if (!box.busy) this.submitCardDecision(cx, box.target ?? n, detailItem, queueRow, r.retryAct);
             },
-            { small: true, iconName: "rig-refresh", disabled: box.busy },
+            { small: true, iconName: "rig-refresh", disabled: box.busy, tip: "The send may not have arrived: check and finish it without sending twice" },
           ))
         ))));
   }
@@ -4905,7 +5299,7 @@ export default class RigView extends View {
 
   notifyTogglePill(t, id = "needs-notify-toggle") {
     const on = (shared("rig.settings")?.notifications ?? true) !== false;
-    return h_flex().id(id).px(8).h(24).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
+    return h_flex().id(id).px(8).h(24).gap(6).rounded(6).items_center().flex_none().cursor_pointer().tooltip(`Turn herdrig's notifications ${on ? "off" : "on"}`)
       .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
       .text_size(11.5).text_color(on ? t.foreground : t.dim)
       .on_click((_e, cx) => this.toggleNotifications(cx))
@@ -4965,7 +5359,7 @@ export default class RigView extends View {
           }
         }
       } catch (e) {
-        say({ ok: false, text: String(e?.message ?? e) });
+        say({ ok: false, text: errorDiagnostic(e) });
       } finally {
         this.usageRefreshing = false;
         cx.notify();
@@ -4977,10 +5371,8 @@ export default class RigView extends View {
     return h_flex().id("usage-windows-disabled").gap(8).items_center().flex_wrap()
       .child(this.dim(t, "Usage windows are off (provider.usage_windows = false)."))
       .child(this.button(t, "usage-open-config", "Open config", () => {
-        const stack = nav().stack ?? [];
-        const top = stack.at(-1) ?? { section: "system" };
-        setShared("rig.nav", { stack: [...stack.slice(0, -1), { ...top, section: "system", settingKey: "provider.usage_windows" }] });
-      }, { small: true }));
+        this.editShownStack((stack) => [...stack.slice(0, -1), { ...(stack.at(-1) ?? { section: "system" }), section: "system", settingKey: "provider.usage_windows" }]);
+      }, { small: true, tip: "Open the setting that turns usage on" }));
   }
 
   usageHostsBlock(t, cx) {
@@ -4998,13 +5390,13 @@ export default class RigView extends View {
       return v_flex().id(`usage-host-${hid}`).rounded(8).bg(t.raised).border_1().border_color(t.border).p(10).gap(6)
         .child(h_flex().gap(8).items_center()
           .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child(h.label))
-          .child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(11).text_color(h.error ? t.blocked : t.muted).child(String(h.status ?? "online")))
+          .child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(11).text_color(h.error ? t.blocked : t.muted).child(statusWord(h.status ?? "online","daemon")))
           .when(!!h.usageReason, (el) => el.child(div().px(6).h(18).rounded(4).flex().items_center().bg(t.background).text_size(11).text_color(t.dim).child(h.usageReason)))
           .child(div().flex_1())
           .when(!!h.readAt, (el) => el.child(this.dim(t, `as of ${this.time(h.readAt,{exact:true})}`))))
         .when(!!h.error, (el) => el.child(h_flex().id(`usage-host-error-${hid}`).gap(8).items_center()
-          .child(div().flex_1().text_size(12).text_color(t.blocked).child(String(h.error)))
-          .child(this.button(t, `usage-host-retry-${hid}`, "Retry", (_e, cx) => this.refreshUsageHosts(cx), { small: true }))))
+          .child(div().flex_1().text_size(12).text_color(t.blocked).child(this.errorText(t,"usage-host-error",h.error)))
+          .child(this.button(t, `usage-host-retry-${hid}`, "Retry", (_e, cx) => this.refreshUsageHosts(cx), { small: true, tip: "Read this host's usage again" }))))
         .when(notes.length > 0, (el) => el.child(v_flex().gap(2).children(notes.map((n, ni) =>
           div().id(`usage-host-note-${hid}-${ni}`).text_size(11.5).text_color(t.muted).child(String(n))
         ))))
@@ -5024,9 +5416,9 @@ export default class RigView extends View {
         }))))
         .when(observations.length > 0, (el) => el.child(v_flex().gap(2).pt(2).border_t(1).border_color(t.border).children(observations.map((o, oi) =>
           h_flex().id(`usage-obs-${hid}-${oi}`).gap(8).items_center().text_size(11.5).text_color(t.muted)
-            .child(div().w(100).flex_none().truncate().text_color(t.foreground).tooltip(String(String(o.runtime ?? "")??"")).child(String(o.runtime ?? "")))
+            .child(div().w(100).flex_none().truncate().text_color(t.foreground).tooltip(statusWord(o.runtime ?? "","runtime")).child(statusWord(o.runtime ?? "","runtime")))
             .child(div().w(140).flex_none().truncate().tooltip(String(String(o.accountLabel ?? o.account ?? "")??"")).child(String(o.accountLabel ?? o.account ?? "")))
-            .child(div().w(90).flex_none().truncate().text_color(t.dim).tooltip(String(String(o.status ?? "")??"")).child(String(o.status ?? "")))
+            .child(div().w(90).flex_none().truncate().text_color(t.dim).tooltip(statusWord(o.status ?? "","seat")).child(statusWord(o.status ?? "","seat")))
             .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim).tooltip(String(this.time(o.lastObservedAt ?? o.updatedAt,{exact:true})??"")).child(this.time(o.lastObservedAt ?? o.updatedAt,{exact:true})))
         ))));
     }));
@@ -5067,11 +5459,15 @@ export default class RigView extends View {
         rawRes = await execFor(config)(cmd.command, cmd.args, { timeout: 60000 });
         r = writeOutcome(rawRes);
       } catch (e) {
-        r = { ok: false, text: plainExecError(e, { kind: "write" }) };
+        const unsent = isKnownUnsentError(e);
+        const line = unsent ? unsentErrorMessage(e).trimEnd() : plainExecError(e, { kind: "write" });
+        r = { ok: false, ...(unsent ? { notSent: true } : {}), text: unsent && !/nothing was (?:sent|changed)/i.test(line) ? `${line} Nothing was sent.` : line };
       }
       this.peopleBusy = false;
       this.peopleResult = { ok: r.ok, text: r.text || (r.ok ? "Updated." : "That didn't work, and OpenRig gave no reason. Nothing was changed."), conn: resultConn };
       if (r.ok) {
+        const rereadCfg = configOfConnection(this.config, actionConn);
+        if (!rereadCfg) { cx.notify(); return; } // the completed action's connection was removed; no state or reads belong to it now
         let parsedStdout = null;
         try { parsedStdout = JSON.parse(String(rawRes?.stdout ?? "").trim()); } catch (_) { parsedStdout = null; }
         if (subargs[0] === "mode" && subargs[1] === "apply") {
@@ -5094,14 +5490,14 @@ export default class RigView extends View {
         }
         refreshSidebar();
         if (entityId) {
-          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/quiet`, true, null, config);
-          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/modes`, true, null, config);
-          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/mode`, true, null, config);
-          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/readiness`, true, null, config);
-          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/decision-room`, true, null, config);
+          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/quiet`, true, null, rereadCfg);
+          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/modes`, true, null, rereadCfg);
+          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/mode`, true, null, rereadCfg);
+          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/readiness`, true, null, rereadCfg);
+          this.read(cx, `/api/gateway/human/${encodeURIComponent(entityId)}/decision-room`, true, null, rereadCfg);
         }
-        this.read(cx, "/api/gateway/participants", true, null, config);
-        this.read(cx, "/api/gateway/connections", true, null, config);
+        this.read(cx, "/api/gateway/participants", true, null, rereadCfg);
+        this.read(cx, "/api/gateway/connections", true, null, rereadCfg);
       }
       cx.notify();
     });
@@ -5205,7 +5601,7 @@ export default class RigView extends View {
         .when(humans.length > 1, (el) => el.child(h_flex().id("people-selector").gap(6).items_center().flex_wrap()
           .children(humans.map((h) => {
             const on = h.entityId === activeId;
-            return h_flex().id(`people-select-${h.entityId}`).px(8).h(22).rounded(5).items_center().cursor_pointer()
+            return h_flex().id(`people-select-${h.entityId}`).px(8).h(22).rounded(5).items_center().cursor_pointer().tooltip(`Show ${h.address}'s quiet hours and modes`)
               .bg(on ? t.accent : t.raised).border_1().border_color(on ? t.accent : t.border)
               .text_size(11.5).text_color(on ? (t.solid_foreground ?? t.background) : t.muted)
               .on_click((_e, cx) => { this.selectedPersonId = h.entityId; cx.notify(); })
@@ -5243,20 +5639,20 @@ export default class RigView extends View {
               .children([1, 2].map(hours => this.button(t, `people-quiet-until-${hours}h`, `Quiet for ${hours}h`, (_e, cx) => {
                 const until = new Date(Date.now() + hours * 3600_000).toISOString();
                 this.runPeopleAction(cx, ["quiet", "set", activeId, "--until", until], activeId);
-              }, { small: true, disabled: editDisabled, tooltip: editTooltip })))
+              }, { small: true, disabled: editDisabled, tooltip: editTooltip, tip: `Quiet for ${hours} hour${hours === 1 ? "" : "s"}: notifications wait until then` })))
               .child(this.button(t, "people-quiet-daily", "Daily 22:00–08:00", (_e, cx) => {
                 const daily = `${this.peopleForm.quietStart || "22:00"}-${this.peopleForm.quietEnd || "08:00"}`;
                 this.runPeopleAction(cx, ["quiet", "set", activeId, "--daily", daily], activeId);
-              }, { small: true, disabled: editDisabled, tooltip: editTooltip }))
+              }, { small: true, disabled: editDisabled, tooltip: editTooltip, tip: "Set daily quiet hours" }))
               .when(isQuietActive, (bEl) => bEl.child(
                 this.button(t, `people-quiet-end-${activeId}`, "I'm back", (_e, cx) => {
                   this.runPeopleAction(cx, ["quiet", "end", activeId], activeId);
-                }, { primary: true, small: true, disabled: editDisabled, tooltip: editTooltip })
+                }, { primary: true, small: true, disabled: editDisabled, tooltip: editTooltip, tip: "End quiet hours now" })
               ))
               .when(Boolean(quietWin || isQuietActive), (bEl) => bEl.child(
                 this.button(t, `people-quiet-clear-${activeId}`, "Remove", (_e, cx) => {
                   this.runPeopleAction(cx, ["quiet", "clear", activeId], activeId);
-                }, { small: true, disabled: editDisabled, tooltip: editTooltip })
+                }, { small: true, disabled: editDisabled, tooltip: editTooltip, tip: "Clear these quiet hours" })
               )))
         ))
         .when(!!activeId, (el) => el.child(
@@ -5265,13 +5661,13 @@ export default class RigView extends View {
               .child(div().when(!pageBodyLayout(this.pageWidth).compact, el => el.flex_1()).text_size(12).font_semibold().text_color(t.foreground).child("Modes"))
               .child(div().text_size(11.5).text_color(curMode ? t.accent : t.muted).child(
                 curMode?.modeName
-                  ? `${curMode.modeName}${curMode.settings?.decision?.policy ? ` · ${curMode.settings.decision.policy}` : ""}`
+                  ? `${curMode.modeName}${curMode.settings?.decision?.policy ? ` · ${statusWord(curMode.settings.decision.policy, "policy")}` : ""}`
                   : "At desk (no mode active)"
               ))
               .when(Boolean(curMode?.modeName), (mEl) => mEl.child(
                 this.button(t, `people-mode-end-${activeId}`, "I'm back", (_e, cx) => {
                   this.runPeopleAction(cx, ["mode", "end", activeId], activeId);
-                }, { primary: true, small: true, disabled: editDisabled, tooltip: editTooltip })
+                }, { primary: true, small: true, disabled: editDisabled, tooltip: editTooltip, tip: "End this mode now" })
               )))
             .when(Boolean(decisionRoomWords), (rEl) => rEl.child(
               v_flex().id("people-decision-room-note").gap(2)
@@ -5287,19 +5683,19 @@ export default class RigView extends View {
                 || m?.quiet === "until-end";
               return h_flex().id(`people-mode-row-${mName}`).px(8).h(28).gap(8).items_center().rounded(6).bg(t.background).border_1().border_color(t.border)
                 .child(div().flex_1().min_w(0).truncate().text_size(12).font_medium().text_color(t.foreground).tooltip(String(mName??"")).child(mName))
-                .child(div().text_size(11.5).text_color(t.muted).child(`policy: ${mPolicy}${mBack ? ` · back ${mBack}` : ""}`))
+                .child(div().text_size(11.5).text_color(t.muted).child(`${statusWord(mPolicy, "policy")}${mBack ? ` · back ${mBack}` : ""}`))
                 .child(this.button(t, `people-mode-preset-${activeId}-${mName}`, "Apply", (_e, cx) => {
                   const applyArgs = ["mode", "apply", activeId, mName];
                   if (needsUntil) {
                     applyArgs.push("--until", new Date(Date.now() + 7200_000).toISOString());
                   }
                   this.runPeopleAction(cx, applyArgs, activeId);
-                }, { small: true, primary: curMode?.modeName !== mName, disabled: editDisabled, tooltip: editTooltip }));
+                }, { small: true, primary: curMode?.modeName !== mName, disabled: editDisabled, tooltip: editTooltip, tip: `Turn on ${mName}` }));
             }) : [this.dim(t, "No saved modes yet.")])
             .child(h_flex().gap(6).items_center().flex_wrap()
               .child(this.button(t, "people-mode-save-sleep", "Save sleep mode (hold)", (_e, cx) => {
                 this.runPeopleAction(cx, ["mode", "save", activeId, "sleep", "--availability", "off", "--quiet", "22:00-08:00"], activeId);
-              }, { small: true, disabled: editDisabled, tooltip: editTooltip }))
+              }, { small: true, disabled: editDisabled, tooltip: editTooltip, tip: `Save a Sleep mode for ${otherName}: away, with quiet hours 22:00 to 08:00` }))
               .child(this.button(t, "people-mode-save-focus", "Save focus mode (auto_decide)", (_e, cx) => {
                 this.runPeopleAction(cx, [
                   "mode", "save", activeId, "focus",
@@ -5308,22 +5704,22 @@ export default class RigView extends View {
                   "--quiet", "until-end",
                   "--decision-room", "Proceed on reversible routine work; escalate irreversible or prod-affecting changes.",
                 ], activeId);
-              }, { small: true, disabled: editDisabled, tooltip: editTooltip })))
+              }, { small: true, disabled: editDisabled, tooltip: editTooltip, tip: `Save a Focus mode for ${otherName}: focused, back in 2 h, quiet until it ends; seats go on with reversible routine work and ask first about anything irreversible` })))
             .child(this.dim(t, `Changes are made as ${actorAddr} with rig gateway human quiet and mode. OpenRig's quiet show and mode current show the same.`))
         ))
         .when(!!this.peopleResult && this.peopleResult.conn === this.activeConnId(), (el) => el.child(
           h_flex().id("people-action-result").gap(6).items_center()
             .child(svg(icon(this.peopleResult.ok ? "check" : "rig-alert")).size(12).flex_none().text_color(this.peopleResult.ok ? t.working : t.blocked))
-            .child(div().flex_1().text_size(12).text_color(this.peopleResult.ok ? t.muted : t.blocked).child(this.peopleResult.text))
+            .child(div().flex_1().text_size(12).text_color(this.peopleResult.ok ? t.muted : t.blocked).child(this.peopleResult.ok ? this.peopleResult.text : this.errorText(t,"people-result-error",this.peopleResult.text)))
         )),
     );
   }
 
   /** An accent text link the keyboard can use (see focusTarget in rig-lib.js): Tab reaches it, it shows focus, and Enter or Space acts while
    *  it holds focus. */
-  inlineLink(t, cx, id, label, act) {
+  inlineLink(t, cx, id, label, act, tip = null) {
     return focusTarget(this, cx, id, div().id(id).text_size(12).text_color(t.accent).cursor_pointer().rounded(3).hover(el => el.underline()), act,
-      el => el.underline().bg(t.hover)).on_click((_e, cx) => act(cx)).child(label);
+      el => el.underline().bg(t.hover), tip).child(label);
   }
 
   healthFindingsCard(t, cx, got, entry = {}) {
@@ -5335,17 +5731,17 @@ export default class RigView extends View {
       const failure = wait ?? (String(row?.qitemId ?? row?.id ?? "") !== qid ? this.dim(t, "Couldn't read queue item: OpenRig returned no matching row.") : null);
       const back = { ...entry }; delete back.healthQitem;
       return this.card(t, "Queue item", [
-        h_flex().child(this.button(t, "health-queue-back", "‹ Health", () => this.push(back), { small: true })),
+        h_flex().child(this.button(t, "health-queue-back", "‹ Health", () => this.push(back), { small: true, tip: "Back to System › Health" })),
         ...(failure ? [failure] : [this.copyValue(t, qid, "health-queue-id", "queue item id"),
           this.plain(t, row?.summary ?? "No summary reported.", "health-queue-summary"),
-          this.kv(t, [["State", row?.state ?? "not reported"], ["From", row?.sourceSession ?? "not reported"], ["To", row?.destinationSession ?? "not reported"]]),
+          this.kv(t, [["State", statusWord(row?.state ?? "not reported", "queue")], ["From", row?.sourceSession ?? "not reported"], ["To", row?.destinationSession ?? "not reported"]]),
           requestMarkdownView(row?.body ?? "No body reported.", { TextView, div, v_flex, id: "health-queue-body" }),
         ]),
       ]);
     }
     if (got.error || (got.data !== undefined && !Array.isArray(got.data?.records))) return this.card(t, "Health", [
       this.dim(t, `Couldn't read health: ${got.error ?? "OpenRig returned no records list."}`),
-      this.button(t, "health-retry", "Retry", (_e, ctx) => this.read(ctx ?? cx, "/api/health", true), { small: true }),
+      this.button(t, "health-retry", "Retry", (_e, ctx) => this.read(ctx ?? cx, "/api/health", true), { small: true, tip: "Read Health again from OpenRig" }),
     ]);
     if (got.data === undefined) return this.card(t, "Health", [this.dim(t, "Checking health…")]);
     const data = got.data, open = shared("rig.open.page") ?? {};
@@ -5363,13 +5759,13 @@ export default class RigView extends View {
     const coverage = partial.map(c => Number.isFinite(c.evaluated) && Number.isFinite(c.total) ? `partial check (${c.evaluated} of ${c.total})` : "partial check").join(" · ");
     const age = Math.max(...records.map(r => r.freshness?.ageSeconds).filter(Number.isFinite));
     const checked = typeof data.evaluatedAt === "string" ? `checked ${this.time(data.evaluatedAt)} · ${healthAge(age)}` : "Check time not reported";
-    const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+    const plural = counted;
     const worstContext = groups.find(g => g.worst)?.records.find(r => r.detector === "context.pressure");
     const worstContextText = worstContext ? `${healthScopeTarget(worstContext, rigs, nodes).label.replace(/^Seat /, "")} at ${healthContextPercentage(worstContext)} context` : null;
     const summary = counts.problems ? `${plural(counts.problems, "problem")} need${counts.problems === 1 ? "s" : ""} a look. ${groups.find(g => g.worst)?.title ?? ""}.`
       : `No problems found.${counts.notes ? ` ${plural(counts.notes, "note")} available for reference.` : ""}`;
     return this.card(t, `Health · ${plural(counts.problems, "problem")} · ${plural(counts.notes, "note")}`, [
-      ...(rig ? [h_flex().id("health-rig-filter").gap(6).items_center().cursor_pointer()
+      ...(rig ? [h_flex().id("health-rig-filter").gap(6).items_center().cursor_pointer().tooltip(`Show findings for every rig, not only ${rig.name}`)
         .on_click(() => this.push({ section: "system", subview: "health" }))
         .child(div().text_size(12).text_color(t.muted).child(rig.name))
         .child(svg(icon("x")).size(11).text_color(t.dim))] : []),
@@ -5389,7 +5785,7 @@ export default class RigView extends View {
           summary: r.summary, scope: r.scope, threshold: r.threshold, explanation: r.explanation, window: r.window, freshness: r.freshness })),
           coverage: data.coverage, evidence: evidence.slice(0, 5), ...(evidence.length > 5 ? { moreEvidence: `+${evidence.length - 5} more` } : {}) }, null, 2);
         return v_flex().id(`health-group-${index}`).gap(6).pb(8).border_b(1).border_color(t.border)
-          .child(h_flex().id(`health-toggle-${index}`).gap(8).items_center().cursor_pointer().on_click(() => toggleOpen(key, shown))
+          .child(h_flex().id(`health-toggle-${index}`).gap(8).items_center().cursor_pointer().tooltip("Show or hide these findings").on_click(() => toggleOpen(key, shown))
             .child(svg(icon(shown ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
             .child(svg(icon(g.worst === 2 ? "rig-diamond" : g.worst === 1 ? "rig-warning" : "rig-info")).size(13).flex_none().text_color(tone))
             .child(div().flex_1().min_w(0).text_size(12.5).text_color(t.foreground).child(g.title))
@@ -5399,7 +5795,7 @@ export default class RigView extends View {
           .when(shown, el => el.child(v_flex().ml(24).gap(8)
             .child(this.plain(t, g.what, `health-what-${index}`))
             .child(h_flex().gap(6).items_center().flex_wrap().children(scopes.map((scope, i) => div().id(`health-scope-${index}-${i}`).text_size(12)
-              .text_color(scope.entry ? t.accent : t.muted).when(Boolean(scope.entry), el => el.cursor_pointer().on_click(() => this.push(scope.entry))).child(scope.label)))
+              .text_color(scope.entry ? t.accent : t.muted).when(Boolean(scope.entry), el => el.cursor_pointer().tooltip(`Open ${scope.label}'s page`).on_click(() => this.push(scope.entry))).child(scope.label)))
               .child(div().id(`health-freshness-${index}`).text_size(11.5).text_color(g.stale ? t.dim : t.muted).child(`· confidence ${confidence} · data ${healthAge(g.ageSeconds)}`)))
             .when(!g.cleared, el => el.child(this.plain(t, `What to do: ${g.todo}`, `health-todo-${index}`).text_color(t.muted)))
             .when(g.records[0].detector === "context.pressure" || !(g.records.length === 1 && g.records[0].scope?.type === "seat" && !healthQueueId(g.records[0])), el => el.child(v_flex().ml(8).pl(10).border_l(1).border_color(t.border).gap(4).children((hiddenRecords ? g.records.slice(0, HEALTH_ROW_CAP) : g.records).map((r, i) => {
@@ -5409,15 +5805,15 @@ export default class RigView extends View {
               return h_flex().id(`health-item-${index}-${i}`).gap(8).items_center().flex_wrap()
                 .when(!g.cleared && r.detector === "context.pressure", el => el.child(svg(icon("rig-info")).size(11).text_color(tone)))
                 .child(div().text_size(12).text_color(qid || target.entry ? t.accent : t.muted)
-                  .when(Boolean(qid || target.entry), el => el.cursor_pointer().on_click(() => this.push(qid ? { ...entry, section: "system", subview: "health", healthQitem: qid } : target.entry))).child(subject))
-                .when(Boolean(count), el => el.child(div().text_size(11.5).text_color(t.muted).child(`${count} queue changes`)))
-                .when(!g.cleared && r.detector === "context.pressure", el => el.child(div().text_size(11.5).text_color(tone).child(`${healthContextPercentage(r)} context used · ${r.severity}`)))
+                  .when(Boolean(qid || target.entry), el => el.cursor_pointer().tooltip(`Open ${subject}`).on_click(() => this.push(qid ? { ...entry, section: "system", subview: "health", healthQitem: qid } : target.entry))).child(subject))
+                .when(Boolean(count), el => el.child(div().text_size(11.5).text_color(t.muted).child(counted(count, "queue change"))))
+                .when(!g.cleared && r.detector === "context.pressure", el => el.child(div().text_size(11.5).text_color(tone).child(`${healthContextPercentage(r)} of the context used (${statusWord(r.severity, "severity").toLowerCase()})`)))
                 .child(div().text_size(11).text_color(t.dim).child(time))
                 .child(div().flex_1())
                 .child(this.copyButton(t, qid ?? r.id, `health-item-${index}-${i}`, qid ? "queue item id" : "finding id"));
             })).when(hiddenRecords > 0, list => list.child(this.inlineLink(t, cx, `health-more-${index}`, `${hiddenRecords} more finding${hiddenRecords === 1 ? "" : "s"}`,
-              () => toggleOpen(allKey, false))))))
-            .child(h_flex().id(`health-details-toggle-${index}`).gap(6).items_center().cursor_pointer().on_click(() => toggleOpen(detailKey, details))
+              () => toggleOpen(allKey, false), `Show all ${g.records.length} findings in this group`)))))
+            .child(h_flex().id(`health-details-toggle-${index}`).gap(6).items_center().cursor_pointer().tooltip("Show or hide the raw details").on_click(() => toggleOpen(detailKey, details))
               .child(svg(icon(details ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
               .child(div().flex_1().text_size(12).text_color(t.muted).child("Details"))
               .when(details, el => el.child(this.copyButton(t, raw, `health-details-${index}`, "health details"))))
@@ -5463,6 +5859,10 @@ export default class RigView extends View {
     const usageDisabled = isUsageWindowsDisabled(usage) || isUsageWindowsDisabled(this.cache["/api/provider/usage/hosts"]);
     const usageWait = usageDisabled ? null : this.status(t, cx, "/api/provider/usage", usage);
     const usageRows = usageDisabled || usageWait ? [] : formatUsageRows(usage.data?.hostUsage ?? []);
+    const narrowUsageRows = (this.pageWidth ?? 960) < 660 && this.filter
+      ? usageRows.filter(r => [r.host, r.provider, r.window, r.usedText, r.resetsAt, r.asOf]
+        .some(value => String(value ?? "").toLowerCase().includes(this.filter.toLowerCase())))
+      : usageRows;
     if (!usageDisabled && !usageWait && usageRows.length === 0) {
       this.read(cx, "/api/provider/usage/hosts");
     }
@@ -5494,7 +5894,7 @@ export default class RigView extends View {
           .on_key_down((event,ctx)=>{if(event.key==='tab'&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt&&this.configPanel?.tabControl(Boolean(event.modifiers?.shift),ctx))ctx.stop_propagation();})
           .children(this.configPanel.render(t,cx,config.data,configProbe,{category:entry.category,settingKey:entry.settingKey}))),
     ],
-      entry.settingKey || entry.category ? h_flex().id("rig-clear-config").px(8).h(22).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
+      entry.settingKey || entry.category ? h_flex().id("rig-clear-config").px(8).h(22).gap(6).rounded(6).items_center().flex_none().cursor_pointer().tooltip(`Clear the ${entry.settingKey ? "setting" : "category"} filter`)
         .bg(t.selected).text_size(11.5).text_color(t.foreground).on_click(() => this.clearConfigScope())
         .child(entry.settingKey ? `setting ${entry.settingKey}` : `category ${entry.category}`).child(svg(icon("x")).size(11).text_color(t.muted)) : null);
     const healthCard = () => this.healthFindingsCard(t, cx, health, entry);
@@ -5506,37 +5906,38 @@ export default class RigView extends View {
           el=>el.child(div().text_size(11).text_color(t.muted).child(machineSetupReceiptLabel(shared("rig.machineSetup"),this.uiTimezone))))
         // The legacy one-connection actions (choose or stop using daemonMachine) are for the legacy config shape. A connections list adds and removes
         // machines as connections: its own rows below with two or more, and Add a machine… with one.
-        .when(!this.config?.connectionsList,el=>el.child(div().id("system-choose-machine").text_color(t.accent).cursor_pointer().child(this.config?.daemonMachine?`Stop using ${this.config.daemonMachine}…`:"Choose machine…")
+        .when(!this.config?.connectionsList,el=>el.child(div().id("system-choose-machine").text_color(t.accent).cursor_pointer().tooltip(`${this.config?.daemonMachine ? `Stop using ${this.config.daemonMachine} for OpenRig` : "Choose which Herdr machine runs OpenRig"}: asks first`).child(this.config?.daemonMachine?`Stop using ${this.config.daemonMachine}…`:"Choose machine…")
           .on_click(()=>{if(this.config?.daemonMachine)this.open({mod:MOD_IDS.menu,kind:"dialog",width:560,height:400,
             props:{target:{kind:"machine"},step:{action:"stop-machine",machine:this.config.daemonMachine}}});else run("rig.choose-machine");})))
-        .when(!!this.config?.connectionsList&&(this.config?.connections??[]).length<2,el=>el.child(div().id("system-add-machine").text_color(t.accent).cursor_pointer().child("Add a machine…")
+        .when(!!this.config?.connectionsList&&(this.config?.connections??[]).length<2,el=>el.child(div().id("system-add-machine").text_color(t.accent).cursor_pointer().tooltip("Add another Herdr machine's OpenRig").child("Add a machine…")
           .on_click(()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:680,props:{target:{kind:"machine"},step:{action:"add-machine"}}})))),
       // Connections the config named but this version doesn't use (an address it can't check, a repeated id, ...): said here, with the reason, so a connection never just goes missing.
       ...((this.config?.connectionNotes ?? []).length ? [v_flex().id("system-connection-notes").gap(3).children(this.config.connectionNotes.map((note, i) => div().id(`system-connection-note-${i}`).text_size(11.5).text_color(t.blocked).child(String(note))))] : []),
-      ...((this.config?.connections ?? []).length > 1 ? [connectionBlocks(t, { connections: this.config.connections, states: this.connectionStates(cx), consentText: this.connConsent ?? null,timezone:this.uiTimezone,
-        mono: settings()?.font_family ?? "monospace", selected: this.connSelected ?? null, onSelect: (i, cx) => { this.connSelected = i; cx.notify(); }, handles: this.connectionHandles(cx),
+      ...((this.config?.connections ?? []).length > 1 ? [connectionBlocks(t, { connections: this.config.connections, activationOwner:this, states: this.connectionStates(cx), consentText: this.connConsent ?? null,timezone:this.uiTimezone,
+        mono: settings()?.font_family ?? "monospace", selected: this.connSelected ?? null, onSelect: (i, cx) => { this.connSelected = i; cx.notify(); }, handles: this.connectionHandles(cx),actionHandles:this.connectionActionHandles(cx),
         onRemove: (c) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 520, height: 260, props: { target: { kind: "machine" }, step: { action: "remove-connection", id: c.id, machine: c.machine ?? null } } }),
         onAdd: () => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 600, height: 680, props: { target: { kind: "machine" }, step: { action: "add-machine" } } }),
         onSwitch: (c) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 320, props: { target: { kind: "machine" }, step: { action: "switch-connection", id: c.id, machine: c.machine ?? null } } }),
-        onSwitchBack: (c) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 520, height: 240, props: { target: { kind: "machine" }, step: { action: "switch-back", id: c.id, machine: c.machine ?? null } } }) })] : []),
+        onSwitchBack: (c) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 520, height: 240, props: { target: { kind: "machine" }, step: { action: "switch-back", id: c.id, machine: c.machine ?? null } } }),
+        onApprove: (c) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 560, height: 360, props: { target: { kind: "machine" }, step: { action: "approve-helper", id: c.id, machine: c.machine ?? null } } }) })] : []),
       this.kv(t, [
         ["Herdrig Version", `herdrig v${HERDRIG_VERSION}`],
         ["OpenRig Version", versionLine],
         ["OpenRig Capabilities", capDetail.line],
         ...(capDetail.reason ? [["Capability Note", this.workerCapabilityMessage()]] : []),
-      ]).tooltip(capDetail.reason ?? ""),
+      ]).tooltip(plainError(capDetail.reason ?? "").text),
       ...(capDetail.suggestedUpgrade ? [div().id("system-suggested-upgrade").text_size(11).text_color(t.dim).child(capDetail.suggestedUpgrade)] : []),
-      this.status(t, cx, "/api/gateway/connections", conn) ?? this.kv(t, [["Slack", `${conn.data.state ?? ""}${conn.data.nextAction ? ` · ${conn.data.nextAction}` : ""}`],
+      this.status(t, cx, "/api/gateway/connections", conn) ?? this.kv(t, [["Slack", `${statusWord(conn.data.state ?? "", "gateway")}${conn.data.nextAction ? ` · ${statusWord(conn.data.nextAction, "gateway")}` : ""}`],
         ["People registered", `${(conn.data.humans ?? []).length}${(conn.data.humans ?? []).length ? ` · ${(conn.data.humans ?? []).map((h) => h.address).join(", ")}` : ""}`]]),
     ]);
     const usageCard = () => this.card(t, "Usage", [
-      ...(this.usageRefreshNote && this.usageRefreshNote.conn === this.activeConnId() ? [div().id("usage-refresh-note").text_size(11.5).text_color(this.usageRefreshNote.ok ? t.muted : t.blocked).child(this.usageRefreshNote.text)] : []),
+      ...(this.usageRefreshNote && this.usageRefreshNote.conn === this.activeConnId() ? [div().id("usage-refresh-note").text_size(11.5).text_color(this.usageRefreshNote.ok ? t.muted : t.blocked).child(this.usageRefreshNote.ok ? this.usageRefreshNote.text : this.errorText(t,"usage-refresh-note-detail",this.usageRefreshNote.text))] : []),
       usageDisabled
         ? this.usageDisabledNote(t)
         : (usageWait ?? v_flex().gap(8)
           .child(usageRows.length > 0
             ? ((this.pageWidth ?? 960) < 660
-              ? v_flex().gap(6).children(usageRows.map((r, i) => {
+              ? v_flex().gap(6).children(narrowUsageRows.length ? narrowUsageRows.map((r, i) => {
                   const color = r.tone === "blocked" ? t.blocked : (r.tone === "warn" || r.tone === "warning") ? t.ansi3 : r.tone === "muted" ? t.muted : t.foreground;
                   return v_flex().id(`usage-${i}`).px(8).py(6).gap(3).rounded(6).bg(t.raised)
                     .child(h_flex().gap(8).items_center()
@@ -5546,7 +5947,7 @@ export default class RigView extends View {
                       .child(div().text_size(12).text_color(color).child(r.usedText))
                       .child(div().flex_1())
                       .child(div().text_size(11.5).text_color(t.dim).child(this.time(r.resetsAt,{exact:true}))));
-                }))
+                }) : [this.dim(t, `No matches for /${this.filter}.`)])
               : this.table(t, "usage", [["Host"], ["Provider", 96], ["Window", 76], ["Used", 136], ["Resets", 160, "right"]],
                 usageRows.map((r) => {
                   const color = r.tone === "blocked" ? t.blocked : (r.tone === "warn" || r.tone === "warning") ? t.ansi3 : r.tone === "muted" ? t.muted : t.foreground;
@@ -5564,16 +5965,16 @@ export default class RigView extends View {
             : this.dim(t, "No usage readings yet."))
           .when(!!usageAsOf && usageRows.length > 0, (el) => el.child(this.dim(t, `as of ${this.time(usageAsOf,{exact:true})}`)))
           .when(hostCount > 1 || hostsOpen, (el) => el.child(v_flex().gap(6).when(hostsFocused, (d) => d.rounded(6).border_1().border_color(t.accent).p(6))
-            .child(h_flex().id("usage-hosts-toggle").gap(4).items_center().cursor_pointer().on_click(toggleUsageHosts)
+            .child(h_flex().id("usage-hosts-toggle").gap(4).items_center().cursor_pointer().tooltip("Show or hide usage per host").on_click(toggleUsageHosts)
               .child(svg(icon(hostsOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
               .child(div().text_size(12).text_color(t.muted).child(`Per host${hostCount > 0 ? ` (${hostCount})` : ""}`)))
             .when(hostsOpen, (d) => d.child(this.usageHostsBlock(t, cx)))))),
-    ], this.button(t, "usage-hosts-refresh", this.usageRefreshing ? "Refreshing…" : "Refresh", (_e, cx) => this.refreshUsageHosts(cx), { small: true, iconName: "rig-refresh", disabled: !!this.usageRefreshing }));
+    ], this.button(t, "usage-hosts-refresh", this.usageRefreshing ? "Refreshing…" : "Refresh", (_e, cx) => this.refreshUsageHosts(cx), { small: true, iconName: "rig-refresh", disabled: !!this.usageRefreshing, tip: "Read every host's usage again" }));
     const costCard = () => this.card(t, "Cost", [this.status(t, cx, "/api/telemetry/usage/cost", cost) ?? v_flex().gap(6)
-      .child(this.table(t, "cost", [["Seat"], ["Status", 100], ["Estimate", 90, "right"]], seats.map((s) => ({ cells: [s.seatSession, s.status, usd(s.costUsd)] }))))
+      .child(this.table(t, "cost", [["Seat"], ["Status", 100], ["Estimate", 90, "right"]], seats.map((s) => ({ cells: [s.seatSession, statusWord(s.status,"seat"), usd(s.costUsd)] }))))
       .child(h_flex().px(8).child(div().flex_1().text_size(12).text_color(t.dim).child(cost.data.note ?? "")).child(div().w(90).text_right().text_size(12.5).font_semibold().child(`Total ${usd(total)}`))) ]);
     const recentCard = () => v_flex().rounded(10).bg(t.background).border_1().border_color(sysRecentFocused ? t.accent : t.border).p(12).gap(8)
-      .child(h_flex().id("sys-recent-toggle").gap(6).items_center().cursor_pointer().on_click(() => toggleOpen("sys:recent", sysRecentOpen))
+      .child(h_flex().id("sys-recent-toggle").gap(6).items_center().cursor_pointer().tooltip("Show or hide recent activity").on_click(() => toggleOpen("sys:recent", sysRecentOpen))
         .child(svg(icon(sysRecentOpen ? "chevron-down" : "chevron-right")).size(11).flex_none().text_color(t.dim))
         .child(div().flex_1().text_size(12.5).font_semibold().text_color(t.foreground).child("Recent activity")))
       .when(sysRecentOpen, (el) => {
@@ -5600,6 +6001,7 @@ export default class RigView extends View {
   // ---- the header ------------------------------------------------------------------------------------------------
   /** The menu target for what is shown (the header's Actions), or null when it has none. */
   targetFor(cx, entry) {
+    if (this.activeConnId() === NO_PAGE_CONNECTION) return null; // a page that names no OpenRig acts for none: no Actions, no reads
     if(entry.section==='topology'&&entry.kind==='assistant'){
       const member=this.hostedMembers(cx)?.members?.find(m=>!m.invalid&&m.seat===entry.session&&m.conn===entry.conn);
       return member?assistantTarget(member,{id:entry.rigId}):null;
@@ -5630,12 +6032,15 @@ export default class RigView extends View {
     const s = shared("rig.status");
     const ttl = s?.ok === false ? ERROR_STATUS_MS : STATUS_MS;
     if (!s || (!s.busy && Date.now() - s.at >= ttl)) return null;
+    const words = s.ok === false ? plainError(s.text, {where:s.where??"OpenRig's machine"}) : {text:s.text};
+    if (s.ok === false && this.loggedStatusAt !== s.at) { this.loggedStatusAt=s.at; console.error(words.detail); }
     this.ticking = true;
     return h_flex().id("rig-status").max_w(420).min_w(0).gap(6).items_center().flex_none()
       .child(s.busy ? svg(icon("spinner")).size(12).flex_none().text_color(t.working)
         .when(this.config?.reducedMotion !== true, icon => icon.spin(900))
         : svg(icon(s.ok ? "check" : "rig-alert")).size(12).flex_none().text_color(s.ok ? t.working : t.blocked))
-      .child(div().min_w(0).truncate().text_size(12).text_color(s.ok === false ? t.blocked : t.muted).when(Boolean(s.text), (el) => el.tooltip(s.text)).child(s.text))
+      .child(div().min_w(0).truncate().text_size(12).text_color(s.ok === false ? t.blocked : t.muted).when(Boolean(words.text), (el) => el.tooltip(words.text)).child(words.text))
+      .when(s.ok === false,el=>el.child(this.copyButton(t,words.detail,`status-error-${s.id}`,"error details")))
       .when(s.ok === false && Boolean(s.canResume && s.rig), (el) => el.child(
         this.button(
           t,
@@ -5651,21 +6056,23 @@ export default class RigView extends View {
               step: { action: "resume", confirm: true },
             },
           }),
-          { small: true, iconName: "rig-play" },
+          { small: true, iconName: "rig-play", tip: `Resume ${s.rig}: asks before starting its seats` },
         ),
       ));
   }
 
   header(t, cx, stack, entry) {
-    // With several OpenRigs the crumb names the box the page belongs to (Topology ▾ › box2 › demo); with one there is nothing to tell apart.
-    const base = crumbsFor(entry), several = (this.config?.connections ?? []).length > 1 && entry?.section !== "file" && base.length > 0;
-    const crumbs = compactLocationCrumbs(several ? [base[0], { text: connectionBoxLabel(this.config, this.activeConnId()), entry: null }, ...base.slice(1)] : base, this.pageWidth ?? 960);
-    const target = this.targetFor(cx, entry), backTo = backTarget({ stack }, this.ownConn(), { fallback: this.initialEntry, primaryConn: this.config?.connectionId });
+    // With several OpenRigs the crumb names the box the page belongs to (Topology ▾ › box2 › demo); with one (or NO_PAGE_CONNECTION) there is nothing to name.
+    const shownConn = this.awayConnId(), base = crumbsFor(entry), several = (this.config?.connections ?? []).length > 1 && Boolean(shownConn) && entry?.section !== "file" && base.length > 0;
+    const crumbs = compactLocationCrumbs(several ? [base[0], { text: connectionBoxLabel(this.config, shownConn), entry: null }, ...base.slice(1)] : base, this.pageWidth ?? 960);
+    const target = this.targetFor(cx, entry), backTo = this.perTab()
+      ? backTarget({ stack: this.tabPagesWithSeed()[this.tabId]?.stack ?? [] }, null, { fallback: entry })
+      : backTarget({ stack }, this.ownConn(), { fallback: this.openingEntry(), primaryConn: this.config?.connectionId });
     const status = this.statusLine(t);
     const staleHeader = !this.topologyStrip ? this.staleReadSummary() : null;
     const narrow = (this.pageWidth ?? 960) < 480;
     const tiny = (this.pageWidth ?? 960) < 320;
-    const tuiLabel = labelledTui(terminals(), spaces(), this.config) ? "Switch to TUI" : "Open in TUI";
+    const tuiLabel = labelledTui(terminals(), this.drawSpaces(), this.config) ? "Switch to TUI" : "Open in TUI";
     return v_flex().flex_none()
       .child(h_flex().id("page-location-bar").h(38).px(14).gap(8).items_center()
         .when(!tiny, row => row.child(div().id("rig-back").size(24).flex().items_center().justify_center().flex_none()
@@ -5682,16 +6089,16 @@ export default class RigView extends View {
           return i?[svg(icon("chevron-right")).size(10).flex_none().text_color(t.dim),crumb]:[crumb];
         })))
         .when(!!entry.filter,el=>el.child(div().id("rig-clear-filter").text_size(12).text_color(t.accent).cursor_pointer()
-          .on_click(()=>this.clearFilter()).child(`/${entry.filter} ×`)))
-        .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"})))
-        .when(!tiny&&!!this.config,el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel})))
+          .tooltip(`Clear the filter /${entry.filter}`).on_click(()=>this.clearFilter()).child(`/${entry.filter} ×`)))
+        .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search this page (/)"})))
+        .when(!tiny&&!!this.activeConfig(),el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel})))
         .when(!tiny,el=>el.child(div().id("rig-close").size(24).flex_none().flex().items_center().justify_center().cursor_pointer().tooltip("Close")
           .on_click(()=>this.closePage()).child(svg(icon("x")).size(14).text_color(t.muted)))))
       // Below 320 px, controls get their own row so the remaining location links still take clicks.
       .when(tiny,el=>el.child(h_flex().id("page-compact-controls").px(14).pb(6).gap(6).items_center()
         .child(this.button(t,"rig-back","",()=>this.back(),{iconName:"chevron-left",tooltip:"Back (Backspace)",disabled:!backTo}).px(6))
-        .child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search"}).px(6))
-        .when(!!this.config,row=>row.child(this.button(t,"rig-open-tui","",(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel}).px(6)))
+        .child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search this page (/)"}).px(6))
+        .when(!!this.activeConfig(),row=>row.child(this.button(t,"rig-open-tui","",(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel}).px(6)))
         .child(div().id("rig-close").size(20).flex_none().cursor_pointer().tooltip("Close").on_click(()=>this.closePage()).child(svg(icon("x")).size(14).text_color(t.muted)))))
       .child(h_flex().id("page-title-bar").px(14).pb(10).gap(12).items_center().flex_wrap()
         .child(v_flex().flex_1().min_w(Math.min(240, Math.max(80, (this.pageWidth ?? 960) - 28))).gap(3)
@@ -5708,16 +6115,89 @@ export default class RigView extends View {
   /** This tab's space: the one its props name (live, so it is found once Herdr has restored it), else the one it was last drawn in. */
   tabSpace() {
     if (!this.propsSpaceId) return this.ownSpace ?? null;
-    try { return (spaces?.() ?? []).find((s) => s?.id === this.propsSpaceId) ?? null; } catch (_) { return null; }
+    return this.drawSpaces().find((s) => s?.id === this.propsSpaceId) ?? this.ownSpace ?? null;
   }
   render(cx) {
     // Values read once per render (see rawRigData); cleared after it, so nothing outside a render sees a stale one.
     this.renderMemo = {};
-    try { return this.renderPage(cx); } finally { this.renderMemo = null; }
+    // A permission can arrive after an await drained by another view: only this page's draw/click owns its poll.
+    this.armDecisionPoll(cx);
+    this.answerDirty = false; // this render draws every answer that has landed
+    try { const result=this.renderPage(cx);this.publishHealthConsumer();return result; } finally { this.renderMemo = null; this.armAnswerCheck(cx); }
+  }
+  /** Presence only, no sample clock: a hidden tab's old marker cannot keep its connection polling. */
+  publishHealthConsumer(){
+    const space=this.drawSpaces().find(s=>s?.active),tab=space?.tabs?.find(t=>t.active)??(space?.tabs?.length===1?space.tabs[0]:null);
+    const own=this.tabSpace()?.id??this.propsSpaceId??this.ownSpace?.id,conn=this.activeConnId();
+    if(!space||!tab?.id||own&&own!==space.id||this.tabId&&this.tabId!==tab.id||!conn||conn===NO_PAGE_CONNECTION)return;
+    const all=shared('rig.pageOnScreen')??{},mine=all[tab.id],used=this.renderMemo?.healthRead===true;
+    if(!used&&!mine?.healthViews?.[this.viewToken])return;
+    const token=this.viewToken??=`v${Date.now().toString(36)}${Math.random().toString(36).slice(2,8)}`;
+    const views=mine?.space===space.id?{...mine.views}:{},healthViews=mine?.space===space.id?{...mine.healthViews}:{};
+    views[token]=conn;if(used)healthViews[token]=conn;else delete healthViews[token];
+    if(mine?.space===space.id&&mine.views?.[token]===conn&&JSON.stringify(mine.healthViews??{})===JSON.stringify(healthViews))return;
+    const live=new Set(this.drawSpaces().flatMap(s=>(s.tabs??[]).map(t=>t.id)));
+    const kept=Object.fromEntries(Object.entries(all).filter(([id])=>live.has(id)));
+    setShared('rig.pageOnScreen',{...kept,[tab.id]:{...(mine?.space===space.id?mine:{}),space:space.id,views,healthViews}});
+  }
+  /** An answer (a read, a transcript tail, the hosted members) asks for a re-render at once unless the page re-rendered for another answer in
+   *  the last ANSWER_COALESCE_MS; then it only marks the page dirty, and the trailing check draws it. No timer is made here: this runs after
+   *  an await, where Herdr would give a new timer to whichever view drained the promise jobs, and that view's close would drop it. */
+  noteAnswer(cx) {
+    if (this.closed) return;
+    const now = Date.now();
+    const since = now - (this.answerNotifiedAt ?? -Infinity); // negative after a clock step back: re-render at once
+    if (since < 0) this.answerCheckAt = null; // a check armed under the old clock would otherwise keep the next window from arming its own
+    if (since >= ANSWER_COALESCE_MS || since < 0) { this.answerNotifiedAt = now; this.answerDirty = false; cx.notify(); }
+    else this.answerDirty = true;
+  }
+  /** From the page's render: an answer is held back only within ANSWER_COALESCE_MS of the re-render another answer asked for, and that
+   *  re-render is this render. So while that window is open it arms one timer for the window's end, which draws an answer held back in it.
+   *  The timer is made here, in the page's own call, never in an answer's continuation; it doesn't re-arm itself. */
+  armAnswerCheck(cx) {
+    if (this.closed || !cx?.timer?.after) return;
+    const end = (this.answerNotifiedAt ?? -Infinity) + ANSWER_COALESCE_MS, left = end - Date.now();
+    // One check per window end: a check still pending for an earlier window (late under load) doesn't cover a later one.
+    if (!(left > 0) || (this.answerCheckAt ?? -Infinity) >= end) return;
+    this.answerCheckAt = end;
+    cx.timer.after(Math.ceil(left), (next) => {
+      if (this.closed) return;
+      // Nothing held: close this window (if it is still the current one), so an answer landing now re-renders at once. A timer can wake a
+      // fraction of a millisecond early, and an answer just before the window's end would otherwise wait for the next notify.
+      if (!this.answerDirty) { if ((this.answerNotifiedAt ?? -Infinity) + ANSWER_COALESCE_MS === end) this.answerNotifiedAt = -Infinity; return; }
+      this.answerDirty = false; this.answerNotifiedAt = Date.now(); next.notify();
+    });
   }
   renderPage(cx) {
-    // A tab with no `space` prop (made by an earlier version) learns its space when drawn: only a shown tab is drawn, so the active space is its own.
-    if (!this.propsSpaceId) { try { const shown = (spaces?.() ?? []).find((s) => s?.active); if (shown) this.ownSpace = shown; } catch (_) {} }
+    // A tab with no `space` prop (or whose `propsSpaceId` no longer matches any live space) learns its space when drawn: only a shown tab is drawn, so the active space is its own.
+    try {
+      const all = this.drawSpaces();
+      if (!this.propsSpaceId || !all.some((s) => s?.id === this.propsSpaceId)) {
+        const shown = all.find((s) => s?.active);
+        if (shown) this.ownSpace = shown;
+      }
+    } catch (_) {}
+    // This tab learns its id now, before anything reads its page; a tab with no history saves the page it starts from once that can be told.
+    this.syncSplitTab();
+    const drewBefore = !this.tabId ? this.legacyShown : undefined; // a pane that drew the shared history before it could latch (a split tab that lost a pane)
+    if (this.nativeTabs() && this.latchTab()) {
+      const pages = shared("rig.tabPages") ?? {};
+      if (!pages[this.tabId]) {
+        const seed = drewBefore ? this.tabSeed(drewBefore) : this.tabSeed();
+        if (seed.entry && seed.persist) setShared("rig.tabPages", { ...pages, [this.tabId]: { stack: [seed.entry], at: Date.now() } });
+      } else if (drewBefore && navKey(pages[this.tabId].stack?.at(-1)) !== navKey(drewBefore)) {
+        // The tab kept a record from a pane that has gone: this pane goes on showing its own page, on top of that history.
+        setShared("rig.tabPages", tabPagesPush(pages, this.tabId, drewBefore));
+      }
+    }
+    // Only tabs that still exist keep a record. Pruned only when Herdr's list holds this tab (a list still being restored is not read as closed tabs).
+    if (this.perTab()) {
+      const live = this.drawSpaces().flatMap((s) => (s?.tabs ?? []).map((t) => t?.id)).filter(Boolean);
+      if (live.includes(this.tabId)) for (const key of ["rig.tabPages", "rig.pageRoutes"]) {
+        const all = shared(key);
+        if (all && typeof all === "object") { const kept = tabPagesPrune(all, live); if (kept !== all) setShared(key, kept); }
+      }
+    }
     this.topologyStrip=null;
     this.wideGraph=false;
     this.pageHeading=null;
@@ -5726,7 +6206,7 @@ export default class RigView extends View {
     this.pageSpec=null;
     this.pageNeedsCounts=null;
     this.workflowCounts={};
-    const graphNav=navKey(nav().stack?.at(-1))+":"+(nav().stack?.at(-1)?.tab??"");
+    const shownForGraph=this.shownEntry(),graphNav=navKey(shownForGraph)+":"+(shownForGraph?.tab??""); // this tab's page: another tab's navigation doesn't reset a live graph
     if(this.graphNav!==graphNav){for(const graph of this.graphs?.values()??[])graph.reset();this.graphNav=graphNav;}
     this.textSeq = 0;
     // Collect only rows the active native render actually builds (expanded rigs/pods and the open seat).
@@ -5745,16 +6225,30 @@ export default class RigView extends View {
     // lags it. Stale, not deleted: a deleted read draws the skeleton in place of the page until the fetch lands, which
     // collapsed the scroll to the top, dropped a focused text box and flashed the page on every event (the reported flash bug).
     // With several OpenRigs, the shown connection's own refresh stamp: another connection's refresh must not re-read this page, and this one's must.
-    // The refresh time comes from the small rig.refreshed, which moves on every refresh; rig.data itself is published only when its content changes.
-    const published = this.rigData(), refreshed = shared("rig.refreshed"), several = (this.config?.connections?.length ?? 0) > 1;
-    const at = several ? refreshed?.byConnection?.[this.activeConnId()] ?? published?.byConnection?.[this.activeConnId()]?.at : refreshed?.at ?? published?.at;
-    if (at && at !== this.dataAt) {
-      this.dataAt = at;
+    // rig.refreshed carries successful-read heartbeats separately from per-connection content versions.
+    // The catalog changes on explicit Refresh, not on every activity publication or idle timer. Invalidate existing connection caches once;
+    // hidden pages/connections read lazily when shown. Config changes already reset the caches in loadConfig.
+    const catalogRefresh=shared('rig.projectCatalogRefresh')??0;
+    if(catalogRefresh!==this.catalogRefreshSeen){
+      this.catalogRefreshSeen=catalogRefresh;
+      for(const cache of Object.values(this.caches??{}))markStale(cache,path=>path==='/api/scopes/projects');
+    }
+    const published=this.rigData(),{refreshed,conn,several}=this.observeSidebarRefresh(published);
+    // Older publishers have only refresh times; retain their invalidation contract as a fallback.
+    const version=several?refreshed?.dataByConnection?.[conn]??refreshed?.byConnection?.[conn]??published?.byConnection?.[conn]?.at:refreshed?.dataStamp??refreshed?.at??published?.at;
+    if(version&&(version!==this.contentAt||conn!==this.contentAtConn)){
+      this.contentAt=version;this.contentAtConn=conn;
       this.invalidateLiveReads();
+    }
+    {
+      // Whether this connection's sidebar is running now (its refresh was seen advancing lately and it is in the layout): read once per render.
+      const conn = this.activeConnId(), seen = this.refreshSeen;
+      this.attentionFromSidebar = conn && seen?.conn === conn && Date.now() - seen.at <= SIDEBAR_FRESH_MS && layoutHasMod(layout(), MOD_IDS.sidebar) ? conn : null;
     }
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
     let entry = this.shownEntry(); // this tab's own connection's page (the global top only when it is this tab's)
+    if (!this.perTab()) this.legacyShown = entry ?? undefined; // what this pane drew from the shared history, kept if it latches later
     const settingsScope=JSON.stringify([entry?.section,entry?.subview,entry?.category,entry?.settingKey,entry?.filter,this.activeConfig()?.connectionId,this.activeConfig()?.daemonUrl,this.activeConfig()?.daemonMachine]);
     if(this.settingsScope!==settingsScope){if(this.configPanel)this.configPanel.selected=null;this.settingsScope=settingsScope;}
     const settingsShown=entry?.section==='system'&&(!entry.subview||['overview','config'].includes(entry.subview));
@@ -5776,16 +6270,16 @@ export default class RigView extends View {
     // entry (rig.pageOnScreen[tab].views[this page]) and only when that entry differs, so panes split in one tab, or tabs taking turns, never overwrite each
     // other and a steady redraw writes nothing. Only the page of the active space writes, under the active tab.
     if ((this.config?.connections?.length ?? 0) > 1) {
-      const shownConn = this.activeConnId(), space = (spaces?.() ?? []).find((s) => s?.active), ownSpaceId = this.propsSpaceId ?? this.ownSpace?.id ?? null;
+      const shownConn = this.activeConnId(), space = this.drawSpaces().find((s) => s?.active), ownSpaceId = this.tabSpace()?.id ?? this.propsSpaceId ?? this.ownSpace?.id ?? null;
       const tab = (space?.tabs ?? []).find((t) => t?.active);
       if (shownConn && shownConn !== NO_PAGE_CONNECTION && space && tab?.id && (ownSpaceId === null || ownSpaceId === space.id)) {
         const all = shared("rig.pageOnScreen"), mine = all?.[tab.id], token = this.viewToken ??= `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
         if (mine?.space !== space.id || mine?.views?.[token] !== shownConn) {
-          const live = new Set((spaces?.() ?? []).flatMap((s) => (s?.tabs ?? []).map((t) => t?.id)));
+          const live = new Set(this.drawSpaces().flatMap((s) => (s?.tabs ?? []).map((t) => t?.id)));
           const kept = Object.fromEntries(Object.entries(all && typeof all === "object" ? all : {}).filter(([id, rec]) => live.has(id) && rec && typeof rec === "object" && rec.views));
           const views = mine?.space === space.id ? { ...mine.views } : {};
           views[token] = shownConn;
-          setShared("rig.pageOnScreen", { ...kept, [tab.id]: { space: space.id, views } });
+          setShared("rig.pageOnScreen", { ...kept, [tab.id]: { ...(mine?.space===space.id?mine:{}),space: space.id, views } });
         }
       }
     }
