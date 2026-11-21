@@ -2,6 +2,7 @@ import {div} from "gpui-kit";
 import {v_flex,h_flex} from "gpui-base";
 import {consentOf,CODE_ERROR_NEXT,formatHostId,HERDR_CONNECTION_OFFERED} from "./rig-connections.js";
 import {machineSetupReceiptLabel} from "./rig-machine-setup.js";
+import {activationPair} from './rig-activation.js';
 
 // System > Connections: one block per connection and "Add a machine…". Drawn only with two or more connections: with one, System looks as it always did.
 const STATE_WORD={connected:"Connected",down:"Not answering",error:"Check failed",checking:"Checking…"};
@@ -9,7 +10,8 @@ const STATE_WORD={connected:"Connected",down:"Not answering",error:"Check failed
 /** `selected` is the highlighted block (Up and Down move it, clamped, and move the keyboard to that block's Remove… when `handles[i]` exists); `onSelect(i, cx)` stores it. */
 /** A tunnel connection on a Herdr machine offers "Use Herdr's connection instead…" (`onSwitch`) only while `herdrOffered` (HERDR_CONNECTION_OFFERED);
  *  a switched one always offers "Switch back to the tunnel…" (`onSwitchBack`). */
-export function connectionBlocks(t,{connections,states={},consentText=null,mono="monospace",timezone,onRemove,onAdd,onSwitch,onSwitchBack,herdrOffered=HERDR_CONNECTION_OFFERED,selected=null,onSelect,handles=[]}={}){
+export function connectionBlocks(t,{connections,activationOwner=connections,states={},consentText=null,mono="monospace",timezone,onRemove,onAdd,onSwitch,onSwitchBack,onApprove,herdrOffered=HERDR_CONNECTION_OFFERED,selected=null,onSelect,handles=[],actionHandles={}}={}){
+  const activation=id=>activationPair(activationOwner,id);
   const row=(id,label,value,{font=false,tip}={})=>h_flex().gap(8).items_center()
     .child(div().w(68).flex_none().whitespace_nowrap().text_color(t.muted).child(label))
     .child(div().id(id).flex_1().min_w(0).truncate().when(font,el=>el.font_family(mono).text_size(11)).when(!!tip,el=>el.tooltip(tip)).child(value));
@@ -28,21 +30,32 @@ export function connectionBlocks(t,{connections,states={},consentText=null,mono=
       .when(!!helper,el=>el.child(row(`connection-helper-${c.id}`,"Helper",helper)))
       .when(!!verified,el=>el.child(div().id(`connection-receipt-${c.id}`).text_color(t.muted).text_size(11).child(machineSetupReceiptLabel(receipt,timezone))))
       .child(row(`connection-home-${c.id}`,"Home",c.openrigHome??"Not set",{font:true,tip:c.openrigHome??undefined}))
-      .when(herdrOffered&&!!onSwitch&&!!c.machine&&/^https?:\/\//.test(c.daemonUrl??""),el=>el.child(div().id(`connection-switch-${c.id}`).role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
-        .focus(el=>el.border_1().border_color(t.accent)).on_click((_e,cx)=>onSwitch(c,cx)).on_key_down((e,cx)=>key(e,cx,cx2=>onSwitch(c,cx2))).child("Use Herdr's connection instead…")))
-      .when(!!onSwitchBack&&String(c.daemonUrl??"").startsWith("herdr://")&&!!c.retainedDaemonUrl,el=>el.child(div().id(`connection-switch-back-${c.id}`).role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
-        .focus(el=>el.border_1().border_color(t.accent)).on_click((_e,cx)=>onSwitchBack(c,cx)).on_key_down((e,cx)=>key(e,cx,cx2=>onSwitchBack(c,cx2))).child("Switch back to the tunnel…")))
-      .child(div().id(`connection-remove-${c.id}`).role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
+      .when(herdrOffered&&!!onSwitch&&!!c.machine&&/^https?:\/\//.test(c.daemonUrl??""),el=>el.child(div().id(`connection-switch-${c.id}`).tooltip("Reach this OpenRig over Herdr's connection instead of the tunnel: asks first").role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
+        .when(!!actionHandles[`connection-switch-${c.id}`],el=>el.track_focus(actionHandles[`connection-switch-${c.id}`]))
+        .focus(el=>el.border_1().border_color(t.accent)).on_mouse_down('left',activation(`switch-${c.id}`).pointer())
+        .on_click(activation(`switch-${c.id}`).click((_e,cx)=>onSwitch(c,cx))).on_key_down(activation(`switch-${c.id}`).key((e,cx)=>key(e,cx,cx2=>onSwitch(c,cx2)))).child("Use Herdr's connection instead…")))
+      // A herdr:// connection whose helper approval is missing or stale (the sidebar's read said so): the review, then that connection's approval.
+      .when(herdrOffered&&!!onApprove&&String(c.daemonUrl??"").startsWith("herdr://")&&state.needsApproval===true,el=>el.child(div().id(`connection-approve-${c.id}`).tooltip(`Check the helper Herdrig uses on ${c.machine ?? "the machine"}, then approve it. Nothing is approved until you choose Approve.`).role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
+        .when(!!actionHandles[`connection-approve-${c.id}`],el=>el.track_focus(actionHandles[`connection-approve-${c.id}`]))
+        .focus(el=>el.border_1().border_color(t.accent)).on_mouse_down('left',activation(`approve-${c.id}`).pointer())
+        .on_click(activation(`approve-${c.id}`).click((_e,cx)=>onApprove(c,cx))).on_key_down(activation(`approve-${c.id}`).key((e,cx)=>key(e,cx,cx2=>onApprove(c,cx2)))).child("Approve helper…")))
+      .when(!!onSwitchBack&&String(c.daemonUrl??"").startsWith("herdr://")&&!!c.retainedDaemonUrl,el=>el.child(div().id(`connection-switch-back-${c.id}`).tooltip("Go back to reaching this OpenRig through its tunnel: asks first").role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
+        .when(!!actionHandles[`connection-switch-back-${c.id}`],el=>el.track_focus(actionHandles[`connection-switch-back-${c.id}`]))
+        .focus(el=>el.border_1().border_color(t.accent)).on_mouse_down('left',activation(`switch-back-${c.id}`).pointer())
+        .on_click(activation(`switch-back-${c.id}`).click((_e,cx)=>onSwitchBack(c,cx))).on_key_down(activation(`switch-back-${c.id}`).key((e,cx)=>key(e,cx,cx2=>onSwitchBack(c,cx2)))).child("Switch back to the tunnel…")))
+      .child(div().id(`connection-remove-${c.id}`).tooltip(c.machine ? `Remove ${c.machine}'s connection: asks first; nothing on ${c.machine} changes` : "Remove this computer's connection: asks first; OpenRig on this computer isn't changed").role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
         .when(!!handles[index],el=>el.track_focus(handles[index]))
         .focus(el=>el.border_1().border_color(t.accent))
-        .on_click((_e,cx)=>onRemove?.(c,cx)).on_key_down((e,cx)=>key(e,cx,cx2=>onRemove?.(c,cx2))).child("Remove…"));
+        .on_mouse_down('left',activation(`remove-${c.id}`).pointer())
+        .on_click(activation(`remove-${c.id}`).click((_e,cx)=>onRemove?.(c,cx))).on_key_down(activation(`remove-${c.id}`).key((e,cx)=>key(e,cx,cx2=>onRemove?.(c,cx2)))).child("Remove…"));
   });
   // Its focus handle is the one after the connections' own: without one, Tab could not reach it and its keys never arrived.
   const addHandle=handles[connections.length];
-  const add=div().id("connection-add-machine").role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
+  const add=div().id("connection-add-machine").tooltip("Add another Herdr machine's OpenRig").role("button").tab_stop(true).px(6).py(3).text_size(12).text_color(t.accent).cursor_pointer()
     .when(!!addHandle,el=>el.track_focus(addHandle))
     .focus(el=>el.border_1().border_color(t.accent))
-    .on_click((_e,cx)=>onAdd?.(cx)).on_key_down((e,cx)=>key(e,cx,cx2=>onAdd?.(cx2))).child("Add a machine…");
+    .on_mouse_down('left',activation('add-machine').pointer())
+    .on_click(activation('add-machine').click((_e,cx)=>onAdd?.(cx))).on_key_down(activation('add-machine').key((e,cx)=>key(e,cx,cx2=>onAdd?.(cx2)))).child("Add a machine…");
   // Up and Down move between blocks, like the other System rows; Enter on a block opens nothing (Remove… and Add a machine… are the controls).
   const move=(event,cx)=>{
     if(event.key!=="up"&&event.key!=="down")return;

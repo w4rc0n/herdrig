@@ -132,7 +132,7 @@ export function connectionConfig(base, conn) {
   const out = { ...(base ?? {}), connectionId: conn.id };
   // Address, machine and home are this connection's own: nothing of another connection's may remain, or a command would run
   // against the wrong daemon or authenticate from the wrong home. What the CLI found for another connection is not this one's.
-  for (const key of ["daemonUrl", "daemonMachine", "openrigHome", "expectedHostId", "daemonUrlSource", "daemonState", "daemonMessage"]) delete out[key];
+  for (const key of ["daemonUrl", "daemonMachine", "openrigHome", "expectedHostId", "daemonUrlSource", "daemonState", "daemonMessage", "retainedDaemonUrl", "transport"]) delete out[key];
   if (conn.daemonUrl) out.daemonUrl = conn.daemonUrl;
   if (conn.machine) out.daemonMachine = conn.machine;
   if (conn.openrigHome) out.openrigHome = conn.openrigHome;
@@ -185,7 +185,8 @@ export function targetConnection(config, target) {
   if ((config.connections ?? []).length > 1 && !hasWrittenAddress(view)) return { ok: false, reason: EXPLICIT_ADDRESS_NEEDED };
   // Another connection's command runs with its own OpenRig home or none at all: the CLI authenticates from the home, and without one
   // it would send the inherited (another daemon's) credential. The legacy connection keeps today's behaviour.
-  if (id !== LEGACY_CONNECTION_ID && !view.openrigHome) return { ok: false, reason: HOME_NEEDED };
+  // Over Herdr's connection the helper runs on the machine with that machine's own OpenRig home: no local home is needed (or used).
+  if (id !== LEGACY_CONNECTION_ID && !view.openrigHome && view.transport !== "herdr" && !String(view.daemonUrl ?? "").startsWith("herdr://")) return { ok: false, reason: HOME_NEEDED };
   return { ok: true, conn, config: view };
 }
 
@@ -245,7 +246,6 @@ export const commandFor = (command, config, target) => `${command}:${(config?.co
 export const operatorCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.operator:${config.connectionId}` : "rig.operator");
 /** The TUI and Needs commands for `config`'s connection: `rig.tui:<conn>` / `rig.needs:<conn>` with several connections (the sidebar answers for that OpenRig, never for the box it happens to draw), the bare name with one. */
 export const tuiCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.tui:${config.connectionId}` : "rig.tui");
-export const needsCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.needs:${config.connectionId}` : "rig.needs");
 /** A request id that is on more than one OpenRig, asked for without a connection the sidebar can use. */
 export const AMBIGUOUS_REQUEST = "That request is on more than one OpenRig. Open it from its row in the sidebar. Nothing was opened.";
 export const qualifyKey = (conn, key) => (conn && conn !== LEGACY_CONNECTION_ID ? `${conn}|${key}` : key);
@@ -504,10 +504,10 @@ export function localDaemonOrigin(value) {
 // One key per loopback ADDRESS, so spellings of it compare equal: localhost, 127.0.0.1, [::1] and 0.0.0.0 with the same
 // scheme and port are one address; any other loopback (127.0.0.4) stays its own.
 export const addressKey = (value) => {
-  const origin = localDaemonOrigin(value) ?? String(value);
+  const origin = localDaemonOrigin(value) || String(value).trim().replace(/\/+$/, ""); // localDaemonOrigin is "" (not null) for a non-loopback address: use the address itself
   const m = /^(https?):\/\/(\[[^\]]+\]|[^:/]+)(?::(\d+))?$/i.exec(origin);
   if (!m) return origin;
-  const host = m[2].toLowerCase(), alias = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(host);
+  const host = m[2].toLowerCase().replace(/\.$/, ""), alias = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0"].includes(host);
   return `${m[1].toLowerCase()}|${alias ? "loopback" : host}|${m[3] ?? (m[1].toLowerCase() === "https" ? "443" : "80")}`;
 };
 
@@ -521,6 +521,19 @@ export async function switchBack(host, before, id) {
   if (!kept) throw new Error("This connection has no tunnel address to switch back to. Nothing was changed.");
   // Another connection may have been given this address since the switch: switching back would put two connections on one address.
   if (raw.connections.some((c, i) => i !== index && c && typeof c === "object" && typeof c.daemonUrl === "string" && addressKey(c.daemonUrl) === addressKey(kept))) throw new Error(`Another connection now uses ${kept}, so this one can't switch back to it. Nothing was changed.`);
+  // The kept tunnel must still reach the same OpenRig: its /healthz names the connection's expected host id, or nothing is written.
+  // A loopback tunnel is read with the plain loopback /healthz read (no bearer, no redirects): the connection's own gated read is scoped to the herdr://
+  // address it still has, so it refuses the tunnel. Only "nothing answers" is said as not answering; any other refusal says what it is.
+  let health = null;
+  try {
+    if (localDaemonOrigin(kept) && typeof host.setupFetch === "function") { const r = await host.setupFetch(`${kept}/healthz`); health = r?.ok ? JSON.parse(await r.text()) : null; }
+    else health = typeof host.health === "function" ? await host.health(kept) : null;
+  } catch (error) {
+    if (error?.code !== "NO_ANSWER" && !(error instanceof SyntaxError)) throw new Error(`Herdr couldn't check the tunnel at ${kept}: ${error?.message ?? error} Nothing was changed.`);
+    health = null;
+  }
+  if (typeof health?.selfHostId !== "string" || !health.selfHostId) throw new Error(`The tunnel at ${kept} doesn't answer, so this connection can't switch back to it. Nothing was changed.`);
+  if (entry.expectedHostId && health.selfHostId !== entry.expectedHostId) throw new Error(`The tunnel at ${kept} now reaches another OpenRig (host ${formatHostId(health.selfHostId)}). Nothing was changed.`);
   const { retainedDaemonUrl: _kept, ...rest } = entry;
   // The herdr:// address it leaves is kept, so tabs Attached over Herdr's connection stay this connection's (one rig == one space).
   const left = herdrAddress(entry.daemonUrl);
@@ -542,12 +555,19 @@ export const codeErrorMessage = (e) => `herdrig couldn't read OpenRig: ${describ
 /** The next step after any message about an error of herdrig's own. */
 /** A refresh that failed because a connection over Herdr's connection needs its approval again (the machine, its account or the helper changed):
  *  said as that, with the one way out it has, never as "couldn't refresh". Anything else gets `fallback`. */
-export const herdrReapprove = (offered = HERDR_CONNECTION_OFFERED) => offered
-  ? "To approve it, switch back to the tunnel in System › Connections, then choose \"Use Herdr's connection instead…\" again."
+export const herdrReapprove = (offered = HERDR_CONNECTION_OFFERED, { single = false, machine = null } = {}) => offered
+  ? (single ? `To approve it again, choose "Approve helper on ${machine ?? "the machine"}…" below.` // one connection: no Connections blocks to point at
+    : "To approve it again, choose \"Approve helper…\" for it in the sidebar or in System › Connections.")
   : "To keep using it, switch back to its tunnel in System › Connections, or put its tunnel address back in openrig/config.json.";
+/** "Approve helper…" while the switch is off: refused before any helper client is made (the same gate as the switch). */
+export const HERDR_APPROVE_NOT_OFFERED = "Approving the helper over Herdr's connection isn't offered in this version. Nothing was approved.";
+/** Whether a read's failure is a herdr:// connection asking for its helper approval again (it carries the machine's confirmation), so
+ *  "Approve helper…" applies. Never for a tunnel or local connection, and never for any other refusal. */
+export const needsHelperApproval = (error, config) => error?.needsConsent === true && !!error?.confirmation
+  && String(config?.daemonUrl ?? "").startsWith("herdr://");
 export const HERDR_REAPPROVE = herdrReapprove();
-export function refreshFailureMessage(error, fallback) {
-  if (error?.needsConsent === true) return `${String(error.message ?? "").trim() || "This connection needs your approval before herdrig uses OpenRig there over Herdr's connection."} ${HERDR_REAPPROVE}`;
+export function refreshFailureMessage(error, fallback, { single = false, machine = null } = {}) {
+  if (error?.needsConsent === true) return `${String(error.message ?? "").trim() || "This connection needs your approval before herdrig uses OpenRig there over Herdr's connection."} ${single ? herdrReapprove(HERDR_CONNECTION_OFFERED, { single, machine }) : HERDR_REAPPROVE}`;
   return fallback;
 }
 export const CODE_ERROR_NEXT = "If it keeps happening, restart Herdr and report this message.";
@@ -594,6 +614,24 @@ export function describeExecTimeout(error, { machine = null, kind = "remote", ac
     return `OpenRig took longer than ${seconds} ${unit} to answer, so herdrig stopped waiting. It may still have done it: check before trying again.`;
   }
   return `OpenRig took longer than ${seconds} ${unit} to answer, so herdrig stopped waiting. Try again in a moment.`;
+}
+
+const EXEC_NOT_STARTED = /^(?:[`'"]?herdr\.exec[`'"]?:\s*)?cannot run /;
+
+/** Whether a thrown error happened before any write left this computer or ran on a machine. */
+export function isKnownUnsentError(error) {
+  if (!error || typeof error !== "object") return EXEC_NOT_STARTED.test(String(error ?? ""));
+  if (error.outcomeUnknown === true) return false;
+  if (error.code === "GATE_REFUSED") return error.dispatched !== true;
+  return error.notSent === true
+    || error.needsConsent === true
+    || error.answered === true
+    || EXEC_NOT_STARTED.test(String(error.message ?? ""));
+}
+
+/** Plain user-facing sentence for an error that happened before any write left. */
+export function unsentErrorMessage(error) {
+  return refreshFailureMessage(error, plainExecError(error, { kind: "read" }));
 }
 
 /** Plain user-facing sentence for a Herdr `exec` error, logging the technical `herdr.exec` detail when rewritten. */

@@ -1,3 +1,4 @@
+import { errorDiagnostic } from "./rig-words.js";
 import { publishedUnder, gateGeneration, gateSameConfig, gateIdentity, gatedFetch } from "./rig-gate.js";
 import { decodeRelayToken } from "./rig-relay-payload.js";
 // Space identity and sidebar size state use public lists and labels, never display names.
@@ -229,6 +230,27 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
   if(expectedHostId&&expectedHostId!==liveId)return refuse("OpenRig's live host identity does not match the expected host. Nothing was opened or relabelled.");
   const liveTerminals=get(host,"terminals");
   const decisions=candidates.map(space=>({space,...classifyRigSpace(host,config,names,space,liveId,liveTerminals)}));
+  // A named host id can be shared by two OpenRigs on this computer (a generated one is unique to one daemon), and so can session names and tmux flags.
+  // The address a space was made with still answering as ANOTHER daemon (another pid) means that space is the other OpenRig's, not this one's moved
+  // address; an answer that doesn't prove it is the same daemon is never adopted without the person's review.
+  const unproven=new Set();
+  // A route with no probe (a page, the palette or the menu routing without the Rig sidebar) can't tell them apart: every ours-by-stamp space waits for the person.
+  if(!machine&&identity.selfHostIdSource!=="generated"&&typeof host.probeHealth!=="function")for(const d of decisions)if(d.kind==="ours-by-stamp")unproven.add(d.space.id);
+  if(!machine&&identity.selfHostIdSource!=="generated"&&typeof host.probeHealth==="function"){
+    const pidOf=value=>Number.isInteger(value?.pid)?value.pid:null;
+    for(const d of decisions.filter(d=>d.kind==="ours-by-stamp")){
+      const origins=[...new Set(d.terminals.filter(t=>t.kind==="ours-by-stamp").map(t=>t.terminal.labels["herdr-openrig.origin"]).filter(Boolean))];
+      for(const origin of origins){
+        let old;
+        try{old=await host.probeHealth(origin);}
+        catch(error){if(!current())return refuse("OpenRig's connection changed. No space was adopted.");if(error?.code!=="NO_ANSWER")unproven.add(d.space.id);continue;} // nothing answers there: the daemon moved
+        if(!current())return refuse("OpenRig's connection changed. No space was adopted.");
+        const was=pidOf(old),now=pidOf(identity);
+        if(was!==null&&now!==null&&was!==now){d.kind="theirs";break;}
+        if(was===null||now===null)unproven.add(d.space.id);
+      }
+    }
+  }
   const excluded=new Set(decisions.filter(d=>d.kind==="theirs").map(d=>d.space.id));
   const scoped={...host,selfHostId:()=>liveId,
     spaces:()=>get(host,"spaces").filter(s=>!excluded.has(s.id)),
@@ -242,7 +264,7 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
   const decision=selected[0];
   const snapshot=JSON.stringify({kind:decision.kind,terminals:decision.terminals});
   const key=JSON.stringify([config?.connectionId??null,decision.space.id]);
-  const automatic=identity.selfHostIdSource==="generated"||sessionVouch(decision.terminals,options);
+  const automatic=!unproven.has(decision.space.id)&&(identity.selfHostIdSource==="generated"||sessionVouch(decision.terminals,options));
   const binding=JSON.stringify([gateIdentity(config),expectedHostId,generation,liveId,identity.selfHostIdSource,automatic,snapshot]);
   // Across mods the gate generation is each mod's own counter, so the shared evidence leaves it out; every caller still checks its own generation through current().
   const sharedBinding=JSON.stringify([gateIdentity(config),expectedHostId,liveId,identity.selfHostIdSource,automatic,snapshot]);
@@ -279,7 +301,7 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
         if(JSON.stringify(classifyRigSpace(host,config,names,decision.space,liveId))!==snapshot)return refuse("The rig space changed during its review. Nothing was relabelled.");
       }
       try{await relabelRigSpaceOrigin(host,config,decision,current);}
-      catch(error){return refuse(String(error?.message??error));}
+      catch(error){return refuse(errorDiagnostic(error));}
       return {ok:true};
       })());
     })};
@@ -394,16 +416,46 @@ function pageOnlyRigSpace(host,context,rigNames,lists=null){
   const tabs=new Set(space.tabs.map(t=>t.id)),inSpace=panes.filter(p=>tabs.has(p.tab));
   return inSpace.length>0&&inSpace.every(p=>!p.terminal&&p.mod==="rig-view");
 }
+/** A space the person keeps for the rig: named exactly after it on this machine, with a Rig page in it, and holding nothing herdrig labelled (their own shells)
+ *  beyond OpenRig's own seat terminals of this rig. An explicit open uses it rather than building a second, numbered space beside it (one rig == one space). It
+ *  is the last resort, after every labelled rule; the callers ask instead when two such spaces exist or two OpenRigs share the machine. A personal space that
+ *  only shares the rig's name (no Rig page), a space holding any terminal herdrig made for a rig, and OpenRig's terminals of another rig are never taken. */
+function namedRigSpace(context,rigNames,terminals,panes){
+  const {space}=context,id=String(space.id),local=id.includes("/")?id.slice(id.indexOf("/")+1):id;
+  if(context.home||local.startsWith("sp-openrig-home-")||!rigNames.has(space.name))return false; // never OpenRig's home space
+  const tabs=new Set((space.tabs??[]).map(t=>t.id));
+  if(!panes.some(p=>tabs.has(p.tab)&&!p.terminal&&p.mod==="rig-view"))return false; // the person shows the rig here; a name alone is not enough
+  return !terminals.some(t=>{
+    if(qualifiedSpace(t)!==space.id)return false;
+    const l=t?.labels??{};
+    if(Object.keys(l).some(k=>k.startsWith("herdr-openrig.")))return true;
+    return Boolean(l["openrig.rig"])&&!rigNames.has(l["openrig.rig"]);
+  });
+}
+/** Immutable structural data for read-only preflight. Lookup policy and vouching are applied separately on every call. */
+export function spaceContextSnapshot(lists,state={}){
+  const byMachine=new Map();
+  return config=>{
+    const machine=config?.daemonMachine||null;
+    if(byMachine.has(machine))return byMachine.get(machine);
+    const spaces=lists.spaces.filter(sp=>(sp.machine??(String(sp.id??'').includes('/')?String(sp.id).split('/')[0]:null))===machine);
+    const prefix=machine?`${machine}/`:null;
+    const terminals=lists.terminals.filter(t=>{const a=String(t?.address??t?.terminal??'');return prefix?a.startsWith(prefix):!a.includes('/');});
+    const value={spaces,terminals,panes:lists.panes,contexts:spaces.length?openRigSpaceContext(spaces,terminals,lists.panes,state):[]};
+    byMachine.set(machine,value);return value;
+  };
+}
 function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,servers=null,strictOrigin=false}={}){
   const expected=rigOrigin(config?.daemonUrl);if(!expected)return {space:null,unconfirmed:null};
   const rigNames=nameSet(names),machine=config?.daemonMachine||null;
   const state=host.routeState?.()??host.shared?.("rig.spaceState")??{};
-  const spacesOnMachine=get(host,"spaces").filter(sp=>(sp.machine??(String(sp.id??"").includes("/")?String(sp.id).split("/")[0]:null))===machine);
+  const snapshot=host.spaceContextSnapshot?.(config);
+  const spacesOnMachine=snapshot?.spaces??get(host,"spaces").filter(sp=>(sp.machine??(String(sp.id??"").includes("/")?String(sp.id).split("/")[0]:null))===machine);
   if(!spacesOnMachine.length)return {space:null,unconfirmed:null};
   const prefix=machine?`${machine}/`:null;
-  const terminals=get(host,"terminals").filter(t=>{const a=String(t?.address??t?.terminal??"");return prefix?a.startsWith(prefix):!a.includes("/");});
-  const panes=get(host,"panes");
-  const onMachine=openRigSpaceContext(spacesOnMachine,terminals,panes,state);
+  const terminals=snapshot?.terminals??get(host,"terminals").filter(t=>{const a=String(t?.address??t?.terminal??"");return prefix?a.startsWith(prefix):!a.includes("/");});
+  const panes=snapshot?.panes??get(host,"panes");
+  const onMachine=snapshot?.contexts??openRigSpaceContext(spacesOnMachine,terminals,panes,state);
   const links=context=>markedOnly?context.markedRigLinks:context.rigLinks;
   // strictOrigin (every path that adopts, marks or builds into a space): a rig terminal with an origin must carry THIS daemon's. One WITHOUT an origin counts only when it carries OUR rig label
   // (herdr-openrig.rig: a space an older herdrig wrote before the origin label existed, which markRigSpace never gave one); a terminal labelled only in OpenRig's native namespace
@@ -432,7 +484,8 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   // The last resort for the open that may adopt (not background activation): the rig's page-only space. One candidate is adopted; several are asked about, never guessed.
   const pageOnly=()=>{
     if(markedOnly)return {space:null,unconfirmed:null};
-    const found=onMachine.filter(context=>pageOnlyRigSpace(host,context,rigNames,{terminals,panes}));
+    const pageOnlySpaces=onMachine.filter(context=>pageOnlyRigSpace(host,context,rigNames,{terminals,panes}));
+    const found=pageOnlySpaces.length?pageOnlySpaces:onMachine.filter(context=>namedRigSpace(context,rigNames,terminals,panes));
     // A page-only space names no daemon (a mod pane carries no label): with two OpenRig connections on this machine
     // it may be the other one's, so it is never silently adopted here. But when a candidate DOES exist, say so as an
     // unconfirmed candidate rather than returning nothing: a caller that asks the person cannot build a second space
@@ -456,7 +509,7 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
 /** What every open path says, and nothing new opens, when the rig's space on a machine can't be confirmed (ONE RIG == ONE SPACE: the grid,
  *  Attach and worker views all ask instead of making a second space). */
 export const unconfirmedSpaceNextSteps=rigName=>`If this space belongs to another OpenRig, leave it open and use that OpenRig's connection. If you choose to replace this OpenRig's existing space, save any work in it before closing it, then open ${rigName} again from the selected connection.`;
-export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl,other=null)=>other?.foreign?`${rigName} already has a space${machine?` on ${machine}`:""} whose terminals were made with ${other.origin??"another address"}, not ${daemonUrl}, so Herdr cannot tell whether it is another OpenRig's or this OpenRig at a new address: nothing was opened, marked or built. ${unconfirmedSpaceNextSteps(rigName)}`:other?.multiConnection?`${rigName} has a rig space that holds only its Rig page, but with more than one OpenRig connection on this machine it may belong to another one of them: nothing was opened or built. Close it if it is not ${rigName}'s, or open ${rigName} from the connection it actually belongs to.`:other?.unvouched?`${rigName} already has a space${machine?` on ${machine}`:""} made of OpenRig's own native seats of a rig of that name, but none of its terminals carry ${daemonUrl}'s address, so Herdr cannot tell whose it is: nothing was opened, marked or built. If it is another OpenRig's, leave it and open ${rigName} from that one. This mod does not open a space of native seats as the rig space yet, so use those seats' own tabs.`:other?.ambiguous?`${rigName} has more than one rig space that holds only its Rig page (${other.ambiguous}), so nothing was opened or built: Herdr cannot tell which one is its space. Close the extra ones and open ${rigName} again.`:`${rigName} already has a space${machine?` on ${machine}`:""}, made with the address ${origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${daemonUrl}, so nothing new was opened. ${unconfirmedSpaceNextSteps(rigName)}`;
+export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl,other=null)=>other?.foreign?`${rigName} already has a space${machine?` on ${machine}`:""} whose terminals were made with ${other.origin??"another address"}, not ${daemonUrl}, so Herdr cannot tell whether it is another OpenRig's or this OpenRig at a new address: nothing was opened, marked or built. ${unconfirmedSpaceNextSteps(rigName)}`:other?.multiConnection?`${rigName} has a space named after it with its Rig page in it, but with more than one OpenRig connection on this machine it may belong to another one of them: nothing was opened or built. Close it if it is not ${rigName}'s, or open ${rigName} from the connection it actually belongs to.`:other?.unvouched?`${rigName} already has a space${machine?` on ${machine}`:""} made of OpenRig's own native seats of a rig of that name, but none of its terminals carry ${daemonUrl}'s address, so Herdr cannot tell whose it is: nothing was opened, marked or built. If it is another OpenRig's, leave it and open ${rigName} from that one. This mod does not open a space of native seats as the rig space yet, so use those seats' own tabs.`:other?.ambiguous?`${rigName} has more than one space named after it with its Rig page in it (${other.ambiguous}), so nothing was opened or built: Herdr cannot tell which one is its space. Close the extra ones and open ${rigName} again.`:`${rigName} already has a space${machine?` on ${machine}`:""}, made with the address ${origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${daemonUrl}, so nothing new was opened. ${unconfirmedSpaceNextSteps(rigName)}`;
 /** The rig the sidebar published (by id or name), for the sessions that vouch for a space of it; null when it isn't known. */
 export function topologyRig(host,refs,config){
   // The sidebar's rows vouch only for the daemon they were read from: the same gate as every other reader of `rig.data` (a refused list or no config reads nothing; other settings' rows are not used).

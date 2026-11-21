@@ -3,7 +3,7 @@
 //
 // Every write runs the CLI as the person (`<name>@external` from `<appHome>/openrig/config.json`), with a seat's inherited
 // OPENRIG_SESSION_NAME removed (rig-lib writeCommand); the CLI keeps owning tokens and sender identity. Results are
-// shown verbatim; an error is not proof nothing happened, so Retry re-reads state before running again.
+// shown in plain words with original diagnostics under Details; an error is not proof nothing happened, so Retry re-reads state before running again.
 //
 // One-click actions (snapshot, follow, open a view, …; rig-lib ONE_CLICK) open no dialog: the Rig sidebar runs them and
 // reports in a toast and the Rig page's status line. Only a failure opens the result dialog here (step.failed), with Retry.
@@ -16,28 +16,34 @@ import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './r
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
 import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat } from "./rig-lib.js";
-import { registerRigRouting, stampRows, ROWS_STALE } from "./rig-lib.js";
-import { targetConnection, pickRig, configOfConnection, adoptConnection, UNKNOWN_CONNECTION, NO_CONNECTION, commandFor, operatorCommandFor, tuiCommandFor, connectionBoxLabel, logExecError, plainExecError, parseExecTimeout } from "./rig-connections.js";
+import { registerRigRouting, stampRows, ROWS_STALE, tabPagesScrub } from "./rig-lib.js";
+import { targetConnection, pickRig, configOfConnection, adoptConnection, UNKNOWN_CONNECTION, NO_CONNECTION, commandFor, operatorCommandFor, tuiCommandFor, connectionBoxLabel, logExecError, plainExecError, parseExecTimeout, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { workerCapabilityText } from "./rig-lib.js";
+import {knownOldProviderViews,readOldProviderViews,oldViewsLocationText,oldViewCandidates} from './rig-old-views.js';
+import {layouts} from 'herdr';
 import { rigOrigin, syncRetainedOrigins } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { AddMachinePanel, AddMachineChooser } from "./rig-add-machine-view.js";
 import { RemoveConnectionPanel } from "./rig-remove-connection-view.js";
 import { SwitchConnectionPanel } from "./rig-switch-connection-view.js";
 import { RemoteOpenRig } from "./rig-openrig-remote.js";
-import { consentOf as openrigConsentOf, consentText as openrigConsentText, HERDR_CONNECTION_OFFERED, SWITCH_NOT_OFFERED } from "./rig-connections.js";
+import { consentOf as openrigConsentOf, consentText as openrigConsentText, HERDR_CONNECTION_OFFERED, SWITCH_NOT_OFFERED, HERDR_APPROVE_NOT_OFFERED } from "./rig-connections.js";
 import { loopbackHealthFetch, machineProbeExec, localDirectoryProbe } from "./rig-remote.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
 import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify as rawNotify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { counted, plainError, statusWord, errorDiagnostic } from "./rig-words.js";
+import {activationPair} from './rig-activation.js';
+import { errorBlock, errorNotice } from "./rig-error-view.js";
+const notify = value => errorNotice(rawNotify, value);
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, gateSameConfig, gateGeneration, CONFIG_CHANGED_OPEN, GateRefusal, gatedOperation, numberedConfigReads } from "./rig-gate.js";
 // A gate refusal is the answer, not a failure to swallow: the person is told it before the menu closes.
 const sayRefusal = (error) => { if (error?.code === "GATE_REFUSED") notify({ title: "OpenRig", body: error.message, level: "warning" }); };
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
-const exec = (command, args, options) => gatedExec(rawExec, command, args, options);
+const exec = (command, args, options) => gatedExec(rawExec, command, args, options, undefined, undefined, appHome());
 const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
 // A Rig sidebar command (`rig.<command>`) is sent only while the Rig sidebar is in the layout (rig-lib sidebarRun): without it,
 // herdr would answer with a raw "unknown command" toast, so a person is told plainly and a background refresh is skipped.
@@ -45,7 +51,7 @@ const run = (name, args) => sidebarRun({ layout, notify }, (n, a) => gatedRun(ra
 const refreshSidebar = () => { if (layoutHasMod(layout(), MOD_IDS.sidebar)) run("rig.refresh"); };
 // A send for a CONNECTION names its gate scope (several OpenRigs: a bare sink refuses). `config` is that connection's own config.
 import { installHerdrTransport } from "./rig-openrig-wire.js";
-const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId);
+const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId, appHome());
 const fetchFor = (config) => (url, init) => gatedFetch(url, init, undefined, config?.connectionId);
 const hcFor = (config) => (args, bytes) => gatedHc(rawHc, args, bytes, undefined, config?.connectionId);
 const runFor = (config) => (name, args) => sidebarRun({ layout, notify }, (n, a) => gatedRun(rawRun, n, a, config?.connectionId), name, args);
@@ -74,12 +80,12 @@ const STACK = "rig-work", PAGE = "rig-page";
 const stamped = (entry) => { const conn = props()?.target?.conn; return entry && conn && !entry.conn && (flatOwner?.config?.connections ?? []).length > 1 ? { ...entry, conn } : entry; };
 /** `from`: the page a Rig page's own dropdown (its Location crumbs, Sections) was opened on. A choice there is a click on that page, like its links and tabs:
  *  a page of the rig on screen stays there, and it never makes a space. Without it the choice is an explicit open. */
-const page = async (entry0, from = null) => {
+const page = async (entry0, from = null, sourceTab = null) => {
   const entry = stamped(entry0);
   setShared("rig.nav", navPush(shared("rig.nav"), entry)); // as before: the page the person asked for is where the Rig page goes when it opens
   const fresh = await freshFileConfig();
   if (fresh.configInvalid) { notify({ title: "OpenRig", body: fresh.configInvalid, level: "warning" }); return { ok: false, reason: fresh.configInvalid }; }
-  return openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology", ...(from ? { fromPage: true, fromEntry: from } : { mayCreate: true }) }, entry);
+  return openOrFocusRigTab({ run, spaces, panes, layout, section: entry?.section ?? "topology", ...(sourceTab ? { sourceTab } : {}), ...(from ? { fromPage: true, fromEntry: from } : { mayCreate: true }) }, entry);
 };
 /** A one-click action's dialog: the title, a two-line error and its hint, Retry and the footer fit unclipped. */
 const RESULT_HEIGHT = 240;
@@ -248,7 +254,7 @@ async function rowConfig(target) {
 }
 async function openSlice(target, file = null) {
   let config;
-  try { config = await rowConfig(target); } catch (e) { return info(target, String(e?.message ?? e)); }
+  try { config = await rowConfig(target); } catch (e) { return info(target, errorDiagnostic(e)); }
   if (!config.daemonUrl) return info(target, config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
   const op = gatedOperation(config.connectionId); // the address above is this operation's: every request below refuses to go once the settings change
   try {
@@ -260,25 +266,25 @@ async function openSlice(target, file = null) {
     const folder = (await slicePaths(config, op)).get(hit.slice);
     if (!folder) return info(target, `OpenRig doesn't say where ${hit.name} is on disk.`);
     return page(fileEntry(`${folder}/${file}`, `${file} · ${hit.name}`));
-  } catch (e) { info(target, String(e?.message ?? e)); }
+  } catch (e) { info(target, errorDiagnostic(e)); }
 }
 
 /** "Open mission…": the project's one mission's card; with several, the Scopes list to pick from. */
 async function openMission(target) {
   let config;
-  try { config = await rowConfig(target); } catch (e) { return info(target, String(e?.message ?? e)); }
+  try { config = await rowConfig(target); } catch (e) { return info(target, errorDiagnostic(e)); }
   if (!config.daemonUrl) return info(target, config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
   try {
     const r = await fetchFor(config)(`${config.daemonUrl}/api/scopes?counts=1`);
     const missions = r.ok ? (await r.json())?.missions ?? [] : [];
     return page(missions.length === 1 ? { section: "scopes", mission: missions[0].mission, name: missions[0].mission } : { section: "scopes" });
-  } catch (e) { info(target, String(e?.message ?? e)); }
+  } catch (e) { info(target, errorDiagnostic(e)); }
 }
 
 export default class RigMenu extends View {
   // The send gate watches this mod's config: every assignment (a reload, a test) is seen at once; null is a constructor's placeholder.
   get config() { return this._config; }
-  set config(value) { this._config = value; observeConfig(value); syncRetainedOrigins(value); }
+  set config(value) { this._config = value; observeConfig(value); syncRetainedOrigins(value); this.herdr?.observe?.(value); } // its own Herdr transport forgets a changed connection's helper and cursor
   init(_p, cx) {
     // OpenRigs over Herdr's connection (herdr:// addresses): the menu's own reads and writes (a pause's review, archive, delete, a new rig) go through
     // the pinned helper on that machine, like the sidebar's and the page's; without this they could never reach a switched OpenRig.
@@ -313,6 +319,7 @@ export default class RigMenu extends View {
       this.openedOn = await freshFileConfig(); // what config.json said when this dialog opened: a later send compares against it
       this.config = await configNow();
       if (this.gone) return;
+      setShared("rig.oldProviderViews",await readOldProviderViews({layout,layouts,readTextFile,currentLayout:()=>shared("layout")},appHome()));
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         const setupConfig=step.conn?configOfConnection(this.config,step.conn):this.config; // the dialog acts for the connection the review was for
         if(!setupConfig){notify({title:"Machine setup",body:"That OpenRig is no longer in the configuration. Nothing was changed.",level:"warning"});this.dismiss();return;}
@@ -327,7 +334,7 @@ export default class RigMenu extends View {
             this.dismiss();
           }});
         if(step.action!=="stop-machine")await this.setupPanel.check(cx,Boolean(step.action==="confirm-machine"&&step.confirmation));
-        cx.timer.after(0,nextCx=>{(step.action==='stop-machine'?this.dialogCancelHandle:this.dialogConfirmHandle)?.focus?.();nextCx.notify();});
+        this.pendingDialogFocus=()=>(step.action==='stop-machine'?this.dialogCancelHandle:this.dialogConfirmHandle)?.focus?.();
       }
       if(step?.action==="add-machine"){
         // A machine with no connection yet. The panel works against ONE Herdr machine the person picked, through one gate, and saves only what it checked.
@@ -349,26 +356,29 @@ export default class RigMenu extends View {
         this.setupPanel=new RemoveConnectionPanel({...this.machineSetupHost(cx,this.config),saved:async()=>{refreshSidebar();}},connection,{
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,
           cancel:()=>this.dismiss(),done:()=>{notify({title:"Connection removed",body:`Removed ${connection.machine??"the connection"}. Its spaces were left as they are.`,level:"info"});this.dismiss();}});
-        cx.timer.after(0,nextCx=>{this.dialogCancelHandle?.focus?.();nextCx.notify();}); // Cancel is focused first
+        this.pendingDialogFocus=()=>this.dialogCancelHandle?.focus?.(); // Cancel is focused first
       }
       // Use Herdr's connection instead of the tunnel, or switch back: one click each, asked here, never automatic.
-      if(step?.action==="switch-connection"||step?.action==="switch-back"){
+      if(step?.action==="switch-connection"||step?.action==="switch-back"||step?.action==="approve-helper"){
         const connection=(this.config?.connections??[]).find(c=>c.id===step.id),conn=connection?configOfConnection(this.config,connection.id):null;
         if(!connection||!conn){notify({title:"Connections",body:"That connection is no longer in the configuration. Nothing was changed.",level:"warning"});this.dismiss();return;}
         // Not offered in this version: no dialog, no helper, no approval. Switching back stays available.
         if(step.action==="switch-connection"&&!HERDR_CONNECTION_OFFERED){notify({title:"Connections",body:SWITCH_NOT_OFFERED,level:"warning"});this.dismiss();return;}
+        const approveOffered=(this.herdrOffered??HERDR_CONNECTION_OFFERED)===true; // `herdrOffered`: for tests; the release's own value otherwise
+        if(step.action==="approve-helper"&&!approveOffered){notify({title:"Connections",body:HERDR_APPROVE_NOT_OFFERED,level:"warning"});this.dismiss();return;}
         const consentFile=`${appHome()}/openrig/openrig-consent.json`;
         // The helper's runs are gated under THIS connection's scope, and its approval lives in its own file (never a spec-save or Attach grant).
         const makeRemote=()=>new RemoteOpenRig({exec:execFor(conn),hc:hcFor(conn),machines,wait:waitWith(cx),appHome:appHome(),writeText:writeTextFile,
           openrigBridgePath:attachRelayPath(appHome(),MOD_IDS.menu).replace(/rig-attach-relay\.cjs$/,"rig-openrig-transport.cjs"),
           readOpenRigConsent:async()=>openrigConsentOf(await readTextFile(consentFile).catch(()=>null),connection.id),
           writeOpenRigConsent:async value=>{const previous=await readTextFile(consentFile).catch(()=>null);return writeTextFile(consentFile,openrigConsentText(previous,connection.id,value).trimEnd(),previous??null);}});
-        const back=step.action==="switch-back";
-        this.setupPanel=new SwitchConnectionPanel(this.machineSetupHost(cx,conn),connection,{direction:back?"back":"herdr",makeRemote,
+        const back=step.action==="switch-back",approve=step.action==="approve-helper";
+        this.setupPanel=new SwitchConnectionPanel(this.machineSetupHost(cx,conn),connection,{direction:approve?"approve":back?"back":"herdr",makeRemote,rig:conn.rig??null,...(approve?{offered:approveOffered,checkOnFirstDraw:true}:{}), // approve: the check starts from the dialog's first draw
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,cancel:()=>this.dismiss(),
-          done:()=>{notify({title:"Connection switched",body:back?`${connection.machine} uses its tunnel again.`:`${connection.machine} now uses Herdr's connection. Its tunnel address is kept for switching back.`,level:"info"});
+          done:(_cx,_conn,result)=>{notify(approve?{title:"Helper approved",body:result?.alreadyApproved?`The helper on ${connection.machine} was already approved. Reading its OpenRig again.`:`The helper on ${connection.machine} is approved. Reading its OpenRig again.`,level:"info"}
+            :{title:"Connection switched",body:back?`${connection.machine} uses its tunnel again.`:`${connection.machine} now uses Herdr's connection. Its tunnel address is kept for switching back.`,level:"info"});
             refreshSidebar();this.dismiss();}});
-        cx.timer.after(0,nextCx=>{this.dialogCancelHandle?.focus?.();nextCx.notify();}); // Cancel is focused first
+        this.pendingDialogFocus=()=>this.dialogCancelHandle?.focus?.(); // Cancel is focused first
       }
 
       if (this.gone) return;
@@ -453,10 +463,10 @@ export default class RigMenu extends View {
       let config;
       try { config = await rowConfig(props().target); }
       catch (e) {
-        this.newSpecs = { error: String(e?.message ?? e) };
-        cx.timer.after(0,nextCx=>{if(!this.newFocusTouched)this.dialogCancelHandle?.focus?.();nextCx.notify();});cx.notify(); return;
+        this.newSpecs = { error: errorDiagnostic(e) };
+        this.pendingDialogFocus=()=>{if(!this.newFocusTouched)this.dialogCancelHandle?.focus?.();};cx.notify(); return;
       }
-      if (!config.daemonUrl) { this.newSpecs = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start')." }; cx.timer.after(0,nextCx=>{if(!this.newFocusTouched)this.dialogCancelHandle?.focus?.();nextCx.notify();});cx.notify(); return; }
+      if (!config.daemonUrl) { this.newSpecs = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start')." }; this.pendingDialogFocus=()=>{if(!this.newFocusTouched)this.dialogCancelHandle?.focus?.();};cx.notify(); return; }
       try {
         const r = await fetchFor(config)(`${config.daemonUrl}/api/specs/library`);
         const body = await r.json();
@@ -464,8 +474,8 @@ export default class RigMenu extends View {
         // Rig specs only: an agent spec isn't a `rig up` source.
         this.newSpecs = list.filter((s) => s && (s.name || s.sourcePath) && (!s.kind || s.kind === "rig"));
         this.newSpec=this.newSpecs[0]??null;
-      } catch (e) { this.newSpecs = { error: String(e?.message ?? e) }; }
-      cx.timer.after(0,nextCx=>{if(!this.newFocusTouched&&this.newMode==='spec')(this.newSpec?this.newSpecHandle:this.dialogCancelHandle)?.focus?.();nextCx.notify();});
+      } catch (e) { this.newSpecs = { error: errorDiagnostic(e) }; }
+      this.pendingDialogFocus=()=>{if(!this.newFocusTouched&&this.newMode==='spec')(this.newSpec?this.newSpecHandle:this.dialogCancelHandle)?.focus?.();};
       cx.notify();
     });
   }
@@ -513,7 +523,7 @@ export default class RigMenu extends View {
     const got = this.newSpecPreviews?.get(spec);
     if (!got || got.loading) return div().text_size(12).text_color(t.dim).child("Reading the spec…");
     if (got.error) return v_flex().gap(4)
-      .child(div().text_size(12).text_color(t.blocked).child(`Couldn't read this spec: ${got.error}`))
+      .child(errorBlock(this,t,"menu-spec-read-error",got.error,{prefix:"Couldn't read this spec: "}))
       .child(div().id("new-rig-spec-retry").text_size(12).text_color(t.accent).cursor_pointer()
         .on_click((_e, cx) => this.loadNewSpecPreview(cx, spec, true)).child("Retry"));
     const data = got.data;
@@ -525,7 +535,7 @@ export default class RigMenu extends View {
         .children(pod.seats.map((seat) => h_flex().gap(6).pl(8).items_center()
           .child(div().min_w(0).truncate().text_size(12).text_color(t.foreground).tooltip(String(seat.lid??"")).child(seat.lid))
           .when(!!seat.runtime || !!seat.model, (el) => el.child(div().px(5).py(1).rounded(4).bg(t.raised).font_family("monospace").text_size(10.5).text_color(t.dim)
-            .child([seat.runtime, seat.model].filter(Boolean).join(" · "))))
+            .child([seat.runtime ? statusWord(seat.runtime,"runtime") : null, seat.model].filter(Boolean).join(" · "))))
           .when(!!seat.profile, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(seat.profile)))))));
   }
 
@@ -566,27 +576,44 @@ export default class RigMenu extends View {
       if (rosterProblem) return { ok: false, notSent: true, kind: "archive", text: rosterProblem };
       let paused = null;
       if (running) {
-        const d = await this.write(this.argsFor(target, "pause"));
+        let d;
+        try { d = await this.write(this.argsFor(target, "pause")); } catch (e) { if (e && typeof e === "object") e.stage = "pause"; throw e; }
         paused = d.json && "sessionsKilled" in d.json ? pauseOutcome(d.json) : null;
         if (!d.ok && !paused?.ok) {
           // The host stopped the pause at its timeout (or it was killed): it may have paused, so never say it wasn't.
           if (d.uncertain) return { ok: false, uncertain: true, kind: "archive", stage: "pause", paused, text: `${target.rig} may have been paused (OpenRig didn't answer in time), and it wasn't archived. Check the rig list before trying again.` };
-          return { ok: false, kind: "archive", paused, text: `${target.rig} wasn't paused, so it wasn't archived: ${d.text || "the CLI gave no reason."}` };
+          return { ok: false, ...(d.notSent ? { notSent: true } : {}), kind: "archive", paused, text: `${target.rig} wasn't paused, so it wasn't archived: ${d.text || "the CLI gave no reason."}` };
         }
       }
-      const a = await this.write(this.argsFor(target, "archive-rig"));
+      let a;
+      try { a = await this.write(this.argsFor(target, "archive-rig")); }
+      catch (e) {
+        if (!running) throw e;
+        if (isKnownUnsentError(e)) {
+          const why = unsentErrorMessage(e).trimEnd().replace(/\s*Nothing was sent\.?$/i, "");
+          return { ok: false, kind: "archive", paused, text: `${target.rig} was paused, but it wasn't archived: ${why || "nothing was archived."}` };
+        }
+        return { ok: false, uncertain: true, kind: "archive", paused, text: `${target.rig} was paused. Archiving ${target.rig} may still have happened (${plainExecError(e, { kind: "read" })}): check the rig list before trying again.` };
+      }
       if (a.ok) {
+        // Only this OpenRig's pages of the rig: another OpenRig's rig of the same name keeps its pages (an unstamped page matches, as before).
+        const sameConn = (entry) => !target.conn || !entry.conn || entry.conn === target.conn;
         const nav = shared("rig.nav");
         if (Array.isArray(nav?.stack)) {
-          const stack = nav.stack.filter(entry => entry.rig !== target.rig && !(target.rigId && entry.rigId === target.rigId) && !(entry.kind === "rig" && entry.name === target.rig));
-          setShared("rig.nav", { ...nav, stack: stack.length ? stack : [{ section: "topology" }] });
+          const stack = nav.stack.filter(entry => !(sameConn(entry) && (entry.rig === target.rig || (target.rigId && entry.rigId === target.rigId) || (entry.kind === "rig" && entry.name === target.rig))));
+          setShared("rig.nav", { ...nav, stack: stack.length ? stack : [this.topologyFallback(target)] });
         }
+        this.scrubTabPages(target, (entry) => sameConn(entry) && (entry.rig === target.rig || (target.rigId && entry.rigId === target.rigId) || (entry.kind === "rig" && entry.name === target.rig)));
         refreshSidebar();
       }
       // The pause already ran: whatever stopped the archive, "Nothing was sent." would be false, so the result says the pause ran and the archive did not.
       // The host stopped the archive at its timeout (or it was killed): it may have completed, so never say it wasn't archived.
       if (!a.ok && a.uncertain) return { ok: false, uncertain: true, kind: "archive", paused, text: `${running ? `${target.rig} was paused. ` : ""}Archiving ${target.rig} didn't answer in time, so it may have been archived: check the rig list before trying again.` };
-      if (running && !a.ok) { const { notSent, ...rest } = a; return { ...rest, kind: "archive", paused, text: `${target.rig} was paused, but it wasn't archived: ${a.text || "the CLI gave no reason."}` }; }
+      if (running && !a.ok) {
+        const { notSent, ...rest } = a;
+        const why = String(a.text ?? "").trimEnd().replace(/\s*Nothing was sent\.?$/i, "");
+        return { ...rest, kind: "archive", paused, text: `${target.rig} was paused, but it wasn't archived: ${why || "the CLI gave no reason."}` };
+      }
       return { ...a, kind: "archive", paused };
     }, { kind: "archive" });
   }
@@ -721,7 +748,8 @@ export default class RigMenu extends View {
     if (this.pending) return;
     this.pending = "Opening";
     const target = props()?.target, from = target?.kind === "page-navigation" && target.from && typeof target.from === "object" ? target.from : null;
-    Promise.resolve(page(entry, from)).catch(sayRefusal).then(() => { this.pending = null; this.dismiss(); });
+    const sourceTab = from && typeof target?.sourceTab === "string" ? target.sourceTab : null; // the Rig tab the dropdown was opened on
+    Promise.resolve(page(entry, from, sourceTab)).catch(sayRefusal).then(() => { this.pending = null; this.dismiss(); });
   }
 
   /** A step that sends something was still running when this dialog closed (Esc, a click beside it, a reload). herdr drops a closed dialog's tasks, so the step's
@@ -749,6 +777,15 @@ export default class RigMenu extends View {
     const id = props()?.overlay; if (id) closeOverlay(id);
   }
 
+  /** The page left when pruning a rig's pages empties the history: Topology, stamped with the OpenRig the archive or delete ran on when several
+   *  are set up (an unstamped page names no OpenRig there, and a later link from it would push another unstamped one). A connection that is set up
+   *  is named even before it can run a command (no address or home written yet); one that isn't stays unstamped rather than guess one. */
+  topologyFallback(target) {
+    const connections = this.config?.connections ?? [];
+    if (connections.length <= 1) return { section: "topology" };
+    const id = target?.conn;
+    return typeof id === "string" && connections.some((c) => c?.id === id) ? { section: "topology", conn: id } : { section: "topology" };
+  }
   /** herdr's teardown (a click beside the dialog closes it): what was typed stays for next time. */
   async close() { this.sayInFlight(); try { this.herdr?.release?.(); } catch (_) {} this.gone = true; this.setupPanel?.expire?.();this.dialogBoundaryTask?.cancel?.();this.setupPanel?.focusTask?.cancel?.();this.dialogHandleTask?.cancel?.();for(const handle of this.dialogButtonHandles??[])handle.release?.();this.cancelMenuReveal?.();this.cancelSpecReveal?.();this.newSpecScroll?.release?.(); this.menuScroll?.release?.(); this.cancelSpecPermission(); this.keepDraft(); }
 
@@ -797,7 +834,7 @@ export default class RigMenu extends View {
     return this.config ?? configNow();
   }
 
-  /** Runs one CLI write as the person; returns { ok, json, text, warning }, plus `uncertain: true` on a failure where the CLI may have run to the end without us hearing (the host stopped it at its timeout, or it was killed: launch and new rig never offer a second run after one), plus `notSent: true` on a pre-send refusal or an authoritative recorded-but-undelivered receipt (never "may still have been delivered"). */
+  /** Runs one CLI write as the person; returns { ok, json, text, warning }, plus `uncertain: true` when it may have finished without us hearing, `notSent: true` only on a pre-send refusal, or `undelivered: true` when OpenRig recorded/retained it without delivery. Only a pre-send refusal re-arms Send. */
   async write(args, options, cx) {
     if (this.gone || !args) return { ok: false, notSent: true, text: ACTION_REFUSED };
     const fresh = await freshFileConfig();
@@ -827,7 +864,7 @@ export default class RigMenu extends View {
     // reports code -1 for a child killed by a signal (or a remote result with no code). A message the CLI printed is not evidence about whether it left. A host that could not start the CLI ("cannot run ...") is not uncertain: nothing ran.
     let raw;
     try { raw = await execFor(conn.config)(cmd.command, cmd.args, { timeout: 180000 }); } catch (e) {
-      if (HOST_STOPPED_CHILD.test(String(e?.message ?? e))) { logExecError(e); return { ok: false, uncertain: true, text: "OpenRig didn't answer in time." }; }
+      if (!isKnownUnsentError(e) && HOST_STOPPED_CHILD.test(String(e?.message ?? e))) { logExecError(e); return { ok: false, uncertain: true, text: "OpenRig didn't answer in time." }; }
       throw e;
     }
     const out = writeOutcome(raw);
@@ -855,10 +892,11 @@ export default class RigMenu extends View {
     cx.spawn(async (cx) => {
       if (this.gone) { this.busy = null; this.running = null; return; }
       try { this.result = await work(cx); } catch (e) {
-        // A gate refusal raised BEFORE anything left (no `dispatched`), and a host that could not start the CLI ("cannot run": nothing ran), are known unsent. One raised after the send, and any other throw,
-        // is not known either way: `uncertain` keeps a launch or create from being offered again (the menu's launch and new rig read it).
-        const rawMsg = String(e?.message ?? e), msg = plainExecError(e, { kind: "read" }), unsent = e?.code === "GATE_REFUSED" && e.dispatched !== true, notStarted = /^(?:[`'"]?herdr\.exec[`'"]?:\s*)?cannot run /.test(rawMsg);
-        this.result = { ok: false, text: msg, ...(kind ? { kind } : {}), ...(unsent || notStarted ? { notSent: true } : { uncertain: true }) };
+        // A refusal raised BEFORE anything left (an undispatched gate refusal, a transport/consent/host refusal before the write ran, or a host that could not start the CLI) is known unsent.
+        // One raised after the send, and any other throw, is not known either way: `uncertain` keeps a launch or create from being offered again (the menu's launch and new rig read it).
+        const unsent = isKnownUnsentError(e);
+        const msg = unsent ? unsentErrorMessage(e) : plainExecError(e, { kind: "read" });
+        this.result = { ok: false, text: msg, ...(kind ? { kind } : {}), ...(e?.stage ? { stage: e.stage } : {}), ...(unsent ? { notSent: true } : { uncertain: true }) };
       }
       this.running = null;
       if (this.gone && this.result?.notSent) { this.busy = null; this.result = null; return; }
@@ -870,11 +908,11 @@ export default class RigMenu extends View {
       if (this.gone) return;
       if (dismissOnSuccess && this.result?.ok) { this.dismiss(); return; }
       cx.notify();
-      if(this.dialogCancelHandle)cx.timer.after(0,nextCx=>{
+      if(this.dialogCancelHandle)this.pendingDialogFocus=()=>{
         if(this.gone)return;
         const openSpace=props()?.step?.action==='new-rig'&&this.result?.ok&&typeof this.result?.createdRig==='string'&&/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(this.result.createdRig);
-        (openSpace?this.dialogOpenSpaceHandle:this.dialogCancelHandle)?.focus?.();nextCx.notify();
-      });
+        (openSpace?this.dialogOpenSpaceHandle:this.dialogCancelHandle)?.focus?.();
+      };
     });
   }
 
@@ -885,7 +923,7 @@ export default class RigMenu extends View {
       const t = complete(props().target, this.config);
       // The confirmation shows the target's own daemon's seats (the write goes there too), never the default one's.
       let conn;
-      try { conn = targetConnection(await this.currentConfig(), t); } catch (e) { this.pause = { error: String(e?.message ?? e) }; cx.notify(); return; }
+      try { conn = targetConnection(await this.currentConfig(), t); } catch (e) { this.pause = { error: errorDiagnostic(e) }; cx.notify(); return; }
       if (!conn.ok) { this.pause = { error: conn.reason }; cx.notify(); return; }
       const config = conn.config;
       if (!config.daemonUrl) { this.pause = { error: config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." }; cx.notify(); return; }
@@ -917,7 +955,7 @@ export default class RigMenu extends View {
       return null;
     } catch (e) {
       return e?.code === "GATE_REFUSED"
-        ? `${String(e.message)} Nothing was sent.`
+        ? `${String(e.message)}${/nothing was sent/i.test(String(e.message))?'':' Nothing was sent.'}`
         : `${target.rig} could not be checked. Nothing was sent. Close this and open it again to confirm again.`;
     }
   }
@@ -941,6 +979,8 @@ export default class RigMenu extends View {
     const caps = this.caps(target); // null: the target's OpenRig isn't read yet; no early refusal (its dispatcher judges it)
     const capReasonOf = (action) => caps ? capabilityDisableReason(action, caps) : null;
     const item = (iconName, label, act, actionName = null, dynamicLabel = false) => {
+      if(["design-view","open-designed-view","cell-split","cell-swap","cell-zoom","close-cell","keyboard"].includes(actionName)||["Take keyboard","Edit layout…","Design worker view…"].includes(label))return;
+      if(label==="New worker view")label="Worker view";
       const capReason = actionName ? capReasonOf(actionName) : null;
       const pReason = actionName && this.config ? personDisableReason(actionName === "reply-answer" ? "reply" : actionName, this.config) : null;
       const reason = capReason ?? pReason;
@@ -956,6 +996,9 @@ export default class RigMenu extends View {
       return out;
     }
     if(target.kind==="sidebar-header"){
+      const old=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
+      if(old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
+        item("x","Close OpenRig's old views",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},340));
       const enabled=(shared("rig.settings")?.notifications??true)!==false;
       item("rig-bell",enabled?"Turn notifications off":"Turn notifications on",()=>{
         setShared("rig.settings",{...(shared("rig.settings")??{}),notifications:!enabled});
@@ -1135,9 +1178,11 @@ export default class RigMenu extends View {
       item("rig-follow", "Follow this slice", () => oneClick({ kind: "follow-target", conn: target.conn, view: `slice:${target.id ?? target.slice}`, name: target.name }, "follow"), "follow");
     }
     if (target.kind === "strip-view") {
+      const old=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
+      if(old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
+        item("x","Close OpenRig's old views",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},340));
       // A worker view's strip pill: close it, follow its rig's active workers, or reach the rig.
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
-      item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
       if (target.rig) item("rig-follow", "Follow active workers", () => oneClick({ ...target, view: `rig:${target.rig}` }, "follow"), "follow");
       this.viewExtras(target.rig, item, target.conn, sidebarItem);
     }
@@ -1157,7 +1202,7 @@ export default class RigMenu extends View {
       out.push({ divider: "" });
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
       this.viewExtras(String(target.target ?? "").startsWith("rig:") ? target.target.slice(4) : null, item, target.conn, sidebarItem);
-      item("x", "Close view", () => oneClick(target, "close-view"), "close-view");
+      // Worker pages use Herdr's native tab close control. Old provider views have the separately confirmed cleanup action.
     }
     if (target.kind === "views") {
       for (const v of target.views ?? []) item("rig-view", v.name, () => selectWorkerView(v.id, { run, layout, views: target.views ?? [], spaces, panes }), null, true);
@@ -1323,6 +1368,7 @@ export default class RigMenu extends View {
   }
   dialogButton(t,element,handle,act,disabled=false,content){
     const index=this.dialogButtonIndex++;
+    const activation=activationPair(this,`dialog-button-${index}`);
     if(!handle&&this.dialogRenderCx){
       this.dialogButtonHandles??=[];
       handle=this.dialogButtonHandles[index];
@@ -1345,8 +1391,8 @@ export default class RigMenu extends View {
       };
     return div().id(`dialog-focus-${index}`).p(2).border(2).border_color('#00000000').rounded(8).flex_none()
       .when(!!handle&&!disabled,el=>el.track_focus(handle)).tab_stop(!disabled)
-      .focus(el=>el.border_color(t.accent)).on_key_down(key)
-      .child(element.on_click((event,cx)=>{if(!disabled)act(event,cx);}).on_key_down(key).when(content!==undefined,el=>el.child(content)));
+      .focus(el=>el.border_color(t.accent)).on_mouse_down('left',activation.pointer()).on_key_down(activation.key(key))
+      .child(element.on_mouse_down('left',activation.pointer()).on_click(activation.click((event,cx)=>{if(!disabled)act(event,cx);})).on_key_down(activation.key(key)).when(content!==undefined,el=>el.child(content)));
   }
 
   adoptionReviewPending() {
@@ -1383,8 +1429,9 @@ export default class RigMenu extends View {
         else if(e.key==="escape"){cx.stop_propagation();this.dismiss();}})
       .children((target.choices ?? []).map((choice,i) => h_flex().id(`page-navigation-${i}`).tab_stop(true).px(8).h(30).gap(12).items_center().rounded(5).cursor_pointer()
         .when(i===(this.navChoiceIndex??0),el=>el.bg(t.selection??t.hover)).hover(el => el.bg(t.hover))
-        .on_click((_e,cx) => this.navigate(choice.entry,cx))
-        .on_key_down((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();this.navigate(choice.entry,cx);}})
+        .on_mouse_down('left',activationPair(this,`page-navigation-${i}`).pointer())
+        .on_click(activationPair(this,`page-navigation-${i}`).click((_e,cx) => this.navigate(choice.entry,cx)))
+        .on_key_down(activationPair(this,`page-navigation-${i}`).key((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();this.navigate(choice.entry,cx);}}))
         .child(div().flex_1().text_size(12.5).text_color(t.foreground).child(choice.label))
         .when(choice.count !== null && choice.count !== undefined, el => el.child(div().text_size(11.5).text_color(t.dim).child(String(choice.count))))));
     if (this.pending) return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
@@ -1425,7 +1472,7 @@ export default class RigMenu extends View {
         : h_flex().id(`rig-menu-${i}`).flex_none().px(8).h(26).gap(8).rounded(5).items_center().text_color(it.disabled ? t.dim : t.foreground)
           .when(i===this.menuIndex,el=>el.bg(t.selection??t.hover)).hover(s=>s.bg(t.hover))
           .on_mouse_move((_e,cx)=>{if(this.menuIndex!==i){this.menuIndex=i;cx.notify();}})
-          .when(!!it.reason, (el) => el.tooltip(it.reason))
+          .when(!!it.reason, (el) => el.tooltip(plainError(it.reason).text))
           .on_click((_e, cx) => this.choose(it, cx))
           .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
           .child(div().flex_1().truncate().when(!!(it.dynamicLabel || it.reason), el=>el.tooltip([String(it.label ?? ""), it.reason].filter(Boolean).join("\n"))).child(it.label))))
@@ -1439,6 +1486,8 @@ export default class RigMenu extends View {
 
   resultView(t, cx, target, step) {
     const r = this.result;
+    const origin = targetConnection(this.config,target);
+    const where = origin.ok ? origin.config.daemonMachine ?? "this computer" : "OpenRig's machine";
     if (this.busy) return div().text_size(12.5).text_color(t.muted).child(`${this.busy}…`);
     if (!r) return null;
     if (step.action === "new-rig" && r.ok) return div().text_size(12.5).child(r.text);
@@ -1446,17 +1495,16 @@ export default class RigMenu extends View {
       const out = deleteOutcome(r.json, target.rig);
       return v_flex().id("delete-result").gap(4)
         .child(div().text_size(13).font_semibold().text_color(out.ok ? t.foreground : t.blocked).child(out.headline))
-        .children(out.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note)));
+        .children(out.notes.map((note,i) => note.startsWith("Error") ? errorBlock(this,t,`delete-note-${i}`,note,{where}) : div().text_size(11.5).text_color(t.dim).child(note)));
     }
     if ((step.action === "delete-rig" || step.action === "archive-rig") && r.kind === "archive") {
       const paused = r.paused;
       return v_flex().id("archive-result").gap(4)
         .child(div().text_size(13).font_semibold().text_color(r.ok ? t.foreground : t.blocked).child(r.ok ? `Archived ${target.rig}` : r.uncertain ? (r.stage === "pause" ? `${target.rig} may have been paused` : `${target.rig} may have been archived`) : `${target.rig} wasn't archived`))
         .when(!!paused, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(paused.headline))
-          .children(paused.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note))))
-        .child(div().text_size(11.5).text_color(r.ok ? t.dim : t.blocked).child(r.ok
-          ? `${target.rig} archived. Restore it any time from Topology → Archived.`
-          : r.text || "It didn't work, and the CLI gave no reason."))
+          .children(paused.notes.map((note,i) => note.startsWith("Error") ? errorBlock(this,t,`archive-pause-note-${i}`,note,{where}) : div().text_size(11.5).text_color(t.dim).child(note))))
+        .child(r.ok ? div().text_size(11.5).text_color(t.dim).child(`${target.rig} archived. Restore it any time from Topology → Archived.`)
+          : errorBlock(this,t,"archive-result-error",r.text || "It didn't work, and the CLI gave no reason.",{where,outcomeUnknown:r.outcomeUnknown || r.uncertain}))
         .when(!r.ok && r.notSent && !/nothing was sent/i.test(String(r.text ?? "")), (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Nothing was sent.")))
         .when(r.ok, (el) => el.child(h_flex().child(this.dialogButton(t,div().id("rig-unarchive").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
           () => { oneClick(target, "unarchive-rig"); this.dismiss(); },false,"Undo"))));
@@ -1466,15 +1514,15 @@ export default class RigMenu extends View {
       const out = pauseOutcome(r.json);
       return v_flex().gap(4)
         .child(div().text_size(13).font_semibold().text_color(out.ok ? t.foreground : t.blocked).child(out.headline))
-        .children(out.notes.map((note) => div().text_size(11.5).text_color(note.startsWith("Error") ? t.blocked : t.dim).child(note)));
+        .children(out.notes.map((note,i) => note.startsWith("Error") ? errorBlock(this,t,`pause-note-${i}`,note,{where}) : div().text_size(11.5).text_color(t.dim).child(note)));
     }
     if (step.action === "resume" && r.json) {
       const out = resumeOutcome(r.json, r.ok);
       const headline = out.ok ? `Resumed ${target.rig}` : out.partial ? `Resumed ${target.rig} · partially` : `${target.rig} wasn't resumed`;
       return v_flex().gap(6)
         .child(div().text_size(13).font_semibold().child(headline))
-        .when(!!out.error, (el) => el.child(div().text_color(t.blocked).child(String(out.error?.fact ?? out.error?.message ?? out.error))))
-        .children((out.notes ?? []).map((note) => div().text_size(11.5).text_color(t.dim).child(note)))
+        .when(!!out.error, (el) => el.child(errorBlock(this,t,"resume-error",out.error?.fact ?? out.error?.message ?? out.error,{where})))
+        .children((out.notes ?? []).map((note,i) => errorBlock(this,t,`resume-note-${i}`,note,{where,tone:t.dim})))
         .children(out.seats.map((s, i) => v_flex().gap(1)
           .child(h_flex().gap(8).items_center()
             .child(svg(icon(s.ok ? "check" : s.status === "failed" ? "x" : "rig-alert")).size(13).flex_none().text_color(s.ok ? t.working : t.blocked))
@@ -1482,15 +1530,16 @@ export default class RigMenu extends View {
             .child(div().flex_1().truncate().text_color(t.muted).tooltip(String(s.label??"")).child(s.label))
             .when(s.needsFresh, (el) => el.child(this.dialogButton(t,div().id(`fresh-${i}`).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().hover((x) => x.bg(t.hover)),null,
               () => dialog({ ...target, logicalId: s.logicalId }, { action: "fresh", confirm: true }, RESULT_HEIGHT),false,"Start fresh…"))))
-          .when(!s.ok && !!s.error, (el) => el.child(div().pl(22).text_size(11.5).text_color(t.dim).child(s.error)))));
+          .when(!s.ok && !!s.error, (el) => el.child(errorBlock(this,t,`resume-seat-error-${i}`,s.error,{where})))));
     }
+    const replyAlreadyWorded = step.action === "reply" && Boolean(r.conflict || r.tokenProtected || r.daemonRefused || r.networkError || r.unconfirmed);
     return v_flex().gap(6)
-      .child(div().text_size(12.5).text_color(r.ok ? t.foreground : t.blocked).child(r.ok ? (r.text || this.doneWords(target, step.action)) : r.text || "It didn't work, and the CLI gave no reason."))
+      .child(r.ok ? div().text_size(12.5).text_color(t.foreground).child(r.text || this.doneWords(target, step.action)) : errorBlock(this,t,"menu-result-error",r.text || "It didn't work, and the CLI gave no reason.",{where,outcomeUnknown:r.outcomeUnknown || r.uncertain}))
       .when(!!r.warning, (el) => el.child(div().text_size(11).text_color(t.dim).child(r.warning)))
       // A refusal that happened before anything left says so, for EVERY action; the uncertain line is only for a request that did leave (the CLI ran, or a refusal came after the send).
       .when(!r.ok && r.notSent && !/nothing was sent/i.test(String(r.text ?? "")),
         (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Nothing was sent.")))
-      .when(!r.ok && !r.notSent, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(step.action === "send" || step.action === "queue"
+      .when(!r.ok && !r.notSent && !r.undelivered && !replyAlreadyWorded, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(step.action === "send" || step.action === "queue"
         ? "It may still have been delivered: check the seat or `rig queue` before trying again."
         : step.action === "reply" ? "It may still have arrived: check the request in Needs-You before answering again."
         : step.action === "change-model" ? `The change may already have been queued: check ${this.changeQueuedFor ? `${this.changeQueuedFor}'s queue` : "the queue it was sent to"} (\`rig queue\`) before queueing it again.`
@@ -1536,7 +1585,10 @@ export default class RigMenu extends View {
     if (RESEND_UNSAFE.has(step.action)) return;
     if (step.action === "delete-rig") { if (this.retryable(step)) this.retryDelete(cx, target, step); return; } // only the delete step has a Retry here (see retryable)
     if (step.action === "pause" || step.action === "resume") {
+      const reviewedSeats = this.pauseSeatIds;
       this.run(cx, "Re-reading the rig", async () => {
+        const rosterProblem = step.action === "pause" ? await this.checkReviewedRoster(target, reviewedSeats, "pausing") : null;
+        if (rosterProblem) return { ok: false, notSent: true, text: rosterProblem };
         const ps = await this.read(["ps", "--nodes", "--rig", target.rig]);
         if (!Array.isArray(ps)) return { ok: false, text: "OpenRig couldn't read the rig's current agents. Nothing was run. Close this and open it again from the list." };
         const running = Array.isArray(ps) ? ps.filter((n) => n.sessionStatus === "running" || n.lifecycleState === "running").length : null;
@@ -1557,11 +1609,26 @@ export default class RigMenu extends View {
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
     if (this.gone || this.busy) return;
+    if(step.action==="close-old-views"){
+      if(this.cleanupQueued)return;
+      if(!layoutHasMod(layout(),MOD_IDS.sidebar)){this.result={ok:false,notSent:true,text:"Open the Rig sidebar, then try again. Nothing was closed."};cx.notify();return;}
+      this.cleanupQueued=true;
+      // Hand off before any await: closing this result must not cancel the confirmed operation or release its transport.
+      const id=`old-views-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      setShared('rig.oldViewsClose',{...(shared('rig.oldViewsClose')??{}),[id]:{createdAt:Date.now(),config:this.openedOn??this.config,views:step.views??[]}});
+      run('rig.close-old-views');
+      this.result={ok:true,text:"Closing old views. The Rig sidebar and System will report the result; you can close this dialog. If no result appears, check the old views before confirming again."};cx.notify();return;
+    }
     if (["send", "queue", "reply"].includes(step?.action) && !this.inputCanSend(step)) return;
     if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.uncertainAttempt) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
     if ((step?.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step?.action)) && !this.reviewReady()) return;
     const assistantReason=assistantActionRefusal(target,step.action);
     if(assistantReason){this.result={ok:false,notSent:true,text:assistantReason};cx.notify();return;}
+    if(['open-view','open-seat','follow','unfollow','prune'].includes(step.action)){
+      if(layoutHasMod(layout(),MOD_IDS.sidebar)){oneClick(target,step.action);this.dismiss();}
+      else{this.result={ok:false,notSent:true,text:"Worker view needs Herdrig's Rig sidebar. Open it, then try again. Nothing was opened."};cx.notify();}
+      return;
+    }
     if(step.action==="confirm-spec-write"){
       if(!step.token)return;
       setShared("rig.specWriteDecisions",{...(shared("rig.specWriteDecisions")??{}),[step.token]:"allow"});
@@ -1636,8 +1703,12 @@ export default class RigMenu extends View {
             const stack = nav.stack.filter((entry) => target.archived
               ? !(sameConn(entry) && target.rigId && entry.rigId === target.rigId)
               : !(sameConn(entry) && (entry.rig === target.rig || (target.rigId && entry.rigId === target.rigId) || (entry.kind === "rig" && entry.name === target.rig))));
-            setShared("rig.nav", { ...nav, stack: stack.length ? stack : [{ section: "topology" }] });
+            setShared("rig.nav", { ...nav, stack: stack.length ? stack : [this.topologyFallback(target)] });
           }
+          const sameConn = (entry) => !target.conn || !entry.conn || entry.conn === target.conn;
+          this.scrubTabPages(target, (entry) => target.archived
+            ? sameConn(entry) && target.rigId && entry.rigId === target.rigId
+            : sameConn(entry) && (entry.rig === target.rig || (target.rigId && entry.rigId === target.rigId) || (entry.kind === "rig" && entry.name === target.rig)));
           refreshSidebar();
         }
         return { ...r, kind: "delete" };
@@ -1750,6 +1821,10 @@ export default class RigMenu extends View {
           revision: target.decisionRevision ?? null,
         }, gatedFetch);
         if (r.ok) refreshSidebar();
+        if (!r.ok && r.code === "decision_revision_changed" && !r.partial) {
+          const msg = "The request changed since you opened it. Open it in Needs-You to read the latest version before answering.";
+          return { ...r, message: msg, text: msg };
+        }
         return r;
       });
       return;
@@ -1774,6 +1849,16 @@ export default class RigMenu extends View {
     const several = (this.config?.connections?.length ?? 0) > 1;
     if (several && !(target?.conn && configOfConnection(this.config, target.conn))) { notify({ title: "Open rig space", body: target?.conn ? UNKNOWN_CONNECTION : NO_CONNECTION, level: "warning" }); return null; }
     return commandFor("rig.space", target?.conn ? { ...this.config, connectionId: target.conn } : this.config, rig);
+  }
+
+  /** An archived or deleted rig's pages leave every Rig tab's own history. A tab left with nothing shows that OpenRig's Topology, never a page
+   *  that names no OpenRig when several are set up. */
+  scrubTabPages(target, drop) {
+    const all = shared("rig.tabPages");
+    if (!all || typeof all !== "object") return;
+    const several = (this.config?.connections?.length ?? 0) > 1;
+    const next = tabPagesScrub(all, drop, { conn: several ? target.conn ?? null : null, several });
+    if (next !== all) setShared("rig.tabPages", next);
   }
 
   changeModelView(t, cx, target) {
@@ -1830,7 +1915,7 @@ export default class RigMenu extends View {
         .child(div().id("swap-routing").text_size(11).text_color(t.dim).child(
           plan.recipient
             ? `Routes via ${plan.recipientLogicalId} (${plan.recipient}) · OpenRig runs ${plan.cliPreview}`
-            : (plan.routingError ?? "No lead or advisor seat found.")
+            : plainError(plan.routingError ?? "No lead or advisor seat found.").text
         )))
       .when(plan.requiresConfirm, (el) => el.child(h_flex().id("swap-confirm").gap(6).items_center().cursor_pointer()
         .on_click((_e, cx) => { this.swapConfirmed = !this.swapConfirmed; this.swapError = null; cx.notify(); })
@@ -1839,7 +1924,7 @@ export default class RigMenu extends View {
         .child(div().text_size(12).child(plan.continuity === "fresh"
           ? "I understand switching to or from agy starts a fresh session"
           : "I understand switching harnesses hands over to a new session"))))
-      .when(!!this.swapError, (el) => el.child(div().id("swap-error").text_size(11.5).text_color(t.blocked).child(this.swapError)));
+      .when(!!this.swapError, (el) => el.child(div().id("swap-error").child(errorBlock(this,t,"swap-error-detail",this.swapError))));
   }
 
   /** The designer's body: seat checklist + '+ Add shell pane' on the left; live-reflowing preview grid with continuous divider-drag on the right; separated bottom bar. */
@@ -2054,7 +2139,7 @@ export default class RigMenu extends View {
           .child(toggle("design-save-toggle", "Save as a named view", this.saveNamed, () => { this.saveNamed = !this.saveNamed; }))
           .child(toggle("design-follow-toggle", "Follow active workers", this.followWorkers, () => { this.followWorkers = !this.followWorkers; }))
           .when(!!this.designStatus && !this.designError, (el) => el.child(div().text_color(t.dim).child(this.designStatus)))
-          .when(!!this.designError, (el) => el.child(div().text_color(t.blocked).child(this.designError)))));
+          .when(!!this.designError, (el) => el.child(errorBlock(this,t,"design-error",this.designError)))));
   }
 
   /** Continuous divider drag in the designer preview canvas. */
@@ -2165,6 +2250,7 @@ export default class RigMenu extends View {
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
+      : step.action === "close-old-views" ? "Close OpenRig's old worker views?"
       : step.action === "spaces-list" ? (step.copy?.title ?? "Spaces list")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? `Copy built-in specs on ${step.confirmation?.machine}?` : `Save specs on ${step.confirmation?.machine}?`)
       : step.action === "adopt-address-space" ? "Use this existing rig space?"
@@ -2174,7 +2260,8 @@ export default class RigMenu extends View {
       : step.action === "rebuild-space" ? `Rebuild ${target.rig}'s tiles?` : actionTitle(target, step.action);
     const go = (cx) => this.go(cx, target, step);
     let body = null;
-    if(step.action==="confirm-spec-write"){
+    if(step.action==="close-old-views")body=div().text_size(12).text_color(t.muted).child(oldViewsLocationText(step.views??[]));
+    else if(step.action==="confirm-spec-write"){
       const c=step.confirmation??{};
       const exact=(label,value,id)=>h_flex().gap(8).items_center()
         .child(div().w(100).flex_none().text_color(t.muted).child(label))
@@ -2249,19 +2336,19 @@ export default class RigMenu extends View {
     } else if (step.action === "change-model" && !this.result?.ok && !this.busy) {
       body = this.changeModelView(t, cx, target);
     } else if (step.action === "info") {
-      body = div().text_color(t.muted).child(step.text ?? "");
+      body = errorBlock(this,t,"menu-info",step.text ?? "",{where:"this computer"});
     } else if (step.action === "reply" && this.inputCanSend(step) && target.summary && target.summary !== target.id) {
       body = div().text_color(t.muted).child(target.summary);
     } else if (step.action === "pause" && !this.result && !this.busy) {
       const p = this.pause;
-      body = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? div().text_color(t.blocked).child(p.error)
+      body = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? errorBlock(this,t,"pause-error",p.error)
         : v_flex().gap(3)
-          .child(div().child(`This stops all ${p.total} agents. Work in progress stops with them:`))
+          .child(div().child(p.total === 0 ? "It has no running agents, so nothing is stopped." : `${p.total === 1 ? "This stops its one agent." : `This stops all ${counted(p.total, "agent")}.`} Work in progress stops with them:`))
           .children(p.busy.map((s) => h_flex().gap(8).child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().tooltip(String(s.logicalId??"")).child(s.logicalId))
             .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))))
           .child(div().text_color(t.dim).child("OpenRig snapshots first (best effort). Resume brings back each conversation where the harness allows."));
     } else if (step.action === "archive-rig" && !this.result && !this.busy) {
-      body = !this.pause ? div().text_color(t.muted).child("Reading the rig…") : this.pause.error ? div().text_color(t.blocked).child(this.pause.error)
+      body = !this.pause ? div().text_color(t.muted).child("Reading the rig…") : this.pause.error ? errorBlock(this,t,"delete-pause-error",this.pause.error)
         : div().text_color(t.muted).child(this.rigRunning(target)
         ? `It pauses its agents${this.pause?.total != null ? ` (${this.pause.total})` : ""}, takes a snapshot first (best effort), and hides the rig from the list. Nothing is deleted. You can restore it any time from Archived.`
         : "It hides the stopped rig from the list. Nothing is deleted. You can restore it any time from Archived.");
@@ -2296,6 +2383,7 @@ export default class RigMenu extends View {
       : null;
     const confirmLabel = step.action === "change-model"
       ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
+      : step.action === "close-old-views" ? "Close old views"
       : step.action === "spaces-list" ? (step.copy?.confirm ?? "Change")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? "Allow built-in copies" : "Allow spec saves")
       : step.action === "adopt-address-space" ? "Use it"
@@ -2389,7 +2477,7 @@ export default class RigMenu extends View {
     const p = this.pause;
     const seats = p?.seats ?? [];
     const what = p && !p.error ? `${target.rig}'s ${seats.length} seat${seats.length === 1 ? "" : "s"}` : `every seat of ${target.rig}`;
-    const list = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? div().text_color(t.blocked).child(p.error)
+    const list = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? errorBlock(this,t,"rig-roster-error",p.error)
       : v_flex().id("delete-seats").gap(3).children(seats.map((s, i) => h_flex().id(`delete-seat-${i}`).gap(8).items_center()
         .child(statusMarkElement({ div, svg }, t, s.status ?? s.tone, { iconOf: icon })).child(div().w(130).truncate().tooltip(String(s.logicalId??"")).child(s.logicalId))
         .child(div().text_color(t.muted).child(`${s.word}${s.owned ? ` · ${s.owned} owned item${s.owned === 1 ? "" : "s"}` : ""}`))));
@@ -2414,7 +2502,7 @@ export default class RigMenu extends View {
     const createReason = seat ? capabilityDisableReason("create-rig", this.caps(props()?.target)) : null;
     const specs = this.newSpecs;
     const specList = !specs ? div().text_color(t.muted).child("Reading the spec library…")
-      : specs.error ? div().text_color(t.blocked).child(specs.error)
+      : specs.error ? errorBlock(this,t,"new-rig-specs-error",specs.error)
       : !specs.length ? div().text_color(t.muted).child("The spec library has no rig specs. Add one to the library, or make a one-seat rig.")
       : v_flex().id("new-rig-specs").gap(2).h(this.newExpandedSpec ? 360 : 132).flex_none().overflow_y_scrollbar().mode("always").track_scroll(this.newSpecScroll)
         .on_size_change((_size,cx)=>{this.newSpecScroll?.scroll_to_item(this.newSpecFocus);cx.notify();})
@@ -2441,7 +2529,7 @@ export default class RigMenu extends View {
       .when(seat, (el) => el.child(field("Name", this.rigName))
         .when(!!this.newProblem && this.newProblemField === "name", x => x.child(div().id("new-rig-name-error").text_size(11.5).text_color(t.blocked).child(this.newProblem)))
         .child(v_flex().gap(3).child(label("Runtime")).child(h_flex().id("new-rig-runtimes").gap(4)
-          .children(NEW_RIG_RUNTIMES.map((r) => pill(`new-rig-runtime-${r}`, r, this.newRuntime === r, () => { this.newRuntime = r; })))))
+          .children(NEW_RIG_RUNTIMES.map((r) => pill(`new-rig-runtime-${r}`, statusWord(r,"runtime"), this.newRuntime === r, () => { this.newRuntime = r; })))))
         .child(field("Working folder", this.folder))
         .when(!!this.newProblem && this.newProblemField === "folder", x => x.child(div().id("new-rig-folder-error").text_size(11.5).text_color(t.blocked).child(this.newProblem)))
         .when(!!createReason, (x) => x.child(div().text_size(11.5).text_color(t.blocked).child(createReason))))
@@ -2460,6 +2548,7 @@ export default class RigMenu extends View {
       if(!completedConfig||fresh.configInvalid||fresh.connectionsRefused||!sameDialogConfig(completedConfig,fresh,config.connectionId))throw new Error(CONFIG_CHANGED_OPEN);
     };
     return {exec:execFor(config),hc:hcFor(config),machines,beforeApprove,setupFetch:loopbackHealthFetch(globalThis.fetch.bind(globalThis),(ms,fn)=>cx.timer.after(ms,fn)),relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:waitWith(cx),
+      stillChosen:currentChoice, // Approve helper: the settings still name the connection this dialog opened on
       localFolderExists:localDirectoryProbe(execFor(config)),localHome:()=>home(),
       machineFolders:name=>[...(spaces()??[]).filter(s=>s?.machine===name).map(s=>s.folder),...(panes()??[]).filter(p=>typeof p?.pane==="string"&&p.pane.startsWith(`${name}/`)).map(p=>p.cwd)],
       health:async url=>{const r=await fetchFor(config)(`${url}/healthz`);if(!r.ok)throw new Error("Cannot read the tunnel's OpenRig health.");return r.json();},
@@ -2489,8 +2578,17 @@ export default class RigMenu extends View {
   render(cx) {
     const t = theme();
     const p = props() ?? {};
+    // Async completions request focus; only the dialog's own draw creates its timer.
+    if(this.pendingDialogFocus){const focus=this.pendingDialogFocus;this.pendingDialogFocus=null;this.dialogFocusTask?.cancel?.();this.dialogFocusTask=cx.timer.after(0,next=>{this.dialogFocusTask=null;if(this.gone)return;focus();next.notify();});}
     if(this.setupPanel)return this.setupPanel.render(t,cx);
-    if(p.step&&["confirm-machine","setup-machine","stop-machine","add-machine","remove-connection","switch-connection","switch-back"].includes(p.step.action))return div().p(14).child("Checking OpenRig configuration…");
+    if(p.step&&["confirm-machine","setup-machine","stop-machine","add-machine","remove-connection","switch-connection","switch-back","approve-helper"].includes(p.step.action)){
+      this.dialogFirstControl=this.dialogLastControl=this.dialogCancelHandle;
+      return div().id('machine-config-loading').p(14).key_context('RigDialog')
+        .on_action('rig-dialog-next',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{}},cx))
+        .on_action('rig-dialog-prev',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{shift:true}},cx))
+        .on_key_down((e,cx)=>this.dialogTab(e,cx))
+        .when(!!this.dialogCancelHandle,el=>el.track_focus(this.dialogCancelHandle).tab_stop(true)).child("Checking OpenRig configuration…");
+    }
     if (!p.target) return div();
     const target = complete(p.target, this.config);
     this.capsDraw = new Map();

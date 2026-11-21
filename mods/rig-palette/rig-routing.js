@@ -1,5 +1,12 @@
+import { errorDiagnostic } from "./rig-words.js";
 // All explicit opens and background grid reconciliation pass through this coordinator.
-import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers } from "./rig-lib.js";
+import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn } from "./rig-lib.js";
+/** The page a Rig tab shows: its own history's top, else the page the router last sent it, else (one OpenRig only) the last page opened anywhere. */
+function tabPageOf(host,config,tab){
+  const own=host.shared?.("rig.tabPages")?.[tab]?.stack?.at(-1)??host.shared?.("rig.pageRoutes")?.[tab];
+  if(own)return own;
+  return (config?.connections?.length??0)>1?{section:"topology",...(config?.connectionId?{conn:config.connectionId}:{})}:host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+}
 import { openRigSpaceContext, resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, unconfirmedSpaceNextSteps, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue, prepareRigSpaceAdoption } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
 import { LEGACY_CONNECTION_ID, pickRig, AMBIGUOUS_NAME, qualifyKey, spaceStatusKey } from "./rig-connections.js";
@@ -47,9 +54,9 @@ export function migrationSourceMatches(host,config,context){
     if(labels['herdr-openrig.origin']||labels['herdr-openrig.host'])matched=true;
   }
   for(const link of context.rigLinks??[])if(link.origin){if(rigOrigin(link.origin)!==expected)return false;matched=true;}
-  const routes=host.shared?.('rig.pageRoutes')??{};
+  const routes=host.shared?.('rig.pageRoutes')??{},tabPages=host.shared?.('rig.tabPages')??{};
   for(const page of context.pages??[]){
-    const entry=routes[page.tab]??page.props?.entry??page.props;
+    const entry=tabPages[page.tab]?.stack?.at(-1)??routes[page.tab]??page.props?.entry??page.props;
     if(entry?.conn&&entry.conn!==(config?.connectionId??LEGACY_CONNECTION_ID))return false;
   }
   for(const [key,id]of Object.entries(state(host).homeSpaces??{})){
@@ -142,7 +149,7 @@ export async function forwardRigOpen(host, request) {
       try { host.run(`rig.route:${id}`); dispatched=true; }
       catch(error){
         const pending={...(host.shared("rig.routeRequests")??{})};delete pending[id];host.setShared("rig.routeRequests",pending);
-        return fail(String(error?.message??error));
+        return fail(errorDiagnostic(error));
       }
     }
     // A reply is written only by acceptRigOpen, which refuses an expired request: any reply here was written in time, even when
@@ -195,7 +202,7 @@ export async function moveMigrationPages(host,config,request) {
     try{
       const checked=pageMigration(host,config,request.spaceId,request.tabId);
       if(!checked||checked.pageFingerprint!==request.pageFingerprint)return fail("The tab changed. Review it again before moving its Rig page.");
-      const entry=host.shared?.("rig.pageRoutes")?.[request.tabId]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+      const entry=tabPageOf(host,config,request.tabId);
       const destination=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
       if(!destination.ok)return destination;
       const current=pageMigration(host,config,request.spaceId,request.tabId);
@@ -210,7 +217,7 @@ export async function moveMigrationPages(host,config,request) {
         remaining.splice(remaining.findIndex(p=>p.pane===page.pane),1);
       }
       return {ok:true,space:destination.space,terminalPanesKept:true};
-    }catch(error){return fail(String(error?.message??error));}
+    }catch(error){return fail(errorDiagnostic(error));}
   })();
   pageMoveJobs.set(key,task);
   try{return await task;}finally{if(pageMoveJobs.get(key)===task)pageMoveJobs.delete(key);}
@@ -279,7 +286,7 @@ export async function migrateRigTabs(host, config, spaceId) {
         left.push({...checked,...(page?{pageOnly:true,pageFingerprint:page.pageFingerprint,
           reason:checked.blockedPane?`${checked.blockedPane} in ${checked.name} stays here; you can move just the Rig page`:"other panes stay here; you can move just the Rig page"}:{})});continue;
       }
-      const entry=host.shared?.("rig.pageRoutes")?.[tab]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+      const entry=tabPageOf(host,config,tab);
       const result=await routeOpen({...host,routeOwner:true},config,checked.panes.some(p=>p.mod===MOD_IDS.view)
         ?{kind:"page",entry,home:true}:{kind:"tui"});
       if(!result.ok){left.push({...checked,ok:false,replaceable:false,reason:result.reason});continue;}
@@ -290,7 +297,7 @@ export async function migrateRigTabs(host, config, spaceId) {
         left.push({...checked,ok:false,replaceable:false,pendingClose:true,destination:result.space,reason:"its destination opened, but closing the original tab was not confirmed"});continue;
       }
       moved.push({...checked,destination:result.space});
-    }catch(error){left.push({tabId:tab,name:list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.find(t=>t.id===tab)?.name||tab,replaceable:false,reason:String(error?.message??error)});}
+    }catch(error){left.push({tabId:tab,name:list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.find(t=>t.id===tab)?.name||tab,replaceable:false,reason:errorDiagnostic(error)});}
   }
   let error=null;
   if(!left.length)try{
@@ -305,7 +312,7 @@ export async function replaceMigrationTab(host,config,request) {
   const checked=await inspectMigrationTab(host,config,request.spaceId,request.tabId);
   if(!checked.replaceable||checked.fingerprint!==request.fingerprint)return fail("The original tab changed. Review it again before replacing it.");
   if(checked.panes.some(p=>p.mod===MOD_IDS.view)){
-    const entry=host.shared?.("rig.pageRoutes")?.[request.tabId]??host.shared?.("rig.nav")?.stack?.at(-1)??{section:"topology"};
+    const entry=tabPageOf(host,config,request.tabId);
     const page=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
     if(!page.ok)return page;
   }
@@ -451,7 +458,7 @@ async function retrySpacePreparation(host,config){
     }
     return null;
   }catch(error){
-    return {ok:false,retryable:true,preparationFailed:true,reason:String(error?.message??error)};
+    return {ok:false,retryable:true,preparationFailed:true,reason:errorDiagnostic(error)};
   }
 }
 
@@ -491,7 +498,10 @@ async function home(host,config,needTui=true,mayCreate=true){
     // a key an earlier version wrote) is this connection's own to find, as in v0.4.7: hiding it built a second home space for the same OpenRig.
     // The own entry is left out by ID, never by key: on a default install its entry has no address (key ["",null]) while the live key carries the address the CLI found.
     const siblingKeys=new Set((config?.connections??[]).filter(c=>c?.id!==config?.connectionId).map(c=>homeKey({daemonUrl:c?.daemonUrl,daemonMachine:c?.machine??c?.daemonMachine}))); siblingKeys.delete(key); // and never this connection's own key, even when a hand-written list gives another entry the same address
-    const otherHomes=new Set(Object.entries(state(host).homeSpaces??{}).filter(([k])=>siblingKeys.has(k)).map(([,id])=>id));
+    const homes=state(host).homeSpaces??{},legacyId=state(host).homeSpace;
+    const otherHomes=new Set(Object.entries(homes).filter(([k])=>siblingKeys.has(k)).map(([,id])=>id));
+    if(legacyId&&(config?.connectionId??LEGACY_CONNECTION_ID)!==LEGACY_CONNECTION_ID&&!Object.values(homes).includes(legacyId)
+      &&(config?.connections??[]).some(c=>c?.id===LEGACY_CONNECTION_ID&&siblingKeys.has(homeKey({daemonUrl:c?.daemonUrl,daemonMachine:c?.machine??c?.daemonMachine}))))otherHomes.add(legacyId);
     const candidates=contexts(host).filter(c=>!otherHomes.has(c.id));
     const multiple=(config?.connections??[]).filter(c=>(c.machine??c.daemonMachine??null)===machine).length>1;
     const liveHost=hostLabelValue(remote?.selfHostId??(typeof host.selfHostId==='function'?host.selfHostId():null));
@@ -506,7 +516,7 @@ async function home(host,config,needTui=true,mayCreate=true){
       const found=homeCandidate(candidates,config,{hostId:remote?.selfHostId});
       if(found.unconfirmed)return fail(`OpenRig's home space on ${machine} was made with the address ${found.unconfirmed.origin??"an earlier one"}. Herdr could not confirm it is the same OpenRig as ${config.daemonUrl}, so no second home was opened. ${unconfirmedSpaceNextSteps("OpenRig")}`);
       if(found.context){
-        try{await markHomeSpace(host,config,found.terminals,{hostId:remote?.selfHostId});}catch(error){return fail(String(error?.message??error));}
+        try{await markHomeSpace(host,config,found.terminals,{hostId:remote?.selfHostId});}catch(error){return fail(errorDiagnostic(error));}
         known=found.context;space=known.space;for(const t of found.terminals)adopt.add(t.address);
         await save(host,{...legacyHome(config,space.id),homeSpaces:{...(state(host).homeSpaces??{}),[key]:space.id}});
       }
@@ -648,12 +658,23 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   // have moved on while the machine was checked); the note says why the rig's own space didn't open.
   // The page is still recorded as this rig's in-place page in the Rig tab of the space it was asked from (its notice, and no space is built for the rig
   // while it is open), without selecting that tab.
-  if(retryFailure&&!destination&&request.stayIfNoSpace&&!request.home){
+  // The page as it is shown: with several OpenRigs it names the one it was opened for.
+  const multi=(config?.connections?.length??0)>1,baseEntry=request.entry ?? {section:"topology"};
+  const entry=multi&&config?.connectionId&&!baseEntry.conn?{...baseEntry,conn:config.connectionId}:baseEntry;
+  // The Rig tab a page that stays goes onto: the one it was asked from when it is in the space it was asked from, else that space's pick.
+  const stayTab=from=>{
+    const fromTabs=from?list(host,"panes").filter(p=>p.mod===MOD_IDS.view&&(from.tabs??[]).some(t=>t.id===p.tab)).map(p=>p.tab):[];
+    return fromTabs.includes(request.sourceTab)?request.sourceTab:pickRigTab(from,fromTabs,host.shared?.("rig.tabPages")??{});
+  };
+  // A machine space that shows one OpenRig takes no other OpenRig's page (pushTabPage refuses it): the page never stays in one, and no fallback picks one.
+  const foreignMachine=space=>{const own=machineSpaceConn(config,space);return Boolean(own&&entry.conn&&entry.conn!==own);};
+  const askedFrom=list(host,"spaces").find(s=>s.id===request.sourceSpace);
+  if(retryFailure&&!destination&&request.stayIfNoSpace&&!request.home&&!foreignMachine(askedFrom)){
     const reason=retryFailure.reason||cachedStatus?.reason||"the rig's space is not reachable";
     const from=list(host,"spaces").find(s=>s.id===request.sourceSpace);
-    const viewTab=from?list(host,"panes").find(p=>p.mod===MOD_IDS.view&&(from.tabs??[]).some(t=>t.id===p.tab))?.tab:null;
+    const viewTab=stayTab(from);
     if(viewTab){
-      host.setShared?.("rig.pageRoutes",{...(host.shared?.("rig.pageRoutes")??{}),[viewTab]:request.entry??{section:"topology"}});
+      pushTabPage(host,viewTab,entry,{spaceConn:machineSpaceConn(config,from)});
       await save(host,{inPlaceOpen:withInPlaceOpen(state(host),targetRigId,config?.connectionId,{at:Date.now(),reason,rigName:targetRigName,space:from.id,tab:viewTab})});
     }
     return {ok:true,stayed:true,inPlace:true,...(viewTab?{space:from.id,tab:viewTab}:{}),note:inPlaceFallbackNote(targetRigName,reason),reason};
@@ -661,9 +682,10 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   if(retryFailure&&!destination){
     const spacesNow=list(host,"spaces"),panesNow=list(host,"panes");
     const activeSpace=spacesNow.find(s=>s.id===request.sourceSpace)??spacesNow.find(s=>s.active);
-    const activeHasView=activeSpace&&panesNow.some(p=>p.mod===MOD_IDS.view&&(activeSpace.tabs??[]).some(t=>t.id===p.tab));
+    const activeHasView=activeSpace&&!foreignMachine(activeSpace)&&panesNow.some(p=>p.mod===MOD_IDS.view&&(activeSpace.tabs??[]).some(t=>t.id===p.tab));
     destination=activeHasView?activeSpace
-      :contexts(host).find(c=>c.home&&(!config?.daemonMachine||spaceMachine(c.space)!==config.daemonMachine))?.space??activeSpace??spacesNow[0]??null;
+      :contexts(host).find(c=>c.home&&!foreignMachine(c.space)&&(!config?.daemonMachine||spaceMachine(c.space)!==config.daemonMachine))?.space
+        ??[activeSpace,...spacesNow].find(s=>s&&!foreignMachine(s))??null;
     if(!destination&&!config?.daemonMachine){
       const result=await home(host,config,false,request.mayCreate===true||request.home===true);if(!result.ok)return result;
       destination=list(host,"spaces").find(s=>s.id===result.space);
@@ -671,13 +693,16 @@ async function perform(host,config,request,rig,key,ambiguous=false){
     if(!destination)return fail(retryFailure.reason||cachedStatus?.reason||"OpenRig's destination space is not reachable.");
   }
   // Asked from a Rig page on screen, for a rig that has no space of its own: the page opens in that Rig tab, in the space in view, not in the home space.
-  if(!destination&&request.stayIfNoSpace&&!request.home)return {ok:true,stayed:true};
+  if(!destination&&request.stayIfNoSpace&&!request.home&&!foreignMachine(askedFrom)){
+    const from=askedFrom,viewTab=stayTab(from);
+    if(viewTab)pushTabPage(host,viewTab,entry,{spaceConn:machineSpaceConn(config,from)});
+    return {ok:true,stayed:true,...(viewTab?{space:from.id,tab:viewTab}:{})};
+  }
   if(!destination){
     const result=await home(host,config,false,request.mayCreate===true||request.home===true); if(!result.ok) return result;
     destination=list(host,"spaces").find(s=>s.id===result.space);
   }
   if(!destination) return fail("OpenRig's destination space is no longer open. Try again.");
-  const entry=request.entry ?? {section:"topology"};
   const show=async()=>{
   // This page job may have waited behind another one for the same destination: a connections list installed meanwhile refuses it before its first side effect.
   const live=host.currentConfig?.();
@@ -686,15 +711,33 @@ async function perform(host,config,request,rig,key,ambiguous=false){
   if(!configUnchanged(host,config)) return fail("OpenRig's connection changed. No page was opened.");
   const current=list(host,"spaces").find(s=>s.id===destination.id);
   if(!current) return fail("OpenRig's destination space closed before its page could open. Try again.");
-  let tab=request.newPage ? null : list(host,"panes").find(p=>p.mod===MOD_IDS.view && current.tabs?.some(t=>t.id===p.tab))?.tab;
+  const routesNow=host.shared?.("rig.pageRoutes")??{},tabPagesNow=host.shared?.("rig.tabPages")??{};
+  if(foreignMachine(current)) return fail("That space shows another OpenRig's pages, so this page wasn't opened there.");
+  // The Rig tabs already in the destination: a new page is never put on one (the pick sees none), and the tab Herdr makes for it is the one not among them.
+  const rigTabsHere=[...new Set(list(host,"panes").filter(p=>p.mod===MOD_IDS.view && current.tabs?.some(t=>t.id===p.tab)).map(p=>p.tab))];
+  const viewTabs=request.newPage?[]:rigTabsHere;
+  const foreignFallbackSpace=Boolean(retryFailure&&multi&&config?.connectionId&&(
+    (config.daemonMachine||null)!==spaceMachine(current)
+    ||(host.shared?.("herdrig.spaces")?.[current.id]?.conn&&host.shared("herdrig.spaces")[current.id].conn!==config.connectionId)
+    ||(state(host).homeSpace===current.id&&config.connectionId!==LEGACY_CONNECTION_ID&&!Object.values(state(host).homeSpaces??{}).includes(current.id))
+    ||(Object.values(state(host).homeSpaces??{}).includes(current.id)&&state(host).homeSpaces?.[homeKey(config)]!==current.id)
+  ));
+  // A tab's OpenRig is its own history's page, else the router's older record for it.
+  const tabConn=id=>(tabPagesNow[id]?.stack?.at(-1)??routesNow[id])?.conn;
+  // The tab the open came from when it is in the destination, else the space's active Rig tab, else the newest-changed unsettled one. In another
+  // OpenRig's space reached by a fallback, only a Rig tab already on this OpenRig is reused; otherwise a new tab is made.
+  let tab=request.newPage ? null : foreignFallbackSpace
+    ? (viewTabs.includes(request.sourceTab)&&tabConn(request.sourceTab)===config.connectionId ? request.sourceTab : viewTabs.find(id=>tabConn(id)===config.connectionId)??null)
+    : (viewTabs.includes(request.sourceTab) ? request.sourceTab : pickRigTab(current,viewTabs,tabPagesNow));
   if(!tab&&legacySelection)return fail("The Rig page closed. Open it again.");
   if(!tab){
+    const existingTabs=new Set(rigTabsHere);
     host.run("tab.new",{space:destination.id,name:"Rig",mod:MOD_IDS.view,props:{entry,section:entry.section??"topology",...(entry.id?{id:entry.id}:{}),space:destination.id}}); // the tab's own space survives a restart
-    tab=await adopted(host,()=>list(host,"panes").find(p=>p.mod===MOD_IDS.view
+    tab=await adopted(host,()=>list(host,"panes").find(p=>p.mod===MOD_IDS.view && !existingTabs.has(p.tab)
       && list(host,"spaces").find(s=>s.id===destination.id)?.tabs?.some(t=>t.id===p.tab))?.tab);
     if(!tab) return fail("Herdr has not opened the Rig page yet. Check its mod errors before retrying.");
   }
-  const routes={...(host.shared?.("rig.pageRoutes")??{}),[tab]:entry}; host.setShared?.("rig.pageRoutes",routes);
+  pushTabPage(host,tab,entry,{spaceConn:machineSpaceConn(config,current)});
   select(host,destination.id,tab);
   if(retryFailure){
     const reason=retryFailure.reason||cachedStatus?.reason||"the rig's space is not reachable";
@@ -742,7 +785,8 @@ export async function routeOpen(host,config,request={}){
     (typeof config.daemonMachine!=="string"||!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(config.daemonMachine)))
     return fail("daemonMachine must name a Herdr machine. No local terminal was started.");
   const selected={...request,sourceSpace:request.sourceSpace??active(host)};
-  if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology"}));
+  // A page with no entry is Topology, stamped with this connection when several are set up (an unstamped page names no OpenRig there).
+  if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology",...((config?.connections?.length??0)>1&&config?.connectionId?{conn:config.connectionId}:{})}));
   const tree=typeof host.layout==="function"?host.layout():host.layout;
   if(!host.routeOwner && layoutHasMod(tree,MOD_IDS.sidebar) && !selected.background){
     const targetConn=selected.conn??selected.entry?.conn??selected.seat?.conn??(selected.kind==="page"&&!requestRig(host,selected).key?config?.connectionId:undefined);
@@ -763,7 +807,7 @@ export async function routeOpen(host,config,request={}){
   const jobEntry=queueBarrier(job,host,0,previous);
   jobs.set(queueKey,jobEntry);
   try{return await job;}catch(error){
-    const msg=String(error?.message??error),step=host.currentStep?.();
+    const msg=errorDiagnostic(error),step=host.currentStep?.();
     return fail(step&&!msg.includes(step)?`Couldn't finish while ${step}: ${msg}`:msg);
   }
   finally{if(jobs.get(queueKey)===jobEntry) jobs.delete(queueKey);}

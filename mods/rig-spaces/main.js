@@ -94,6 +94,7 @@ export default class Spaces extends View {
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // Refresh only when the refs could have changed (see `due`).
+    if (rig.watchSpaces(this, cx)) return; // herdrig hook
     cx.timer.every(250, (cx) => this.checkNew(cx));
   }
 
@@ -113,6 +114,7 @@ export default class Spaces extends View {
     // Moved there: what it knew of that place may be old.
     const at = {};
     for (const s of sp) at[s.id] = where(s, ps);
+    rig.pruneBorn(this.born, at); // herdrig hook
     const keys = new Set(Object.values(at).filter((k) => JSON.parse(k)[1]));
     for (const k of Object.keys(this.git)) if (!keys.has(k)) {
       delete this.git[k];

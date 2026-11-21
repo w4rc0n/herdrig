@@ -6,6 +6,8 @@ const {spawnSync}=require("node:child_process");
 const {MAX_BYTES,utf8,targetName,absolute,rootState}=require("./rig-spec-files.cjs");
 const SPEC_SHA256="737eb9b9dbd16b5271eb67cdb36fdb4805ba25f890f9138e522d0f282731baa8";
 const FOLDER=".local/share/herdr-openrig",FILE="rig-spec-files.cjs";
+// Above RemoteSpecs.call's 60 s bridge timeout: a younger file may belong to a live concurrent transfer and keeps its O_EXCL refusal.
+const STALE_TRANSFER_MS=120000;
 const hash=b=>crypto.createHash("sha256").update(b).digest("hex");
 function transferPath(appHome){
  if(!absolute(appHome)||fs.realpathSync(appHome)!==appHome)throw Error("Invalid private app folder.");
@@ -14,7 +16,23 @@ function transferPath(appHome){
  const st=fs.lstatSync(folder);if(!st.isDirectory()||st.isSymbolicLink()||fs.realpathSync(folder)!==folder)throw Error("Refused unsafe spec transfer folder.");
  return path.join(folder,"spec-transfer.txt");
 }
-function prepare(appHome){const file=transferPath(appHome),fd=fs.openSync(file,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.closeSync(fd);return{ok:true};}
+function openExclusive(file){const fd=fs.openSync(file,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);fs.closeSync(fd);return{ok:true};}
+function prepare(appHome,now=Date.now()){
+ const file=transferPath(appHome);
+ try{return openExclusive(file);}catch(e){
+  if(e.code!=="EEXIST")throw e;
+  let fd;
+  try{fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);}
+  catch(openErr){if(openErr.code==="ENOENT")return openExclusive(file);throw Error("Refused unsafe spec transfer file.");}
+  let st;try{st=fs.fstatSync(fd);}finally{fs.closeSync(fd);}
+  if(!st.isFile()||(st.mode&0o777)!==0o600||st.uid!==process.getuid())throw Error("Refused unsafe spec transfer file.");
+  if(!(now-st.mtimeMs>=STALE_TRANSFER_MS))throw e;
+  const cur=fs.lstatSync(file);
+  if(cur.isSymbolicLink()||cur.dev!==st.dev||cur.ino!==st.ino||cur.mtimeMs!==st.mtimeMs)throw e;
+  try{fs.unlinkSync(file);}catch(u){if(u.code!=="ENOENT")throw u;}
+  return{...openExclusive(file),reclaimed:true};
+ }
+}
 function readTransfer(appHome){
  const file=transferPath(appHome),fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
  try{
@@ -23,8 +41,22 @@ function readTransfer(appHome){
   const bytes=b.subarray(0,used);utf8(bytes);return{file,bytes,stat:st};
  }finally{fs.closeSync(fd);}
 }
-function remove(appHome){const f=transferPath(appHome);try{const s=fs.lstatSync(f);if(s.isSymbolicLink()||!s.isFile()||(s.mode&0o777)!==0o600||s.uid!==process.getuid())throw Error("Refused unsafe spec transfer cleanup.");fs.unlinkSync(f);}catch(e){if(e.code!=="ENOENT")throw e;}return{ok:true};}
-function digest(appHome){const r=readTransfer(appHome);try{return{ok:true,sha256:hash(r.bytes)};}finally{remove(appHome);}}
+function remove(appHome,onlyEmpty=false){
+ const f=transferPath(appHome);
+ try{
+  const s=fs.lstatSync(f);
+  if(s.isSymbolicLink()||!s.isFile()||(s.mode&0o777)!==0o600||s.uid!==process.getuid())throw Error("Refused unsafe spec transfer cleanup.");
+  if(onlyEmpty&&s.size!==0)return{ok:true,kept:true};
+  fs.unlinkSync(f);
+ }catch(e){if(e.code!=="ENOENT")throw e;}
+ return{ok:true};
+}
+function checkedContent(bytes,expected){
+ const actual=hash(bytes);
+ if(!/^[a-f0-9]{64}$/.test(expected??"")||actual!==expected)throw Error("The spec transfer changed; nothing was sent. Try again.");
+ return actual;
+}
+function digest(appHome,expectedContentSha256){try{const r=readTransfer(appHome);return{ok:true,sha256:checkedContent(r.bytes,expectedContentSha256)};}finally{remove(appHome);}}
 function invoke(run,args,input,timeout=30000){
  const r=run("hc",args,{...(input!==undefined?{input}:{}),encoding:"utf8",shell:false,timeout,maxBuffer:8*MAX_BYTES});
  if(r.error)throw Error(r.error.message);return r;
@@ -87,19 +119,21 @@ function install(machine,home,expected,run=spawnSync){
  if(inspect(run,machine,home).sha256!==SPEC_SHA256)throw Error("Spec-helper verification failed.");
  return{ok:true,path:info.path,sha256:SPEC_SHA256};
 }
-function execute({appHome,machine,home,node,verb,target,expectedSha256,expectedRoots,record},run=spawnSync){
- if(!["roots","save","copy","copy-folder"].includes(verb)||!absolute(node)||verb!=="roots"&&!targetName(target)||verb==="copy-folder"&&!target.endsWith("/rig.yaml"))throw Error("Invalid remote spec operation.");
- profile(run,machine,record);const info=inspect(run,machine,home);
- if(info.sha256!==SPEC_SHA256)throw Error("The spec helper needs installation or approval for this release.");
- const nodeCheck=invoke(run,["exec","--on",machine,"--","which","node"]);
- if(nodeCheck.status!==0||String(nodeCheck.stdout).trim()!==node)throw Error("The remote Node executable changed.");
- let input;
+function execute({appHome,machine,home,node,verb,target,expectedSha256,expectedContentSha256,expectedRoots,record},run=spawnSync){
+ let failed=false;
  try{
+  if(!["roots","save","copy","copy-folder"].includes(verb)||!absolute(node)||verb!=="roots"&&!targetName(target)||verb==="copy-folder"&&!target.endsWith("/rig.yaml"))throw Error("Invalid remote spec operation.");
+  let input;
   if(verb!=="roots"){
    const transfer=readTransfer(appHome);
+   checkedContent(transfer.bytes,expectedContentSha256);
    if(verb==="save"&&!/^[a-f0-9]{64}$/.test(expectedSha256??""))throw Error("Missing loaded-content hash.");
    input=JSON.stringify({content:transfer.bytes.toString("utf8"),expectedSha256,expectedRoots});
   }
+  profile(run,machine,record);const info=inspect(run,machine,home);
+  if(info.sha256!==SPEC_SHA256)throw Error("The spec helper needs installation or approval for this release.");
+  const nodeCheck=invoke(run,["exec","--on",machine,"--","which","node"]);
+  if(nodeCheck.status!==0||String(nodeCheck.stdout).trim()!==node)throw Error("The remote Node executable changed.");
   profile(run,machine,record);
   // copy-folder names the built-in's rig.yaml; the helper derives the folder itself. Expected roots and the text go on stdin.
   const args=["exec","--on",machine,...(verb!=="roots"?["--stdin"]:[]),"--json","--",node,info.path,verb,...(verb==="roots"?[]:["--",target])];
@@ -115,18 +149,21 @@ function execute({appHome,machine,home,node,verb,target,expectedSha256,expectedR
    if(outer.code!==0&&!result.error)throw Error();
   }catch{throw Error(r.stderr||"Invalid remote spec-helper response.");}
   return result;
- }finally{if(verb!=="roots")remove(appHome);}
+ }catch(e){failed=true;throw e;}
+ finally{if(["save","copy","copy-folder"].includes(verb)&&appHome){try{remove(appHome);}catch(ce){if(!failed)throw ce;}}}
 }
 if(require.main===module){
  try{
   const[mode,...args]=process.argv.slice(2);let result;
   if(mode==="inspect"){if(args.length)throw Error("Invalid inspect arguments.");result={ok:true,sha256:hash(shipped())};}
-  else if(["prepare","digest","remove"].includes(mode)){if(args.length!==1)throw Error("Invalid transfer arguments.");result={prepare,digest,remove}[mode](args[0]);}
+  else if(mode==="prepare"){if(args.length!==1)throw Error("Invalid transfer arguments.");result=prepare(args[0]);}
+  else if(mode==="digest"){if(args.length!==2)throw Error("Invalid transfer arguments.");result=digest(args[0],args[1]);}
+  else if(mode==="remove"){if(args.length!==1&&!(args.length===2&&args[1]==="--if-empty"))throw Error("Invalid transfer arguments.");result=remove(args[0],args[1]==="--if-empty");}
   else if(mode==="install"){if(args.length!==3)throw Error("Invalid install arguments.");result=install(args[0],args[1],JSON.parse(args[2]));}
   else if(mode==="preview"){if(args.length!==4)throw Error("Invalid root-preview arguments.");result=preview(args[0],args[1],args[2],JSON.parse(args[3]));}
-  else if(mode==="run"){if(args.length!==9)throw Error("Invalid remote arguments.");const[appHome,machine,home,node,verb,target,expectedSha256,roots,record]=args;result=execute({appHome,machine,home,node,verb,target,expectedSha256,expectedRoots:JSON.parse(roots),record:JSON.parse(record)});}
+  else if(mode==="run"){if(args.length!==10)throw Error("Invalid remote arguments.");const[appHome,machine,home,node,verb,target,expectedSha256,roots,record,expectedContentSha256]=args;result=execute({appHome,machine,home,node,verb,target,expectedSha256,expectedContentSha256,expectedRoots:JSON.parse(roots),record:JSON.parse(record)});}
   else throw Error("Unknown spec transport operation.");
   console.log(JSON.stringify(result));if(result.error)process.exitCode=1;
  }catch(e){console.log(JSON.stringify({error:String(e.message??e).replace(/[\r\n\x00-\x1f\x7f]+/g," ")}));process.exitCode=1;}
 }
-module.exports={SPEC_SHA256,FOLDER,FILE,invoke,transferPath,prepare,readTransfer,remove,digest,profile,inspect,install,execute,shipped,preview};
+module.exports={SPEC_SHA256,STALE_TRANSFER_MS,FOLDER,FILE,invoke,transferPath,prepare,readTransfer,remove,digest,profile,inspect,install,execute,shipped,preview};

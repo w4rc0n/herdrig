@@ -1,9 +1,10 @@
+import { errorDiagnostic } from "./rig-words.js";
 // The sidebar owns reconciliation. Daemon previews are read-only; Herdr owns PTYs.
 import {isValidSessionName,rigSeatServers} from "./rig-lib.js";
 import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
 import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue,prepareRigSpaceAdoption} from "./rig-space-context.js";
-import {rigSpaceRelocation} from "./rig-spaces.js";
+import {rigSpaceRelocation,localGridPreflight} from "./rig-spaces.js";
 import {LEGACY_CONNECTION_ID} from "./rig-connections.js";
 
 const list=(host,key)=>(typeof host[key]==="function"?host[key]():host[key])??[];
@@ -77,7 +78,7 @@ export class HostWorkerViews{
   }
   // The live settings of THIS config's own connection (with several OpenRigs, another connection's change leaves this one's work alone).
   current(config){
-    if(this.closed||!config?.daemonMachine||!rigOrigin(config.daemonUrl)||this.host.currentConfig&&identity(this.host.currentConfig(config))!==identity(config))
+    if(this.closed||!rigOrigin(config.daemonUrl)||this.host.currentConfig&&identity(this.host.currentConfig(config))!==identity(config))
       throw new Error("OpenRig's connection changed. The worker view was left in place.");
   }
   // Every Herdr call goes through the synced connection's own send scope when the host offers one (an unscoped send is refused with several OpenRigs).
@@ -92,12 +93,13 @@ export class HostWorkerViews{
     throw new Error(`Herdr did not confirm ${description}. Existing tiles were kept.`);
   }
   owned(config,view,remote){
-    const expected=rigOrigin(config.daemonUrl),prefix=config.daemonMachine+"/";
+    const expected=rigOrigin(config.daemonUrl),prefix=config.daemonMachine?config.daemonMachine+"/":"";
     return list(this.host,"panes").flatMap(pane=>{
       const terminal=list(this.host,"terminals").find(t=>addr(t)===pane.terminal),labels=terminal?.labels??{};
       if(!String(addr(terminal)??"").startsWith(prefix)||!String(pane.tab).startsWith(prefix)
+        ||(!config.daemonMachine&&(String(addr(terminal)??"").includes("/")||String(pane.tab).includes("/")))
         ||labels["herdr-openrig.role"]!=="worker-view"||labels["herdr-openrig.view"]!==view
-        ||labels["herdr-openrig.machine"]!==config.daemonMachine||rigOrigin(labels["herdr-openrig.origin"])!==expected
+        ||(labels["herdr-openrig.machine"]??null)!==(config.daemonMachine??null)||rigOrigin(labels["herdr-openrig.origin"])!==expected
         // Rule Y: positive evidence. A stamped tile is ours only with THIS daemon's host id; an unstamped one (older herdrig) only for the legacy connection.
         ||(labels["herdr-openrig.host"]?labels["herdr-openrig.host"]!==hostLabelValue(remote.selfHostId):own(config).length>0)
         ||labels["herdr.tab"]!==machineLocalId(pane.tab,config.daemonMachine)
@@ -123,6 +125,13 @@ export class HostWorkerViews{
   async update(config,view,key,options){
     let host=this.host;const previous=this.entries.get(key)??host.loadViews?.()?.[key]??null;
     if(!options.explicit&&previous?.paused)return {...previous,ok:false,paused:true};
+    // Empty host lists during startup/restore are not evidence of a person's close.
+    // Keep persisted membership and follow state until layout evidence is available.
+    // If all worker tabs really closed and only mod panes remain, an empty terminal
+    // list also keeps the dead view following until a terminal appears or an explicit
+    // Worker view open reconciles it. Deferring is safer than inferring a close.
+    if(!options.explicit&&previous&&["spaces","panes","terminals"].some(kind=>!list(host,kind).length))
+      return {ok:false,reason:"Herdr's layout is still loading. Existing worker views were kept."};
     try{
       this.current(config);
       const remote=await host.prepareRemote(config);if(!remote.ok){
@@ -136,11 +145,31 @@ export class HostWorkerViews{
       if(options.expectedPlan&&preview?.planId!==options.expectedPlan)
         return {ok:false,reason:"This worker view changed since preview. Refresh it before opening."};
       const plan=hostWorkerPlan(preview,nodes,remote,view);
+      if(remote.local){
+        // A loopback daemon address may be a tunnel. Verify the exact local tmux server before creating any viewer.
+        const preflight=await localGridPreflight({exec:host.execFor?host.execFor(config):host.exec},
+          {tiles:plan.pages.flatMap(page=>page.tiles).filter(tile=>!tile.placeholder&&!tile.blank)});
+        this.current(config);
+        if(!preflight.ok)return preflight;
+      }
       const target=options.target??previous?.target;
       const adoption=target&&options.explicit?await prepareRigSpaceAdoption(host,config,[target.id,target.name],{sessions:nodes.map(n=>n.canonicalSessionName).filter(Boolean),servers:rigSeatServers({seats:nodes})}):{ok:true};
       if(!adoption.ok)return adoption;
       if(adoption.host)host=adoption.host;
       const existing=this.owned(config,view,remote).filter(tile=>list(host,"panes").some(p=>p.pane===tile.pane.pane));
+      const parked=new Set();
+      for(const tile of existing.filter(t=>t.session&&t.programArgv[0]!=="sleep")){
+        if(!options.explicit&&previous?.endedCheckedAt&&Date.now()-previous.endedCheckedAt<30000){
+          if(previous.endedTerminals?.includes(tile.pane.terminal))parked.add(tile.pane.terminal);
+          continue;
+        }
+        try{
+          const screen=JSON.parse(await this.hc(["read","--json",tile.pane.terminal],config));
+          // This suffix is a heuristic: seat output could quote it. An explicit reopen
+          // can then reattach that same seat; ownership, argv and snapshots still bind it.
+          if(String(screen.text??"").trimEnd().endsWith("Close this pane, then reopen the rig space to retry."))parked.add(tile.pane.terminal);
+        }catch{} // an unreadable screen is not evidence that a tile may be replaced
+      }
       for(const tile of existing.filter(t=>t.session&&t.programArgv[0]!=="sleep")){
         const wanted=plan.pages.flatMap(p=>p.tiles).find(t=>t.session===tile.session&&!t.placeholder);
         if(wanted&&!!payloadFrom(tile.programArgv[2]).readOnly!==wanted.readOnly)
@@ -155,7 +184,10 @@ export class HostWorkerViews{
         following:options.following??previous?.following??plan.kind==="following",
         pruneMs:options.pruneMs??previous?.pruneMs??0,planId:plan.planId,name:plan.name,missing:plan.missing,
         members:plan.pages.flatMap(p=>p.tiles).filter(t=>!t.blank).map(({session,label,runtime,readOnly})=>({session,label,runtime,readOnly})),
-        paused:false,inactiveSince:{...(previous?.inactiveSince??{})},pruned:{...(previous?.pruned??{})}};
+        paused:false,inactiveSince:{...(previous?.inactiveSince??{})},pruned:{...(previous?.pruned??{})},ended:parked.size,
+        endedTerminals:[...parked],endedCheckedAt:!options.explicit&&previous?.endedCheckedAt&&Date.now()-previous.endedCheckedAt<30000?previous.endedCheckedAt:Date.now(),
+        closed:options.explicit?{}:{...(previous?.closed??{})}};
+      if(!options.explicit)for(const member of previous?.members??[])if(!existing.some(t=>t.session===member.session)&&!entry.pruned[member.session])entry.closed[member.session]=true;
       if(!Number.isFinite(entry.pruneMs)||entry.pruneMs<0||entry.pruneMs>604800000)throw new Error("Choose a prune time from zero to seven days.");
       const now=host.now?.()??Date.now(),bySession=new Map(nodes.map(n=>[n.canonicalSessionName,n]));
       for(const tile of existing.filter(t=>t.session)){
@@ -187,18 +219,18 @@ export class HostWorkerViews{
       const newSpace=!space,spaceId=space?.id??machineId("sp-worker-"+nonce(),config.daemonMachine);
       const labels=(tile,page,argv,tab)=>[
         `herdr.space=${machineLocalId(spaceId,config.daemonMachine)}`,`herdr.tab=${machineLocalId(tab,config.daemonMachine)}`,
-        "herdr-openrig.role=worker-view",`herdr-openrig.view=${view}`,`herdr-openrig.machine=${config.daemonMachine}`,
+        "herdr-openrig.role=worker-view",`herdr-openrig.view=${view}`,...(config.daemonMachine?[`herdr-openrig.machine=${config.daemonMachine}`]:[]),
         `herdr-openrig.origin=${config.daemonUrl}`,`herdr-openrig.seat=${tile.session??""}`,`herdr-openrig.page=${page}`,
         `herdr-openrig.blank=${tile.blank?"1":"0"}`,`herdr-openrig.viewer-argv=${JSON.stringify(argv)}`,
         ...(rig?[`herdr-openrig.rig=${rig.name}`]:["herdr-openrig.home=1"]),
         ...(hostLabelValue(remote.selfHostId)?[`herdr-openrig.host=${hostLabelValue(remote.selfHostId)}`]:[]), // the daemon's host id: which OpenRig these tiles show
       ];
-      const fresh=new Set(),newTabs=new Set();
-      const start=async(tile,page,tab,parent=null,direction="right")=>{
+      const fresh=new Set(),newTabs=new Set();let additionalPages=0;
+      const start=async(tile,page,tab,parent=null,direction="right",replaceParked=false)=>{
         await ready();let pane;
         if(parent){
           const liveParent=this.owned(config,view,remote).find(t=>sameSplitTarget(parent,t,config,remote));
-          if(!liveParent||liveParent.pane.focused&&!fresh.has(parent.pane.terminal))throw new Error("The worker split target changed or has focus. It was left alone.");
+          if(!liveParent||liveParent.pane.focused&&!fresh.has(parent.pane.terminal)&&!replaceParked)throw new Error("The worker split target changed or has focus. It was left alone.");
           const before=new Set(list(host,"panes").map(p=>p.pane)),argv=["env",`HERDR_OPENRIG_VIEW_TILE=${nonce()}`,...tile.argv];
           this.run(config,"pane.split",{pane:parent.pane.pane,direction,argv});
           pane=await this.waitFor(()=>list(host,"panes").find(p=>p.tab===tab&&!before.has(p.pane)&&list(host,"terminals")
@@ -207,13 +239,31 @@ export class HostWorkerViews{
           if(record.parent||record.terminal?.parent)throw new Error("Herdr assigned a parent to a worker tile. No parent was closed.");
           await this.hc(["label",pane.terminal,...labels(tile,page,argv,tab)],config);
         }else{
-          const result=JSON.parse(await this.hc(["run","--on",config.daemonMachine,"--bg","--json","--no-parent","--no-notify",
+          const result=JSON.parse(await this.hc(["run",...(config.daemonMachine?["--on",config.daemonMachine]:[]),"--bg","--json","--no-parent","--no-notify",
             ...labels(tile,page,tile.argv,tab).flatMap(label=>["--label",label]),"--",...tile.argv],config));
           pane=await this.waitFor(()=>list(host,"panes").find(p=>p.terminal===result.address&&p.tab===tab),"worker page adoption");
         }
         fresh.add(pane.terminal);
         return this.waitFor(()=>this.owned(config,view,remote).find(t=>t.pane.pane===pane.pane),"worker tile labels");
       };
+      let reattached=0;
+      if(options.explicit)for(const old of [...existing].filter(t=>parked.has(t.pane.terminal))){
+        const wanted=plan.pages.flatMap(p=>p.tiles).find(t=>t.session===old.session&&!t.placeholder);
+        if(!wanted)continue;
+        await ready();
+        const live=this.owned(config,view,remote).find(t=>t.pane.pane===old.pane.pane);
+        if(!live||live.snapshot!==old.snapshot)continue;
+        const record=JSON.parse(await this.hc(["get","--json","--",old.pane.terminal],config));
+        if(JSON.stringify(record.argv)!==JSON.stringify(old.terminal.argv)||record.pid!==old.terminal.pid||record.created_ms!==old.terminal.created_ms)continue;
+        const next=await start(wanted,old.page,old.pane.tab,old,"right",true);
+        await ready();
+        const current=this.owned(config,view,remote).find(t=>t.pane.pane===old.pane.pane);
+        if(!current||current.snapshot!==old.snapshot||!this.owned(config,view,remote).some(t=>t.pane.pane===next.pane.pane))continue;
+        this.run(config,"pane.close",{pane:old.pane.pane});
+        existing.splice(existing.indexOf(old),1,next);reattached++;
+      }
+      entry.ended-=reattached;
+      entry.endedTerminals = entry.endedTerminals.filter(terminal => existing.some(tile => tile.pane.terminal === terminal));
       // Upgrade only our old inert blanks on an explicit reopen; retain every seat viewer.
       if(options.explicit)for(const old of existing.filter(t=>t.blank&&!t.session&&t.programArgv[0]==="sleep"&&!t.pane.focused)){
         const next=await start(workerPad(remote),old.page,old.pane.tab,old);
@@ -233,7 +283,7 @@ export class HostWorkerViews{
       }));
       let pages=[...new Set(existing.map(t=>t.pane.tab))];
       for(let index=0;index<plan.pages.length;index++){
-        const page=plan.pages[index],wanted=page.tiles.map(t=>t.session&&(present.has(t.session)||entry.pruned[t.session])?workerPad(remote):t);
+        const page=plan.pages[index],wanted=page.tiles.map(t=>t.session&&(present.has(t.session)||entry.pruned[t.session]||entry.closed[t.session])?workerPad(remote):t);
         let anchors=this.owned(config,view,remote).filter(t=>t.page===index),tab=anchors[0]?.pane.tab,pageIndex=index;
         const oldTitle=list(host,"spaces").flatMap(space=>space.tabs??[]).find(item=>item.id===tab)?.name;
         // Only migrate the generated old title; a person's renamed tab stays theirs.
@@ -243,7 +293,7 @@ export class HostWorkerViews{
         if(anchors.length){
           for(const tile of wanted.filter(t=>!t.blank)){
             const parent=anchors.find(t=>!t.pane.focused);
-            if(!parent){tab=machineId("tb-worker-"+nonce(),config.daemonMachine);pageIndex=pages.length;anchors=[await start(tile,pageIndex,tab)];pages.push(tab);newTabs.add(tab);}
+            if(!parent){tab=machineId("tb-worker-"+nonce(),config.daemonMachine);pageIndex=pages.length;anchors=[await start(tile,pageIndex,tab)];pages.push(tab);newTabs.add(tab);additionalPages++;}
             else anchors.push(await start(tile,pageIndex,tab,parent,anchors.length%2?"right":"down"));
             present.add(tile.session);
           }
@@ -258,7 +308,7 @@ export class HostWorkerViews{
           for(const tile of this.owned(config,view,remote).filter(t=>t.pane.tab===tab)){this.current(config);this.run(config,"layout.resize",{id:tile.pane.pane,weight:1});}
           for(const tile of wanted)if(tile.session)present.add(tile.session);
         }
-        if(newTabs.has(tab))this.run(config,"tab.rename",{id:tab,name:page.name});
+        if(newTabs.has(tab))this.run(config,"tab.rename",{id:tab,name:pageIndex===index?page.name:`${plan.name} · ${pageIndex+1}`});
       }
       for(const tile of retire){
         await ready();const current=this.owned(config,view,remote).find(t=>t.pane.pane===tile.pane.pane);
@@ -290,10 +340,14 @@ export class HostWorkerViews{
       entry.pages=pages.map((tab,index)=>({tab,name:plan.pages[index]?.name??`${plan.name} · ${index+1}`}));entry.space=spaceId;
       this.entries.set(key,entry);await this.save();this.schedule();
       if(options.explicit&&entry.pages.length){this.run(config,"space.select",{id:spaceId});this.run(config,"tab.select",{id:entry.pages[0].tab});}
-      return {ok:true,...entry};
+      const leftEnded = options.explicit ? parked.size - reattached : 0;
+      const reasons=[];
+      if(reattached||leftEnded)reasons.push(`Reattached ${reattached} ended tile${reattached===1?"":"s"}.${leftEnded?` ${leftEnded} left as they were: they changed.`:""}`);
+      if(additionalPages)reasons.push(`Focused worker tiles were kept; opened ${additionalPages} additional page${additionalPages===1?'':'s'}.`);
+      return {ok:true,...entry,reattached,...(reasons.length?{reason:reasons.join(' ')}:{})};
     }catch(error){
-      if(previous){this.entries.set(key,{...previous,paused:true,error:String(error?.message??error)});await this.save();this.schedule();}
-      return {ok:false,paused:!!previous,reason:String(error?.message??error),kept:true};
+      if(previous){this.entries.set(key,{...previous,paused:true,error:errorDiagnostic(error)});await this.save();this.schedule();}
+      return {ok:false,paused:!!previous,reason:errorDiagnostic(error),kept:true};
     }
   }
   async save(){await this.host.saveViews?.(Object.fromEntries(this.entries));this.host.changed?.(Object.fromEntries(this.entries));}

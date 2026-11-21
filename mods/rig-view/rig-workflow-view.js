@@ -1,6 +1,7 @@
 import {div,svg} from 'gpui-kit';
 import {h_flex,v_flex} from 'gpui-base';
 import {relativeTimeText,iconsAt} from './rig-lib.js';
+import {statusWord} from './rig-words.js';
 import {workflowEntry,workflowWord,workflowSourceEntry,packetNextSteps,WORKFLOW_CAVEAT,RECEIPT_CAVEAT,WORKFLOW_PURPOSE_MISSING} from './rig-workflow.js';
 const icon=iconsAt('mods/rig-view');
 /** Read-only presentation. Suggested commands are only literal text and clipboard content. */
@@ -9,10 +10,10 @@ export class WorkflowPanel {
   muted(t,text){return div().text_size(11.5).text_color(t.dim).child(text);}
   // A link with somewhere to go is the page's keyboard link (its own focus handle, so Tab reaches it and Enter or Space opens it); one with
   // nowhere to go is dim text.
-  link(t,id,label,entry){
-    if(entry&&this.page?.inlineLink)return this.page.inlineLink(t,this.cx,id,label,()=>this.navigate(entry));
-    return div().id(id).text_size(12).text_color(entry?t.accent:t.dim).when(!!entry,el=>el.cursor_pointer().on_click(()=>this.navigate(entry))).child(label);}
-  owner(t,id,session){return typeof session==='string'&&session.trim()?this.link(t,id,workflowWord(session),session==='INDETERMINATE'?null:this.ownerEntry(session)):div();}
+  link(t,id,label,entry,tip){
+    if(entry&&this.page?.inlineLink)return this.page.inlineLink(t,this.cx,id,label,()=>this.navigate(entry),tip);
+    return div().id(id).text_size(12).text_color(entry?t.accent:t.dim).when(!!entry,el=>el.tooltip(tip).cursor_pointer().on_click(()=>this.navigate(entry))).child(label);}
+  owner(t,id,session){return typeof session==='string'&&session.trim()?this.link(t,id,workflowWord(session),session==='INDETERMINATE'?null:this.ownerEntry(session),`Open ${workflowWord(session)}'s page`):div();}
   fields(t,rows){return v_flex().gap(4).children(rows.map(([label,value,mono])=>h_flex().gap(8).items_start().flex_wrap()
     .child(div().min_w(90).text_size(11.5).text_color(t.dim).child(label))
     .child(div().flex_1().min_w(80).text_size(12).when(!!mono,el=>el.font_family(this.monoFamily)).text_color(value==='unknown'||value==='not reported'?t.dim:t.foreground).child(value))));}
@@ -28,8 +29,8 @@ export class WorkflowPanel {
     if(entry.workflow&&!wf)return this.muted(t,"This workflow isn't in the mission's current view.");
     if(!wf)return this.page.card(t,'Workflows',model.instances.length?model.instances.map((w,i)=>
       h_flex().id(`workflow-instance-${i}`).gap(8).items_center().flex_wrap()
-        .child(this.link(t,`workflow-open-${i}`,w.title,this.entry(context,w)))
-        .child(this.muted(t,w.status))):[
+        .child(this.link(t,`workflow-open-${i}`,w.title,this.entry(context,w),'Open this workflow'))
+        .child(this.muted(t,statusWord(w.status,"workflow")))):[
       div().text_size(12).child('No workflows are bound to this mission.'),
       h_flex().gap(3).flex_wrap().text_size(11.5).text_color(t.dim)
         .child(div().child("A workflow runs when a mission's lifecycle is instantiated:"))
@@ -38,13 +39,13 @@ export class WorkflowPanel {
     const packet=wf.packets.find(p=>p.packet_id===entry.packet);
     if(entry.packet&&!packet)return this.muted(t,"This packet is no longer current work in this workflow.");
     if(packet)return this.packet(t,context,wf,packet);
-    const current=wf.steps.filter(s=>s.current),position=current.length===1?`step ${wf.steps.indexOf(current[0])+1} of ${wf.steps.length} · ${current[0].id}`:`${current.length} current steps`;
+    const current=wf.steps.filter(s=>s.current),position=current.length===1?`step ${wf.steps.indexOf(current[0])+1} of ${wf.steps.length}${current[0].title?` · ${current[0].title}`:""}`:`${current.length} current steps`;
     const name=workflowWord(wf.workflow_name),version=`version ${workflowWord(wf.workflow_version)}`;
-    this.page.pageHeading={title:wf.title,icon:'rig-split',status:`${wf.status} · ${position} · ${wf.title===name?'':name+' · '}${version} · as of ${this.time(model.derivedAt)}`};
+    this.page.pageHeading={title:wf.title,icon:'rig-split',status:`${statusWord(wf.status,"workflow")} · ${position} · ${wf.title===name?'':name+' · '}${version} · as of ${this.time(model.derivedAt)}`};
     const tab=entry.workflowTab??this.page.activePageView??'work';
     if(tab==='obligations')return this.page.card(t,'Obligations',[
       this.muted(t,RECEIPT_CAVEAT),...wf.obligations.map((o,i)=>v_flex().id(`workflow-obligation-${i}`).gap(4)
-        .child(div().text_size(12).child(`${workflowWord(o.stepId)} · ${o.required===true?'required':o.required===false?'extension':'unknown'} · ${workflowWord(o.state)} · ${o.receiptState==='not-required'?'no receipt needed':'receipt '+workflowWord(o.receiptState)}`))
+        .child(div().text_size(12).child(`${workflowWord(o.stepId)} · ${o.required===true?'required':o.required===false?'extension':'unknown'} · ${statusWord(o.state,"queue")} · ${o.receiptState==='not-required'?'no receipt needed':'receipt '+statusWord(o.receiptState,"queue")}`))
         .when(!!o.receipt,el=>el.child(this.fields(t,[['Evidence',workflowWord(o.receipt.evidenceRef)],['Recorder',workflowWord(o.receipt.actorSession)],['At',this.time(o.receipt.closedAt,true)]]))))
     ]);
     if(tab==='plan')return this.plan(t,wf);
@@ -55,15 +56,15 @@ export class WorkflowPanel {
       return h_flex().id(`workflow-step-${i}`).gap(8).py(5).items_center().flex_wrap().child(mark)
         .child(div().min_w(80).text_size(12).child(s.id))
         .children(s.owners.map((owner,j)=>this.owner(t,`workflow-owner-${i}-${j}`,owner)))
-        .child(this.muted(t,s.packets[0]?.latest_transition?.ts?`${workflowWord(s.packets[0].queue_state)} · ${relativeTimeText(s.packets[0].latest_transition.ts)}`:s.state))
-        .when(s.current,el=>el.child(this.link(t,`workflow-step-open-${i}`,'open work',this.entry(context,wf,s.packets[0]))));
+        .child(this.muted(t,s.packets[0]?.latest_transition?.ts?`${statusWord(s.packets[0].queue_state,"queue")} · ${relativeTimeText(s.packets[0].latest_transition.ts)}`:statusWord(s.state,"queue")))
+        .when(s.current,el=>el.child(this.link(t,`workflow-step-open-${i}`,'open work',this.entry(context,wf,s.packets[0]),"Open this step's current work")));
     })))
       .child(this.page.card(t,'Current work',[
         ...(wf.packets.length?[]:[this.muted(t,'No current work reported')]),...wf.packets.map((p,i)=>h_flex().gap(8).items_center().flex_wrap()
-          .child(this.link(t,`workflow-packet-${i}`,workflowWord(p.step_id),this.entry(context,wf,p)))
-          .child(this.muted(t,workflowWord(p.queue_state))).child(this.owner(t,`workflow-packet-owner-${i}`,p.owner))),this.muted(t,WORKFLOW_CAVEAT)]))
+          .child(this.link(t,`workflow-packet-${i}`,workflowWord(p.step_id),this.entry(context,wf,p),`Open work packet ${workflowWord(p.step_id)}`))
+          .child(this.muted(t,statusWord(p.queue_state,"queue"))).child(this.owner(t,`workflow-packet-owner-${i}`,p.owner))),this.muted(t,WORKFLOW_CAVEAT)]))
       .child(this.page.card(t,'Sources',wf.sources.filter(s=>s.kind==='slice').map((s,i)=>{
-        const target=workflowSourceEntry(context,s);return this.link(t,`workflow-source-${i}`,target?`Slice ${target.slice}`:'Slice source not reported',target);
+        const target=workflowSourceEntry(context,s);return this.link(t,`workflow-source-${i}`,target?`Slice ${target.slice}`:'Slice source not reported',target,`Open slice ${target?.slice} in Scopes`);
       })));
   }
   plan(t,wf){
@@ -85,8 +86,8 @@ export class WorkflowPanel {
       this.muted(t,"Run by the owner when needed. herdrig shows it; it doesn't run it."),this.command(t,'workflow-reconcile-action',recon.nextAction)]));
   }
   packet(t,context,wf,p){
-    this.page.pageHeading={title:`Work · ${workflowWord(p.step_id)}`,status:`${workflowWord(p.queue_state)} · ${workflowWord(p.owner)} · ${relativeTimeText(p.latest_transition?.ts)}`,
-      statusView:h_flex().gap(6).items_center().flex_wrap().child(this.muted(t,workflowWord(p.queue_state)))
+    this.page.pageHeading={title:`Work · ${workflowWord(p.step_id)}`,status:`${statusWord(p.queue_state,"queue")} · ${workflowWord(p.owner)} · ${relativeTimeText(p.latest_transition?.ts)}`,
+      statusView:h_flex().gap(6).items_center().flex_wrap().child(this.muted(t,statusWord(p.queue_state,"queue")))
         .child(this.owner(t,'workflow-packet-owner',p.owner)).child(this.muted(t,relativeTimeText(p.latest_transition?.ts)))};
     const blocker=p.blocker??{},wake=p.wake_schedule??{},transition=p.latest_transition??{};
     const wakeText=Number.isFinite(wake.interval_seconds)?`scheduled check every ${wake.interval_seconds} s (a check, not guaranteed delivery)`
@@ -96,14 +97,14 @@ export class WorkflowPanel {
       .child(this.page.card(t,'Waiting and continuation',[
         this.fields(t,[['Last change',workflowWord(transition.transition_note)],['Recorded by',workflowWord(transition.actor_session)],['At',this.time(transition.ts,true)],['Wake',wakeText]]),
         ...(p.blocked_on?[h_flex().gap(8).items_center().flex_wrap().child(this.muted(t,'Blocked on'))
-          .child(this.link(t,'workflow-blocker',workflowWord(blocker.summary??p.blocked_on),this.queueEntry(blocker.qitem_id??p.blocked_on)))
-          .child(this.muted(t,workflowWord(blocker.state))).child(this.owner(t,'workflow-blocker-owner',blocker.destination_session))]:[])]))
+          .child(this.link(t,'workflow-blocker',workflowWord(blocker.summary??p.blocked_on),this.queueEntry(blocker.qitem_id??p.blocked_on),"Open what's blocking this work in System › Health"))
+          .child(this.muted(t,statusWord(blocker.state,"queue"))).child(this.owner(t,'workflow-blocker-owner',blocker.destination_session))]:[])]))
       .child(this.page.card(t,'Next action',[
         this.muted(t,"Run by the owner when the work is done. herdrig shows it; it doesn't run it."),this.command(t,'workflow-targeted-action',p.targeted_action)]))
       .child(this.page.card(t,'Then',packetNextSteps(wf,p).map(s=>v_flex().gap(4).child(div().text_size(12).child(s.id))
         .when(!!s.gate,el=>el.child(this.muted(t,`${workflowWord(s.gate.target)} · ${workflowWord(s.gate.summary)}`))))
         .concat(packetNextSteps(wf,p).length?[]:[this.muted(t,'No next step reported')])) )
-      .child(h_flex().gap(8).items_center().flex_wrap().child(this.link(t,'workflow-queue-item',p.packet_id,this.queueEntry(p.packet_id)).font_family(this.monoFamily))
+      .child(h_flex().gap(8).items_center().flex_wrap().child(this.link(t,'workflow-queue-item',p.packet_id,this.queueEntry(p.packet_id),'Open this queue item in System › Health').font_family(this.monoFamily))
         .child(this.page.copyButton(t,p.packet_id,'workflow-packet-id','queue item id')))
       .child(this.muted(t,`Evidence · ${p.evidence_ref==null?'none yet':workflowWord(p.evidence_ref)}`));
   }

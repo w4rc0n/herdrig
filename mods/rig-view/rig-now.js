@@ -1,4 +1,6 @@
+import { errorDiagnostic } from "./rig-words.js";
 import { formatAbsoluteTime } from './rig-time.js';
+import { plainError } from './rig-words.js';
 /** Screen text only, from OpenRig's public tail API. Never reads harness files or input drafts. */
 const plain = s => s.replace(/\*\*|`/g, "").replace(/^\s*(?:[-*]|\d+\.)\s+/, "").trim();
 const ansi = s => s.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
@@ -158,7 +160,7 @@ export class NowTailCache {
         if (fingerprint(previous) !== fingerprint(record)) this.changed(key);
       }).catch(error => {
         if (!this.closed) {
-          const message = String(error?.message ?? error);
+          const message = errorDiagnostic(error);
           this.records.set(key, { ...previous, parsed: nowLine(""), attemptAt: now, error: message });
           if (previous?.error !== message || previous?.parsed?.line) this.changed(key);
         }
@@ -178,6 +180,7 @@ export function nowTailPresentation(record, now = Date.now(), timezone = null) {
   const unsupported = record?.status === 404;
   return { line: record?.parsed?.line ?? "", lines: record?.parsed?.lines ?? [], stale,
     prefix: stale ? `${age} · ` : "", asOf: Number.isFinite(captured) ? formatAbsoluteTime(captured,{timezone,exact:true}) : "time unknown",
-    state: record?.parsed?.withheld ? "withheld" : stale ? "not live" : "live", reason: record?.parsed?.withheld ? record.parsed.withheldReason ?? "Ambiguous input or incoming-message boundary; screen text withheld." : unsupported ? "This OpenRig doesn't serve transcripts." : String(record?.error ?? health.reason ?? "No recent screen text from OpenRig.").replace(/_/g, " "),
+    state: record?.parsed?.withheld ? "withheld" : stale ? "not live" : "live", reason: record?.parsed?.withheld ? record.parsed.withheldReason ?? "Ambiguous input or incoming-message boundary; screen text withheld." : unsupported ? "This OpenRig doesn't serve transcripts." : plainError(record?.error ?? health.reason ?? "No recent screen text from OpenRig.").text,
+    errorDetail: record?.error ?? null,
     working: Boolean(record?.parsed?.working), elapsed: record?.parsed?.elapsed ?? "" };
 }

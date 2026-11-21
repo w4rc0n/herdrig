@@ -1,3 +1,4 @@
+import { errorDiagnostic } from "./rig-words.js";
 import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, rigSeatServers, layoutHasMod, MOD_IDS, relayIdentity } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
 import { commandFor, operatorCommandFor } from "./rig-connections.js";
@@ -24,7 +25,7 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
   // under. Per-send checks judge each send alone, and the origin check needs two connections, so with one an edit of the machine or address mid-flow went unseen and the
   // viewer started on the old machine. `changed()` is the last look before an act (null with no operation: the gate refuses every gated send itself).
   const op = gatedOperationOrRefusal(config?.connectionId);
-  const changed = () => { if (op.since < 0) return null; try { op.check(); return null; } catch (error) { return { ok: false, disabled: true, reason: String(error?.message ?? error) }; } };
+  const changed = () => { if (op.since < 0) return null; try { op.check(); return null; } catch (error) { return { ok: false, disabled: true, reason: errorDiagnostic(error) }; } };
   const asAttachFailure = (res) => res?.execTimeout && typeof res.reason === "string"
     ? { ...res, reason: res.reason.replace(/^Stopped:/, "Attach stopped:") }
     : res;

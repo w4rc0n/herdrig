@@ -1,3 +1,4 @@
+import { counted } from "./rig-words.js";
 // Public /api/health presentation. No daemon internals, mutations, or diagnostic judgments.
 export function currentHealthRecords(records = []) {
   return (Array.isArray(records) ? records : []).filter(r => r && typeof r === "object" && !classifyHealth(r).cleared);
@@ -82,7 +83,7 @@ export function healthPhrases(records) {
     }
     if (first.status === "active") return {
       title: "A lot of coordination for this work",
-      what: `This work has ${counts.length === 1 ? `${counts[0]} queue changes` : "many queue changes"} compared with its recorded results. OpenRig suggests checking whether that coordination is useful.`,
+      what: `This work has ${counts.length === 1 ? counted(counts[0], "queue change") : "many queue changes"} compared with its recorded results. OpenRig suggests checking whether that coordination is useful.`,
       todo: "Open the queue item and check whether its coordination can be simpler." };
   }
   return { title: first.summary || first.detector || "Health finding",

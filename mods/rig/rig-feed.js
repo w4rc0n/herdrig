@@ -6,6 +6,7 @@ export class ConnectionFeed {
     this.config = null;
     this.data = null; // { topology, attention, at, ... } as this connection last read it
     this.error = null; // last read error
+    this.needsApproval = false; // its last read: a herdr:// connection asking for its helper approval again ("Approve helper…")
     this.sidebarState = null;
     this.cliVersion = null;
     this.healthz = null;
@@ -15,6 +16,7 @@ export class ConnectionFeed {
     this.sock = null;
     this.hadDisconnect = false;
     this.forceCapabilityProbe = false;
+    this.forceHelpProbe = false; // explicit Refresh/Retry; reconnects only invalidate live provider reads
     this.workerPreviewSupport = null;
     this.hostedReader = null; // this connection's connected-assistant roster reader
     this.providerProbe = null; // { key, at, value }: the cached live provider-availability read
@@ -22,13 +24,15 @@ export class ConnectionFeed {
     this.refreshing = false;
     this.again = false;
     this.prioritySeeded = false; // its needs notifications have seen one read (the first is silent)
+    this.fullAttention = null; // its background whole attention list: { key, data, ms, nextAt, pending, unsupported, error }
   }
 
   /** The connection now means another OpenRig (its address, home or machine changed): nothing read from the old one stays, so no row of it is drawn or acted on under the new identity,
    *  and the new one is read from scratch (capabilities probed again, backoff started over, its first needs read silent). The stream and the refresh in flight are the caller's. */
   moved() {
-    this.data = null; this.error = null; this.sidebarState = null; this.cliVersion = null; this.healthz = null; this.live = false; this.lists = {}; this.uiTimezone = undefined;
-    this.workerPreviewSupport = null; this.providerProbe = null; this.hostedReader = null; this.prioritySeeded = false;
+    this.data = null; this.error = null; this.needsApproval = false; this.sidebarState = null; this.cliVersion = null; this.healthz = null; this.live = false; this.lists = {}; this.uiTimezone = undefined;
+    this.workerPreviewSupport = null; this.providerProbe = null; this.hostedReader = null; this.prioritySeeded = false; this.fullAttention = null;
     this.delay = 1000; this.hadDisconnect = false; this.forceCapabilityProbe = true;
+    this.forceHelpProbe = true;
   }
 }

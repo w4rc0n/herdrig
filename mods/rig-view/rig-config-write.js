@@ -17,7 +17,9 @@ const configWrites=globalThis[registryKey]??(globalThis[registryKey]=new Map());
 // The lock is ONE DAEMON's: the identity string the page builds is [origin, machine, connection], and `localhost`, `127.0.0.1` and `[::1]` on one port are the same daemon, so a write pending through one
 // spelling must still block a save through another (the gate drops the old response; it does not cancel a write already sent). Other origins keep their own spelling.
 const LOOPBACK=new Set(['localhost','127.0.0.1','::1','[::1]']);
-export const lockKey=identity=>{try{const a=JSON.parse(identity);if(!Array.isArray(a))return identity;const u=addressParts(a[0]);if(!u)return identity;const origin=LOOPBACK.has(u.hostname)?`${u.protocol}//loopback:${u.port||(u.protocol==='https:'?'443':'80')}`:u.origin;return JSON.stringify([origin,...a.slice(1)]);}catch{return identity;}};
+// One OpenRig, one lock, whichever road reaches it (its tunnel, or herdr://<machine>/<hostId> after a switch): with a connection id and its expected host id
+// the lock is [connection, host id]; without a host id, the address as before.
+export const lockKey=identity=>{try{const a=JSON.parse(identity);if(!Array.isArray(a))return identity;if(typeof a[2]==="string"&&a[2]&&typeof a[3]==="string"&&a[3])return JSON.stringify(["openrig",a[2],a[3]]);const u=addressParts(a[0]);if(!u)return identity;const origin=LOOPBACK.has(u.hostname)?`${u.protocol}//loopback:${u.port||(u.protocol==='https:'?'443':'80')}`:u.origin;return JSON.stringify([origin,...a.slice(1)]);}catch{return identity;}};
 const writeRecord=identity=>{identity=lockKey(identity);let r=configWrites.get(identity);if(!r){r={pending:new Set(),owners:new Map(),uncertain:false,failed:false,idle:new Set(),waiters:new Set()};configWrites.set(identity,r);}return r;};
 export function closeConfigWrites(owner){for(const[identity,r]of configWrites){
   if(r.pending.size&&r.owners?.has(owner)){r.ownerClosed=true;r.uncertain=true;r.daemonLabel=r.owners.get(owner);}
@@ -46,7 +48,7 @@ export function configOperationRequest(request, after, identity=null, owner=null
   let expired=false,closed=false,didWrite=false;
   const waiting=new Set();
   const error=()=>Object.assign(new Error(CONFIG_SAVE_TIMEOUT),{code:'CONFIG_DEADLINE'});
-  after(15000,()=>{if(closed)return;expired=true;if(didWrite&&identity)writeRecord(identity).uncertain=true;for(const reject of waiting)reject(error());waiting.clear();});
+  const deadline=after(15000,()=>{if(closed)return;expired=true;if(didWrite&&identity)writeRecord(identity).uncertain=true;for(const reject of waiting)reject(error());waiting.clear();});
   const bounded=(...args)=>new Promise((resolve,reject)=>{
     if(expired||closed){reject(error());return;}
     waiting.add(reject);
@@ -65,7 +67,7 @@ export function configOperationRequest(request, after, identity=null, owner=null
     raw.then(({ok,status,data})=>{settled();if(!expired&&!closed){waiting.delete(reject);resolve({ok,status,json:async()=>data});}},cause=>{if(record){record.uncertain=true;record.rejected=true;}settled();waiting.delete(reject);reject(cause);});
   });
   bounded.expired=()=>expired;
-  bounded.finish=()=>{closed=true;waiting.clear();};
+  bounded.finish=()=>{closed=true;deadline?.cancel?.();waiting.clear();};
   return bounded;
 }
 

@@ -92,22 +92,49 @@ function responseOf(origin, r) {
   return { ok: status >= 200 && status < 300, status, url: origin + r.path, headers: { get: () => null }, text: async () => body, json: async () => JSON.parse(body) };
 }
 
+const markUnsent = (e) => {
+  if (e && typeof e === "object" && e.outcomeUnknown !== true) {
+    if (e.code === "GATE_REFUSED") delete e.dispatched;
+    else e.notSent = true;
+  }
+  return e;
+};
+const unsentError = (msg, extra = {}) => Object.assign(Error(msg), { notSent: true, ...extra });
+
 export class HerdrTransport {
   /** `connection(scope, parsed)` gives `{remote, config}` for a request: that connection's RemoteOpenRig and its config, or throws when the
    *  scope has no such connection. */
-  constructor({ connection, onPrepared = () => {} }) { this.connection = connection; this.onPrepared = onPrepared; this.ready = new Map(); this.batches = new Map(); this.cursors = new Map(); }
+  constructor({ connection, onPrepared = () => {}, generation = null }) { this.connection = connection; this.onPrepared = onPrepared; this.generation = generation; this.ready = new Map(); this.batches = new Map(); this.cursors = new Map(); this.pending = new Map(); }
   key(scope, parsed) { return `${scope ?? ""}\u0000${parsed.origin}`; }
+  /** A write's check of its connection's settings, taken when the write starts: true while that connection's gate generation is the same. */
+  writeCheck(scope) { if (typeof this.generation !== "function") return null; const at = this.generation(scope); return () => this.generation(scope) === at; }
   /** The prepared helper for a connection, once: approval, install and the host id pin. A failure is not kept, so the next request asks again. */
   prepared(scope, parsed) {
     const key = this.key(scope, parsed);
     if (!this.ready.has(key)) {
       const job = (async () => {
-        const { remote, config } = this.connection(scope, parsed);
-        const p = await remote.prepare(config);
-        if (!p.ok) throw Object.assign(Error(`${parsed.machine} needs your approval before herdrig uses OpenRig there over Herdr's connection.`), { needsConsent: true, confirmation: p.confirmation });
-        if (p.hostId !== parsed.hostId) throw Error(`${parsed.machine} now runs a different OpenRig than this connection was set up for. Nothing was sent.`);
-        this.onPrepared(scope, parsed, config); // the helper answered as the host id in the address: what a switched connection's old labels wait for
-        return { remote, p };
+        try {
+          const { remote, config } = this.connection(scope, parsed);
+          // Waiting for the person's approval: the same answer until the settings (the gate generation) or the stored approval change. Each
+          // prepare is about twenty remote execs, so a refresh every few seconds must not repeat it (one local file read instead).
+          // Held only where the stored approval can be read: otherwise approving could never be noticed.
+          const canHold = typeof remote.host?.readOpenRigConsent === "function";
+          const generation = typeof this.generation === "function" ? this.generation(scope) : null;
+          const stored = canHold ? JSON.stringify((await remote.host.readOpenRigConsent()) ?? null) : null;
+          const pending = canHold ? this.pending.get(key) : null;
+          // A fresh error (and confirmation) each time: a caller that tags or edits the error it caught must not change what the next caller gets.
+          if (pending && pending.generation === generation && pending.stored === stored) throw unsentError(pending.message, JSON.parse(pending.extra));
+          this.pending.delete(key);
+          const p = await remote.prepare(config);
+          if (!p.ok) {
+            const message = `${parsed.machine} needs your approval before herdrig uses OpenRig there over Herdr's connection.`, extra = { needsConsent: true, confirmation: p.confirmation };
+            if (canHold) this.pending.set(key, { generation, stored, message, extra: JSON.stringify(extra) }); // a copy: its confirmation too
+            throw unsentError(message, extra);
+          }
+          if (p.hostId !== parsed.hostId) throw unsentError(`${parsed.machine} now runs a different OpenRig than this connection was set up for. Nothing was sent.`, { wrongHost: true });
+          this.onPrepared(scope, parsed, config); // the helper answered as the host id in the address: what a switched connection's old labels wait for
+          return { remote, p };
+        } catch (e) { throw markUnsent(e); }
       })();
       this.ready.set(key, job);
       job.catch(() => { if (this.ready.get(key) === job) this.ready.delete(key); });
@@ -125,9 +152,9 @@ export class HerdrTransport {
     this.observed = seen;
   }
   /** Forgets every prepared helper and cursor of one connection (scope). */
-  forgetScope(scope) { for (const map of [this.ready, this.cursors]) for (const key of [...map.keys()]) if (key.startsWith(`${scope ?? ""}\u0000`)) map.delete(key); }
+  forgetScope(scope) { for (const map of [this.ready, this.cursors, this.pending]) for (const key of [...map.keys()]) if (key.startsWith(`${scope ?? ""}\u0000`)) map.delete(key); }
   /** Forgets a connection's prepared helper and cursor (its settings changed, or it answered as another OpenRig). */
-  forget(scope, origin) { for (const map of [this.ready, this.cursors]) for (const key of [...map.keys()]) if (key === `${scope ?? ""}\u0000${origin}`) map.delete(key); }
+  forget(scope, origin) { for (const map of [this.ready, this.cursors, this.pending]) for (const key of [...map.keys()]) if (key === `${scope ?? ""}\u0000${origin}`) map.delete(key); }
   /** A failure with no answer from the helper (it didn't run, was killed, said nothing readable) drops the prepared helper, so the next request
    *  checks the machine, the approval and the helper again. A clean error the helper answered (OpenRig stopped there, an older daemon) keeps it:
    *  preparing again would cost about twenty hc calls on every refresh for nothing. The cursor stays, unless the answer came from another
@@ -140,11 +167,11 @@ export class HerdrTransport {
 
   fetch(url, init = {}, scope = null) {
     const parsed = parseHerdrUrl(url);
-    if (!parsed) return Promise.reject(Error(`Not an address of an OpenRig over Herdr's connection: ${String(url).slice(0, 80)}`));
+    if (!parsed) return Promise.reject(unsentError(`Not an address of an OpenRig over Herdr's connection: ${String(url).slice(0, 80)}`));
     const method = String(init?.method ?? "GET").toUpperCase();
     if (method === "GET") return this.get(scope, parsed);
     if (method === "POST") return this.post(scope, parsed, init);
-    return Promise.reject(Error(`${method} requests aren't available over Herdr's connection yet. Nothing was sent.`));
+    return Promise.reject(unsentError(`${method} requests aren't available over Herdr's connection yet. Nothing was sent.`));
   }
   /** GETs made in the same turn share one exec (or several of at most 16 paths). */
   get(scope, parsed) {
@@ -172,10 +199,11 @@ export class HerdrTransport {
   }
   async post(scope, parsed, init) {
     const body = init.body ?? "";
-    if (typeof body !== "string") throw Error("A request body over Herdr's connection must be text. Nothing was sent.");
+    if (typeof body !== "string") throw unsentError("A request body over Herdr's connection must be text. Nothing was sent.");
     const headers = init.headers ?? {}, type = headers["content-type"] ?? headers["Content-Type"] ?? "application/json";
+    const stillCurrent = this.writeCheck(scope);
     const { remote, p } = await this.prepared(scope, parsed);
-    const answer = await remote.post(p, parsed.path, type, body).catch((e) => this.failed(scope, parsed, e));
+    const answer = await remote.post(p, parsed.path, type, body, { stillCurrent }).catch((e) => this.failed(scope, parsed, e));
     // The helper sent it: an answer too large or refused (a redirect) means the write happened and only its answer can't be read.
     if (answer?.tooLarge || answer?.error) throw Object.assign(Error(`The write reached OpenRig on ${parsed.machine}, but its answer couldn't be read (${answer.error ?? "too large"}). Check before sending it again.`), { outcomeUnknown: true });
     return responseOf(parsed.origin, answer);
@@ -183,7 +211,7 @@ export class HerdrTransport {
   /** A rig CLI run (`env -u … K=V … <rig> <args>`, as cliEnv and writeCommand build it) on a herdr:// connection: carried by the helper's rig verb
    *  when it is one of its writes, refused plainly otherwise. Returns what exec returns: `{code, stdout, stderr}`. */
   async cli(command, args, scope = null) {
-    if (command !== "env" || !Array.isArray(args)) throw Error(HERDR_CLI_REFUSED);
+    if (command !== "env" || !Array.isArray(args)) throw unsentError(HERDR_CLI_REFUSED);
     let i = 0; const vars = {};
     while (i < args.length) {
       if (args[i] === "-u") { i += 2; continue; }
@@ -192,33 +220,38 @@ export class HerdrTransport {
       vars[m[1]] = m[2]; i++;
     }
     const parsed = parseHerdrUrl(vars.OPENRIG_URL);
-    if (!parsed) throw Error(HERDR_CLI_REFUSED);
-    const { config } = this.connection(scope, parsed), prefix = Array.isArray(config?.rig) && config.rig.length ? config.rig : ["rig"];
-    if (!prefix.every((t, k) => args[i + k] === t)) throw Error(HERDR_CLI_REFUSED);
+    if (!parsed) throw unsentError(HERDR_CLI_REFUSED);
+    let config;
+    try { ({ config } = this.connection(scope, parsed)); } catch (e) { throw markUnsent(e); }
+    const prefix = Array.isArray(config?.rig) && config.rig.length ? config.rig : ["rig"];
+    if (!prefix.every((t, k) => args[i + k] === t)) throw unsentError(HERDR_CLI_REFUSED);
     const match = rigShapeOf(args.slice(i + prefix.length));
-    if (!match) throw Error(HERDR_CLI_REFUSED);
+    if (!match) throw unsentError(HERDR_CLI_REFUSED);
     const person = match.actor ?? vars.OPENRIG_SESSION_NAME ?? "-";
+    const stillCurrent = this.writeCheck(scope);
     const { remote, p } = await this.prepared(scope, parsed);
-    const data = await remote.rig(p, match.shape, person, match.values, match.body).catch((e) => this.failed(scope, parsed, e));
+    const data = await remote.rig(p, match.shape, person, match.values, match.body, { stillCurrent }).catch((e) => this.failed(scope, parsed, e));
     return { code: data.code, stdout: data.stdout ?? "", stderr: data.stderr ?? "" };
   }
   /** One long-poll for the connection, resuming where its last delivered one (on any socket) stopped. Returns the events and `commit()`, which
    *  the caller runs only once it has really handed the events on: a poll whose socket closed meanwhile, or that failed, moves nothing. */
-  async events(scope, parsed) {
+  async events(scope, parsed, waitMs) {
     const key = this.key(scope, parsed), { remote, p } = await this.prepared(scope, parsed);
-    const answer = await remote.events(p, this.cursors.get(key) ?? null).catch((e) => this.failed(scope, parsed, e));
+    const answer = await remote.events(p, this.cursors.get(key) ?? null, waitMs).catch((e) => this.failed(scope, parsed, e));
     const events = answer.events ?? [];
     // A guessed anchor ("0" on a daemon without a watermark, when the log looked empty) would replay history as live if a later poll resumed from
     // it, so a quiet guessed poll keeps nothing. Once events arrived, their last id is a real cursor and is kept.
     const keep = typeof answer.cursor === "string" && !(answer.anchor === "guess" && events.length === 0);
     return { events, commit: () => { if (keep) this.cursors.set(key, answer.cursor); } };
   }
-  /** A socket-shaped event stream: an HTTP 200 event-stream head, then each poll's events as SSE bytes. A quiet poll reads as Herdr's idle
+  /** A socket-shaped event stream: an HTTP 200 head only after remote preparation and a successful anchor read. A locally made wrapper is not
+   *  a live connection: returning the head before a read reset the sidebar's backoff on every outage attempt. The initial anchor has no long
+   *  poll wait, so a quiet connection opens promptly. Keep its result until read, so closing before delivery moves no cursor. A quiet poll reads as Herdr's idle
    *  timeout, so the stream reader asks its health check and reads again; a failure is thrown and the reader reconnects with its backoff. */
   eventSocket(url, scope = null) {
     const parsed = parseHerdrUrl(url);
     if (!parsed) throw Error(`Not an address of an OpenRig over Herdr's connection: ${String(url).slice(0, 80)}`);
-    let closed = false, asked = false, headSent = false;
+    let closed = false, asked = false, headSent = false, firstPoll = null;
     // A new stream starts from the newest event, as a reconnected SSE stream does: after an outage, a sleep or a switch away and back, the stored
     // backlog is never replayed as if it were live. The sidebar's own refresh brings the state up to date.
     this.cursors.delete(this.key(scope, parsed));
@@ -227,8 +260,14 @@ export class HerdrTransport {
       read: async () => {
         if (closed) return null;
         if (!asked) throw Error("The event stream was read before it was asked for.");
-        if (!headSent) { headSent = true; return utf8Bytes("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"); }
-        const { events, commit } = await this.events(scope, parsed);
+        if (!headSent) {
+          firstPoll = await this.events(scope, parsed, 0);
+          if (closed) return null;
+          headSent = true;
+          return utf8Bytes("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+        }
+        const { events, commit } = firstPoll ?? await this.events(scope, parsed);
+        firstPoll = null;
         if (closed) return null; // closed while the poll was out: nothing delivered, so the cursor stays where it was
         commit();
         if (!events.length) throw Error(IDLE_ERROR);

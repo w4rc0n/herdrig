@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.2
+Version: v0.5.3
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -118,9 +118,10 @@ Check the `Version:` line in the README you copied, or open System and read **He
 
 - **Network:** only OpenRig's local address (`127.0.0.1:7433` unless your OpenRig uses another port), over HTTP and SSE.
   It reads live state; write requests follow your actions:
-  - a Decision Card act;
+  - a Decision Card act, or dismissal of your queue updates after the 10-second Undo window;
   - a usage refresh;
-  - spec validation and library sync, when you save a spec or copy one to the library.
+  - spec validation and library sync, when you save a spec or copy one to the library; whole-folder Copy & edit
+    also renames the new library copy, including when resuming an unfinished copy.
   - a per-setting save or reset in System → Configuration. Saved boot settings may still need a daemon restart;
     Herdrig never restarts OpenRig.
 
@@ -131,7 +132,10 @@ Check the `Version:` line in the README you copied, or open System and read **He
   On a configured machine, pinned helpers run through `hc exec`; spec content travels on stdin, without staging
   a remote transfer file. Helper installation and verification use that machine's ordinary file and identity tools.
 - **Files:** it reads `<appHome>/openrig/config.json` (optional: your OpenRig name), `<appHome>/openrig/state.json`,
-  and the spec and slice files you open in its viewer. It writes `<appHome>/openrig/state.json` and the user spec files
+  the saved layout files used to discover old views, `<appHome>/mods/spaces/main.js` for compatibility, and the
+  spec and slice files you open in its viewer. Connection and layout actions also read and write `config.json`,
+  `machine-consent.json`, `spec-consent.json` and `spaces-list.json` under `<appHome>/openrig/`.
+  It writes `<appHome>/openrig/state.json` and the user spec files
   you edit and save in its spec editor. Local edits are limited to this machine's spec folders, with symlinks resolved:
   OpenRig's spec library `<OpenRig home>/specs`, and `workspace.specs_root` from the local `rig`. The home is
   `openrigHome` if you set it, else `OPENRIG_HOME` in Herdr's environment, else `~/.openrig`, so a default install
@@ -154,28 +158,26 @@ with no shell, and attaches only to session names OpenRig makes.
 Earlier versions' **Copy & edit** for a spec could read a file the OpenRig daemon named on your machine and send it
 to the daemon. This version copies only the spec text OpenRig served.
 
-## Worker views (OpenRig 0.7.12 and later)
+## Worker views
 
 v0.5.0's native checks ran on OpenRig 0.7.14, 0.7.16 and 0.7.17 with herdr-app 0.1.16 (on 0.7.16 and 0.7.17: install from the release package, an upgrade from 0.7.14 and 0.7.16 respectively, Attach and Needs on two machines). The API/CLI compatibility smoke ran on OpenRig 0.7.13, and native worker-view checks on 0.7.12.
 
-[The herdr-app provider](https://github.com/mvschwarz/openrig/pull/2744) opens worker
-views in the Herdr window on the **same machine as OpenRig**. Worker view, **Show in worker view**, and saved-view
-preview + Open turn on when that provider reports the window available. Herdrig checks availability and supported
-verbs, not the version number alone. A tunnel alone cannot make that provider reach a window on your computer.
-Herdrig can't close those provider views yet: close one with `rig terminal close <view-id>` or close its Herdr tab.
-With a custom app home, give the close command the same `--app-home` as the open command.
-Opening a worker view can leave a progress spinner visible after the view has opened. Inspect the opened view
-before retrying: another Open creates another view.
-Attach, the TUI tab and Herdrig's own Seats grids use their separate connection paths.
+**Worker view** opens your rig's live seats as tiles in ordinary Herdr tabs, in the rig's own space: one tab per
+page, named after the page. Close a tile or a whole page with Herdr's own close; your seats keep running.
+Choosing Worker view again selects the open pages, and reattaches any tile whose viewer ended.
+**Show in worker view** focuses a seat's tile (in its worker page, or in the Seats tab).
+Saved views open the same way and keep their page layout. **Follow** adds seats as they start working or need you.
+Idle tiles stay until you set a prune time: optional **herdrig prune**, off by default, removes unfocused idle tiles after 5, 10 or
+30 minutes. Worker views work for this computer's OpenRig and a configured machine's alike. Saved views and
+Follow need an OpenRig that can plan worker views (0.7.12 or later); without one, Worker view opens the Seats tab.
 
-When `daemonMachine` is configured and the provider has no window, **Worker view** instead opens Herdrig's
-worker pages here through the approved helper on that machine. Saved views keep their page geometry; read-only
-seats reject typing. Commands from a preview are never executed. **Follow** adds new seats without rebuilding
-live viewers. Optional **herdrig prune**, off by default, removes only verified, unfocused inactive viewers after
-5, 10 or 30 minutes; the seats keep running. Personal panes, changed viewers and restored shells stay.
-Failed refreshes pause following with **Retry**, with no local fallback. Reopening selects the existing pages.
-If a saved view changes a retained tile's read-only mode, close its worker tab and reopen; Herdrig never
-silently relabels an interactive viewer as read-only or replaces it. Design and cell editing stay provider-only.
+Older versions opened OpenRig's own worker views, with a pill strip. To close those, use **Close OpenRig's old
+views** in the sidebar's System section. If no local OpenRig can close them, close their Herdr tabs; seats keep running.
+The confirmation also finds old views in saved Herdr layouts without switching your layout. Afterward, close
+any leftover tab there with Herdr's tab close. A focused worker tile stays untouched; rebuilding another tile
+may open an additional, numbered page, which the result explains.
+
+Worker views need Herdrig's Rig sidebar. Open it before trying Worker view from a standalone page or palette.
 
 The same release includes [pull-mode relay delivery](https://github.com/mvschwarz/openrig/pull/2844),
 [unsetting a person's gateway binding](https://github.com/mvschwarz/openrig/pull/2812), and
@@ -184,14 +186,6 @@ The same release includes [pull-mode relay delivery](https://github.com/mvschwar
 Local and remote Seats tiles fit their panes when alone and yield sizing to Attach when it is open (tmux 3.2+).
 Sizing settles within about five seconds; a quicker Seats revisit can briefly resize Attach.
 Remote Seats use the verified relay on the configured machine; only each tile's own client flags change.
-
-**More than one OpenRig:** for an OpenRig added on another Herdr machine, worker views use Herdrig's worker pages
-where that OpenRig offers them, and never the provider (it would need this computer's app home, which means nothing
-on that machine). Otherwise its worker views say they aren't available from this computer yet, and nothing is sent.
-
-**Provider limits:** Follow and auto-prune for herdr-app, custom worker-view grids (`--grid`/`--replace`), and
-cell editing (`close --cell`) are not supported on upstream main yet. Those controls stay greyed out until OpenRig
-adds the required support. The provider release alone will not enable them; no release date is promised.
 
 ## Using more than one OpenRig
 
@@ -248,8 +242,6 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
   on the same machine, commands for them there say "Two OpenRigs on <machine> need a home for each; this version
   supports one per machine." and nothing is sent.
 - Adding a second OpenRig for a machine that already has one is refused ("`<machine>` already has a connection.").
-- OpenRig's own herdr-app provider still opens worker views only on its own machine. Herdrig's worker pages,
-  Attach and Seats grids work on each machine.
 - If a machine's OpenRig address changes, Herdrig asks once before it treats that machine's existing rig spaces as its
   own.
 - With more than one OpenRig added, **Copy & edit** of a built-in spec that has its own folder (such as `starter`) works
@@ -259,11 +251,6 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
 ## Known limitations
 
 - Herdr-app [v0.1.16](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.16) includes [#977](https://github.com/herdrdev/herdr-app/pull/977), which keeps the active space in view. Update Herdr if you are using an older version.
-- **Provider worker views need one machine.** OpenRig's own provider must reach a Herdr window on its machine.
-  Herdrig's configured-machine worker pages, Attach and Seats grids use separate paths.
-- **With upstream OpenRig's own `herdr-app` provider** serving the window, the four mods work with less chrome: no
-  cell-level seat identity, follow countdown or per-view row.
-- **Follow and auto-prune** require herdr-app support plus both `--follow` and `--prune-after` in `rig terminal open`.
 - **Some actions need your OpenRig name.** Sending, queueing, changing a seat's model, and editing quiet hours or
   modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
 - **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.

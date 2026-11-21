@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.5.3
+
+Worker views in Herdr's own tabs, separate page histories, and less idle work.
+
+- **Worker views in Herdr's own tabs.** Worker view opens herdrig's pages as ordinary tabs, counted in the sidebar's Views badge; its tooltip explains the action and where tiles run. Older OpenRig views can be closed from System. Follow leaves idle tiles open unless you set a prune time.
+- **Separate Rig tabs keep their own history,** so Back and Escape stay in the tab you use. Split Rig panes and older layouts retain their shared history.
+- **The sidebar shows requests sooner and does less idle work.** It no longer waits for the whole Needs list before showing requests. Idle app CPU was about 72% lower in a software-rendered 33-space test; the measured setup and remaining banner limitation are below.
+- **Clearer when something fails.** Refusals say when nothing was sent, errors use plain words, and Cancel keeps your reply draft.
+
+### Updating from v0.5.2
+
+- Updating asks for no new approval. Machines you've already approved keep their Attach approval.
+- After switching from one OpenRig address to a connections list, close any open worker views and Rig pages, then reopen them from the sidebar. Existing tabs keep their old connection and may show an incorrect view count or unavailable status; Follow may stop updating them. Old Rig tabs without a connection also refuse Follow slice, Attach, Focus pane and Send/Queue until closed and reopened.
+
+### All changes
+
+- When OpenRig records or retains a message without delivering it, the result says so and Send stays off; it no longer says "Nothing was sent."
+- Spaces list drift: no change against Herdr 0.1.16.
+- Worker-view waits and delayed refreshes no longer depend on another tab staying open. A machine lookup stays retryable until its probe starts.
+- Visible Health changes still update immediately. Sample clocks do not trigger updates across the app, and hidden connections do no extra Health checks. Health's checked time and history refresh once a minute while shown.
+- Open Rig pages reuse unchanged sidebar answers without repeated full-list reads. Graph edges, recent handoffs and other page-only details refresh once a minute while shown. If a sidebar stops answering, its last answer can be reused for up to 75 seconds before the page checks for itself. Saved worker layouts are checked again when they change or you choose Refresh.
+- A seat's CONTEXT shows the Claude account it is set to launch with, when OpenRig reports one. This does not check who is signed in now.
+- Worker view now opens herdrig's own pages in ordinary Herdr tabs. If you have older OpenRig worker views with a pill strip, use **Close OpenRig's old views** (System) to close them; your seats keep running.
+- Opening a health finding that has disappeared now points to Health on the same OpenRig, rather than saying the request was already answered.
+- Reply in your own words, Open seat and Open assistant page in Needs now work from the keyboard.
+- Enter on a control now runs its action once, so Add a machine and other dialogs do not open twice. Connection dialogs keep Cancel or Close reachable while their configuration loads.
+- Closing the old-view cleanup dialog no longer interrupts cleanup. The Rig sidebar and System report the result.
+- Add a machine waits for its folder check before showing verification and choosing which field needs attention. Folder edits still check again after an earlier check completes, and asynchronous failures return keyboard focus to the right field.
+- Live updates and reconnect attempts keep working when another Herdr tab is active. Closing or changing a connection prevents its delayed event refresh from starting new work.
+- Refresh shows newly added projects without restarting Herdr. Your selected project stays selected; if the check fails, the last project list stays visible.
+- Connected assistants remembers whether it is open, and dialogs keep keyboard focus after asynchronous checks. Settings can finish checking an uncertain save without depending on another tab.
+- Repeated changes to the Rig page's Needs perspective, folds and last-seen state now save even when no sidebar is open.
+- Rig page buttons and links explain what they do when you hover over them.
+- Helper approval from another view resumes a waiting grid check automatically.
+- Recovery warnings stay visible without repeated checks of unchanged grids. Unavailable connections retry less often, say why, and can still be retried at once.
+- The sidebar avoids repeated checks and redraws when nothing has changed, including after you change OpenRig's settings. Real activity changes and connection errors still appear, and old notices and space information are cleared when they are no longer needed.
+- In a software-rendered test with 33 spaces and 128 tabs, idle app CPU use across processor cores fell by about 72%, from 243–245% to 68–69%. This was two measured runs per build on Herdr 0.1.16; it is not a guarantee for every setup, and render-interrupt banners can still appear under load.
+- Permission dialogs stop polling after they close, and the Spaces list checks less often while idle.
+- Rig pages reuse unchanged data and draw batches of new answers together, reducing repeated reads and redraws.
+- Separate Rig tabs keep their own page history, so Back and Escape stay in the tab you use. A tab split into several Rig panes still shares one history, as before; older layouts without native tabs also keep shared history.
+- Pause and Archive refusals say "Nothing was sent" once when their connection disappears. A spec save that finishes after its editor closes still reports that it saved.
+- **The sidebar shows your rigs and requests without waiting for OpenRig's whole Needs list.** On a large OpenRig that list can take several seconds; requests are now read on their own (quickly) at every refresh, and the rest of the list is read in the background, at most once at a time. When it's slow, Needs says how often it's read. The Rig page uses the sidebar's copy instead of reading it again.
+- After a capability check fails, a connection keeps its last confirmed controls while its OpenRig version still matches, instead of offering unsupported actions again. Connections says when it is using that last answer.
+- Error banners explain what went wrong, with the original message under Details. Status labels and counts use plain words, such as "needs attention", "1 seat" and "1 rig".
+- A smaller installation includes only the code each mod needs, with its helpers, icons and release information.
+- **In the narrow Rig view, the Usage section now follows the page filter.** Beside a grid (under about 660 px wide), a filter narrows the Usage cards as it does the wide table, and says when nothing matches. This was a known issue in v0.5.2.
+- Health checks on this computer refuse an answer that redirects or does not confirm the requested address.
+- **Open rig space goes into the space you already keep for the rig** (one named after it), instead of making a second, numbered one.
+- Hover over the Needs read time or a connected assistant's queue icon to read its explanation. These tooltips now appear instead of filling Herdr's log with warnings.
+- **With several OpenRigs, opening a rig's space from the sidebar opens that OpenRig's rig, even when two OpenRigs have a rig with the same id,** and a space another OpenRig on this computer made is no longer taken over when the two share a host name.
+- **With several OpenRigs, archiving a rig no longer drops another OpenRig's same-named rig from the Rig page's back history.** Before, archiving `demo` on one machine also removed the pages of a `demo` on another.
+- **With several OpenRigs, the Topology page you land on after archiving or deleting a rig, or after opening the Rig page with no page chosen, belongs to that rig's OpenRig.** Before, it named no OpenRig, so a link from it could open on the wrong one.
+- **With several OpenRigs, each OpenRig's spaces show only its own pages:** opening another OpenRig's request goes to that OpenRig's space instead of changing a Rig page in another space, and an older Rig page in an OpenRig's space adopts that OpenRig instead of saying `"This page names no OpenRig"`.
+- Interrupted spec Save and Copy & edit recover from temporary files left behind by a failed transfer. Fresh concurrent transfers are refused, and every write checks its intended text so two windows cannot mix their spec contents.
+- Different non-loopback OpenRig addresses stay distinct, while equivalent spellings of one address still prevent duplicate connections.
+- Capability checks refresh when OpenRig changes, keep each connection's answers separate, and retry when they fail.
+- **Connections stays current.** System › Connections now follows the sidebar when an OpenRig stops answering and when it recovers.
+- **System › Connections shows a change to a machine's helper approval at once.** Approving the Attach helper, or removing its approval, updates the Helper row right away; before, the row changed only after you edited the settings.
+- Worker-view headers do less repeated work while idle; countdowns and new status still update.
+- Cancel in a reply box now keeps what you typed; Discard draft throws it away.
+- **When OpenRig refuses a send before it leaves, herdrig says "Nothing was sent." and lets you try again.** This covers Send, Queue, Reply, Launch, Archive, one-click actions and People actions: the machine is offline or not approved, OpenRig's settings changed meanwhile, or OpenRig's command reports that nothing ran. Your text and the confirm button stay. A request OpenRig refused outright no longer adds "It may still have arrived"; a dropped connection or a server error still does.
+- After a People action, its page refreshes using that OpenRig's current connection settings.
+- The Rig graph no longer shows extra pods named after parts of a seat's name during a refresh.
+- **A rig's Graph keeps its legend in place.** The status line above the graph ("Last handoff … ago" or a seat's details) stays on one line and ends in "…" when it is long; it no longer pushes the legend onto a second line and flickers between the two layouts every second. The handoff's age now counts in seconds for the first minute, then in minutes, then in hours.
+- **Retry after a failed Pause checks the seats again.** If the rig's seats changed since you reviewed them, nothing is sent; reopen Pause to review the new list.
+
 ## v0.5.2
 
 Faster and steadier with several OpenRigs.

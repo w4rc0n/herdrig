@@ -2,6 +2,7 @@
 // configured machine and freshly resolved box roots, including after a dialog.
 import { RemoteMachine,herdrIdentityOf} from './rig-remote.js';
 import { specCopyName, sameDaemon } from './rig-lib.js';
+import { sha256Text } from './rig-sha256.js';
 export const SPEC_SHA256 = '737eb9b9dbd16b5271eb67cdb36fdb4805ba25f890f9138e522d0f282731baa8';
 const jobs = new Map();
 const identity = r => [r.target ?? '', r.id ?? '', r.via ?? '', r.session ?? ''];
@@ -59,24 +60,37 @@ export class RemoteSpecs {
   const fresh=await new RemoteMachine(this.host).ready(config.daemonMachine);
   if(JSON.stringify(identity(fresh))!==JSON.stringify(identity(record)))throw Error('The Herdr machine changed. Nothing was written.');
  }
- remote(p,verb,target='',expectedSha256=''){
-  return this.call(p.config,'run',[this.host.appHome,p.machine,p.home,p.node,verb,target,expectedSha256,JSON.stringify(p.roots),JSON.stringify(p.record)]);
+ remote(p,verb,target='',expectedSha256='',expectedContentSha256=''){
+  return this.call(p.config,'run',[this.host.appHome,p.machine,p.home,p.node,verb,target,expectedSha256,JSON.stringify(p.roots),JSON.stringify(p.record),expectedContentSha256]);
  }
  async transfer(config,text,operation){
+  // Bind the intended UTF-8 bytes before touching the shared scratch file. A second stale-file reclaimer may replace it.
+  const expectedContentSha256=sha256Text(text);
   // O_EXCL in the bridge also serializes separate mod runtimes/windows. Only
-  // remove a transfer this operation successfully created.
-  await this.call(config,'prepare',[this.host.appHome]);
+  // remove a transfer this operation successfully created (or an empty file left if settings changed mid-prepare).
+  try{
+   await this.call(config,'prepare',[this.host.appHome]);
+  }catch(error){
+   if(error?.code==='GATE_REFUSED'&&error.dispatched===true)await this.call(config,'remove',[this.host.appHome,'--if-empty']).catch(()=>{});
+   throw error;
+  }
+  let failed=false;
   try{
    await this.host.writeText(`${this.host.appHome}/openrig/spec-transfer.txt`,text,'');
-   return await operation();
-  }finally{await this.call(config,'remove',[this.host.appHome]);}
+   return await operation(expectedContentSha256);
+  }catch(error){
+   failed=true;throw error;
+  }finally{
+   try{await this.call(config,'remove',[this.host.appHome]);}
+   catch(cleanupError){if(!failed)throw cleanupError;}
+  }
  }
  // Local copy readbacks share the same constant transfer and cross-operation lock as remote writes.
  hashText(config,text){
   const key=this.host.appHome;
   const job=(jobs.get(key)??Promise.resolve()).catch(()=>{}).then(async()=>{
-   const result=await this.transfer(config,text,()=>this.call(config,'digest',[key]));
-   if(!/^[a-f0-9]{64}$/.test(result.sha256??''))throw Error('The spec text hash could not be verified.');
+   const result=await this.transfer(config,text,expected=>this.call(config,'digest',[key,expected]));
+   if(result.sha256!==sha256Text(text))throw Error('The spec text hash could not be verified.');
    return result.sha256;
   });
   jobs.set(key,job);return job.finally(()=>{if(jobs.get(key)===job)jobs.delete(key);});
@@ -96,16 +110,16 @@ export class RemoteSpecs {
    }
    await this.unchanged(config,p.record);
    // A built-in's whole folder, with its agent paths made absolute in the same step (one grant, one helper call).
-   if(request.verb==='copy-folder')return this.transfer(config,request.content,()=>this.remote(p,'copy-folder',request.sourcePath));
+   if(request.verb==='copy-folder')return this.transfer(config,request.content,expected=>this.remote(p,'copy-folder',request.sourcePath,'',expected));
    if(request.verb==='save'){
-    const base=await this.transfer(config,request.baseText,()=>this.call(config,'digest',[key]));
+    const base=await this.transfer(config,request.baseText,expected=>this.call(config,'digest',[key,expected]));
     await this.unchanged(config,p.record);
-    return this.transfer(config,request.content,()=>this.remote(p,'save',request.target,base.sha256));
+    return this.transfer(config,request.content,expected=>this.remote(p,'save',request.target,base.sha256,expected));
    }
    const base=specCopyName(request.name);
    for(let i=0;i<20;i++){
     const target=`${p.roots[0]}/${base}${i===0?'':i===1?'-copy':`-copy-${i}`}.yaml`;
-    try{return await this.transfer(config,request.content,()=>this.remote(p,'copy',target));}
+    try{return await this.transfer(config,request.content,expected=>this.remote(p,'copy',target,'',expected));}
     catch(error){if(error.code!=='copy_exists')throw error;}
    }
    throw Error('No free copy name was found in the box spec folders.');

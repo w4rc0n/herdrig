@@ -17,7 +17,7 @@ export function archivedElements({ div, svg, h_flex }, t, records, { host = null
   if (!rigs.length) return [];
   const key = `archived:${host ?? "all"}`;
   register({ key, foldKey: key, expandable: true, isOpen: open, parentKey: "branch:topology" });
-  return [h_flex().id(key).pl(indent).pr(8).h(22).gap(6).items_center().text_color(t.dim).cursor_pointer()
+  return [h_flex().id(key).tooltip(`${open ? 'Hide' : 'Show'} the ${rigs.length} archived rigs`).pl(indent).pr(8).h(22).gap(6).items_center().text_color(t.dim).cursor_pointer()
     .on_click(toggle).child(svg(icon(open ? "chevron-down" : "chevron-right")).size(11))
     .child(div().text_size(12).child(`Archived (${rigs.length})`)),
   ...(open ? rigs.map(r => {
@@ -30,7 +30,7 @@ export function archivedElements({ div, svg, h_flex }, t, records, { host = null
       .on_mouse_down("right", () => menu(r)).tooltip(`${r.name ?? r.id} · ${ago}`)
       .child(svg(icon("rig-archive")).size(12))
       .child(div().flex_1().min_w(0).truncate().text_size(12).tooltip(`${label}\n${ago}`).child(label))
-      .child(div().id(`restore-rig-${r.id}`).px(6).h(20).rounded(5).bg(t.raised).text_size(11).text_color(t.accent).flex().items_center().cursor_pointer()
+      .child(div().id(`restore-rig-${r.id}`).tooltip(`Restore ${r.name ?? r.id} from the archive`).px(6).h(20).rounded(5).bg(t.raised).text_size(11).text_color(t.accent).flex().items_center().cursor_pointer()
         .on_click((_e, cx) => { cx.stop_propagation(); restore(r); }).child("Restore"));
   }) : [])];
 }

@@ -17,7 +17,7 @@ export function workerViewDetails(entry){
 
 /** Narrow projection: deliberately never inspect preview commands, roots or socket paths. */
 function verifiedRemote(remote){
-  if(!remote?.ok||!remote.machine||!remote.selfHostId||!goodHome(remote.node)||!goodHome(remote.relayPath))
+  if(!remote?.ok||(!remote.machine&&!remote.local)||!remote.selfHostId||!goodHome(remote.node)||!goodHome(remote.relayPath))
     throw new Error("The remote worker-view destination has not been verified.");
 }
 export function workerPad(remote){
@@ -56,7 +56,7 @@ export function hostWorkerPlan(preview,nodes,remote,view=null){
       const argv=reason?["sleep","2147483647"]:[remote.node,remote.relayPath,base64EncodeUtf8(JSON.stringify({
         mode:"grid",session,serverArgs,readOnly:pane.readOnly,title,
       }))];
-      return {session,label,runtime,readOnly:pane.readOnly,title,argv,...(reason?{placeholder:true,reason}:{})};
+      return {session,label,runtime,readOnly:pane.readOnly,title,argv,...(!reason?{serverArgs}:{}),...(reason?{placeholder:true,reason}:{})};
     });
     for(let i=0;i<blanks;i++)tiles.push(workerPad(remote));
     return {name:pages.length>1?`${name} · ${index+1}/${pages.length}`:name,columns,rows,tiles};
