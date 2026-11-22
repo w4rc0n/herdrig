@@ -105,8 +105,8 @@ export async function leaveOldStrip(host,config,views,appHome,capsFor,returnLayo
       result={ok:false,closed:0,failures:[]};lines.push("The old views weren't closed: this OpenRig can't close them from here.");
     }else{
       result=await closeOldViews(host,config,views,appHome,capsFor);
-      if(result.ok)lines.push(`Closed ${result.closed} old views.`);
-      else lines.push(closeFailureText(result,views.length));
+      if(result.ok)lines.push(result.closed?`Closed ${result.closed} old views.`:'Nothing needed closing.');
+      else lines.push(closeFailureText(result,result.closed+result.failedViews.length));
     }
   }
   try{
@@ -144,10 +144,19 @@ export function oldViewCandidates(config,capsFor){
   const list=config.connections?.length?config.connections.map(c=>configOfConnection(config,c.id)).filter(Boolean):[config];
   return list.filter(c=>!c.daemonMachine&&capsFor(c.connectionId??LEGACY_CONNECTION_ID)?.herdrAppProvider===true);
 }
-export function knownOldProviderViews(tree,cached=[]){
+const goneKey=config=>JSON.stringify((config?.connections?.length?config.connections.map(c=>configOfConnection(config,c.id)).filter(Boolean):[config])
+  .filter(c=>c&&!c.daemonMachine).map(c=>[c.connectionId??LEGACY_CONNECTION_ID,c.daemonUrl??null,c.openrigHome??null]).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))));
+/** Session-only receipts, scoped to the configured local authorities; never inferred from a failed/uncertain close. */
+export const oldViewsGone=(shared,config)=>shared?.('rig.oldProviderGone')?.[goneKey(config)]??[];
+function rememberGone(host,config,id){
+  if(!host.shared||!host.setShared)return;
+  const all=host.shared('rig.oldProviderGone')??{},key=goneKey(config);
+  host.setShared('rig.oldProviderGone',{...all,[key]:[...new Set([...(all[key]??[]),id])]});
+}
+export function knownOldProviderViews(tree,cached=[],gone=[]){
   const found=new Map(cached.map(view=>[view.id,{...view,current:false}]));
   for(const view of oldProviderViews(tree))found.set(view.id,{...found.get(view.id),...view,current:true});
-  return [...found.values()];
+  return [...found.values()].filter(view=>!gone.includes(view.id));
 }
 /** Read-only dependency on Herdr's documented layouts/<name>.json format.
  * Unknown shapes, unreadable files and malformed JSON are skipped independently. */
@@ -172,10 +181,18 @@ export function oldViewsLocationText(views){
   return `${views.length} old view${views.length===1?'':'s'}: ${current} in this window, ${saved} in saved layouts${names.length?` (${names.join(', ')})`:''}. Only their viewers end; your seats keep running.`;
 }
 /** A view-not-found is the only result that permits trying another local OpenRig. All other failures remain uncertain. */
+/** Explicit fallback: close only the reviewed views; the current layout is never changed. */
+export async function closeOldViewsOnly(host,config,views,appHome,capsFor){
+  const result=await closeOldViews(host,config,views,appHome,capsFor);
+  const text=result.ok?(result.closed?`Closed ${result.closed} old view${result.closed===1?'':'s'}.`:'Nothing needed closing.'):closeFailureText(result,result.closed+result.failedViews.length);
+  return{...result,switched:false,title:result.ok?(result.closed?"Closed OpenRig's old views":'The old views were already gone'):result.closed?"Some old views weren't closed":"Couldn't close the old views",
+    text:`${text}\nThe strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout).\nYour seats keep running.`};
+}
 export async function closeOldViews(host,config,views,appHome,capsFor){
   const candidates=oldViewCandidates(config,capsFor),failures=[],failedViews=[];let closed=0;
   const fail=(view,reason)=>{failures.push(`${view.name}: ${reason}`);failedViews.push({id:view.id,name:view.name,reason:closeReason(reason)});};
   for(const view of views){
+    if(oldViewsGone(host.shared,config).includes(view.id))continue;
     if(!(await readOldProviderViews(host,appHome)).some(v=>v.id===view.id))continue;
     let known=false;
     for(const candidate of candidates){
@@ -190,12 +207,15 @@ export async function closeOldViews(host,config,views,appHome,capsFor){
         if([receipt,result.json,result.json?.error].some(value=>value?.outcomeUnknown===true||value?.uncertain===true)){
           fail(view,'The close was not confirmed. Check this view before trying again.');known=true;break;
         }
-        if(result.ok){closed++;known=true;break;}
+        if(result.ok){closed++;rememberGone(host,config,view.id);known=true;break;}
         if(result.json?.error?.code==='view_not_found'||result.json?.code==='view_not_found')continue;
         fail(view,result.text||'The close was not confirmed.');known=true;break;
       }catch(error){fail(view,String(error?.message??error));known=true;break;}
     }
-    if(!known)fail(view,'No OpenRig on this computer knows it.');
+    if(!known){
+      if(candidates.length)rememberGone(host,config,view.id); // Every eligible local authority replied definitely view_not_found.
+      else fail(view,'No OpenRig on this computer knows it.');
+    }
   }
   return{ok:failures.length===0,text:`Closed ${closed} old view${closed===1?'':'s'}; seats keep running.${failures.length?'\n'+failures.join('\n'):''}`,closed,failures,failedViews};
 }
