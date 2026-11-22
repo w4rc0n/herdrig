@@ -16,7 +16,7 @@ import { errorBlock, errorNotice } from "./rig-error-view.js";
 const notify = value => errorNotice(rawNotify, value);
 import { followedConnection, spaceMachine } from "./rig-follow.js";
 import { herdrIdentityOf } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, hasOldProviderStrip } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, hasOldProviderStrip, oldViewsGone } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal, gateSameConfig, CONFIG_CHANGED, numberedConfigReads } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
@@ -467,7 +467,7 @@ export default class RigPalette extends View {
         return (ll.startsWith(q) || q.startsWith(firstWord) || Boolean(label && label.toLowerCase().includes(q))) && notExactUnboxed(hasConn, ll);
       };
       const own = [];
-      if ((hasOldProviderStrip(layout())||knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]).length && oldViewCandidates(this.config, conn => this.caps(conn)).length)
+      if ((hasOldProviderStrip(layout())||knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).length && oldViewCandidates(this.config, conn => this.caps(conn)).length)
         && ("leave openrig's old strip".includes(q)||"close old worker views".includes(q))) {
         own.push({line:"leave-old-strip",label:"Leave OpenRig's old strip…",hint:"Close old views and switch to the layout you pick"});
       }
@@ -560,7 +560,7 @@ export default class RigPalette extends View {
     // The TUI's refresh re-reads its own view; here the sidebar re-reads (the page follows it).
     if (verb === "refresh" && !arg) { run("rig.refresh"); this.dismiss(); return true; }
     if ((verb === "leave-old-strip"||verb === "close-old-worker-views") && !arg) {
-      const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
+      const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config));
       if (!hasOldProviderStrip(layout())&&(!views.length || !oldViewCandidates(this.config, conn => this.caps(conn)).length)) {
         this.error = "There is no OpenRig strip in this window.";
         cx.notify(); return true;

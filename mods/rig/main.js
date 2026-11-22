@@ -49,7 +49,7 @@ const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 import { RemoteMachine, detectDaemonMachine, offerForMachine, machineProbeExec, herdrIdentityOf, loopbackHealthFetch, goodHome } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViews, hasOldProviderStrip, ensureOldStripPage } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViewsOnly, hasOldProviderStrip, ensureOldStripPage, oldViewsGone } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { HostWorkerViews } from "./rig-worker-controller.js";
 import {workerViewDetails} from "./rig-worker-views.js";
@@ -1903,7 +1903,7 @@ export default class RigSidebar extends View {
           this.inFlightActions?.delete(id); // The native page, not this layout copy, owns the operation from here.
           return;
         }
-        const result=await closeOldViews(host,reviewed,request.views??[],appHome(),conn=>connectionCapabilities(shared,reviewed,conn,terminals()));
+        const result=await closeOldViewsOnly(host,reviewed,request.views??[],appHome(),conn=>connectionCapabilities(shared,reviewed,conn,terminals()));
         if(!ticket.expired&&(!this.closed||ticket.switching))publish(result);
       }catch(error){if(!this.closed&&!ticket.expired)publish({ok:false,text:String(error?.message??error)});}
       finally{deadline?.cancel?.();if(this.oldViewsClosing===ticket)this.oldViewsClosing=null;this.inFlightActions?.delete(id);}
@@ -4478,7 +4478,7 @@ export default class RigSidebar extends View {
       const cleanupResult=this.oldViewsCloseResult();
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(cleanupResult.ok===false?t.blocked:t.muted).child(cleanupResult.text));
-      const oldViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
+      const oldViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config));
       if (hasOldProviderStrip(layout())||oldViews.length) {
         const closeActivation=activationPair(this,'system-close-old-worker-views');
         const openOldViews=()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,
