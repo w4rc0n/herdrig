@@ -49,7 +49,7 @@ const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 import { RemoteMachine, detectDaemonMachine, offerForMachine, machineProbeExec, herdrIdentityOf, loopbackHealthFetch, goodHome } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViews } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViews, hasOldProviderStrip, ensureOldStripPage } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { HostWorkerViews } from "./rig-worker-controller.js";
 import {workerViewDetails} from "./rig-worker-views.js";
@@ -1860,8 +1860,8 @@ export default class RigSidebar extends View {
       // cx is the sidebar command-loop context. The ownerless job has no view to notify.
       const publish=result=>{
         setShared('rig.oldViewsCloseResult',{id,session:this.cleanupSession,expiresAt:Date.now()+120000,...result});
-        setShared('rig.status',{id,busy:false,...result,at:Date.now()});notify({title:'Old worker views',body:result.text,level:result.ok?'info':'warning'});cx.notify();
-        cx.timer?.after?.(120000,next=>{if(!this.closed&&shared('rig.oldViewsCloseResult')?.id===id){setShared('rig.oldViewsCloseResult',null);cx.notify();}},{owner:null});
+        setShared('rig.status',{id,busy:false,...result,at:Date.now()});notify({title:result.title??'Old worker views',body:result.text,level:result.ok?'info':'warning'});
+        if(!this.closed){cx.notify();cx.timer?.after?.(120000,next=>{if(!this.closed&&shared('rig.oldViewsCloseResult')?.id===id){setShared('rig.oldViewsCloseResult',null);cx.notify();}},{owner:null});}
       };
       if(!Number.isFinite(request?.createdAt)||Date.now()-request.createdAt>120000||request.createdAt>Date.now()+1000){publish({ok:false,text:'This cleanup confirmation expired. Nothing was started. Check the old views, then confirm again.'});return;}
       if(this.oldViewsClosing){
@@ -1889,15 +1889,29 @@ export default class RigSidebar extends View {
           return current;
         };
         await fresh();
-        const result=await closeOldViews({layout,layouts,readTextFile,currentConfig:fresh,execFor},reviewed,request.views??[],appHome(),conn=>connectionCapabilities(shared,reviewed,conn,terminals()));
-        if(!this.closed&&!ticket.expired)publish(result);
+        const host={layout,layouts,readTextFile,currentConfig:fresh,execFor,run,spaces,panes,shared,setShared,
+          currentLayout:()=>shared('layout'),wait:ms=>this.closed?Promise.resolve():new Promise(done=>cx.timer.after(ms,done,{owner:null})),beforeSwitch:fresh};
+        if(request.returnLayout){
+          const tab=await ensureOldStripPage(host);await fresh();
+          setShared('rig.stripRecovery',{...(shared('rig.stripRecovery')??{}),[id]:{...request,tab,session:this.cleanupSession}});
+          cx.timer.after(15000,next=>{
+            const pending=shared('rig.stripRecovery')??{};
+            if(!Object.hasOwn(pending,id))return; // A native page already took it and owns its result.
+            const remaining={...pending};delete remaining[id];setShared('rig.stripRecovery',remaining);
+            publish({ok:false,recovery:true,title:"Still in OpenRig's old strip",text:"The Rig page didn't start the cleanup, so nothing was closed. Try again, or open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running."});
+          },{owner:null});
+          this.inFlightActions?.delete(id); // The native page, not this layout copy, owns the operation from here.
+          return;
+        }
+        const result=await closeOldViews(host,reviewed,request.views??[],appHome(),conn=>connectionCapabilities(shared,reviewed,conn,terminals()));
+        if(!ticket.expired&&(!this.closed||ticket.switching))publish(result);
       }catch(error){if(!this.closed&&!ticket.expired)publish({ok:false,text:String(error?.message??error)});}
       finally{deadline?.cancel?.();if(this.oldViewsClosing===ticket)this.oldViewsClosing=null;this.inFlightActions?.delete(id);}
     },{owner:null});
   }
   oldViewsCloseResult(){
     const result=shared('rig.oldViewsCloseResult');
-    return result&&this.cleanupSession&&result.session===this.cleanupSession&&result.expiresAt>Date.now()?result:null;
+    return result&&(result.recovery===true||this.cleanupSession&&result.session===this.cleanupSession)&&result.expiresAt>Date.now()?result:null;
   }
 
   /** Runs every queued one-click request (rig-lib ONE_CLICK), each in a task of its own; one taken is never run twice. */
@@ -4465,19 +4479,19 @@ export default class RigSidebar extends View {
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(cleanupResult.ok===false?t.blocked:t.muted).child(cleanupResult.text));
       const oldViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
-      if (oldViews.length) {
+      if (hasOldProviderStrip(layout())||oldViews.length) {
         const closeActivation=activationPair(this,'system-close-old-worker-views');
-        const openOldViews=()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:340,
+        const openOldViews=()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,
           props:{target:{kind:"old-views"},step:{action:"close-old-views",views:oldViews,confirm:true}}});
-        const canClose = oldViewCandidates(this.config, conn => connectionCapabilities(shared, this.config, conn, terminals())).length > 0;
-        const label = canClose ? `OpenRig's old worker views: ${oldViews.length} · ` : "OpenRig's old worker views: close their Herdr tabs; seats keep running.";
+        const canClose = hasOldProviderStrip(layout())||oldViewCandidates(this.config, conn => connectionCapabilities(shared, this.config, conn, terminals())).length > 0;
+        const label = oldViews.length ? `OpenRig's old strip: ${oldViews.length} views · ` : "OpenRig's old strip is still on screen · ";
         const oldRow = h_flex().id("system-old-worker-views").pl(treeIndent(1)).pr(8).h(22)
           .child(div().text_size(12).text_color(t.muted).tooltip(label).child(label).truncate());
         if (canClose) oldRow.child(div().id("system-close-old-worker-views").role("button").tab_stop(true)
           .text_size(12).text_color(t.accent).cursor_pointer().focus(el=>el.border_1().border_color(t.accent))
           .on_mouse_down('left',closeActivation.pointer())
           .on_key_down(closeActivation.key((event,cx)=>{if(['enter','space',' '].includes(String(event.key??'').toLowerCase())){cx.stop_propagation();openOldViews();}}))
-          .on_click(closeActivation.click(openOldViews)).child("Close…"));
+          .on_click(closeActivation.click(openOldViews)).child("Leave it…"));
         out.push(oldRow);
       }
       for (const item of orderedSys) {

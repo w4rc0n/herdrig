@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.4
+
+Leave OpenRig's old strip and return to the Herdr layout you choose. The Rig page stays open and your seats keep running.
+
+- **Leave OpenRig's old strip…** closes older worker views where possible and switches to the layout you choose, even when the strip is empty. Choosing Herdr's own layout leaves out the Rig sidebar. The Rig page stays open and seats keep running. Viewer-close and layout-switch results are reported separately. Closing a space does not remove the strip; Herdr's own layout palette can also switch away from it.
+- Results say which old views were confirmed closed and whether the layout switched. Duplicate view names are grouped, and a stopped OpenRig gives one short reason. If the Rig page closes before cleanup starts, it says nothing was closed.
+
 ## v0.5.3
 
 Worker views in Herdr's own tabs, separate page histories, and less idle work.
