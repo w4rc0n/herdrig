@@ -189,7 +189,7 @@ export class AddMachinePanel {
             .when(!!this.copyHandles.Command,el=>el.track_focus(this.copyHandles.Command)).focus(el=>el.border(1).border_color(t.accent))
             .on_mouse_down('left',activationPair(this,'add-machine-copy-command').pointer())
             .on_click(activationPair(this,'add-machine-copy-command').click((_e,cx)=>cx.write_to_clipboard(command)))
-            .on_key_down(activationPair(this,'add-machine-copy-command').key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(command);}}))
+            .on_key_down(activationPair(this,'add-machine-copy-command').key((event,cx)=>{if(!event.is_held&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();cx.write_to_clipboard(command);}}))
             .child(svg(this.copyIcon).size(12).text_color(t.muted))):div().id("add-machine-no-address").text_color(t.muted).child(this.suggested?"The command appears when the address is a loopback address such as http://127.0.0.2:7433.":"No free loopback address was found. Type one yourself."))
         .child(div().text_color(t.muted).child("OpenRig home on this computer"))
         .child(Input.new(this.homeInput).id("add-machine-home"))
@@ -280,13 +280,13 @@ export class AddMachineChooser {
         .focus(el=>el.border_1().border_color(t.accent))
         .on_mouse_down('left',activationPair(this,`pick-${row.name}`).pointer())
         .on_click(activationPair(this,`pick-${row.name}`).click((_e,cx)=>cx.spawn(cx=>this.choose(row,cx))))
-        .on_key_down(activationPair(this,`pick-${row.name}`).key((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}})).child(row.name));
+        .on_key_down(activationPair(this,`pick-${row.name}`).key((e,cx)=>{if(!e.is_held&&["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}})).child(row.name));
     }
     const closeLabel=this.phase==="choose"&&this.rows.length?"Cancel":"Close";
     const close=div().id("add-machine-choose-close-focus").p(2).border(2).border_color("#00000000").rounded(7).role("button").tab_stop(true)
       .when(!!this.cancelHandle,el=>el.track_focus(this.cancelHandle)).focus(el=>el.border_color(t.accent))
       .on_mouse_down('left',activationPair(this,'choose-close').pointer())
-      .on_key_down(activationPair(this,'choose-close').key((e,cx)=>{if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();this.expire();this.cancel?.(cx);}}))
+      .on_key_down(activationPair(this,'choose-close').key((e,cx)=>{if(!e.is_held&&["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();this.expire();this.cancel?.(cx);}}))
       .child(div().id("add-machine-choose-close").px(10).py(6).rounded(5).text_size(12).bg(t.raised).cursor_pointer()
         .on_mouse_down('left',activationPair(this,'choose-close').pointer())
         .on_click(activationPair(this,'choose-close').click((_e,cx)=>{this.expire();this.cancel?.(cx);})).child(closeLabel));

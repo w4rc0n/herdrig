@@ -314,6 +314,7 @@ export class RigSpaces {
       exec: base.exec ? async (...a) => { dropIndex(); try { return await base.exec(...a); } finally { dropIndex(); } } : undefined,
       wait: base.wait ? async (ms) => { dropIndex(); try { return await base.wait(ms); } finally { dropIndex(); } } : undefined,
       health: base.health ? async (...a) => { dropIndex(); try { return await base.health(...a); } finally { dropIndex(); } } : undefined,
+      probeHealth: base.probeHealth ? async (...a) => { dropIndex(); try { return await base.probeHealth(...a); } finally { dropIndex(); } } : undefined,
       prepareHome: base.prepareHome ? async (...a) => { dropIndex(); try { return await base.prepareHome(...a); } finally { dropIndex(); } } : undefined,
       prepareRemote: base.prepareRemote ? async (...a) => { dropIndex(); try { return await base.prepareRemote(...a); } finally { dropIndex(); } } : undefined,
     });

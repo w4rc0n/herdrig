@@ -3872,7 +3872,19 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
  * Execute a single or multi-question Mission Control action (`POST /api/mission-control/action`),
  * chaining `expectedRevision` from each step's response `decisionRevision`.
  */
+/** Whether a person's ask may be approved: only when its queue row says humanIntent "decision". OpenRig sends every ask without questions
+ *  with verb approve, and approve closes the row as done while sending nothing back to the asker, so anything else (no intent, or a row
+ *  not read yet or unreadable) is a request the person answers in words. */
+export function isDecisionAsk(_item, queueRow) {
+  return queueRow?.humanIntent === "decision";
+}
+export const REQUEST_NOT_A_DECISION = "This request asks you to do something; mark it done from its card. Nothing was sent.";
+
 export async function submitMissionActions(config, item, act = {}, postOrOpts = {}) {
+  // Approve only a decision: refused before any read or send, so a request is never closed with nothing sent back to its asker.
+  if (resolveMissionVerb(item, act) === "approve" && !isDecisionAsk(item, act?.queueRow)) {
+    return { ok: false, notSent: true, code: "not_a_decision", conflict: false, message: REQUEST_NOT_A_DECISION, text: REQUEST_NOT_A_DECISION, committedQuestionIds: [], stepsCompleted: 0 };
+  }
   // ONE operation for the whole answer, taken before the address is read: every POST of a multi-question answer is sent under the generation the first one began
   // with, so a settings change between two POSTs refuses the rest (a bare `gatedFetch` would start a new generation per request and send the second to the old daemon).
   const op = gatedOperationOrRefusal(config?.connectionId); // the answer's own connection (several OpenRigs: a bare operation refuses)
