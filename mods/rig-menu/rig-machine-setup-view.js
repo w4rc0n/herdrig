@@ -79,7 +79,7 @@ export class MachineSetupPanel {
         .when(!!this.copyHandles[label],el=>el.track_focus(this.copyHandles[label])).focus(el=>el.border(1).border_color(this.theme.accent))
         .on_mouse_down('left',activationPair(this,`copy-${label}`).pointer())
         .on_click(activationPair(this,`copy-${label}`).click((_e,cx)=>cx.write_to_clipboard(value)))
-        .on_key_down(activationPair(this,`copy-${label}`).key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.write_to_clipboard(value);}}))
+        .on_key_down(activationPair(this,`copy-${label}`).key((event,cx)=>{if(!event.is_held&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();cx.write_to_clipboard(value);}}))
         .child(svg(this.copyIcon).size(12).text_color(this.theme.muted))));
   }
   render(t,cx){

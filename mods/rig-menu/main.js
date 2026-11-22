@@ -1425,13 +1425,14 @@ export default class RigMenu extends View {
       .when(!!this.handle,el=>el.track_focus(this.handle))
       .on_key_down((e,cx)=>{const choices=target.choices??[];if(!choices.length)return;
         if(e.key==="down"||e.key==="up"){this.navChoiceIndex=((this.navChoiceIndex??0)+(e.key==="down"?1:-1)+choices.length)%choices.length;cx.stop_propagation();cx.notify();}
-        else if(e.key==="enter"){cx.stop_propagation();this.navigate(choices[this.navChoiceIndex??0].entry,cx);}
+        // The rows have no focus handle of their own, so Enter and Space arrive here: both open the highlighted choice, once (a held repeat does nothing).
+        else if(["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();if(!e.is_held)this.navigate(choices[this.navChoiceIndex??0].entry,cx);}
         else if(e.key==="escape"){cx.stop_propagation();this.dismiss();}})
       .children((target.choices ?? []).map((choice,i) => h_flex().id(`page-navigation-${i}`).tab_stop(true).px(8).h(30).gap(12).items_center().rounded(5).cursor_pointer()
         .when(i===(this.navChoiceIndex??0),el=>el.bg(t.selection??t.hover)).hover(el => el.bg(t.hover))
         .on_mouse_down('left',activationPair(this,`page-navigation-${i}`).pointer())
         .on_click(activationPair(this,`page-navigation-${i}`).click((_e,cx) => this.navigate(choice.entry,cx)))
-        .on_key_down(activationPair(this,`page-navigation-${i}`).key((e,cx)=>{if(e.key==="enter"){cx.stop_propagation();this.navigate(choice.entry,cx);}}))
+        .on_key_down(activationPair(this,`page-navigation-${i}`).key((e,cx)=>{if(!e.is_held&&["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();this.navigate(choice.entry,cx);}}))
         .child(div().flex_1().text_size(12.5).text_color(t.foreground).child(choice.label))
         .when(choice.count !== null && choice.count !== undefined, el => el.child(div().text_size(11.5).text_color(t.dim).child(String(choice.count))))));
     if (this.pending) return v_flex().id("rig-menu").size_full().p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)

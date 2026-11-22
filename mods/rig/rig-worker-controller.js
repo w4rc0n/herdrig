@@ -53,6 +53,8 @@ function payloadFrom(value){
 const inactive=node=>!node||node.sessionStatus!=="running"||["idle","idle-at-prompt","done","stopped","departed"]
   .includes(node.activityState?.activity??node.activityState?.display??node.agentActivity?.state);
 
+/** The worker view's screen scan (is a seat tile's viewer ended?): one budget for all its reads, and how many run at once. */
+const SCAN_BUDGET_MS=15000,SCAN_READERS=4;
 export class HostWorkerViews{
   constructor(host){this.host=host;this.pending=new Map();this.entries=new Map(Object.entries(host.loadViews?.()??{}));this.wakeVersion=0;}
   sync(config,view,options={}){
@@ -157,18 +159,35 @@ export class HostWorkerViews{
       if(!adoption.ok)return adoption;
       if(adoption.host)host=adoption.host;
       const existing=this.owned(config,view,remote).filter(tile=>list(host,"panes").some(p=>p.pane===tile.pane.pane));
-      const parked=new Set();
+      const parked=new Set(),toRead=[];
       for(const tile of existing.filter(t=>t.session&&t.programArgv[0]!=="sleep")){
         if(!options.explicit&&previous?.endedCheckedAt&&Date.now()-previous.endedCheckedAt<30000){
           if(previous.endedTerminals?.includes(tile.pane.terminal))parked.add(tile.pane.terminal);
           continue;
         }
-        try{
-          const screen=JSON.parse(await this.hc(["read","--json",tile.pane.terminal],config));
-          // This suffix is a heuristic: seat output could quote it. An explicit reopen
-          // can then reattach that same seat; ownership, argv and snapshots still bind it.
-          if(String(screen.text??"").trimEnd().endsWith("Close this pane, then reopen the rig space to retry."))parked.add(tile.pane.terminal);
-        }catch{} // an unreadable screen is not evidence that a tile may be replaced
+        toRead.push(tile);
+      }
+      // One budget for the whole screen scan, reads a few at a time: with a stalled core or box link every read would wait its own limit,
+      // and an explicit reopen queued behind this update would wait n × that. The budget's timer is the host's ownerless deadline, made once
+      // here; a tile not read in time counts as unread, which is never evidence that it may be replaced.
+      if(toRead.length){
+        const expired=Symbol("expired"),budget=this.host.deadline?this.host.deadline(SCAN_BUDGET_MS).then(()=>expired):null;
+        let out=false;const stop=()=>{out=true;};budget?.then(stop,stop); // both arms: a deadline that rejected would also end the scan, never unhandled
+        const reader=async()=>{
+          while(toRead.length&&!out){
+            const tile=toRead.shift();
+            try{
+              const read=this.hc(["read","--json",tile.pane.terminal],config);read.catch(()=>{}); // a read that fails after the budget is unread: no state change, never unhandled
+              const got=await(budget?Promise.race([read,budget]):read);
+              if(got===expired)return;
+              const screen=JSON.parse(got);
+              // This suffix is a heuristic: seat output could quote it. An explicit reopen
+              // can then reattach that same seat; ownership, argv and snapshots still bind it.
+              if(String(screen.text??"").trimEnd().endsWith("Close this pane, then reopen the rig space to retry."))parked.add(tile.pane.terminal);
+            }catch{} // an unreadable screen is not evidence that a tile may be replaced
+          }
+        };
+        await Promise.all(Array.from({length:Math.min(SCAN_READERS,toRead.length)},reader));
       }
       for(const tile of existing.filter(t=>t.session&&t.programArgv[0]!=="sleep")){
         const wanted=plan.pages.flatMap(p=>p.tiles).find(t=>t.session===tile.session&&!t.placeholder);

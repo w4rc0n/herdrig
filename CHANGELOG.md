@@ -16,6 +16,11 @@ Worker views in Herdr's own tabs, separate page histories, and less idle work.
 
 ### All changes
 
+- **Requests offer Approve only when the sender marked them as a decision** (`--human-intent decision`). Other requests, including ones sent without that flag, show Reply and Mark done…, and both send your words back to the asking seat. Approve on a marked decision now asks before it closes the request.
+- Space opens the highlighted page in the page menu, as Enter does.
+- Worker view and Reattach answer within about 15 seconds when Herdr or a machine stops answering, instead of waiting for every tile in turn.
+- Space works again like Enter on the add-machine and machine-setup Copy buttons, the sidebar's machine search and offer, and the page menu's navigation, as it did in v0.5.2.
+- Opening an existing rig space leaves it unchanged if its terminals change while OpenRig's address is being checked.
 - When OpenRig records or retains a message without delivering it, the result says so and Send stays off; it no longer says "Nothing was sent."
 - Spaces list drift: no change against Herdr 0.1.16.
 - Worker-view waits and delayed refreshes no longer depend on another tab staying open. A machine lookup stays retryable until its probe starts.

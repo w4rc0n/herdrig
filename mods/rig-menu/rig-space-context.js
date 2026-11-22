@@ -198,6 +198,11 @@ function writeReview(host,key,entry){
   host.setShared(REVIEWS_KEY,all);
 }
 
+const terminalOwnershipEvidence=t=>({
+  address:t.address??t.terminal,argv:t.argv,pid:t.pid,created_ms:t.created_ms,
+  labels:Object.fromEntries(Object.entries(t.labels??{}).filter(([key])=>key.startsWith("herdr-openrig.")||key==="herdr.space"||key==="herdr.tab").sort(([a],[b])=>a.localeCompare(b))),
+});
+
 /** The only address-change adoption stage. Writing roots call it before choosing a destination; read-only and marked lookups stay unchanged. */
 export async function prepareRigSpaceAdoption(host,config,names,options={}){
   const machine=config?.daemonMachine||null,expected=rigOrigin(config?.daemonUrl),rigNames=nameSet(names);
@@ -230,6 +235,12 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
   if(expectedHostId&&expectedHostId!==liveId)return refuse("OpenRig's live host identity does not match the expected host. Nothing was opened or relabelled.");
   const liveTerminals=get(host,"terminals");
   const decisions=candidates.map(space=>({space,...classifyRigSpace(host,config,names,space,liveId,liveTerminals)}));
+  // Host terminal reads are snapshots, not live objects. Keep immutable ownership evidence across every probe.
+  const evidence=decision=>JSON.stringify(decision.terminals.map(({terminal})=>terminalOwnershipEvidence(terminal)).sort((a,b)=>String(a.address).localeCompare(String(b.address))));
+  const snapshots=new Map(decisions.map(d=>[d.space.id,evidence(d)]));
+  const terminalSnapshots=new Map(decisions.flatMap(d=>d.terminals.map(({terminal:t})=>[t.address??t.terminal,JSON.stringify(terminalOwnershipEvidence(t))])));
+  const unchanged=()=>decisions.every(d=>evidence(classifyRigSpace(host,config,names,d.space,liveId))===snapshots.get(d.space.id));
+  const changed=()=>refuse("The rig space changed while its identity was checked. Nothing further was relabelled; open it again.");
   // A named host id can be shared by two OpenRigs on this computer (a generated one is unique to one daemon), and so can session names and tmux flags.
   // The address a space was made with still answering as ANOTHER daemon (another pid) means that space is the other OpenRig's, not this one's moved
   // address; an answer that doesn't prove it is the same daemon is never adopted without the person's review.
@@ -243,8 +254,9 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
       for(const origin of origins){
         let old;
         try{old=await host.probeHealth(origin);}
-        catch(error){if(!current())return refuse("OpenRig's connection changed. No space was adopted.");if(error?.code!=="NO_ANSWER")unproven.add(d.space.id);continue;} // nothing answers there: the daemon moved
+        catch(error){if(!current())return refuse("OpenRig's connection changed. No space was adopted.");if(!unchanged())return changed();if(error?.code!=="NO_ANSWER")unproven.add(d.space.id);continue;} // nothing answers there: the daemon moved
         if(!current())return refuse("OpenRig's connection changed. No space was adopted.");
+        if(!unchanged())return changed();
         const was=pidOf(old),now=pidOf(identity);
         if(was!==null&&now!==null&&was!==now){d.kind="theirs";break;}
         if(was===null||now===null)unproven.add(d.space.id);
@@ -300,7 +312,8 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
         // A dialog authorises only the terminal snapshot the person saw.
         if(JSON.stringify(classifyRigSpace(host,config,names,decision.space,liveId))!==snapshot)return refuse("The rig space changed during its review. Nothing was relabelled.");
       }
-      try{await relabelRigSpaceOrigin(host,config,decision,current);}
+      if(!unchanged())return changed();
+      try{await relabelRigSpaceOrigin(host,config,decision,current,terminalSnapshots);}
       catch(error){return refuse(errorDiagnostic(error));}
       return {ok:true};
       })());
@@ -365,10 +378,14 @@ async function confirmRigSpaceAdoption(host,confirmation,current,{token=`${Date.
 }
 
 /** Change only origin on the chosen space's proven terminals. A failed write never authorises creating a replacement space. */
-async function relabelRigSpaceOrigin(host,config,decision,current){
+async function relabelRigSpaceOrigin(host,config,decision,current,terminalSnapshots){
   for(const {terminal,kind} of decision.terminals){
     if(kind!=="ours-by-stamp")continue;
     if(!current())throw Error("OpenRig's connection changed. No further terminal was relabelled.");
+    const address=terminal.address??terminal.terminal;
+    const live=get(host,"terminals").find(t=>(t.address??t.terminal)===address);
+    if(!live||JSON.stringify(terminalOwnershipEvidence(live))!==terminalSnapshots.get(address))
+      throw Error("A terminal changed while the space's address was being updated. No further terminal was relabelled; open it again.");
     const result=await host.hc(["label",terminal.address??terminal.terminal,`herdr-openrig.origin=${rigOrigin(config.daemonUrl)}`]);
     if(result?.code!==0)throw Error("Herdr could not finish updating the space's address. No second space was opened; retry the open to check the remaining terminals.");
     if(!current())throw Error("OpenRig's connection changed while updating the space. No second space was opened.");

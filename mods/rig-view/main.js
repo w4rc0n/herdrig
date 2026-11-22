@@ -62,7 +62,7 @@ import { MOD_IDS, sidebarRun, NO_PERSON, TERMINAL_TOKEN_PROTECTED, DECISION_TOKE
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
   rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount,
-  tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
+  tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, isDecisionAsk, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, rigPageOnScreen as rigPageOnScreenIn, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, formatStaleAge, attachRelayPath, waitWith,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
 import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
@@ -4582,7 +4582,7 @@ export default class RigView extends View {
         const actionLabel = n.native
           ? "Relaunch / Resume…"
           : n.verb === "approve"
-            ? "Approve / Answer"
+            ? "Respond" // the list has no queue row: opening the card decides between a request and a decision
             : n.reply === "resolve"
               ? "Resolve"
               : n.reply === "answer"
@@ -4704,10 +4704,16 @@ export default class RigView extends View {
     const resolve = verb === "resolve", tier = tierOf(n);
     const tone = tier === "escalation" || tier === "alert" ? t.blocked : t.accent;
     const tierWord = tier === "escalation" ? "Escalation · stuck work" : tier === "alert" ? "Needs you now" : "Routine";
-    const kind = resolve ? "Parked · needs your words" : qState.totalCount ? "Decision" : verb === "approve" ? "Approval" : "Question";
+    // OpenRig sends every ask without questions as approve; only a queue row saying humanIntent "decision" makes it one. Anything else, or a row
+    // not read yet, is a request: answered in words that go back to the asker, never closed by one click.
+    const decision = isDecisionAsk(n, queueRow), request = verb === "approve" && !qState.totalCount && !decision;
+    const rowTags = Array.isArray(queueRow?.tags) ? queueRow.tags : typeof queueRow?.tags === "string" ? queueRow.tags.split(",").map(x => x.trim()) : [];
+    const ownerRun = rowTags.includes("owner-run") || rowTags.includes("gate:human");
+    const kind = resolve ? "Parked · needs your words" : qState.totalCount ? "Decision" : verb === "approve" ? (decision ? "Approval" : "Request") : "Question";
     const owner = resolve ? parkedWorkOwner(queueRow ?? n) : asker;
     const resolved = resolveAskerSeat(owner, this.currentTopology(cx), n.conn ?? null);
     const logical = resolved.found ? resolved.seat.logicalId : String(owner ?? "the asking seat").split("@")[0].replace(/-/g, ".");
+    const requestLine = ownerRun ? `${logical} is asking you to do this yourself. Reply with what you did or what you found, or say why not.` : `Reply to ${logical} with your answer, or what you did.`;
     const rig = resolved.found ? resolved.seat.rig : String(owner ?? "").split("@").slice(1).join("@");
     const at = n.at ?? queueRow?.tsUpdated, timestamp = Date.parse(at ?? ""), elapsed = Math.max(0, Date.now() - timestamp);
     const age = !Number.isFinite(timestamp) ? "unknown duration" : elapsed < 60000 ? "less than a minute" : elapsed < 3600000 ? `${Math.floor(elapsed / 60000)} min` : `${Math.floor(elapsed / 3600000)} h`;
@@ -4722,26 +4728,39 @@ export default class RigView extends View {
     const openComposer = (cx, denying = false) => {
       if (!verb || n.native || busy) return;
       const b = targetBox(); b.cardMode = true; b.composerOpen = true; b.denying = denying; b.result = null;
-      this.bindReplyInput(b, denying ? `Why not? ${asker ?? "the asking seat"} reads this.` : resolve ? "Your decision, in your own words" : "Your answer, in your own words");
+      this.bindReplyInput(b, denying ? `Why not? ${asker ?? "the asking seat"} reads this.` : resolve ? "Your decision, in your own words" : request ? "Your answer, what you did, or the output it asked for" : "Your answer, in your own words");
       b.input.focus(); cx?.notify?.();
     };
     const send = (act, cx) => { if (!busy) this.submitCardDecision(cx, n, detailItem, queueRow, act); };
+    // Mark done (a request) and Approve (a decision) ask first, with Cancel focused; Mark done needs the person's words.
+    const openConfirm = (cx, which) => {
+      if (!verb || n.native || busy) return;
+      const b = targetBox(); b.cardMode = true; b.confirm = which; b.result = null;
+      if (which === "done" && !b.doneInput) {
+        b.doneInput = TextareaState.new({ placeholder: "What you did", rows: 2, value: "" });
+        b.doneInput.on("change", (_e, cx) => cx?.notify?.());
+      }
+      liveFocus(b.cardHandles?.["confirm-cancel"])?.focus?.(); cx?.notify?.();
+    };
     const optionKeys = qState.questions.flatMap(q => q.options.map(o => `option:${q.id}:${o.id}`));
-    this.prepareNeedFocus(cx, box, ["card", "approve", "deny", "resolve", "answer", "reply", "details", "resume", ...optionKeys]);
-    const action = (key, label, click, { primary = false, recommended = false } = {}) => {
+    this.prepareNeedFocus(cx, box, ["card", ...(request ? ["mark-done"] : ["approve"]), "deny", "resolve", "answer", "reply", "details", "resume", "confirm-cancel", "confirm-go", ...optionKeys]);
+    const action = (key, label, click, { primary = false, recommended = false, disabled = false, tip = null } = {}) => {
       const handle = liveFocus(box?.cardHandles?.[key]);
       const activation=activationPair(this,`need-${key}-${id}`);
       return h_flex().id(`need-${key}-${id}`).h(32).px(12).gap(8).items_center().justify_center().rounded(6)
-        .tooltip(whose?.onSomeoneElsesAsk ?? (key === "resume" ? `Answer and let ${logical} go on` : key.startsWith("option:") ? "Answer with this option" : key === "approve" ? `Approve what ${logical} asked for` : key === "deny" ? `Say no: ${logical} reads your reason` : `${key === "resolve" ? "Send your decision" : "Send your answer"} to ${logical}`))
+        .tooltip(whose?.onSomeoneElsesAsk ?? tip ?? (key === "resume" ? `Answer and let ${logical} go on` : key.startsWith("option:") ? "Answer with this option" : key === "approve" ? `Approve what ${logical} asked for (asks first)`
+          : request && key === "answer" ? `Send ${logical} your words. They go back to ${logical}, and this request closes.` : key === "mark-done" ? `Tell ${logical} what you did and close this request (asks first)`
+          : key === "confirm-cancel" ? "Go back without sending anything" : key === "confirm-go" ? (box?.confirm === "done" ? `Send ${logical} what you did and close this request` : `Close this request as approved`) : key === "deny" ? `Say no: ${logical} reads your reason` : `${key === "resolve" ? "Send your decision" : "Send your answer"} to ${logical}`))
         .when(narrow, el => el.w_full()).when(!narrow, el => el.flex_none())
-        .bg(primary ? (t.solid ?? t.accent) : t.raised).text_color(primary ? (t.solid_foreground ?? t.background) : t.foreground)
-        .border_1().border_color(primary ? (t.solid ?? t.accent) : t.border).text_size(13)
-        .when(!busy, el => el.cursor_pointer().hover(s => s.bg(primary ? t.accent : t.hover)))
+        // A disabled control looks it (muted, no hover or pointer) and says why in its tooltip, instead of staying silently inert.
+        .bg(primary && !disabled ? (t.solid ?? t.accent) : t.raised).text_color(disabled ? t.muted : primary ? (t.solid_foreground ?? t.background) : t.foreground)
+        .border_1().border_color(primary && !disabled ? (t.solid ?? t.accent) : t.border).text_size(13)
+        .when(!busy && !disabled, el => el.cursor_pointer().hover(s => s.bg(primary ? t.accent : t.hover)))
         .when(!!handle, el => el.track_focus(handle).tab_stop(true).tab_index(0))
         .when(Boolean(handle?.is_focused?.()), el => el.border_color(t.accent).border_2())
         .on_mouse_down("left", activation.pointer((_e, cx) => { cx.stop_propagation(); liveFocus(handle)?.focus?.(); }))
-        .on_key_down(activation.key((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); if (!busy) click(cx); } }))
-        .on_click(activation.click((_e, cx) => { cx.stop_propagation(); if (!busy) click(cx); }))
+        .on_key_down(activation.key((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); if (!busy && !disabled) click(cx); } }))
+        .on_click(activation.click((_e, cx) => { cx.stop_propagation(); if (!busy && !disabled) click(cx); }))
         .child(label).when(recommended, el => el.child(div().text_size(10.5).child("Recommended")));
     };
     const actions = [];
@@ -4755,13 +4774,41 @@ export default class RigView extends View {
             action(`option:${q.id}:${o.id}`, o.label, cx => send({ mode: "choices", choices: [{ questionId: q.id, optionId: o.id }] }, cx), { primary: o.recommended, recommended: o.recommended })))));
       }
       if (qState.needsResume) actions.push(action("resume", "Send answers back", cx => send({ mode: "resume" }, cx), { primary: true }));
-    } else if (verb === "approve") actions.push((narrow ? v_flex() : h_flex()).gap(8)
-      .child(action("approve", "Approve", cx => send({ mode: "approve" }, cx), { primary: true }))
+    } else if (verb === "approve" && decision) actions.push((narrow ? v_flex() : h_flex()).gap(8)
+      .child(action("approve", "Approve…", cx => openConfirm(cx, "approve"), { primary: true }))
+      .child(action("deny", "Deny…", cx => openComposer(cx, true))));
+    else if (request) actions.push((narrow ? v_flex() : h_flex()).gap(8)
+      .child(action("answer", "Reply…", cx => openComposer(cx), { primary: true }))
+      .child(action("mark-done", "Mark done…", cx => openConfirm(cx, "done")))
       .child(action("deny", "Deny…", cx => openComposer(cx, true))));
     else if (resolve || verb === "answer") {
       if (!box?.composerOpen) actions.push((narrow ? v_flex() : h_flex()).child(action(resolve ? "resolve" : "answer", resolve ? "Resolve with my words…" : "Answer…", cx => openComposer(cx), { primary: true })));
     }
     else actions.push(this.dim(t, "This request still needs you. No response action was provided here; use Open in TUI to respond."));
+    const confirming = box?.confirm === "done" || box?.confirm === "approve" ? box.confirm : null;
+    const doneWords = confirming === "done" ? String(box.doneInput?.value() ?? "").trim() : "";
+    const confirmReady = confirming === "approve" || !!doneWords;
+    const closeConfirm = (cx) => { if (box) box.confirm = null; this.typing = false; cx?.notify?.(); };
+    const confirmGo = (cx) => {
+      if (busy || !confirming || !confirmReady) return;
+      const which = confirming; box.confirm = null; this.typing = false;
+      // Mark done sends the person's words as their answer, so the asker hears; it never sends approve.
+      if (which === "done") send({ mode: "answer-text", text: `Done: ${doneWords}`, doneResult: `Sent to ${logical}. This request is closed.` }, cx);
+      else send({ mode: "approve" }, cx);
+    };
+    const confirmPanel = confirming ? v_flex().id(`need-confirm-${id}`).gap(8).p(12).rounded(6).border_1().border_color(t.border).bg(t.raised)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_key_down((e, cx) => { if (e.key === "escape") { cx.stop_propagation(); closeConfirm(cx); } })
+      .child(div().text_size(13).text_color(t.foreground).child(confirming === "done" ? "Mark this done?" : "Approve this?"))
+      .child(div().text_size(12).text_color(t.muted).child(confirming === "done"
+        ? `Only if you've done what it asks. What you write goes back to ${logical}, and this request closes.`
+        : `This closes the request as approved. ${logical} sees it as done; nothing else is sent back. To add a note, use Reply instead.`))
+      .when(confirming === "done" && !!box?.doneInput, el => el.child(div().id(`need-confirm-words-${id}`).border_1().border_color(t.border).rounded(6).p(6)
+        .on_key_down(() => { this.typing = true; }).child(Textarea.new(box.doneInput).h(52))))
+      .child(h_flex().gap(8).flex_wrap()
+        .child(action("confirm-cancel", "Cancel", cx => closeConfirm(cx)))
+        .child(action("confirm-go", confirming === "done" ? "Mark done" : "Approve", cx => confirmGo(cx), { primary: true, disabled: !confirmReady, tip: confirmReady ? null : "Write what you did first" })))
+      : null;
     const markDown = (body, key) => requestMarkdownView(body, { TextView, div, v_flex, id: key }).text_size(12.5).text_color(t.foreground);
     const cardKey = (e, cx) => {
       if (this.typing && e.key !== "escape") return;
@@ -4785,6 +4832,7 @@ export default class RigView extends View {
         .child(div().flex_1().text_size(11.5).text_color(t.dim).child(kind))
         .child(this.copyButton(t, text.source, `need-body-${id}`, "request body source")))
       .child(div().id(`need-headline-${id}`).text_size(narrow ? 15.5 : 17).line_height(1.3).font_semibold().text_color(t.foreground).tooltip(String(n.summary ?? text.headline)).child(displayHeadline))
+      .when(request, el => el.child(div().id(`need-request-line-${id}`).text_size(12).text_color(t.muted).child(requestLine)))
       .when(Boolean(box?.changedSinceAnswered), el => el.child(h_flex().gap(6).items_center().text_size(12).text_color(t.muted)
         .child(svg(icon("rig-refresh")).size(12)).child("Changed since you answered")))
       .when(Boolean(text.opening), el => el.child(div().id(`need-opening-${id}`).max_h(76).overflow_hidden().child(markDown(text.opening, `need-opening-text-${id}`))))
@@ -4801,8 +4849,8 @@ export default class RigView extends View {
         .child(div().flex_1().text_size(12).text_color(box.result.ok ? t.muted : t.blocked).child(box.result.ok ? box.result.text : this.errorText(t,`need-result-error-${id}`,box.result.text)))))
       .when(Boolean(box?.result?.networkError && box.result.retryAct), el => el.child(this.button(t, `need-check-and-finish-${id}`, "Check and finish",
         (_e, cx) => { if (!busy) this.submitCardDecision(cx, box.target ?? n, detailItem, queueRow, box.result.retryAct); }, { small: true, disabled: busy, tip: "The send may not have arrived: check and finish it without sending twice" })))
-      .when(!receipt && !box?.result?.networkError, el => el.children(actions)
-        .when(!n.native && (qState.totalCount > 0 || verb === "approve"), el => el.child(focusTarget(this,cx,`need-reply-link-${id}`,div().id(`need-reply-link-${id}`).tooltip("Answer in your own words").text_size(12).text_color(t.accent).cursor_pointer()
+      .when(!receipt && !box?.result?.networkError, el => el.children(actions).when(!!confirmPanel, el => el.child(confirmPanel))
+        .when(!n.native && (qState.totalCount > 0 || (verb === "approve" && !request)), el => el.child(focusTarget(this,cx,`need-reply-link-${id}`,div().id(`need-reply-link-${id}`).tooltip("Answer in your own words").text_size(12).text_color(t.accent).cursor_pointer()
           .child("Reply in your own words"),cx=>{cx.stop_propagation();openComposer(cx);},el=>el.border_1().border_color(t.accent))
           .on_mouse_down('left',activationPair(this,`need-reply-link-${id}`).pointer((_e,cx)=>{cx.stop_propagation();liveFocus(this.focusTargets?.get(`need-reply-link-${id}`))?.focus?.();}))))
         .when(Boolean(box?.composerOpen), el => el.child(this.replyBox(t, cx, n, { detailItem, queueRow, onSomeoneAskText: whose?.onSomeoneElsesAsk }))
@@ -5094,6 +5142,7 @@ export default class RigView extends View {
         };
         const actWithProgress = {
           ...act,
+          queueRow, // the guard in submitMissionActions sends approve only for a row saying humanIntent "decision"
           onStep: (step, total) => {
             box.stepProgress = { step, total };
             cx.notify();
@@ -5140,7 +5189,8 @@ export default class RigView extends View {
           }
           if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
           const sentText = this.sentNeedConfirmation(itemForAction, queueRow, act);
-          const confirmation = `${sentText} ${outcome.text}`;
+          const confirmation = act.doneResult ? `${act.doneResult}${outcome.text && /kept|Already answered/.test(outcome.text) ? ` ${outcome.text}` : ""}` : `${sentText} ${outcome.text}`;
+          if (act.doneResult) box.doneInput?.set_value("");
           this.answered[this.replyKey(n)] = { summary: requestHeadline(n), text: confirmation, at: Date.now(), conn: adoptConnection(this.config, n?.conn) ?? null };
           box.composerOpen = false; box.changedSinceAnswered = false;
           box.result = { ok: true, text: confirmation };

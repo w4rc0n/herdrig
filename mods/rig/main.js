@@ -1191,7 +1191,7 @@ export default class RigSidebar extends View {
         .when(!!this.machineFindHandle,el=>el.track_focus(this.machineFindHandle).tab_stop(true).tab_index(0))
         .on_mouse_down('left',activationPair(this,'find-daemon-machine').pointer())
         .on_click(activationPair(this,'find-daemon-machine').click((_e,cx)=>cx.spawn(cx=>this.findDaemonMachine(cx))))
-        .on_key_down(activationPair(this,'find-daemon-machine').key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();cx.spawn(cx=>this.findDaemonMachine(cx));}}))
+        .on_key_down(activationPair(this,'find-daemon-machine').key((event,cx)=>{if(!event.is_held&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.findDaemonMachine(cx));}}))
         .child(this.machineFinding?"Finding…":"Find where OpenRig runs"));
     const act=(use,cx)=>{
       if(use){
@@ -1217,12 +1217,12 @@ export default class RigSidebar extends View {
         .child(div().id("rig-use-daemon-machine").px(6).py(3).rounded(4).text_size(11.5).text_color(t.accent).cursor_pointer()
           .when(!!this.machineUseHandle,el=>el.track_focus(this.machineUseHandle).tab_stop(true).tab_index(0))
           .on_mouse_down('left',activationPair(this,'use-daemon-machine').pointer())
-          .on_key_down(activationPair(this,'use-daemon-machine').key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();act(true,cx);}}))
+          .on_key_down(activationPair(this,'use-daemon-machine').key((event,cx)=>{if(!event.is_held&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();act(true,cx);}}))
           .on_click(activationPair(this,'use-daemon-machine').click((_e,cx)=>act(true,cx))).child(`Use ${offer.machine}`))
         .child(div().id("rig-decline-daemon-machine").px(6).py(3).text_size(11.5).text_color(t.muted).cursor_pointer()
           .when(!!this.machineDeclineHandle,el=>el.track_focus(this.machineDeclineHandle).tab_stop(true).tab_index(0))
           .on_mouse_down('left',activationPair(this,'decline-daemon-machine').pointer())
-          .on_key_down(activationPair(this,'decline-daemon-machine').key((event,cx)=>{if(event.key==="enter"){cx.stop_propagation();act(false,cx);}}))
+          .on_key_down(activationPair(this,'decline-daemon-machine').key((event,cx)=>{if(!event.is_held&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();act(false,cx);}}))
           .on_click(activationPair(this,'decline-daemon-machine').click((_e,cx)=>act(false,cx))).child("Not now")))
       .when(!!this.machineOfferError,el=>el.child(errorBlock(this,t,"machine-offer-error",this.machineOfferError,{where:"this computer"})));
   }
