@@ -38,7 +38,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    tmuxAttachCommand:seat.tmuxAttachCommand,host:seat.host,sessionAlive:r.attachable,allSeats:true,compactActions:!layout.attach};
   const open=()=>navigate(entry);
   page.pageRows.push({key:r.key,entry,target,expandable:false,open});
-  const look=statusLook(r.status),age=r.since&&r.status!=='unknown'?relativeTimeText(r.since).replace(/ ago$/,'').replace('just now','<1m').replace(' min','m').replace(' hr','h').replace(/ days?$/,'d'):'';
+  const look=statusLook(r.status),age=r.since&&r.status!=='unknown'&&r.status!=='terminal_gone'?relativeTimeText(r.since).replace(/ ago$/,'').replace('just now','<1m').replace(' min','m').replace(' hr','h').replace(/ days?$/,'d'):'';
   const words=`${look.word}${age?` · ${age}`:''}`,runtime=[seat.runtime,seat.model].filter(Boolean).join(' · ');
   const actions=()=>h_flex().w(layout.attach?110:20).gap(4).items_center().flex_none()
    .when(layout.attach&&r.attachable,el=>el.child(page.button(t,`all-seat-attach-${id}`,'Attach',(_e,cx)=>{cx?.stop_propagation?.();attach(target,cx);},{small:true,iconName:'terminal',tip:`Attach to ${seat.logicalId??seat.session}'s terminal in a new tab`})))
@@ -64,7 +64,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    .when(layout.runtime,el=>el.child(div().w(36).flex_none().text_size(11.5).text_color(t.blocked).child(r.needIds.length?`◆ ${r.needIds.length}`:'')))
    .child(active?actions():div().w(layout.attach?110:20).flex_none()));
  };
- const pulseName={idle:'idle',working:'working',blocked:'blocked',needs:'needs you',unreported:'not reported'}[page.pulseFilter]??page.pulseFilter;
+ const pulseName={idle:'idle',working:'working',blocked:'blocked',needs:'needs you',unreported:'not reported',gone:'unreachable'}[page.pulseFilter]??page.pulseFilter;
  const noMatch=page.filter?`No seats match ‹${page.filter}›${pulseName?` in ${pulseName}`:''}.`:`No seats in ${pulseName??'the current filters'}.`;
  const empty=()=>{
   const key='all-seats-empty-action',open=cx=>{if(!models.length)openSpecs();else{page.pulseFilter=null;page.filter=null;navigate({section:'topology',topologyTab:'seats',filter:''});}cx?.notify?.();};
@@ -75,7 +75,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
    .on_click((_e,cx)=>open(cx)));
  };
  const group=g=>{
-  const countItems=[['working',g.counts.working,t.ansi2],[needsYouWord(g.counts.needs),g.counts.needs,t.blocked],['blocked',g.counts.blocked,t.blocked],
+  const countItems=[['working',g.counts.working,t.ansi2],[needsYouWord(g.counts.needs),g.counts.needs,t.blocked],['unreachable',g.counts.gone??0,t.blocked],['blocked',g.counts.blocked,t.blocked],
     ['idle',g.counts.idle,t.muted],['not reported',g.counts.unreported,t.dim]].filter(([,n])=>n);
   const line=h_flex().id(`all-seats-group-${g.rig.id}`).px(6).py(6).gap(6).items_center().flex_wrap().text_size(12).text_color(t.muted)
    .child(div().font_semibold().child(g.rig.name));

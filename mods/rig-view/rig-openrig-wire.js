@@ -19,7 +19,12 @@ export function installHerdrTransport(env) {
       const host = {
         exec: env.execFor(scope), hc: env.hcFor(scope),
         machines: env.machines, wait: env.wait, appHome: env.appHome(), openrigBridgePath: env.bridgePath(), writeText: env.writeTextFile,
-        readOpenRigConsent: async () => consentOf(await env.readTextFile(file), id),
+        // A file that exists but can't be read (Herdr answers null only for a missing one): OpenRig was never asked, so it isn't an outage.
+        readOpenRigConsent: async () => {
+          let text;
+          try { text = await env.readTextFile(file); } catch (e) { throw Object.assign(Error("Herdrig couldn't read its approvals file."), { approvalsUnreadable: true, notSent: true, cause: e }); }
+          return consentOf(text, id);
+        },
         writeOpenRigConsent: async (value) => { const previous = await env.readTextFile(file); return env.writeTextFile(file, consentText(previous, id, value).trimEnd(), previous ?? null); },
       };
       return { remote: new RemoteOpenRig(host), config: { ...conn, expectedHostId: parsed.hostId } };

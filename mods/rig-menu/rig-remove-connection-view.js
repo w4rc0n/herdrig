@@ -2,6 +2,7 @@ import { errorDiagnostic } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
 import {div} from "gpui-kit";
 import {errorBlock} from "./rig-error-view.js";
+import {withFocusContext,releaseFocusTargets} from './rig-lib.js';
 import {v_flex,h_flex} from "gpui-base";
 import {removeConnection} from "./rig-connections.js";
 
@@ -13,7 +14,7 @@ export class RemoveConnectionPanel {
     this.phase="ready";this.error=null;
     this.name=connection?.machine??"this connection";
   }
-  expire(){}
+  expire(){this.expired=true;releaseFocusTargets(this);}
   remove(cx){
     if(this.busy||this.phase!=="ready")return;
     this.busy=true;this.phase="working";this.error=null;cx.notify();
@@ -37,7 +38,8 @@ export class RemoveConnectionPanel {
       .child(div().id(id).px(10).py(6).rounded(5).text_size(12).bg(primary?this.theme.accent:this.theme.raised).text_color(primary?this.theme.solid_foreground:this.theme.foreground)
         .when(disabled,el=>el.opacity(.45)).when(!disabled,el=>el.cursor_pointer()).on_mouse_down('left',activation.pointer()).on_click(activation.click((_e,cx)=>{if(!disabled)callback(cx);})).child(text));
   }
-  render(t,cx){
+  render(...args){return withFocusContext(this,args[1],()=>this.renderFocused(...args));}
+  renderFocused(t,cx){
     this.theme=t;
     const cycle=(forward,cx)=>{
       cx.stop_propagation();if(this.busy)return;
@@ -52,7 +54,7 @@ export class RemoveConnectionPanel {
         if(event.key==="tab"&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt)cycle(!event.modifiers?.shift,cx);
         else if(event.key==="escape"&&!this.busy){cx.stop_propagation();this.cancel?.(cx);}})
       .child(div().text_size(15).font_semibold().child(`Remove ${this.name}?`))
-      .child(div().id("remove-connection-body").child(`Its rigs and needs leave the sidebar. Its spaces and tiles stay as they are, and nothing on ${this.name} changes.`));
+      .child(div().id("remove-connection-body").child(`Its rigs and needs leave the sidebar. Its spaces and tiles stay as they are, and nothing on ${this.name} changes.${this.connection&&!this.connection.machine?' You can add it back from Add a machine.':''}`));
     if(this.error)root.child(div().id("remove-connection-error").text_color(t.blocked).child(errorBlock(this,t,"remove-connection-error-detail",this.error,{where:"this computer"})));
     if(this.warning)root.child(div().id("remove-connection-warning").text_color(t.working).child(this.warning));
     if(this.busy)root.child(div().id("remove-connection-progress").text_color(t.muted).child("Removing…"));

@@ -16,7 +16,7 @@ import { errorBlock, errorNotice } from "./rig-error-view.js";
 const notify = value => errorNotice(rawNotify, value);
 import { followedConnection, spaceMachine } from "./rig-follow.js";
 import { herdrIdentityOf } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, hasOldProviderStrip, oldViewsGone } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, hasOldProviderStrip, oldViewsGone, oldStripCleanupBusy, oldStripBusyTip } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal, gateSameConfig, CONFIG_CHANGED, numberedConfigReads } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
@@ -35,12 +35,12 @@ const runFor = (config) => (name, args) => sidebarRun({ layout, notify }, (n, a)
 let flatOwner = null; // the view this mod copy is acting for
 const configReads = numberedConfigReads(); // numbered config reads (see init)
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
-import { MOD_IDS, sidebarRun, LAUNCH_DIALOG_HEIGHT, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, rigOfConnection, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, backTarget, layoutHasMod, unsafeReadPath, launchFolderProblem, needTarget, startOneClick, LOCAL_COMMANDS, currentCapabilities, connectionCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
+import { MOD_IDS, sidebarRun, LAUNCH_DIALOG_HEIGHT, REMOTE_OPERATOR_REASON, parseConfig, discoverDaemonFromCli, readCommand, openOrFocusTui, attachToSeat, rigOfConnection, isLoopbackDaemonUrl, paletteRoute, resolveTuiLineFallback, fileEntry, draftKey, navPush, navBack, backTarget, unsafeReadPath, launchFolderProblem, needTarget, enrichAttentionItems, sweepFinding, startOneClick, LOCAL_COMMANDS, currentCapabilities, connectionCapabilities, capabilityDisableReason, TUI_RESOLVE_REASON, expandAllTopology, collapseAllTopology, openOrFocusRigTab, attachRelayPath, waitWith } from "./rig-lib.js";
 
 /** The palette's own commands, offered first when they match what is typed. */
-import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat } from "./rig-lib.js";
+import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat, rowTitle, withFocusContext, releaseFocusTargets } from "./rig-lib.js";
 import { readSidebarView, writeSidebarView } from "./rig-sidebar-view-state.js";
-import { registerRigRouting, stampRows, rowsIdentityOf, onScreenRigTab, tabPagesBack, tabPagesScrub } from "./rig-lib.js";
+import { registerRigRouting, stampRows, messageDialogSpace, rowsIdentityOf, onScreenRigTab, tabPagesBack, tabPagesScrub } from "./rig-lib.js";
 const OWN = LOCAL_COMMANDS;
 const OWN_EXACT = new Set(OWN.map((o) => o.line));
 
@@ -75,7 +75,7 @@ export default class RigPalette extends View {
   get config() { return this._config; }
   set config(value) { this._config = value; observeConfig(value); syncRetainedOrigins(value); this.herdr?.observe?.(value); } // its own Herdr transport forgets a changed connection's helper and cursor
   /** Every overlay this instance opens is stamped with ITS OWN config (its rows were read under it), never the latest instance's. */
-  open(spec) { return rawOpenOverlay(stampRows(spec, rowsIdentityOf(this.config, spec?.props?.target?.conn))); }
+  open(spec) { return rawOpenOverlay(messageDialogSpace(stampRows(spec, rowsIdentityOf(this.config, spec?.props?.target?.conn)))); }
   init(_p, cx) {
     flatOwner = this;
     // OpenRigs over Herdr's connection (herdr:// addresses): what the palette runs (a send, a queue row, a launch) goes through the pinned helper on
@@ -98,7 +98,12 @@ export default class RigPalette extends View {
     this.busy = false;
     cx.spawn(async (cx) => {
       // Reads are numbered across every palette of this mod copy (rig-gate.js numberedConfigReads): an older palette's read that lands after a newer one gets the INSTALLED config, never its own stale one.
-      this.config = await configReads(async () => parseConfig(await readTextFile(`${appHome()}/openrig/config.json`)));
+      try { this.config = await configReads(async () => parseConfig(await readTextFile(`${appHome()}/openrig/config.json`))); }
+      catch (error) {
+        this.error = errorDiagnostic(error);
+        notify({ title: "Couldn't read OpenRig settings", body: this.error, level: "warning" });
+        cx.notify(); return;
+      }
       setShared("rig.oldProviderViews",await readOldProviderViews({layout,layouts,readTextFile,currentLayout:()=>shared("layout")},appHome()));
       let cached = null;
       try { cached = JSON.parse(localStorage.getItem("registry") ?? "null"); } catch (_) { cached = null; }
@@ -273,7 +278,7 @@ export default class RigPalette extends View {
   /** Closes the palette (named apart from close(), which herdr calls at teardown). */
   dismiss() { this.sayInFlight(); const id = props()?.overlay; if (id) closeOverlay(id); else run("mod.open", { name: MOD_IDS.palette }); }
   /** herdr's teardown (a click beside the palette, a reload): what is running is said first, as dismiss() does. */
-  async close() { this.sayInFlight(); try { this.herdr?.release?.(); } catch (_) {} }
+  async close() { this.sayInFlight(); this.closed=true;releaseFocusTargets(this); try { this.herdr?.release?.(); } catch (_) {} }
   /** Open operator or Open TUI was still running when the palette closed (Esc, a click beside it). herdr drops a closed palette's tasks, so the step's result is never seen: a viewer may be
    *  half started and a failure would go unsaid. Said once, in words; a step that finishes clears `running` before it dismisses the palette itself, so it says nothing then. */
   sayInFlight() {
@@ -442,7 +447,8 @@ export default class RigPalette extends View {
         const hasConn = Boolean(perBox && rig.conn);
         const rigLine = `rig ${rig.name}`, rigLower = rigLine.toLowerCase();
         if (rigLower.includes(q) && notExactUnboxed(hasConn, rigLower)) {
-          live.push({ line: rigLine, rigId: rig.id, hint: "Rig card", navigation: true, ...boxed(rig, rig.name) });
+          live.push({ line: rigLine, rigId: rig.id, hint: "Rig card", navigation: true, ...boxed(rig, rig.name),
+            entry: { section: "topology", kind: "rig", rigId: rig.id, ...(rig.conn ? { conn: rig.conn } : {}), name: rig.name } });
         }
         for (const pod of rig.pods) {
           if (live.length >= 8) break;
@@ -451,7 +457,8 @@ export default class RigPalette extends View {
             const seatRef = `${s.logicalId}@${rig.name}`;
             const seatLine = `agent ${seatRef}`, seatLower = seatLine.toLowerCase();
             if (seatLower.includes(q) && notExactUnboxed(hasConn, seatLower)) {
-              live.push({ line: seatLine, rigId: rig.id, hint: `Seat card · ${rig.name}`, navigation: true, ...boxed(rig, seatRef) });
+              live.push({ line: seatLine, rigId: rig.id, hint: `Seat card · ${rig.name}`, navigation: true, ...boxed(rig, seatRef),
+                entry: { section: "topology", kind: "seat", rig: rig.name, rigId: rig.id, ...(rig.conn ? { conn: rig.conn } : {}), name: s.logicalId, session: s.session } });
             }
           }
         }
@@ -467,9 +474,9 @@ export default class RigPalette extends View {
         return (ll.startsWith(q) || q.startsWith(firstWord) || Boolean(label && label.toLowerCase().includes(q))) && notExactUnboxed(hasConn, ll);
       };
       const own = [];
-      if ((hasOldProviderStrip(layout())||knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).length && oldViewCandidates(this.config, conn => this.caps(conn)).length)
+      if (hasOldProviderStrip(layout())
         && ("leave openrig's old strip".includes(q)||"close old worker views".includes(q))) {
-        own.push({line:"leave-old-strip",label:"Leave OpenRig's old strip…",hint:"Close old views and switch to the layout you pick"});
+        own.push({line:"leave-old-strip",label:"Leave OpenRig's old strip…",hint:oldStripCleanupBusy(shared)?oldStripBusyTip:"Close old views and switch to the layout you pick"});
       }
       for (const o of OWN) {
         if (matchesOwn(o.line, o.line.split(" ")[0], o.label, Boolean(o.conn))) {
@@ -514,12 +521,24 @@ export default class RigPalette extends View {
   /** Enter and Ctrl+Enter alike: the row Up/Down chose, else what is typed. A chosen verb that needs an
    *  argument fills the input with the verb to type it after, rather than running its sample. */
   choose(cx) {
-    const rows = this.rows(), index = this.selectionIndex(rows);
+    // The rows on screen when they were drawn for this input: rebuilding them from rig.data now could shift a clicked row's index, or drop it,
+    // after a refresh that changed the data (a rig whose nodes read failed is published without seats).
+    const drawn = this.drawnRows?.input === this.input.value() ? this.drawnRows.rows : null;
+    const rows = drawn ?? this.rows(), index = this.selectionIndex(rows);
     const row = index >= 0 ? rows[index] : null;
     if (row?.verb && row.args && !row.args.startsWith("[")) {
       this.input.set_value(`${row.verb} `);
       this.selected = -1;
       cx.notify();
+      return;
+    }
+    // A Rig or Seat card row already names the page it opens, from the data it was drawn from: show it at once. Resolving its line again
+    // (a CLI round trip) and looking the seat up in rig.data after that await could find a refresh that published the rig without its
+    // seats (its nodes read failed), and fall back to a filter that matches nothing.
+    if (row?.navigation && row.entry) {
+      const acting = this.actingOn(this.shownPage(), row.conn ? { conn: row.conn } : {});
+      if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return; }
+      this.applyRoute({ entry: row.entry }, acting);
       return;
     }
     this.submit(cx, row ? row.line : this.input.value(), {
@@ -560,8 +579,9 @@ export default class RigPalette extends View {
     // The TUI's refresh re-reads its own view; here the sidebar re-reads (the page follows it).
     if (verb === "refresh" && !arg) { run("rig.refresh"); this.dismiss(); return true; }
     if ((verb === "leave-old-strip"||verb === "close-old-worker-views") && !arg) {
-      const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config));
-      if (!hasOldProviderStrip(layout())&&(!views.length || !oldViewCandidates(this.config, conn => this.caps(conn)).length)) {
+      const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).filter(view=>view.current);
+      if (oldStripCleanupBusy(shared)) { this.error=oldStripBusyTip;cx.notify();return true; }
+      if (!hasOldProviderStrip(layout())) {
         this.error = "There is no OpenRig strip in this window.";
         cx.notify(); return true;
       }
@@ -881,27 +901,37 @@ export default class RigPalette extends View {
       conn: kernelRig?.conn ?? config?.connectionId, // topology not loaded yet: the connection it acts for
       session: operatorSeat?.session ?? "operator-agent@kernel",
       logicalId: operatorSeat?.logicalId ?? "operator.agent",
+      runtime: operatorSeat?.runtime,
       tmuxAttachCommand: operatorSeat?.tmuxAttachCommand ?? "tmux attach -t operator-agent@kernel",
       attachable: true,
     };
   }
 
   openOperator(cx, opts = {}) {
-    if (!this.config) { this.error = CONFIG_LOADING; this.note = null; cx.notify(); return true; }
+    const request=this.prepareOperator(cx,opts);
+    if(request)cx.spawn(task=>this.runOperator(task,request));
+    return true;
+  }
+
+  prepareOperator(cx, opts = {}) {
+    if (!this.config) { this.error = CONFIG_LOADING; this.note = null; cx.notify(); return null; }
     const acting = opts.conn ? this.actingFor(opts.conn) : this.acting(); // taken now, used for everything below
-    if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return true; }
+    if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return null; }
     const config = acting.config;
-    if (config.configInvalid) { this.error = config.configInvalid; this.note = null; cx.notify(); return true; }
+    if (config.configInvalid) { this.error = config.configInvalid; this.note = null; cx.notify(); return null; }
     const daemonUrl = config.daemonUrl ?? sharedLoopbackDaemonUrl(config, shared("rig.data"));
     if (!isLoopbackDaemonUrl(daemonUrl) && !herdrIdentityOf({ ...config, daemonUrl })) { // a switched box's operator is reached like its seats
       this.error = REMOTE_OPERATOR_REASON;
       this.note = null;
       cx.notify();
-      return true;
+      return null;
     }
     const target = this.operatorTarget(config, sharedRigData(config, shared)?.topology ?? []);
     this.busy = true; this.running = "operator"; cx.notify();
-    cx.spawn(async (cx) => {
+    return {config,daemonUrl,target};
+  }
+
+  async runOperator(cx,{config,daemonUrl,target}) {
       try {
         const res = await attachToSeat({ exec: execFor(config), run: runFor(config), hc: hcFor(config), spaces, panes, terminals: () => terminals?.() ?? [], layout, shared, setShared, openOverlay:spec=>this.open(spec),closeOverlay,currentConfig:()=>configOfConnection(this.config,config.connectionId),wait: waitWith(cx), relayPath: attachRelayPath(appHome(), MOD_IDS.palette) }, target, { ...config, daemonUrl }, { name: "Operator", operator: true });
         // Ask before the old viewer is stopped or closed; the confirm re-runs Attach with the replace.
@@ -912,8 +942,6 @@ export default class RigPalette extends View {
         this.running = null;
         this.dismiss();
       }
-    });
-    return true;
   }
 
   async resolveDaemonUrl(config = this.config) {
@@ -955,7 +983,11 @@ export default class RigPalette extends View {
     if (["read", "slice-file", "reply", "launch"].includes(route.act) && this.gonePage(top)) return fail(this.gonePage(top)); // these act on the page in view
     const note = (message) => { this.note = message; cx.notify(); };
     try {
-      if (route.act === "operator") { this.openOperator(cx, { conn: acting.config?.connectionId }); return; }
+      if (route.act === "operator") {
+        const request=this.prepareOperator(cx,{conn:acting.config?.connectionId});
+        if(request)await this.runOperator(cx,request);
+        return;
+      }
       if (route.act === "design-view") { this.design(cx, route.rig, { conn: acting.config?.connectionId }); return; }
       if (route.act === "change-model") { this.changeModel(cx, route.seat, { conn: acting.config?.connectionId }); return; }
       if (route.act === "notifications") {
@@ -1002,7 +1034,9 @@ export default class RigPalette extends View {
         // overwritten: the person opens one first, as the TUI's reply asks.
         // Requests only (an OpenRig that ignores kind lists everything; the updates are filtered out below). A failed narrow read reads the whole list, as before.
         const asks = await this.get("/api/attention?kind=action", acting.config).catch(rethrowGate(null)) ?? await this.get("/api/attention", acting.config);
-        const items = (asks?.items ?? []).map(needTarget).filter((n) => !n.update && n.reply !== "none");
+        // OpenRig's checks on other rows take no reply: the aggregate's rows carry the tags that tell them apart (an unread aggregate tells none apart).
+        const agg = await this.get("/api/queue/attention-aggregate", acting.config).catch(rethrowGate(null));
+        const items = enrichAttentionItems(asks?.items ?? [], agg).map(needTarget).filter((n) => !n.update && n.reply !== "none" && !sweepFinding(n));
         let target = null;
         if (top.section === "needs" && top.id) {
           target = items.find((n) => n.id === top.id);
@@ -1016,7 +1050,7 @@ export default class RigPalette extends View {
         setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [`needs:${target.id}`]: true });
         setShared("rig.replyFocus", { id: target.id, at: Date.now() });
         if (top.section === "needs" && (top.id === target.id || !top.id)) { return this.show(top, acting); }
-        return this.show({ section: "needs", id: target.id, name: target.summary }, acting); // the need came from acting's attention: its page is acting's
+        return this.show({ section: "needs", id: target.id, name: rowTitle(target.summary) }, acting); // the need came from acting's attention: its page is acting's
       }
       if (route.act === "launch") {
         // launch-folder / launch-host are remembered for the launch dialog; launch opens it for the spec shown.
@@ -1045,11 +1079,13 @@ export default class RigPalette extends View {
     } catch (e) { fail(errorDiagnostic(e)); }
   }
 
-  render(cx) {
+  render(cx) {return withFocusContext(this,cx,()=>this.renderFocused(cx));}
+  renderFocused(cx) {
     this.drawMemo = {};
     try {
       const t = theme();
       const rows = this.rows();
+      this.drawnRows = { input: this.input.value(), rows }; // what a click or Enter chooses from: the rows on screen, not ones rebuilt later
       const selectedIndex = this.selectionIndex(rows);
       return v_flex().id("rig-palette").size_full().bg(t.raised).border(1).border_color(t.border).rounded(10).p(8).gap(6).text_color(t.foreground)
         .on_key_down((e, cx) => {

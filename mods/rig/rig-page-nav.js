@@ -15,7 +15,7 @@ export function pageViewOptions(entry = {}, spec = null, counts = {}) {
   if(kind==='mission')return [['slices','Slices'],...(counts.workflowsSupported?[['workflows',`Workflows (${counts.workflows??0})`]]:[])];
   if(kind==="rig")return [["table","Table"],["recent","Recent"],["overview","Overview"],["graph","Graph"],["health","Health"]];
   if(kind==="seat")return [["activity","Activity"],["queue","Queue"],["files","Files"]];
-  if(kind==="needs")return entry.id?[]:[["requests",`Requests (${counts.requests??0})`],["updates",`Updates (${counts.updates??0})`]];
+  if(kind==="needs")return entry.id?[]:[["requests",`Requests (${counts.requests??0}${(counts.checks??0)>0?` · ${counts.checks} ${counts.checks===1?'check':'checks'}`:''})`],["updates",`Updates (${counts.updates??0})`]];
   if(kind==="spec")return spec?.kind==="rig"?[["graph","Graph"],["yaml","YAML"]]:[["yaml","YAML"]];
   return kind==="system"?SYSTEM_PAGE_VIEWS:[];
 }

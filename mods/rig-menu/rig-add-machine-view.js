@@ -1,10 +1,11 @@
 import { errorDiagnostic } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
+import {withFocusContext,releaseFocusTargets} from './rig-lib.js';
 import {div,svg} from "gpui-kit";
 import {errorBlock} from "./rig-error-view.js";
 import {v_flex,h_flex,InputState,Input} from "gpui-base";
 import {machineSetupGate,listAddableMachines} from "./rig-remote.js";
-import {connectionsOf,nextTunnelAddress,tunnelCommand,openrigHomeProblem,openrigHomeWarning,formatHostId,plainExecError} from "./rig-connections.js";
+import {connectionsOf,nextTunnelAddress,tunnelCommand,openrigHomeProblem,openrigHomeWarning,formatHostId,plainExecError,localConnectionMissing} from "./rig-connections.js";
 
 // The "add a machine" dialog. One gate per open dialog; it is expired on save, on cancel and when the dialog goes away.
 // Phases: checking (the box side) -> ready (the tunnel section) -> tunnel (reading it) -> verified -> saving -> done; "nothing" when no OpenRig answers there.
@@ -29,7 +30,7 @@ export class AddMachinePanel {
       state.on("submit",(_e,cx)=>this.checkTunnel(cx)); // Enter checks; it never saves
     }
   }
-  expire(){this.gate.expire();this.pendingFocus=null;this.focusTask?.cancel?.();}
+  expire(){this.expired=true;releaseFocusTargets(this);this.gate.expire();this.pendingFocus=null;this.focusTask?.cancel?.();}
   /** Puts the keyboard in a field once it is drawn; a refused check keeps the person in the field it names. */
   focusField(state,cx,{select=false}={}){
     this.pendingFocus={state,select};
@@ -144,7 +145,8 @@ export class AddMachinePanel {
         .when(disabled,el=>el.opacity(.45)).when(!disabled,el=>el.cursor_pointer())
         .on_mouse_down('left',activation.pointer()).on_click(activation.click((_e,cx)=>{if(!disabled)callback(cx);})).child(text));
   }
-  render(t,cx){
+  render(...args){return withFocusContext(this,args[1],()=>this.renderFocused(...args));}
+  renderFocused(t,cx){
     this.theme=t;
     if(this.pendingFocus){const {state,select}=this.pendingFocus;this.pendingFocus=null;this.focusTask?.cancel?.();
       this.focusTask=cx.timer?.after?.(0,next=>{if(this.gate.expired())return;state.focus?.();if(select)state.set_selected_range?.({start:0,end:String(state.value()??"").length});next.notify?.();});}
@@ -218,11 +220,11 @@ export class AddMachinePanel {
 /** The handle when it can still be used (is_focused() on a released one throws), else null. */
 const liveFocus=h=>{if(!h)return null;try{h.is_focused?.();return h;}catch(_){return null;}};
 export class AddMachineChooser {
-  constructor(host,{liveConfig,makePanel,cancel,cancelHandle,primaryHandle}={}){
-    this.host=host;this.liveConfig=liveConfig;this.makePanel=makePanel;this.cancel=cancel;this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
+  constructor(host,{liveConfig,makePanel,makeLocalPanel,cancel,cancelHandle,primaryHandle}={}){
+    this.host=host;this.liveConfig=liveConfig;this.makePanel=makePanel;this.makeLocalPanel=makeLocalPanel;this.cancel=cancel;this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;
     this.phase="loading";this.rows=[];this.error=null;this.panel=null;
   }
-  expire(){this.expired=true;this.focusTask?.cancel?.();this.panel?.expire?.();for(const handle of this.rowHandles??[])handle?.release?.();this.rowHandles=[];}
+  expire(){this.expired=true;releaseFocusTargets(this);this.focusTask?.cancel?.();this.panel?.expire?.();for(const handle of this.rowHandles??[])handle?.release?.();this.rowHandles=[];}
   cycleFocus(forward,cx){
     cx.stop_propagation();
     const handles=[...(this.phase==="choose"?this.rowHandles??[]:[]),this.cancelHandle].map(liveFocus).filter(Boolean);
@@ -236,6 +238,7 @@ export class AddMachineChooser {
   async load(cx){
     try{
       const live=this.liveConfig?.()??{},taken=[live.daemonMachine,...(live.connections??[]).map(c=>c?.machine)];
+      this.local=localConnectionMissing(live)&&typeof this.makeLocalPanel==='function';
       this.rows=await listAddableMachines(this.host,taken);this.phase="choose";
       // Each row's focus handle is made by the next draw (rowHandlesFor), never in this continuation: a handle made after an await belongs to
       // whichever view drained the promise jobs. Without one Tab can't reach the row and its keys never arrive.
@@ -244,6 +247,11 @@ export class AddMachineChooser {
     }catch(error){this.phase="error";this.error=plainExecError(error,{machine:this.machine,kind:"remote"});}
     cx.notify();
   }
+  async chooseLocal(cx){
+    if(this.expired||this.panel||!this.local)return;
+    // This method starts from the chooser's live event task, before its first await.
+    this.panel=this.makeLocalPanel(cx);cx.notify();await this.panel.open(cx);
+  }
   async choose(row,cx){
     if(this.expired||this.panel)return;
     this.panel=this.makePanel(row.name,{target:row.target,session:row.session});
@@ -251,17 +259,18 @@ export class AddMachineChooser {
   }
   /** From a draw (the view's own call): one timer that makes a focus handle per machine row (never in the draw itself, which Herdr refuses). */
   rowHandlesFor(cx){
-    const rows=this.rows;
-    if(this.expired||this.rowHandlesPending||!rows.length||!cx?.timer?.after||(this.rowHandles?.length===rows.length&&this.rowHandles.every(h=>liveFocus(h))))return;
+    const rows=this.rows,count=rows.length+(this.local?1:0);
+    if(this.expired||this.rowHandlesPending||!count||!cx?.timer?.after||(this.rowHandles?.length===count&&this.rowHandles.every(h=>liveFocus(h))))return;
     this.rowHandlesPending=true;
     cx.timer.after(0,next=>{
       this.rowHandlesPending=false;
       if(this.expired||this.rows!==rows||!next?.focus_handle)return;
-      this.rowHandles=rows.map((_,i)=>liveFocus(this.rowHandles?.[i])??next.focus_handle());
+      this.rowHandles=Array.from({length:count},(_,i)=>liveFocus(this.rowHandles?.[i])??next.focus_handle());
       next.notify?.();
     });
   }
-  render(t,cx){
+  render(...args){return withFocusContext(this,args[1],()=>this.renderFocused(...args));}
+  renderFocused(t,cx){
     if(this.panel)return this.panel.render(t,cx);
     this.theme=t;
     if(this.phase==="choose")this.rowHandlesFor(cx);
@@ -272,17 +281,22 @@ export class AddMachineChooser {
     let body=v_flex().flex_1().min_h(0).overflow_y_scrollbar().gap(6);
     if(this.phase==="loading")body=body.child(div().id("add-machine-loading").text_color(t.muted).child("◌ Reading Herdr's machines…"));
     else if(this.phase==="error")body=body.child(div().id("add-machine-choose-error").text_color(t.blocked).child(errorBlock(this,t,"add-machine-choose-error-detail",this.error,{where:"this computer"})));
-    else if(!this.rows.length)body=body.child(div().id("add-machine-none").child("Every connected Herdr machine already has a connection."));
+    else if(!this.rows.length&&!this.local)body=body.child(div().id("add-machine-none").child("Every connected Herdr machine already has a connection."));
     else{
       body=body.child(div().text_color(t.muted).child("Machine"));
+      if(this.local){const activation=activationPair(this,'pick-local');body=body.child(v_flex().id('add-machine-pick-local').role('button').tab_stop(true).px(8).py(5).rounded(5).bg(t.raised).cursor_pointer()
+        .when(!!this.rowHandles?.[0],el=>el.track_focus(this.rowHandles[0])).focus(el=>el.border_1().border_color(t.accent))
+        .on_mouse_down('left',activation.pointer()).on_click(activation.click((_e,next)=>next.spawn(task=>this.chooseLocal(task))))
+        .on_key_down(activation.key((e,next)=>{if(['enter',' ','space'].includes(e.key)&&!e.is_held){next.stop_propagation();next.spawn(task=>this.chooseLocal(task));}}))
+        .child(div().child('This computer')).child(div().text_size(11).text_color(t.muted).child('The OpenRig that runs here')));}
       for(const [i,row] of this.rows.entries())body=body.child(div().id(`add-machine-pick-${row.name}`).role("button").tab_stop(true).px(8).py(5).rounded(5).bg(t.raised).cursor_pointer()
-        .when(!!this.rowHandles?.[i],el=>el.track_focus(this.rowHandles[i]))
+        .when(!!this.rowHandles?.[i+(this.local?1:0)],el=>el.track_focus(this.rowHandles[i+(this.local?1:0)]))
         .focus(el=>el.border_1().border_color(t.accent))
         .on_mouse_down('left',activationPair(this,`pick-${row.name}`).pointer())
         .on_click(activationPair(this,`pick-${row.name}`).click((_e,cx)=>cx.spawn(cx=>this.choose(row,cx))))
         .on_key_down(activationPair(this,`pick-${row.name}`).key((e,cx)=>{if(!e.is_held&&["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}})).child(row.name));
     }
-    const closeLabel=this.phase==="choose"&&this.rows.length?"Cancel":"Close";
+    const closeLabel=this.phase==="choose"&&(this.rows.length||this.local)?"Cancel":"Close";
     const close=div().id("add-machine-choose-close-focus").p(2).border(2).border_color("#00000000").rounded(7).role("button").tab_stop(true)
       .when(!!this.cancelHandle,el=>el.track_focus(this.cancelHandle)).focus(el=>el.border_color(t.accent))
       .on_mouse_down('left',activationPair(this,'choose-close').pointer())

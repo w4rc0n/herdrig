@@ -2,6 +2,7 @@ import { errorDiagnostic } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
 import {div} from "gpui-kit";
 import {errorBlock} from "./rig-error-view.js";
+import {withFocusContext,releaseFocusTargets} from './rig-lib.js';
 import {v_flex,h_flex} from "gpui-base";
 import {switchConnection,switchBack,HERDR_CONNECTION_OFFERED,SWITCH_NOT_OFFERED,HERDR_APPROVE_NOT_OFFERED} from "./rig-connections.js";
 
@@ -16,7 +17,7 @@ export class SwitchConnectionPanel {
     this.phase="ready";this.error=null;this.confirmation=null;
     this.name=connection?.machine??"this connection";
   }
-  expire(){this.left=true;}
+  expire(){this.left=true;releaseFocusTargets(this);}
   // Cancel or Escape: a check still running finishes unseen (it only reads), and never reports or refreshes for a dialog the person left.
   leaveDialog(cx){this.left=true;this.cancel?.(cx);}
   // The connection's own rig command (a connection entry has none; it is the config's shared setting): without it the bridge falls back to a bare `node`.
@@ -69,7 +70,8 @@ export class SwitchConnectionPanel {
   words(){
     if(this.direction==="back")return{title:`Switch ${this.name} back to the tunnel?`,body:`herdrig will reach ${this.name}'s OpenRig through its tunnel again. The helper stays on ${this.name}, unused; nothing there changes.`,address:this.connection.retainedDaemonUrl,go:"Switch back"};
     // Approve helper: one review, like Attach's. The dialog runs the check as it opens; a check that failed offers Try again and approves nothing.
-    const reason=`Herdrig reaches ${this.name}'s OpenRig through a small helper there. Its approval is missing or out of date: the machine, its account or the helper changed. An update can change the helper.`;
+    const reason=this.confirmation?.updated===true?`This version of Herdrig ships a new helper for ${this.name}.`
+      :`Herdrig reaches ${this.name}'s OpenRig through a small helper there. Its approval is missing or out of date: the machine, its account or the helper changed. An update can change the helper.`;
     if(this.phase==="consent")return this.direction==="approve"?{title:`Approve the helper on ${this.name}`,body:`${reason}\n\n${this.confirmation?.words??""}`,go:"Approve"}
       :{title:`Approve the helper on ${this.name}`,body:this.confirmation?.words??"",go:"Approve and switch"};
     if(this.direction==="approve")return{title:`Approve the helper on ${this.name}`,body:reason,go:"Try again"};
@@ -77,7 +79,8 @@ export class SwitchConnectionPanel {
       address:this.connection.daemonUrl,body:`herdrig will reach ${this.name}'s OpenRig through Herdr's own connection instead of its tunnel, which is kept so you can switch back in one click. It installs a small helper on ${this.name} after you approve it. Commands run there as you: on a machine shared with other users, they could briefly see a message being sent (its text, or a queue row's summary line, never the body).`,
       go:"Continue"};
   }
-  render(t,cx){
+  render(...args){return withFocusContext(this,args[1],()=>this.renderFocused(...args));}
+  renderFocused(t,cx){
     this.theme=t;
     // Approve helper: one review, like Attach's. The check starts from this dialog's own first draw (a timer the draw sets), so its task is the
     // dialog's, never one made after another view's awaits.

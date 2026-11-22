@@ -8,13 +8,26 @@ function layoutNodes(tree){
   walk(tree);return out;
 }
 export const hasOldProviderStrip=tree=>layoutNodes(tree).some(node=>node.content?.mod==='rig-strip');
-export const oldStripLayoutLabel=name=>name==='main'?'Herdr':name;
-function closeReason(value){
-  const text=String(value??'').trim();
-  if(/^(?:Error:\s*)?(?:OpenRig )?Daemon (?:is )?not running\./i.test(text))return "OpenRig isn't running.";
-  if(!text||/[\r\n]/.test(text)||text.length>180)return 'OpenRig did not confirm the close.';
+const cleanDisplay=value=>String(value??'').replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g,'');
+export const oldStripLayoutLabel=name=>name==='main'?'Herdr':cleanDisplay(name)||'that layout';
+export const oldStripBusyTip="A cleanup of OpenRig's old strip is already running in this window.";
+export function oldStripCleanupOwner(shared){
+  const lock=shared('rig.oldViewsCloseLock');
+  return lock?.until>Date.now()?lock.id:null;
+}
+export const oldStripCleanupBusy=shared=>Boolean(oldStripCleanupOwner(shared)||Object.values(shared('rig.oldViewsClose')??{}).some(request=>Date.now()-request.createdAt<=120000));
+export function releaseOldStripCleanup(shared,setShared,id){
+  if(shared('rig.oldViewsCloseLock')?.id===id)setShared('rig.oldViewsCloseLock',null);
+}
+function displayErrorLine(value){
+  const text=cleanDisplay(value).trim();
+  if(!text||/[\r\n]/.test(text)||text.length>180)return null;
   const line=text.replace(/^Error:\s*/,'').replace(/[\u0000-\u001f\u007f]/g,' ').trim();
-  return /[.!?]$/.test(line)?line:`${line}.`;
+  return !line?null:/[.!?]$/.test(line)?line:`${line}.`;
+}
+function closeReason(value){
+  if(/^(?:Error:\s*)?(?:OpenRig )?Daemon (?:is )?not running\./i.test(cleanDisplay(value).trim()))return "OpenRig isn't running.";
+  return displayErrorLine(value)??'OpenRig did not confirm the close.';
 }
 function failedViewNames(views){
   const counts=new Map();
@@ -24,22 +37,32 @@ function failedViewNames(views){
   if(more)shown.push(`and ${more} more`);
   return shown.join(', ');
 }
-function closeFailureText(result,total){
+function closeFailureText(result){
+  const unchecked=result.uncheckedViews??[];
+  const uncheckedText=unchecked.length?`Not checked: ${failedViewNames(unchecked)}. herdrig couldn't read the old views again, so it didn't try to close them. They may still be open.`:'';
+  if(!result.failedViews.length)return [result.closed?`Closed ${result.closed} old view${result.closed===1?'':'s'}.`:'',uncheckedText].filter(Boolean).join(' ');
+  const total=result.closed+result.failedViews.length;
   const unknown="No OpenRig on this computer knows it.",unknownCount=result.failedViews.filter(view=>view.reason===unknown).length;
   const reasons=[...new Set(result.failedViews.map(view=>view.reason===unknown&&unknownCount>1?'No OpenRig on this computer knows them.':closeReason(view.reason)))];
   const reason=reasons.length>2?'OpenRig gave several reasons. Check these views before trying again.':reasons.join(' ');
   const count=result.closed?`Closed ${result.closed} of ${total} old views.`:"Couldn't close the old views.";
-  return `${count} Not confirmed: ${failedViewNames(result.failedViews)}. ${reason} They may still be open.`;
+  return [`${count} Not confirmed: ${failedViewNames(result.failedViews)}. ${reason} They may still be open.`,uncheckedText].filter(Boolean).join(' ');
+}
+async function readStripLayout(host,appHome,name){
+  if(!safeLayoutName(name)||!(host.layouts?.()??[]).includes(name))return {state:'missing'};
+  try{
+    const tree=JSON.parse(await host.readTextFile(`${appHome}/layouts/${name}.json`));
+    if(!tree||!['block','row','column','stack'].includes(tree.type))return {state:'unreadable'};
+    if(!(host.layouts?.()??[]).includes(name))return {state:'missing'};
+    return {state:hasOldProviderStrip(tree)?'strip':'ready',tree};
+  }catch{return {state:'unreadable'};}
 }
 /** Only Herdr's public layout list and files; never the provider's journal or generated-file ownership markers. */
 export async function oldStripLayouts(host,appHome){
   const choices=[];
   for(const name of host.layouts?.()??[]){
     if(!safeLayoutName(name))continue;
-    try{
-      const tree=JSON.parse(await host.readTextFile(`${appHome}/layouts/${name}.json`));
-      if(tree&&['block','row','column','stack'].includes(tree.type)&&!hasOldProviderStrip(tree))choices.push({name,label:oldStripLayoutLabel(name)});
-    }catch{} // A missing/unreadable layout cannot be selected for recovery.
+    if((await readStripLayout(host,appHome,name)).state==='ready')choices.push({name,label:oldStripLayoutLabel(name)});
   }
   return choices;
 }
@@ -99,21 +122,28 @@ export async function ensureOldStripPage(host){
 export async function leaveOldStrip(host,config,views,appHome,capsFor,returnLayout){
   const label=oldStripLayoutLabel(returnLayout),lines=[];
   let result={ok:true,closed:0,failures:[]},switched=false;
-  if(!(await oldStripLayouts(host,appHome)).some(choice=>choice.name===returnLayout))return{ok:false,closed:0,switched:false,title:"Still in OpenRig's old strip",text:`Couldn't switch to ${label}: that layout changed or is no longer available. Open the palette (Ctrl+Shift+P) and choose a Layout.\nYour seats keep running.`};
+  if((await readStripLayout(host,appHome,returnLayout)).state!=='ready')return{ok:false,closed:0,switched:false,title:"Still in OpenRig's old strip",text:`Couldn't switch to ${label}: that layout changed or is no longer available. Open the palette (Ctrl+Shift+P) and choose a Layout.\nYour seats keep running.`};
   if(views.length){
     if(!oldViewCandidates(config,capsFor).length){
       result={ok:false,closed:0,failures:[]};lines.push("The old views weren't closed: this OpenRig can't close them from here.");
     }else{
       result=await closeOldViews(host,config,views,appHome,capsFor);
-      if(result.ok)lines.push(result.closed?`Closed ${result.closed} old views.`:'Nothing needed closing.');
-      else lines.push(closeFailureText(result,result.closed+result.failedViews.length));
+      if(result.ok)lines.push(result.closed?`Closed ${result.closed} old view${result.closed===1?'':'s'}.`:'Nothing needed closing.');
+      else lines.push(closeFailureText(result));
     }
   }
   try{
     await host.beforeSwitch?.();
-    if(!(await oldStripLayouts(host,appHome)).some(choice=>choice.name===returnLayout))throw Error('That layout changed or is no longer available.');
+    if((await readStripLayout(host,appHome,returnLayout)).state!=='ready')throw Error('That layout changed or is no longer available');
     await keepRigPage(host);
     await host.beforeSwitch?.();
+    const destination=await readStripLayout(host,appHome,returnLayout);
+    if(destination.state==='unreadable'){
+      lines.push(`Couldn't read ${label} just before switching, so the window stayed where it was. Pick a layout again.`);
+      return{...result,ok:false,switched:false,title:"Still in OpenRig's old strip",text:[...lines,'Your seats keep running.'].join('\n')};
+    }
+    if(destination.state!=='ready')throw Error('That layout changed or is no longer available');
+    host.checkActive?.();
     host.willSwitch?.();
     const reply=await host.run('layout.switch',{name:returnLayout});
     if(reply?.error)throw Error(String(reply.error));
@@ -121,7 +151,14 @@ export async function leaveOldStrip(host,config,views,appHome,capsFor,returnLayo
     // A successful run can remove the initiating sidebar before Herdr publishes its new public snapshot.
     if(!host.didSwitch?.()&&(host.currentLayout?.()!==returnLayout||hasOldProviderStrip(host.layout())))throw Error('Herdr did not confirm the layout switch.');
     switched=true;lines.push(returnLayout==='main'?"Now using Herdr. The Rig sidebar isn't in this layout.":`Now using ${label}.`);
-  }catch(error){lines.push(`Couldn't switch to ${label}: ${String(error?.message??error)}. Open the palette (Ctrl+Shift+P) and choose a Layout.`);}
+  }catch(error){
+    const detail=displayErrorLine(error?.message??error);
+    if(!detail){
+      const message=`Herdr didn't confirm the switch to ${label}. If the strip is still on screen, open the palette (Ctrl+Shift+P) and choose a Layout.`;
+      return{...result,ok:false,switched:false,title:'Layout switch not confirmed',text:[message,...lines,'Your seats keep running.'].join('\n')};
+    }
+    lines.push(`Couldn't switch to ${label}: ${detail} Open the palette (Ctrl+Shift+P) and choose a Layout.`);
+  }
   lines.push('Your seats keep running.');
   return{...result,ok:result.ok&&switched,switched,title:switched?"Left OpenRig's old strip":"Still in OpenRig's old strip",text:lines.join('\n')};
 }
@@ -134,7 +171,7 @@ export function oldProviderViews(tree){
     const content=node.content;
     if(content?.mod==='rig-strip')for(const view of Array.isArray(content.props?.views)?content.props.views:[]){
       if(typeof view?.id==='string'&&/^rv-[A-Za-z0-9_-]{1,160}$/.test(view.id)&&!found.has(view.id))
-        found.set(view.id,{id:view.id,name:String(view.name??view.id).slice(0,160)});
+        found.set(view.id,{id:view.id,name:cleanDisplay(view.name??view.id).slice(0,160)||view.id});
     }
     walk(node.header);walk(content?.pane?.header);for(const child of Array.isArray(node.children)?node.children:[])walk(child);
   };walk(tree);return [...found.values()];
@@ -160,21 +197,24 @@ export function knownOldProviderViews(tree,cached=[],gone=[]){
 }
 /** Read-only dependency on Herdr's documented layouts/<name>.json format.
  * Unknown shapes, unreadable files and malformed JSON are skipped independently. */
-export async function readOldProviderViews(host,appHome){
+async function scanOldProviderViews(host,appHome){
   const found=new Map(oldProviderViews(host.layout()).map(view=>[view.id,{...view,current:true,layouts:[]}]));
+  const unreadable=new Set();
   for(const name of host.layouts?.()??[]){
     if(typeof name!=='string'||!name||name==='.'||name==='..'||/[\/\\\u0000-\u001f]/.test(name))continue;
     try{
       const tree=JSON.parse(await host.readTextFile(`${appHome}/layouts/${name}.json`));
+      if(!tree||!['block','row','column','stack'].includes(tree.type)&&!hasOldProviderStrip(tree)){unreadable.add(name);continue;}
       for(const view of oldProviderViews(tree)){
         const prior=found.get(view.id)??{...view,current:false,layouts:[]};
         if(!prior.layouts.includes(name))prior.layouts.push(name);
         found.set(view.id,prior);
       }
-    }catch{} // A stale or unrecognized layout is not authority to mutate it.
+    }catch{unreadable.add(name);}
   }
-  return [...found.values()];
+  return {views:[...found.values()],unreadable};
 }
+export async function readOldProviderViews(host,appHome){return (await scanOldProviderViews(host,appHome)).views;}
 export function oldViewsLocationText(views){
   const current=views.filter(v=>v.current!==false).length,saved=views.length-current;
   const names=[...new Set(views.filter(v=>v.current===false).flatMap(v=>v.layouts??[]))];
@@ -184,16 +224,21 @@ export function oldViewsLocationText(views){
 /** Explicit fallback: close only the reviewed views; the current layout is never changed. */
 export async function closeOldViewsOnly(host,config,views,appHome,capsFor){
   const result=await closeOldViews(host,config,views,appHome,capsFor);
-  const text=result.ok?(result.closed?`Closed ${result.closed} old view${result.closed===1?'':'s'}.`:'Nothing needed closing.'):closeFailureText(result,result.closed+result.failedViews.length);
-  return{...result,switched:false,title:result.ok?(result.closed?"Closed OpenRig's old views":'The old views were already gone'):result.closed?"Some old views weren't closed":"Couldn't close the old views",
+  const text=result.ok?(result.closed?`Closed ${result.closed} old view${result.closed===1?'':'s'}.`:'Nothing needed closing.'):closeFailureText(result);
+  return{...result,switched:false,title:result.ok?(result.closed?"Closed OpenRig's old views":'The old views were already gone'):result.closed||result.uncheckedViews.length?"Some old views weren't closed":"Couldn't close the old views",
     text:`${text}\nThe strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout).\nYour seats keep running.`};
 }
 export async function closeOldViews(host,config,views,appHome,capsFor){
-  const candidates=oldViewCandidates(config,capsFor),failures=[],failedViews=[];let closed=0;
+  const candidates=oldViewCandidates(config,capsFor),failures=[],failedViews=[],uncheckedViews=[];let closed=0;
   const fail=(view,reason)=>{failures.push(`${view.name}: ${reason}`);failedViews.push({id:view.id,name:view.name,reason:closeReason(reason)});};
-  for(const view of views){
+  for(const reviewed of views){
+    const view={...reviewed,name:cleanDisplay(reviewed.name).slice(0,160)||reviewed.id};
     if(oldViewsGone(host.shared,config).includes(view.id))continue;
-    if(!(await readOldProviderViews(host,appHome)).some(v=>v.id===view.id))continue;
+    const inventory=await scanOldProviderViews(host,appHome);
+    if(!inventory.views.some(v=>v.id===view.id)){
+      if(view.layouts?.some(name=>inventory.unreadable.has(name))||view.current===false&&!view.layouts?.length&&inventory.unreadable.size)uncheckedViews.push(view);
+      continue;
+    }
     let known=false;
     for(const candidate of candidates){
       try{
@@ -217,5 +262,5 @@ export async function closeOldViews(host,config,views,appHome,capsFor){
       else fail(view,'No OpenRig on this computer knows it.');
     }
   }
-  return{ok:failures.length===0,text:`Closed ${closed} old view${closed===1?'':'s'}; seats keep running.${failures.length?'\n'+failures.join('\n'):''}`,closed,failures,failedViews};
+  return{ok:failures.length===0&&uncheckedViews.length===0,text:`Closed ${closed} old view${closed===1?'':'s'}; seats keep running.${failures.length?'\n'+failures.join('\n'):''}`,closed,failures,failedViews,uncheckedViews};
 }

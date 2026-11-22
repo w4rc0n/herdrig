@@ -237,8 +237,6 @@ export function consentText(previousText, id, record) {
 export const adoptConnection = (config, id) => (typeof id === "string" && id !== "" ? id : (config?.connections ?? []).length === 1 ? config.connections[0].id : undefined);
 
 
-/** A row or group key made specific to one connection, so two OpenRigs never share a fold, order or selection key. The legacy connection's
- *  keys are the old ones (stored state stays found). */
 /** A `rig.<command>` for a target of `config`'s connection. herdr delivers a mod command as its NAME only (its args are dropped), so with several connections the
  *  connection goes in the name, `rig.<command>:<conn>|<target>`; the sidebar reads it back only for one of its own connections. One connection: `rig.<command>:<target>`. */
 export const commandFor = (command, config, target) => `${command}:${(config?.connections?.length ?? 0) > 1 && config?.connectionId ? `${config.connectionId}|` : ""}${target}`;
@@ -248,6 +246,8 @@ export const operatorCommandFor = (config) => ((config?.connections?.length ?? 0
 export const tuiCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.tui:${config.connectionId}` : "rig.tui");
 /** A request id that is on more than one OpenRig, asked for without a connection the sidebar can use. */
 export const AMBIGUOUS_REQUEST = "That request is on more than one OpenRig. Open it from its row in the sidebar. Nothing was opened.";
+/** A row or group key made specific to one connection, so two OpenRigs never share a fold, order or selection key. The legacy connection's
+ *  keys are the old ones (stored state stays found). */
 export const qualifyKey = (conn, key) => (conn && conn !== LEGACY_CONNECTION_ID ? `${conn}|${key}` : key);
 
 /** The key of one rig's space status (the card on its row) and of its "opening" mark: the rig id alone with ONE OpenRig, exactly as it always was, and qualified by the
@@ -647,4 +647,43 @@ export function plainExecError(error, options = {}) {
     return raw.replace(EXEC_PREFIX, "");
   }
   return raw;
+}
+
+/** A connections list with no entry for this computer: every entry names a Herdr machine (this computer's entry was removed, or the list was
+ *  written that way). The way back to it, "This computer", is offered only then. A legacy config (no list) is this computer's own already. */
+export const localConnectionMissing = (config) => Boolean(config?.connectionsList) && Array.isArray(config?.connections) && config.connections.length > 0
+  && config.connections.every((c) => Boolean(c?.machine));
+export const LOCAL_ALREADY_CONNECTED = "This computer is already connected. Nothing was saved.";
+export const localTaken = (connection) => `That's the OpenRig, or the OpenRig home, that ${connection?.machine ?? "another connection"} already uses. Nothing was saved.`;
+const homeKey = (value) => String(value ?? "").replace(/\/+$/, "");
+
+/** Adds this computer's OpenRig back to a connections list, as one compare-and-swap append against config.json. The caller (the
+ *  "Add this computer" check) has already read every value from that home's own OpenRig; this refuses on its own anyway: no list, a list that
+ *  already has an entry for this computer, an address that isn't loopback, a bad host id or home, and an address, host id or OpenRig home another
+ *  connection uses (`canonicalHomes`: the listed homes as the check resolved them). The entry has no machine key, which is what makes it this
+ *  computer's; existing entries and unknown fields are preserved (never re-normalized), and it goes last, so the first
+ *  connection stays the primary. Never loosens `addMachineConnection`. */
+export async function addLocalConnection(host, before, { daemonUrl, expectedHostId, openrigHome, canonicalHomes = [] } = {}) {
+  const cleanUrl = url(daemonUrl);
+  if (!cleanUrl || !LOOPBACK_ADDRESS.test(cleanUrl)) throw new Error("This computer's OpenRig must answer on a loopback address. Nothing was saved.");
+  if (typeof expectedHostId !== "string" || !HOST_ID.test(expectedHostId)) throw new Error("A checked host id is required. Nothing was saved.");
+  const homeProblem = openrigHomeProblem(openrigHome);
+  if (homeProblem) throw new Error(homeProblem);
+  let raw;
+  try { raw = JSON.parse(before ?? ""); } catch { throw new Error("openrig/config.json is not valid JSON."); }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("openrig/config.json must contain an object.");
+  if (!Array.isArray(raw.connections)) throw new Error("This OpenRig has no connections list, so this computer is its connection already. Nothing was saved.");
+  const { connections, invalid } = connectionsOf(raw);
+  if (invalid) throw new Error(CONFIG_LIST_INVALID);
+  if (connections.some((c) => !c.machine)) throw new Error(LOCAL_ALREADY_CONNECTED);
+  const key = addressKey(cleanUrl), home = homeKey(openrigHome), canonical = new Set(canonicalHomes.map(homeKey));
+  for (const c of connections) {
+    if ((c.daemonUrl && addressKey(c.daemonUrl) === key) || c.expectedHostId === expectedHostId || (c.openrigHome && homeKey(c.openrigHome) === home)) throw new Error(localTaken(c));
+  }
+  if (canonical.has(home)) throw new Error(localTaken(null));
+  let id;
+  do { id = `conn-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`; } while (connections.some((c) => c.id === id));
+  const next = { id, daemonUrl: cleanUrl, token: null, expectedHostId, openrigHome };
+  await host.writeConfig(JSON.stringify({ ...raw, connections: [...raw.connections, next] }, null, 2) + "\n", before);
+  return next;
 }

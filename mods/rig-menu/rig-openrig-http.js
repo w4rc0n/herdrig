@@ -104,7 +104,7 @@ const unsentError = (msg, extra = {}) => Object.assign(Error(msg), { notSent: tr
 export class HerdrTransport {
   /** `connection(scope, parsed)` gives `{remote, config}` for a request: that connection's RemoteOpenRig and its config, or throws when the
    *  scope has no such connection. */
-  constructor({ connection, onPrepared = () => {}, generation = null }) { this.connection = connection; this.onPrepared = onPrepared; this.generation = generation; this.ready = new Map(); this.batches = new Map(); this.cursors = new Map(); this.pending = new Map(); }
+  constructor({ connection, onPrepared = () => {}, generation = null }) { this.connection = connection; this.onPrepared = onPrepared; this.generation = generation; this.ready = new Map(); this.preparedEntries = new Map(); this.batches = new Map(); this.cursors = new Map(); this.pending = new Map(); }
   key(scope, parsed) { return `${scope ?? ""}\u0000${parsed.origin}`; }
   /** A write's check of its connection's settings, taken when the write starts: true while that connection's gate generation is the same. */
   writeCheck(scope) { if (typeof this.generation !== "function") return null; const at = this.generation(scope); return () => this.generation(scope) === at; }
@@ -133,11 +133,12 @@ export class HerdrTransport {
           }
           if (p.hostId !== parsed.hostId) throw unsentError(`${parsed.machine} now runs a different OpenRig than this connection was set up for. Nothing was sent.`, { wrongHost: true });
           this.onPrepared(scope, parsed, config); // the helper answered as the host id in the address: what a switched connection's old labels wait for
+          if (this.ready.get(key) === job) this.preparedEntries.set(key, { remote, p });
           return { remote, p };
         } catch (e) { throw markUnsent(e); }
       })();
       this.ready.set(key, job);
-      job.catch(() => { if (this.ready.get(key) === job) this.ready.delete(key); });
+      job.catch(() => { if (this.ready.get(key) === job) this.dropPrepared(key); });
     }
     return this.ready.get(key);
   }
@@ -152,16 +153,23 @@ export class HerdrTransport {
     this.observed = seen;
   }
   /** Forgets every prepared helper and cursor of one connection (scope). */
-  forgetScope(scope) { for (const map of [this.ready, this.cursors, this.pending]) for (const key of [...map.keys()]) if (key.startsWith(`${scope ?? ""}\u0000`)) map.delete(key); }
+  forgetScope(scope) { for (const map of [this.ready, this.cursors, this.pending]) for (const key of [...map.keys()]) if (key.startsWith(`${scope ?? ""}\u0000`)) { this.dropPrepared(key); map.delete(key); } }
   /** Forgets a connection's prepared helper and cursor (its settings changed, or it answered as another OpenRig). */
-  forget(scope, origin) { for (const map of [this.ready, this.cursors, this.pending]) for (const key of [...map.keys()]) if (key === `${scope ?? ""}\u0000${origin}`) map.delete(key); }
+  forget(scope, origin) { const key = `${scope ?? ""}\u0000${origin}`; this.dropPrepared(key); this.cursors.delete(key); this.pending.delete(key); }
+  dropPrepared(key) {
+    const entry = this.preparedEntries.get(key);
+    if (entry) entry.remote.forgetHelperCheck?.(entry.p);
+    this.preparedEntries.delete(key); this.ready.delete(key);
+  }
   /** A failure with no answer from the helper (it didn't run, was killed, said nothing readable) drops the prepared helper, so the next request
    *  checks the machine, the approval and the helper again. A clean error the helper answered (OpenRig stopped there, an older daemon) keeps it:
    *  preparing again would cost about twenty hc calls on every refresh for nothing. The cursor stays, unless the answer came from another
    *  OpenRig: its events are another log. */
   failed(scope, parsed, error) {
+    const key = this.key(scope, parsed), entry = this.preparedEntries.get(key);
+    if (entry) entry.remote.forgetHelperCheck?.(entry.p);
     if (/different OpenRig/.test(String(error?.message)) || error?.wrongHost) this.forget(scope, parsed.origin);
-    else if (!error?.answered) this.ready.delete(this.key(scope, parsed));
+    else if (!error?.answered) this.dropPrepared(key);
     throw error;
   }
 

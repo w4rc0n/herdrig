@@ -4,10 +4,11 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.4
+Version: v0.5.5
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
-graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
+graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
+steady, and busy icons remain still.
 The busy words stay visible. Hover a shortened name or label to read the full text; existing read-only and other
 context stays below the full name. Graphs keep their header detail reveal, and Now keeps its transcript hover card.
 
@@ -132,7 +133,7 @@ use the duration threshold. Working evidence survives an app restart; separate s
 
 Before you install it: this mod **reaches OpenRig's local address** (`127.0.0.1:7433` unless that OpenRig uses another
 port) over HTTP and SSE (reads live state and, when you click an action, posts to OpenRig: Decision Card acts, a usage
-refresh, update dismissals after their Undo window, spec validation, library sync and copied-folder renaming), **runs programs** (`rig`, `tmux` started directly by the mod's relay, never through a shell,
+refresh, update dismissals after their Undo window, spec validation, library sync, copied-folder renaming and a restore-plan preview), **runs programs** (`rig`, `tmux` started directly by the mod's relay, never through a shell,
 `hc`, `node`, `printenv`/`realpath` for the spec editor's folders, and `test -d` when checking a typed OpenRig home folder), **reads files outside its own folder**: `<appHome>/openrig/config.json` (optional: the person's OpenRig
 name), `state.json`, and the spec/slice files you open in its file viewer (`SPEC.md`, `PROGRESS.md` and similar, from
 the folders OpenRig reports), and **writes** `<appHome>/openrig/state.json` plus the user spec file you edit and save
@@ -157,8 +158,9 @@ text for you to Save. Other single-file copies still use the YAML OpenRig served
 the note says which files must exist beside the copy before it can launch.
 
 It **runs the `rig` CLI, which uses the person's existing OpenRig setup** (its home, port and sign-in).
-For connection discovery, it reads none of OpenRig's own files; the folder-copy helper reads validated shipped
-built-in content. With a click, **Start
+**Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port. For Codex,
+**Change model / harness** reads `<accountHome>/models_cache.json` and watches the folder while the catalog is open.
+The account home comes from OpenRig's seat status. The folder-copy helper reads validated shipped built-in content. With a click, **Start
 OpenRig** runs `rig daemon start`. Configured-machine operations use Herdr's existing SSH connection; approved
 spec content goes to that machine. No unrelated external service is contacted.
 
@@ -388,17 +390,18 @@ machine's spec folders after resolving symlinks, or the separately approved fold
 specs are not editable), and calls `POST /api/specs/library/sync` (which also runs
 after **Copy to library**). Whole-folder **Copy & edit** also calls `POST /api/specs/library/:id/rename` to
 name the new copy (`<spec>-copy`, then `-copy-2`, and so on), including when resuming an unfinished copy.
+Opening **Resume rig** sends `POST /api/up` with the selected rig as `sourceRef` and `plan: true`.
 System → Configuration saves or resets one setting through `POST` or `DELETE`
 on `/api/config/:key`; environment-sourced and withheld instructions stay read-only. A saved boot setting can
 need a later restart, and Herdrig never restarts the daemon. Other actions run a `rig` command you could have typed (`rig send`, `rig queue`,
-`rig gateway human quiet|mode …`, `rig specs add …`, `rig snapshot`, `rig seat …`, `rig terminal …`, or
+`rig gateway human quiet|mode …`, `rig specs add …`, `rig snapshot`, `rig seat …`, `rig terminal …`, `rig compact …`, or
 `rig daemon start` when you click **Start OpenRig**).
 
 ## Built from
 
 **Blocks.** Four self-contained mods, each a folder in `mods/` with its own `main.js`, `mod.json`, the shared
 helpers reachable from its imports, and 41 `rig-*.svg` icons. The packaged JavaScript/CommonJS file counts are
-49 for `rig`, 61 for `rig-view`, 36 for `rig-palette`, and 43 for `rig-menu`; shared files outside a mod's import
+52 for `rig`, 69 for `rig-view`, 36 for `rig-palette`, and 48 for `rig-menu`; shared files outside a mod's import
 closure are not copied there. The fifth folder, `rig-spaces`, contains three packaged JavaScript files and three SVGs,
 Herdr's own Spaces list with rig marks (below). This repository ships these five mods:
 
@@ -447,10 +450,10 @@ keeps working when it does not.
 **Herdr functions and commands it calls.** `run` (`tab.new`, `tab.select`, `tab.rename`, `layout.select`, `layout.resize`,
 `layout.clone`, `layout.set`, `tab.close`, `pane.close`, `pane.split`, `pane.focus`, `pane.zoom`, `mod.open`),
 `shared` / `setShared`, `layout()`, `layouts()`, `spaces()`, `panes()`, `terminals()`, `machines()`, `settings()`,
-`window()`, `home()`, `theme()`, `openOverlay`, `closeOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`.
+`window()`, `home()`, `theme()`, `openOverlay`, `closeOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`, `watchFolder`.
 
 **Programs it runs.** `rig` (the OpenRig CLI — `rig ps`, `rig queue`, `rig gateway human quiet|mode …`, `rig terminal …`,
-`rig snapshot`, `rig seat …`, `rig specs …`, the rest of the one-click actions; after a confirmation, `rig down` to
+`rig snapshot`, `rig seat …` (including `set-typing-guard --mode queue-only|off`), `rig specs …`, the rest of the one-click actions; after a confirmation, `rig down` to
 pause a rig or, with `--delete`, delete it, `rig archive` / `rig unarchive`, and `rig up` / `rig create` for a new rig;
 and, with your yes, **Start OpenRig** runs `rig daemon start`), `tmux` for Attach, started directly by the mod's relay (`node rig-attach-relay.cjs`) as
 `tmux [-L name | -S path] attach-session -t =<session>` with no shell. The session must be a name OpenRig makes, and
@@ -460,28 +463,36 @@ with no command run. `hc` for attaching (`--label herdr-openrig.role=attach --la
 TUI terminal (`--label herdr-openrig.role=tui`), and `node` to run that relay, which also reports the seat's state to Herdr (OSC 7501). For the spec editor,
 `printenv OPENRIG_HOME` (Herdr's own environment: a Herdr started from a desktop launcher may not have the variable
 your shell sets, so set `openrigHome` in `<appHome>/openrig/config.json` for a home outside `~/.openrig`) and
-`realpath`, which resolves each spec folder and file so a symlink can't lead the editor elsewhere.
+`realpath`, which resolves each spec folder and file so a symlink can't lead the editor elsewhere. Add a machine
+uses `test -d` to check a typed OpenRig home. Seat compaction uses `rig compact --help` to check support,
+`rig compact --json -- <session>` to request it and `rig compact --cancel --json -- <session>` to request cancellation.
+**Change model / harness** runs `node rig-model-catalog.cjs`. It reads the Codex model cache or queries the
+local runtime with `claude --help`, `pi --list-models`, or `omp models --json --no-extensions`.
 
 **Network, programs, files — the full disclosure.** It **reaches OpenRig's local address** (`127.0.0.1:7433` unless
 that OpenRig uses another port), read from `rig status --json`, for local HTTP reads (`/healthz`, `/api/kernel/status`,
-`/api/ps`, `/api/rigs/*`, `/api/native-seats*`, `/api/attention*`, `/api/queue/*`, `/api/gateway/connections`,
+`/api/ps`, `/api/rigs/*`, `/api/native-seats*`, `/api/seat/status/*`, `/api/seat/held-messages/*`, `/api/attention*`, `/api/queue/*`, `/api/gateway/connections`,
 `/api/gateway/participants`, `/api/gateway/human/*`, `/api/health`, `/api/scopes*`, `/api/specs/library`,
-`/api/terminal/*`, `/api/views/execution`, `/api/provider/usage*`, `/api/telemetry/usage/cost`, `/api/usage*`, `/api/config*`), subscribes to
+`/api/terminal/*`, `/api/views/execution`, `/api/provider/usage*`, `/api/telemetry/usage/cost`,
+`/api/compaction/state?session=…`, `/api/telemetry/v1/nodes/:nodeId/tenures?limit=1`, `/api/usage*`, `/api/config*`), subscribes to
 `/api/activity/events` (SSE) for live state, and sends local HTTP `POST` requests only when you click an action
 (`POST /api/mission-control/action` for **Needs** Decision Card acts — `approve`, `deny`, `answer`, `resolve` —
 and update dismissals after their 10-second Undo window;
 `POST /api/provider/usage/hosts/refresh` when refreshing per-host usage; `POST /api/agents/validate` or
 `POST /api/rigs/import/validate` when validating a user spec edit; and `POST /api/specs/library/sync` on **Save** and
 after **Copy to library**; `POST /api/specs/library/:id/rename` names a whole-folder copy, including a resumed
-unfinished copy; `POST`/`DELETE /api/config/:key` save/reset a setting). It **runs** the programs above; `rig` uses the person's existing OpenRig setup (its home,
-port and sign-in), and the mod reads none of OpenRig's own files. With a click, **Start OpenRig** runs
+unfinished copy; `POST /api/up` with `plan: true` previews a restore; `POST`/`DELETE /api/config/:key` save/reset a setting). Typing-guard changes use the CLI with inherited seat identity removed and no synthesized actor; held messages are read-only, not retired or replayed. It **runs** the programs above; `rig` uses the person's existing OpenRig setup (its home,
+port and sign-in). With a click, **Start OpenRig** runs
 `rig daemon start`. It **reads** `<appHome>/openrig/config.json` (optional: the person's OpenRig name),
 `<appHome>/openrig/state.json` (your saved sidebar folds, sibling order, `needsView`, `lastSeenNeedsAt`, and mode
 application IDs), and the spec/slice files you open in its file viewer (`SPEC.md`, `PROGRESS.md` and similar, from the
 folders OpenRig reports). It **writes** `<appHome>/openrig/state.json` and the user spec files you edit and save
 in its spec editor (only local user spec folders or separately approved remote folders; built-in specs are not editable).
-It also **reads** `<appHome>/layouts/<name>.json` to discover old provider views and
-`<appHome>/mods/spaces/main.js` to check Spaces-list compatibility. Connection and consent actions **read and write**
+It also **reads** `<appHome>/layouts/<name>.json` to discover old provider views,
+`<appHome>/mods/spaces/main.js` to check Spaces-list compatibility,
+`<openrigHome>/daemon.json` to check the PID and port when you add this computer, and
+`<accountHome>/models_cache.json` to list Codex models in Change model / harness. It watches the containing folder
+while that model catalog is open. Connection and consent actions **read and write**
 `<appHome>/openrig/config.json`, `machine-consent.json` and `spec-consent.json`; System → Layout reads and writes
 `<appHome>/openrig/spaces-list.json`. The consent filenames are also under `<appHome>/openrig/`.
 It keeps dismissal and navigation state under that same folder, drafts in Herdr's

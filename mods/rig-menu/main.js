@@ -15,28 +15,31 @@
 import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
-import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat } from "./rig-lib.js";
-import { registerRigRouting, stampRows, ROWS_STALE, tabPagesScrub } from "./rig-lib.js";
+import {readRestorePlan,readConversationRollCall,restorePlanView,rollCallView} from './rig-resume.js';
+import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat, withFocusContext, releaseFocusTargets } from "./rig-lib.js";
+import { registerRigRouting, stampRows, messageDialogSpace, ROWS_STALE, tabPagesScrub } from "./rig-lib.js";
 import { targetConnection, pickRig, configOfConnection, adoptConnection, UNKNOWN_CONNECTION, NO_CONNECTION, commandFor, operatorCommandFor, tuiCommandFor, connectionBoxLabel, logExecError, plainExecError, parseExecTimeout, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
-import { workerCapabilityText } from "./rig-lib.js";
-import {knownOldProviderViews,readOldProviderViews,oldViewCandidates,hasOldProviderStrip,oldStripLayouts,oldViewsGone} from './rig-old-views.js';
+import { workerCapabilityText, rowTitle, rowTip, rowText, rowIdIn, sweepFinding, checkLabel, TERMINAL_GONE_REASON, TERMINAL_GONE_SEND_NOTE, TERMINAL_GONE_RIG_REASON, rigTerminalsGone } from "./rig-lib.js";
+import {knownOldProviderViews,readOldProviderViews,hasOldProviderStrip,oldStripLayouts,oldViewsGone,oldStripCleanupBusy,oldStripBusyTip} from './rig-old-views.js';
 import {layouts} from 'herdr';
 import { rigOrigin, syncRetainedOrigins } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
 import { AddMachinePanel, AddMachineChooser } from "./rig-add-machine-view.js";
+import {AddLocalPanel} from './rig-add-local-view.js';
 import { RemoveConnectionPanel } from "./rig-remove-connection-view.js";
 import { SwitchConnectionPanel } from "./rig-switch-connection-view.js";
 import { RemoteOpenRig } from "./rig-openrig-remote.js";
 import { consentOf as openrigConsentOf, consentText as openrigConsentText, HERDR_CONNECTION_OFFERED, SWITCH_NOT_OFFERED, HERDR_APPROVE_NOT_OFFERED } from "./rig-connections.js";
-import { loopbackHealthFetch, machineProbeExec, localDirectoryProbe } from "./rig-remote.js";
+import { loopbackHealthFetch, machineProbeExec, localDirectoryProbe,localProbeExec } from "./rig-remote.js";
 import { rigSpaceRelocation } from "./rig-spaces.js";
-import { h_flex, v_flex, TextareaState, Textarea, InputState, Input, ScrollHandle } from "gpui-base";
-import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify as rawNotify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
+import { h_flex, v_flex, TextView, TextareaState, Textarea, InputState, Input, ScrollHandle, Scrollbar } from "gpui-base";
+import { appHome, home, readTextFile, writeTextFile, watchFolder, theme, run as rawRun, exec as rawExec, props, openOverlay as rawOpenOverlay, closeOverlay, notify as rawNotify, setShared as rawSetShared, shared, layout, window, spaces, panes, terminals, hc as rawHc, settings, machines } from "herdr";
 import { counted, plainError, statusWord, errorDiagnostic } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
+import {SeatTypingGuard,TYPING_GUARD_UNSUPPORTED,TYPING_GUARD_TIP} from './rig-typing-guard.js';
 import { errorBlock, errorNotice } from "./rig-error-view.js";
 const notify = value => errorNotice(rawNotify, value);
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, gateSameConfig, gateGeneration, CONFIG_CHANGED_OPEN, GateRefusal, gatedOperation, numberedConfigReads } from "./rig-gate.js";
@@ -48,7 +51,17 @@ const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
 // A Rig sidebar command (`rig.<command>`) is sent only while the Rig sidebar is in the layout (rig-lib sidebarRun): without it,
 // herdr would answer with a raw "unknown command" toast, so a person is told plainly and a background refresh is skipped.
 const run = (name, args) => sidebarRun({ layout, notify }, (n, a) => gatedRun(rawRun, n, a), name, args);
-const refreshSidebar = () => { if (layoutHasMod(layout(), MOD_IDS.sidebar)) run("rig.refresh"); };
+const refreshSidebar = () => { if (layoutShowsMod(layout(), MOD_IDS.sidebar)) run("rig.refresh"); };
+const sidebarShownOrGuidance = command => {
+  const refusal = sidebarRefusal(layout(), command);
+  if (refusal) notify({ title: refusal, level: "info" });
+  return !refusal;
+};
+// Refuse before publishing: a hidden sidebar cannot consume the queued dismissal.
+const requestVisibleDismissal = (scope, action, value) => {
+  if (!sidebarShownOrGuidance("rig.update-action")) return;
+  requestDismissal({ shared, setShared, run, scope }, action, value);
+};
 // A send for a CONNECTION names its gate scope (several OpenRigs: a bare sink refuses). `config` is that connection's own config.
 import { installHerdrTransport } from "./rig-openrig-wire.js";
 const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId, appHome());
@@ -58,14 +71,14 @@ const runFor = (config) => (name, args) => sidebarRun({ layout, notify }, (n, a)
 
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
-const openOverlay = (spec) => rawOpenOverlay(stampRows(spec, props()?.target?.rowsConfig ?? null)); // a dialog opened from a menu keeps the stamp of the target it was opened for
+const openOverlay = (spec) => rawOpenOverlay(messageDialogSpace(stampRows(spec, props()?.target?.rowsConfig ?? null))); // a dialog opened from a menu keeps the stamp of the target it was opened for
 import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, LAUNCH_DIALOG_HEIGHT, navPush, actionArgs, appHomeArgsRefusal, writeOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
-  SWAP_RUNTIMES, SWAP_MODELS_BY_RUNTIME, SWAP_EFFORTS_BY_RUNTIME, filterAllowedModels, changeModelPlan,
+  SWAP_RUNTIMES, changeModelPlan, filterAllowedModels,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, closeRigInspection, selectWorkerView,
-  currentCapabilities, connectionCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, attachToSeat, resetGroupOrder, submitMissionActions, attachRelayPath, waitWith, layoutHasMod, isLoopbackDaemonUrl,
+  currentCapabilities, connectionCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, attachToSeat, resetGroupOrder, submitMissionActions, missionActionPreflight, attachRelayPath, waitWith, layoutShowsMod, isLoopbackDaemonUrl,
   statusMarkElement, deleteOutcome, rigNameProblem, newRigFromSpecArgs, newRigOneSeatArgs, commandLine, NEW_RIG_RUNTIMES,
   readRigSpecPreview, singleLineText } from "./rig-lib.js";
 
@@ -303,12 +316,17 @@ export default class RigMenu extends View {
     if(!props()?.step)this.handle?.focus?.();
     this.typing = false;
     const step = props()?.step;
+    this.swapLeadPending = step?.action === "change-model";
     if(step){
       cx.bind_keys?.([{keystroke:'tab',action:'rig-dialog-next',context:'RigDialog'},{keystroke:'shift-tab',action:'rig-dialog-prev',context:'RigDialog'}]);
       this.dialogCancelHandle=cx.focus_handle?.();
       this.dialogConfirmHandle=cx.focus_handle?.();
       this.dialogArchiveHandle=cx.focus_handle?.();
       this.dialogOpenSpaceHandle=cx.focus_handle?.();
+      this.heldCopyHandle=cx.focus_handle?.();
+      this.heldRowCopyHandle=cx.focus_handle?.();
+      this.heldTextHandle=cx.focus_handle?.();
+      cx.bind_keys?.([{keystroke:'tab',action:'rig-held-next',context:'RigHeldText'},{keystroke:'shift-tab',action:'rig-held-prev',context:'RigHeldText'},{keystroke:'escape',action:'rig-held-close',context:'RigHeldText'}]);
       // Made here, with the dialog, never after an await below: a handle made there would belong to whichever view drained the promise jobs.
       this.dialogRetryHandle=cx.focus_handle?.();
       this.dialogCopyHandles=Object.fromEntries(['Folder','SHA-256','Command'].map(label=>[label,cx.focus_handle?.()]));
@@ -316,9 +334,23 @@ export default class RigMenu extends View {
     cx.spawn(async (cx) => {
       // The daemon's address as the other mods find it (config.json, a loopback address in shared state, then the CLI),
       // so Attach and Retry work without the sidebar too.
-      this.openedOn = await freshFileConfig(); // what config.json said when this dialog opened: a later send compares against it
-      this.config = await configNow();
+      try {
+        this.openedOn = await freshFileConfig(); // what config.json said when this dialog opened: a later send compares against it
+        this.config = await configNow();
+      } catch (error) {
+        if (this.gone) return;
+        this.swapLeadPending = false;
+        const text = errorDiagnostic(error);
+        this.result = { ok: false, text };
+        notify({ title: "Couldn't read OpenRig settings", body: text, level: "warning" });
+        cx.notify(); return;
+      }
       if (this.gone) return;
+      if (step?.action === "change-model" && !this.swapRequest) {
+        this.queueSwapCatalog(complete(props().target, this.config));
+        await this.readSwapCatalogs(cx);
+        if (this.gone) return;
+      }
       setShared("rig.oldProviderViews",await readOldProviderViews({layout,layouts,readTextFile,currentLayout:()=>shared("layout")},appHome()));
       if(step?.action==='close-old-views'){
         this.oldStripChoices=await oldStripLayouts({layouts,readTextFile},appHome());
@@ -328,14 +360,16 @@ export default class RigMenu extends View {
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         const setupConfig=step.conn?configOfConnection(this.config,step.conn):this.config; // the dialog acts for the connection the review was for
         if(!setupConfig){notify({title:"Machine setup",body:"That OpenRig is no longer in the configuration. Nothing was changed.",level:"warning"});this.dismiss();return;}
+        this.machineConfirmationToken=step.action==='confirm-machine'?step.token:null;
         this.setupPanel=new MachineSetupPanel(this.machineSetupHost(cx,setupConfig),setupConfig,step.machine??step.confirmation?.machine,{
           mono:settings()?.font_family??"monospace",copyIcon:icon("rig-copy"),stop:step.action==="stop-machine",
           initialConfirmation:step.action==="confirm-machine"?(step.confirmation??null):null,
           waitingForRig:step.waitingForRig??null,
+          continuationText:step.token?(step.continuationText??'What you started continues when you close this.'):null,
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,retryHandle:this.dialogRetryHandle,
           copyHandles:this.dialogCopyHandles,
           cancel:()=>this.dismiss(),done:(_cx,result)=>{
-            if(step.token){setShared("rig.machineConfirmation",step.token);run("rig.confirm-machine");}
+            this.completeMachineConfirmation();
             this.dismiss();
           }});
         if(step.action!=="stop-machine")await this.setupPanel.check(cx,Boolean(step.action==="confirm-machine"&&step.confirmation));
@@ -349,9 +383,18 @@ export default class RigMenu extends View {
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,
           copyHandles:{Command:this.dialogCopyHandles?.Command},
           cancel:()=>this.dismiss(),done:()=>{notify({title:"Machine added",body:`Added ${machine}. Its rigs show in the sidebar in its spaces; its first Attach asks you to approve the helper there.`,level:"info"});this.dismiss();}});
-        if(step.machine){this.setupPanel=makePanel(step.machine,step.picked??null);await this.setupPanel.check(cx);}
+        const makeLocalPanel=ownerCx=>new AddLocalPanel({
+          ...this.machineSetupHost(ownerCx,this.config),...this.localSetupHost(),
+          localProbe:options=>localProbeExec(rawExec,options),
+          requestFor:task=>this.machineSetupHost(task,this.config).setupFetch,
+          saved:async()=>{refreshSidebar();},
+        },{ownerCx,rigArgv:Array.isArray(this.config?.rig)&&this.config.rig.length?this.config.rig:['rig'],mono:settings()?.font_family??'monospace',
+          cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,cancel:()=>this.dismiss(),
+          done:()=>{notify({title:'Added this computer',body:"This computer's OpenRig is connected again. Its rigs show in the sidebar.",level:'info'});this.dismiss();}});
+        if(step.local)this.pendingLocalPanel=makeLocalPanel; // native state is made by this dialog's next draw-set timer
+        else if(step.machine){this.setupPanel=makePanel(step.machine,step.picked??null);await this.setupPanel.check(cx);}
         else{
-          this.setupPanel=new AddMachineChooser({hc:hcFor(this.config)},{liveConfig:()=>this.config,makePanel,cancel:()=>this.dismiss(),cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle});
+          this.setupPanel=new AddMachineChooser({hc:hcFor(this.config)},{liveConfig:()=>this.config,makePanel,makeLocalPanel,cancel:()=>this.dismiss(),cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle});
           await this.setupPanel.load(cx);
         }
       }
@@ -386,7 +429,27 @@ export default class RigMenu extends View {
         this.pendingDialogFocus=()=>this.dialogCancelHandle?.focus?.(); // Cancel is focused first
       }
 
+      if (step?.action === "resume") await this.loadResumePlan(cx);
+      if (step?.action === "change-model") await this.loadSwapRepresentative();
       if (this.gone) return;
+      const guardTarget=props()?.target;
+      if((!step||step.action==='typing-guard')&&guardTarget?.session&&['seat','cell'].includes(guardTarget.kind)&&!guardTarget.terminal&&!isTerminalSeat(guardTarget)){
+        this.typingGuardRefusal=rowsPublishedUnder(guardTarget,this.config);
+        const own=this.typingGuardRefusal?{ok:false}:targetConnection(this.config,guardTarget);
+        if(own.ok){
+          const cfg=own.config;
+          const published=sharedRigData(cfg,shared);
+          const healthz=published?.byConnection?published.byConnection[cfg.connectionId]?.healthz:published?.healthz;
+          this.typingGuard=new SeatTypingGuard({fetch:fetchFor(cfg),exec:execFor(cfg),after:(ms,fn)=>cx.timer.after(ms,fn,{owner:null}),closed:()=>this.gone,
+            currentConfig:()=>configOfConnection(this.config,cfg.connectionId),
+            sameConfig:(before,after)=>sameDialogConfig(before,after,cfg.connectionId),
+            readConfig:async()=>configOfConnection(await freshFileConfig(),cfg.connectionId)},cfg,guardTarget.session,
+            {version:healthz?.semver??healthz?.openrigVersion?.semver??null,label:guardTarget.logicalId??guardTarget.session});
+          await this.typingGuard.load();
+          if(this.gone)return;
+        }
+        else if(!this.typingGuardRefusal)this.typingGuardRefusal=own.reason??UNKNOWN_CONNECTION;
+      }
       cx.notify();
       // A one-click action that failed in the sidebar arrives with its failure, for Retry; without the sidebar one starts
       // once, here: never from render, where notify isn't allowed.
@@ -533,7 +596,7 @@ export default class RigMenu extends View {
         .on_click((_e, cx) => this.loadNewSpecPreview(cx, spec, true)).child("Retry"));
     const data = got.data;
     return v_flex().gap(4)
-      .when(!!data.summary, (el) => el.child(div().truncate().text_size(11.5).text_color(t.dim).tooltip(String(data.summary??"")).child(data.summary)))
+      .when(!!data.summary, (el) => el.child(div().truncate().text_size(11.5).text_color(t.dim).tooltip(rowTip(data.summary)).child(rowTitle(data.summary))))
       .child(div().text_size(11.5).text_color(t.dim).child(`${data.pods.length} pod${data.pods.length === 1 ? "" : "s"} · ${data.seatCount} seat${data.seatCount === 1 ? "" : "s"}`))
       .children(data.pods.map((pod) => v_flex().gap(2).pt(3)
         .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(pod.label))
@@ -705,12 +768,127 @@ export default class RigMenu extends View {
     this.swapCurModel = seat?.model ?? target?.model ?? null;
     this.swapCurEffort = seat?.effort ?? target?.effort ?? null;
     this.swapRuntime = SWAP_RUNTIMES.includes(this.swapCurRuntime) ? this.swapCurRuntime : "claude-code";
-    const allowed = filterAllowedModels(SWAP_MODELS_BY_RUNTIME[this.swapRuntime] ?? []);
-    this.swapModel = this.swapCurModel && allowed.includes(this.swapCurModel) ? this.swapCurModel : (allowed[0] ?? null);
-    const efforts = SWAP_EFFORTS_BY_RUNTIME[this.swapRuntime] ?? [];
-    this.swapEffort = this.swapCurEffort && efforts.includes(this.swapCurEffort) ? this.swapCurEffort : (efforts[0] ?? null);
+    this.swapModel = this.swapCurModel;
+    this.swapEffort = this.swapCurEffort;
+    this.swapCatalog = { status: "loading" };
+    this.swapModelInput = InputState.new({ placeholder: "Model ID", value: "" });
+    this.swapModelInput.on("change", (_event, cx) => {
+      this.swapManual = true;
+      this.selectSwapModel(this.swapModelInput.value().trim() || null);
+      cx.notify();
+    });
     this.swapConfirmed = false;
     this.swapError = null;
+  }
+
+  selectSwapModel(model) {
+    if (this.swapModel !== model) this.swapEffort = null;
+    if (model === this.swapCurModel && this.swapRuntime === this.swapCurRuntime) this.swapEffort ??= this.swapCurEffort;
+    this.swapModel = model;
+    this.swapError = null;
+  }
+
+  queueSwapCatalog(target) {
+    this.swapCatalog = { status: "loading" };
+    this.swapRequest = { target, runtime: this.swapRuntime };
+  }
+
+  refreshSwapCatalog(cx, target) {
+    this.queueSwapCatalog(target);
+    cx.notify();
+    cx.spawn(task => this.readSwapCatalogs(task));
+  }
+
+  async readSwapCatalogs(cx) {
+    if (this.swapReading) return;
+    this.swapReading = true;
+    try {
+      while (!this.gone && this.swapRequest !== this.swapRead) {
+        const request = this.swapRead = this.swapRequest;
+        const result = await this.loadSwapCatalog(request);
+        if (!this.gone && this.swapRequest === request) {
+          this.swapCatalog = result;
+          const current = this.swapRuntime === this.swapCurRuntime;
+          const selected = result.models?.find(model => model.id === this.swapModel);
+          if (!this.swapManual && !selected && (!current || this.swapModel !== this.swapCurModel)) {
+            this.swapModel = current ? this.swapCurModel : null;
+          }
+          const levels = selected?.efforts ?? result.runtimeEfforts;
+          if (!levels?.includes(this.swapEffort)) this.swapEffort = current ? this.swapCurEffort : null;
+          cx.notify();
+        }
+      }
+    } finally {
+      this.swapReading = false;
+    }
+  }
+
+  async loadSwapCatalog({ target, runtime }) {
+    const unavailable = reason => ({ status: "unavailable", reason });
+    const source = ({ codex:"codex-cache", "claude-code":"claude-help", pi:"pi-cli", omp:"omp-cli" })[runtime];
+    if (!source) return unavailable("This harness doesn't expose a supported model list.");
+    const own = targetConnection(this.config, target);
+    if (!own.ok) return unavailable("The seat's OpenRig connection couldn't be resolved.");
+    const cfg = own.config;
+    if (cfg.daemonMachine || !cfg.daemonUrl || !isLoopbackDaemonUrl(cfg.daemonUrl)) {
+      return unavailable("The list is only read on this computer.");
+    }
+    try {
+      const op = gatedOperation(cfg.connectionId);
+      let accountHome = source === "claude-help" ? home() : undefined;
+      if (source !== "claude-help") {
+        if (runtime !== this.swapCurRuntime || !target.session) return unavailable("The target harness's account home isn't known.");
+        const response = await op.fetch(`${cfg.daemonUrl}/api/seat/status/${encodeURIComponent(target.session)}`);
+        if (!response.ok) return unavailable("OpenRig couldn't read the seat's account home.");
+        const seat = await response.json();
+        const reported = seat.runtime_home;
+        const variable = runtime === "codex" ? "CODEX_HOME" : "PI_CODING_AGENT_DIR";
+        if (seat.current_occupant !== target.session || seat.runtime !== runtime
+          || (target.rigId && seat.rig_id !== target.rigId)
+          || (target.logicalId && seat.logical_id !== target.logicalId)
+          || reported?.variable !== variable || reported.ignored || typeof reported.home !== "string"
+          || !reported.home.startsWith("/")) return unavailable("OpenRig didn't report this seat's account home.");
+        accountHome = reported.home;
+      }
+      if (this.gone || this.swapRuntime !== runtime) return unavailable("The harness changed.");
+      const helper = attachRelayPath(appHome(), MOD_IDS.menu)?.replace(/rig-attach-relay\.cjs$/, "rig-model-catalog.cjs");
+      if (!helper) return unavailable("The installed catalog reader couldn't be located.");
+      op.check();
+      const result = await execFor(cfg)("env", ["-i", "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        "LANG=C.UTF-8", "node", helper, source, ...(accountHome ? [accountHome] : [])], { timeout: 10000 });
+      op.check();
+      if (result.code !== 0 || typeof result.stdout !== "string" || result.stdout.length > 1024 * 1024) {
+        return unavailable("The local catalog reader didn't return a list.");
+      }
+      const list = JSON.parse(result.stdout);
+      if (list?.status === "ready" && Array.isArray(list.models)) {
+        return { ...list, ...(source === "codex-cache" ? { watchHome:accountHome } : {}) };
+      }
+      return unavailable(typeof list?.reason === "string" ? singleLineText(list.reason).slice(0, 160) : "The local list wasn't readable.");
+    } catch {
+      return unavailable("The local list couldn't be checked.");
+    }
+  }
+
+  watchSwapCatalog(cx, target) {
+    const watchHome = this.swapCatalog?.watchHome;
+    if (!watchHome || this.swapWatchedHome === watchHome) return;
+    this.swapWatchedHome = watchHome;
+    cx.timer.after(0, next => {
+      if (this.gone) return;
+      next.spawn(async task => {
+        while (!this.gone && this.swapWatchedHome === watchHome) {
+          let files;
+          try { files = await watchFolder(watchHome); } catch { return; }
+          if (this.gone || this.swapWatchedHome !== watchHome) return;
+          if (this.swapRuntime === "codex" && files.some(file => file === "models_cache.json" || file === `${watchHome}/models_cache.json`)) {
+            this.queueSwapCatalog(target);
+            task.notify();
+            await this.readSwapCatalogs(task);
+          }
+        }
+      });
+    });
   }
 
   clampFocusCell(fc = this.focusCell) {
@@ -774,9 +952,18 @@ export default class RigMenu extends View {
     } catch (_) { /* nothing more can be said */ }
   }
 
+  releaseCompactionReview() {
+    const step=props()?.step;
+    if(step?.action!=='confirm-seat-compaction'||!step.token||this.compactionConfirmed||this.compactionReviewReleased)return;
+    this.compactionReviewReleased=true;
+    setShared('rig.compactionDecisions',{...(shared('rig.compactionDecisions')??{}),[step.token]:'cancel'});
+  }
+
   dismiss(discard = false) {
+    this.releaseCompactionReview();
     this.sayInFlight();
     this.gone = true;
+    this.resumeRollCallTimer?.cancel?.();this.resumeRollCallTimer=null;
     this.cancelSpecPermission();
     if (discard) this.dropDraft(); else this.keepDraft();
     const id = props()?.overlay; if (id) closeOverlay(id);
@@ -792,7 +979,37 @@ export default class RigMenu extends View {
     return typeof id === "string" && connections.some((c) => c?.id === id) ? { section: "topology", conn: id } : { section: "topology" };
   }
   /** herdr's teardown (a click beside the dialog closes it): what was typed stays for next time. */
-  async close() { this.sayInFlight(); try { this.herdr?.release?.(); } catch (_) {} this.gone = true; this.setupPanel?.expire?.();this.dialogBoundaryTask?.cancel?.();this.setupPanel?.focusTask?.cancel?.();this.dialogHandleTask?.cancel?.();for(const handle of this.dialogButtonHandles??[])handle.release?.();this.cancelMenuReveal?.();this.cancelSpecReveal?.();this.newSpecScroll?.release?.(); this.menuScroll?.release?.(); this.cancelSpecPermission(); this.keepDraft(); }
+  completeMachineConfirmation() {
+    if(this.gone||this.machineConfirmationEmitted||!this.machineConfirmationToken)return;
+    this.machineConfirmationEmitted=true;
+    if(!layoutShowsMod(layout(),MOD_IDS.sidebar)){notify({title:`${this.setupPanel?.machine??this.setupPanel?.config?.daemonMachine??'Machine'} is set up`,body:"The next step needs the Rig sidebar, which is hidden. Show it, then try again.",level:"info"});return;}
+    setShared("rig.machineConfirmation",this.machineConfirmationToken);
+    run("rig.confirm-machine");
+  }
+
+  async close() {
+    this.resumeRollCallTimer?.cancel?.();this.resumeRollCallTimer=null;
+    // Herdr's reserved Escape closes the overlay before a panel key handler runs.
+    this.releaseCompactionReview();
+    // Treat only a settled successful approval as Done; a busy close is cancellation.
+    if(this.setupPanel?.phase==='done'&&!this.setupPanel.busy&&!this.setupPanel.followUpBusy)this.completeMachineConfirmation();
+    this.sayInFlight(); try { this.herdr?.release?.(); } catch (_) {} this.gone = true; releaseFocusTargets(this);
+    for(const release of this.machinePreparationReleases??[])release();
+    this.machinePreparationReleases?.clear();
+    this.machineQueueTimer?.cancel?.();this.machineQueueTimer=null;
+    this.compactionStartTimer?.cancel?.();this.compactionStartTimer=null;
+    if(this.compactionStarting){
+      const token=props()?.step?.token,all={...(shared('rig.compactionDecisions')??{})},record=all[token];
+      if(record){
+        if(record.dispatched)delete all[token];
+        else all[token]={...record,status:'expired'};
+        setShared('rig.compactionDecisions',all);
+      }
+    }
+    for(const ticket of this.machineQueueWaits??[])ticket.reject(new Error('This machine setup was closed. No further action was started.'));
+    this.machineQueueWaits?.clear();
+    this.heldCopyTimer?.cancel?.(); this.setupPanel?.expire?.();this.dialogBoundaryTask?.cancel?.();this.setupPanel?.focusTask?.cancel?.();this.dialogHandleTask?.cancel?.();for(const handle of this.dialogButtonHandles??[])handle.release?.();this.cancelMenuReveal?.();this.cancelSpecReveal?.();this.newSpecScroll?.release?.(); this.menuScroll?.release?.(); this.cancelSpecPermission(); this.keepDraft();
+  }
 
   cancelSpecPermission() {
     const step=props()?.step;
@@ -856,7 +1073,7 @@ export default class RigMenu extends View {
     const target=props()?.target;
     if(target?.kind==='assistant'){
       if(args[0]!=='queue'||args[1]!=='create'||args[args.indexOf('--destination')+1]!==target.session)return{ok:false,notSent:true,text:'Connected assistants only accept queued work.'};
-      const verified=await verifyAssistantTarget(fetchFor(conn.config),conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done):null);if(!verified.ok)return{ok:false,notSent:true,text:verified.reason};
+      const verified=await verifyAssistantTarget(fetchFor(conn.config),conn.config,target,cx?.timer?(ms,done)=>cx.timer.after(ms,done,{owner:null}):null);if(!verified.ok)return{ok:false,notSent:true,text:verified.reason};
       // The roster await can outlive a config-file edit; observing it here also updates the send gate.
       const afterVerify=await freshFileConfig();
       if(this.gone)return{ok:false,notSent:true,text:ACTION_REFUSED};
@@ -918,6 +1135,7 @@ export default class RigMenu extends View {
         const openSpace=props()?.step?.action==='new-rig'&&this.result?.ok&&typeof this.result?.createdRig==='string'&&/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(this.result.createdRig);
         (openSpace?this.dialogOpenSpaceHandle:this.dialogCancelHandle)?.focus?.();
       };
+      if(props()?.step?.action==='resume'&&this.result?.json?.status==='restored')await this.loadResumeRollCall(cx);
     });
   }
 
@@ -944,6 +1162,56 @@ export default class RigMenu extends View {
       }
       cx.notify();
     });
+  }
+
+  async loadResumePlan(cx) {
+    const ticket=this.resumePlanTicket={};this.resumePlan={loading:true};cx.notify();
+    try{
+      const target=complete(props().target,this.config),root=await this.currentConfig(),conn=targetConnection(root,target);
+      if(!conn.ok)throw new Error(conn.reason);
+      const plan=await readRestorePlan({exec:execFor(conn.config),fetch:fetchFor(conn.config)},target,conn.config);
+      const now=await this.currentConfig();
+      if(!sameDialogConfig(root,now,target.conn))throw new Error(CONFIG_CHANGED_OPEN);
+      if(this.gone||this.resumePlanTicket!==ticket)return;
+      this.resumePlan=plan;this.resumePlanConfig=root;
+    }catch(error){if(!this.gone&&this.resumePlanTicket===ticket)this.resumePlan={error:plainExecError(error,{kind:'read'})};}
+    if(!this.gone&&this.resumePlanTicket===ticket)cx.notify();
+  }
+
+  resetResumeRollCall() {
+    this.resumeRollCallTimer?.cancel?.();this.resumeRollCallTimer=null;
+    this.resumeRollCall=null;this.resumeRollCallTicket=null;
+    this.resumeRollCallAutoUsed=false;this.resumeRollCallAutoPending=false;
+    this.resumeRollCallEpoch={};
+  }
+
+  async loadResumeRollCall(cx) {
+    if(this.gone)return;
+    const ticket=this.resumeRollCallTicket={};this.resumeRollCall={loading:true};cx.notify();
+    try{
+      const target=complete(props().target,this.config),root=await this.currentConfig(),conn=targetConnection(root,target);
+      if(!conn.ok)throw new Error(conn.reason);
+      const rollTarget={...target,rigId:this.result?.json?.rigId??this.resumePlan?.rigId??target.rigId};
+      const value=await readConversationRollCall({exec:execFor(conn.config),fetch:fetchFor(conn.config)},rollTarget,conn.config);
+      const now=await this.currentConfig();
+      if(!sameDialogConfig(root,now,target.conn))throw new Error(CONFIG_CHANGED_OPEN);
+      if(this.gone||this.resumeRollCallTicket!==ticket)return;
+      this.resumeRollCall=value;
+      if(value.unknown&&!this.resumeRollCallAutoUsed)this.resumeRollCallAutoPending=true;
+    }catch(error){if(!this.gone&&this.resumeRollCallTicket===ticket)this.resumeRollCall={error:plainExecError(error,{kind:'read'})};}
+    if(!this.gone&&this.resumeRollCallTicket===ticket)cx.notify();
+  }
+
+  requestResumeRead(cx,kind) {
+    if(this.gone||this.busy)return;
+    if(kind==='rollcall'){this.resumeRollCallTimer?.cancel?.();this.resumeRollCallTimer=null;this.resumeRollCallAutoPending=false;}
+    cx.spawn(async next=>{try{await (kind==='plan'?this.loadResumePlan(next):this.loadResumeRollCall(next));}catch(error){if(!this.gone)notify({title:'Resume rig',body:errorDiagnostic(error),level:'warning'});}});
+  }
+
+  resumeReadView(t,cx,target,kind) {
+    const button=(id,label,read)=>this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).bg(t.raised).cursor_pointer(),null,(_e,next)=>this.requestResumeRead(next,read),false,label);
+    const fresh=(id,logicalId)=>this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).bg(t.raised).cursor_pointer(),null,()=>dialog({...target,logicalId},{action:'fresh',confirm:true},RESULT_HEIGHT),false,'Start fresh…');
+    return kind==='plan'?restorePlanView(t,this.resumePlan,target.rig,button,fresh):rollCallView(t,this.resumeRollCall,button,fresh);
   }
 
   /** Re-reads `/api/rigs/:id/nodes` and compares `seatIdsOf(nodes)` against the roster the person reviewed (`reviewedSeats`). */
@@ -993,6 +1261,13 @@ export default class RigMenu extends View {
     };
     // An item the Rig sidebar runs (`rig.<command>`): with no Rig sidebar in the layout it is shown disabled, with the plain reason.
     const sidebarItem = (iconName, label, command, act, dynamicLabel = false) => { const reason = sidebarRefusal(layout(), command); out.push({ icon: iconName, label, act, disabled: !!reason, reason, dynamicLabel }); };
+    const oldStripItem=()=>{
+      if(!hasOldProviderStrip(layout()))return;
+      const views=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).filter(view=>view.current);
+      const disabled=oldStripCleanupBusy(shared);
+      out.push({icon:"x",label:"Leave OpenRig's old strip…",disabled,reason:disabled?oldStripBusyTip:null,
+        act:()=>dialog({kind:"old-views"},{action:"close-old-views",views,confirm:true},480)});
+    };
     if(target.kind==='assistant'){
       if(!assistantAddress(target.session)||!targetConnection(this.config,target).ok)return out;
       item('rig-queue','Queue work…',()=>dialog(target,{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true},300),'queue');
@@ -1001,9 +1276,7 @@ export default class RigMenu extends View {
       return out;
     }
     if(target.kind==="sidebar-header"){
-      const old=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config));
-      if(hasOldProviderStrip(layout())||old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
-        item("x","Leave OpenRig's old strip…",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},480));
+      oldStripItem();
       const enabled=(shared("rig.settings")?.notifications??true)!==false;
       item("rig-bell",enabled?"Turn notifications off":"Turn notifications on",()=>{
         setShared("rig.settings",{...(shared("rig.settings")??{}),notifications:!enabled});
@@ -1022,6 +1295,7 @@ export default class RigMenu extends View {
     }
     if (target.kind === "seat" || target.kind === "cell") {
       const stoppedSeat = isStopped(target);
+      let typingGuardItem=null;
       if(target.allSeats){
         item('rig-card','Open rig page',()=>page({section:'topology',kind:'rig',rigId:target.rigId,conn:target.conn,name:target.rig}));
         if(target.session)item('rig-copy','Copy session name',cx=>cx.write_to_clipboard(target.session));
@@ -1029,11 +1303,27 @@ export default class RigMenu extends View {
       // The row's own actions first: ⋯, the right-click and the Menu key open this same list.
       // A terminal seat is a person's shell, not an agent: no message, work or model to give it.
       if (!(target.terminal === true || isTerminalSeat(target))) {
-        item("rig-send", "Send message…", () => dialog(target, { input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true }), "send");
+        const guard=this.typingGuard,state=guard?.state;
+        const previous=guard?.guard?.effectiveLevel??guard?.guard?.desiredLevel??guard?.guard?.effectiveMode;
+        typingGuardItem={icon:state?.checked?'check':'rig-keyboard',label:'Quiet while I type',checked:!!state?.checked,
+          disabled:!guard||!!guard.checking||!state||!!guard.reason||!!state.pending,reason:this.typingGuardRefusal??(!guard||guard.checking?'Checking this seat’s typing guard…':guard.reason??(!state?TYPING_GUARD_UNSUPPORTED:state.pending?'The typing guard is changing. Wait for its current operation to finish.':null)),tip:TYPING_GUARD_TIP+(previous&&!['off','queue-only'].includes(previous)?` This seat uses OpenRig's ${previous} typing guard, set outside Herdrig. Choosing this replaces it.`:''),
+          act:()=>{
+            if(!guard||guard.reason)return;
+            const mode=state?.checked?'off':'queue-only';
+            if(mode==='queue-only'&&previous&&previous!=='off'&&previous!=='queue-only'){
+              dialog(target,{action:'typing-guard',mode,previous,confirmationText:`Replace ${target.logicalId??target.session}'s ${previous} typing guard with Quiet while I type? Turning Quiet off later sets the seat to off, not ${previous}.`},320);return;
+            }
+            return guard.set(mode).then(result=>{
+              notify({title:'Typing guard',body:result.text,level:result.ok?'info':'warning'});
+              if(result.treatedAsHold)dialog(target,{action:'typing-guard',mode:'off',treatedAsHold:true,confirmationText:`This OpenRig treated it as hold: managed compaction is paused for ${target.logicalId??target.session}. Turn it off?`},320);
+            });
+          }};
+        item("rig-send", "Send message…", () => dialog(target, { input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true, ...(target.status === "terminal_gone" ? { note: TERMINAL_GONE_SEND_NOTE } : {}) }, target.status === "terminal_gone" ? 290 : 260), "send"); // the note needs the page's taller dialog
         item("rig-queue", "Queue work…", () => dialog(target, { input: true, placeholder: "One-line summary; the body follows on the next lines", action: "queue", multiLine: true }, 300), "queue");
         item("rig-swap", "Change model / harness…", () => openOverlay({ mod: MOD_IDS.menu, kind: "dialog", modal: true, width: 520, height: 420, props: { target, step: { action: "change-model" } } }), "change-model");
       }
       item("rig-seat", "Open seat page", () => page({ section: "topology", kind: "seat", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.logicalId, session: target.session }));
+      if(typingGuardItem)out.push(typingGuardItem);
       if (target.session&&!target.allSeats) item("rig-copy", "Copy session address", (cx) => cx.write_to_clipboard(target.session));
       out.push({
         icon: "terminal",
@@ -1060,8 +1350,8 @@ export default class RigMenu extends View {
           if (typeof cx?.spawn !== "function") return attach(undefined);
           return new Promise((resolve) => { cx.spawn(async (cx) => { resolve(await attach(waitWith(cx)).catch((error) => { sayRefusal(error); return null; })); }); });
         },
-        disabled: stoppedSeat,
-        reason: stoppedSeat ? "Stopped: seat has no running session to attach" : null,
+        disabled: stoppedSeat || target.status === "terminal_gone",
+        reason: target.status === "terminal_gone" ? TERMINAL_GONE_REASON : stoppedSeat ? "Stopped: seat has no running session to attach" : null,
       });
       if(target.allSeats&&target.compactActions){const index=out.findIndex(item=>item.label==='Attach');if(index>=0)out.unshift(...out.splice(index,1));}
       // Focusing a pane the seat already has needs nothing from OpenRig; with none, Focus pane opens a view, which needs
@@ -1097,6 +1387,8 @@ export default class RigMenu extends View {
       if (transcript) item("file-text", "Open transcript", () => page(fileEntry(transcript, `Transcript · ${target.logicalId ?? target.session}`)));
       if (target.kind === "cell") item("rig-keyboard", "Take keyboard", () => oneClick(target, "keyboard"));
       else item("rig-view", "Show in worker view", () => oneClick(target, "open-seat"), "open-seat");
+      // Its tmux server stopped answering: every action that needs the seat's terminal says why instead of failing with an unrelated warning.
+      if (target.status === "terminal_gone") for (const it of out) if (["Attach", "Focus pane", "Open terminal", "Show in worker view", "Take keyboard"].includes(it.label)) { it.disabled = true; it.reason = TERMINAL_GONE_REASON; }
       // A native seat's `hc run` children: peek at one over the tab, herdr's own way.
       const children = Array.isArray(target.children) ? target.children : [];
       if (children.length) out.push({ divider: "Helpers (hc run)" });
@@ -1143,6 +1435,9 @@ export default class RigMenu extends View {
       const on = !!followed?.following?.enabled;
       const followReason = capReasonOf(on ? "unfollow" : "follow");
       out.push({ icon: on ? "check" : "rig-follow", label: "Follow active workers", act: () => oneClick({ ...target, view: `rig:${target.rig}` }, on ? "unfollow" : "follow"), disabled: !!followReason, reason: followReason });
+      // Every seat of this rig sits on a tmux server that stopped answering: its rig space, a worker view or Follow would only fail.
+      if (rigTerminalsGone(pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig }).rig))
+        for (const it of out) if (["Open rig space", "Worker view", "New worker view"].includes(it.label) || (it.label === "Follow active workers" && !on)) { it.disabled = true; it.reason = TERMINAL_GONE_RIG_REASON; } // turning Follow off needs no tmux server
       item("rig-snapshot", "Snapshot now", () => oneClick(target, "snapshot"));
       item("rig-target", "Open mission…", () => openMission(target));
       out.push({ divider: "" });
@@ -1183,9 +1478,7 @@ export default class RigMenu extends View {
       item("rig-follow", "Follow this slice", () => oneClick({ kind: "follow-target", conn: target.conn, view: `slice:${target.id ?? target.slice}`, name: target.name }, "follow"), "follow");
     }
     if (target.kind === "strip-view") {
-      const old=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config));
-      if(hasOldProviderStrip(layout())||old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
-        item("x","Leave OpenRig's old strip…",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},480));
+      oldStripItem();
       // A worker view's strip pill: close it, follow its rig's active workers, or reach the rig.
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
       if (target.rig) item("rig-follow", "Follow active workers", () => oneClick({ ...target, view: `rig:${target.rig}` }, "follow"), "follow");
@@ -1248,16 +1541,17 @@ export default class RigMenu extends View {
         const resolved = targetDismissalTarget();
         if (resolved === null) return;
         const scopedTarget = target.conn || !resolved.conn ? target : { ...target, conn: resolved.conn };
-        requestDismissal({ shared, setShared, run, scope: resolved.scope }, target.dismissed ? "restore" : "dismiss", target.dismissed ? updateKey(scopedTarget) : scopedTarget);
+        requestVisibleDismissal(resolved.scope, target.dismissed ? "restore" : "dismiss", target.dismissed ? updateKey(scopedTarget) : scopedTarget);
       });
       // A native seat closed outside OpenRig. Offered, never done on its own.
       if (target.native) {
         item("rig-refresh", "Relaunch fresh…", () => dialog({ ...target, reason: "native seat closed outside OpenRig" }, { action: "fresh", confirm: true }, 220));
         item("rig-play", "Resume…", () => dialog({ kind: "rig", rig: target.rig, conn: target.conn }, { action: "resume", confirm: true }, 380));
       }
-      if (target.reply !== "none") item("rig-reply", "Reply…", () => dialog(target, { input: true, placeholder: "Your answer, in your own words", action: "reply", multiLine: true }, 290), target.reply === "answer" ? "reply-answer" : "reply");
-      item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: target.summary }));
-      const copyId = String(target.qitemId || target.id || "");
+      if (target.reply !== "none" && !sweepFinding(target)) item("rig-reply", "Reply…", () => dialog(target, { input: true, placeholder: "Your answer, in your own words", action: "reply", multiLine: true }, 290), target.reply === "answer" ? "reply-answer" : "reply");
+      const check = sweepFinding(target);
+      item("rig-card", "Open this item", () => page({ section: "needs", id: target.id, name: check ? checkLabel(check, shared("rig.data")?.attentionItems) : rowTitle(target.summary) }));
+      const copyId = String(target.answer?.qitemId || target.qitemId || rowIdIn(target.id) || target.id || ""); // the bare row id, not the queue:/queue-update: page id
       if (copyId) item("rig-copy", "Copy request id", (cx) => cx.write_to_clipboard(copyId));
     }
     if (target.kind === "updates-group") {
@@ -1266,7 +1560,7 @@ export default class RigMenu extends View {
         const resolved = targetDismissalTarget();
         if (resolved === null) return;
         const scopedItems = resolved.conn ? items.map((it) => (it?.conn ? it : { ...it, conn: resolved.conn })) : items;
-        requestDismissal({ shared, setShared, run, scope: resolved.scope }, "dismiss", scopedItems);
+        requestVisibleDismissal(resolved.scope, "dismiss", scopedItems);
       });
     }
     if (target.kind === "open-view") item("rig-view", `Open ${target.view}`, () => oneClick(target, "open-view"), "open-view", true);
@@ -1333,6 +1627,32 @@ export default class RigMenu extends View {
     return seats;
   }
 
+  async loadSwapRepresentative() {
+    const target = complete(props()?.target, this.config);
+    try {
+      const conn = targetConnection(await this.currentConfig(), target);
+      if (!conn.ok || !target?.rigId) return;
+      const response = await fetchFor(conn.config)(`${conn.config.daemonUrl}/api/rigs/${encodeURIComponent(target.rigId)}`);
+      const detail = response.ok ? await response.json() : null;
+      if (this.gone || detail?.rig?.id !== target.rigId) return;
+      if (detail.representative === target.session) {
+        const roster = await fetchFor(conn.config)(`${conn.config.daemonUrl}/api/rigs/${encodeURIComponent(target.rigId)}/nodes`);
+        const nodes = roster.ok ? await roster.json() : null;
+        if (Array.isArray(nodes)) this.swapSeats = nodes.map((node) => ({ logicalId: node.logicalId, session: node.canonicalSessionName }));
+      }
+      if (!this.gone) this.swapRepresentative = detail.representative;
+    } catch { /* An unreadable route leaves queueing disabled. */ }
+    finally { this.swapLeadPending = false; }
+  }
+
+  swapPlan(target) {
+    return changeModelPlan(
+      { ...target, runtime: this.swapCurRuntime, model: this.swapCurModel, effort: this.swapCurEffort },
+      { runtime: this.swapRuntime, model: this.swapModel, effort: this.swapEffort },
+      { seats: this.swapSeats ?? this.rigSeats(target), representative: this.swapRepresentative, catalog: this.swapCatalog },
+    );
+  }
+
   /** Where a cell target's `cellId` sits in a grid ({ r, c }), if its cells carry ids. */
   cellAt(grid, target) {
     for (const [r, row] of grid.rows.entries()) for (const [c, cell] of row.cells.entries()) if (target.cellId && cell.cellId === target.cellId) return { r, c };
@@ -1349,10 +1669,23 @@ export default class RigMenu extends View {
   argsFor(target, action, text) { return actionArgs(target, action, text, appHome()); }
 
   // ---- views --------------------------------------------------------------------------------------------------------
+  // Links such as error Details are built before the footer. Include only their
+  // drawn handles, in construction order, alongside dialog fields and buttons.
+  focusTargetDrawn(_id,handle){
+    if(!this.dialogRenderCx||!handle)return;
+    this.dialogFirstControl??=handle;this.dialogLastControl=handle;
+  }
   dialogTab(e,cx){
     if(String(e.key).toLowerCase()!=='tab'||e.modifiers?.control||e.modifiers?.platform||e.modifiers?.alt)return false;
     cx.stop_propagation();
     if(this.newMode!==undefined)this.newFocusTouched=true;
+    const heldAt=this.heldFocusControls?.findIndex(handle=>handle?.is_focused?.())??-1;
+    if(heldAt>=0){
+      const handles=this.heldFocusControls,next=handles[(heldAt+(e.modifiers?.shift?-1:1)+handles.length)%handles.length];
+      this.dialogBoundaryTask?.cancel?.();
+      this.dialogBoundaryTask=cx.timer.after(16,nextCx=>{if(!this.gone){next.focus();nextCx.notify();}});
+      return true;
+    }
     const first=this.dialogFirstControl,last=this.dialogLastControl;
     const boundary=e.modifiers?.shift&&first?.is_focused?.()?last:!e.modifiers?.shift&&last?.is_focused?.()?first:null;
     if(boundary){
@@ -1445,49 +1778,48 @@ export default class RigMenu extends View {
       .when(this.adoptionReviewPending(),el=>el.opacity(0.45))
       .child(div().id("rig-menu-pending").px(8).py(6).text_color(t.muted).child(`${this.pending}…`));
     const items = this.items(target);
+    const check = target.kind === "need" ? sweepFinding(target) : null;
     if(!items[this.menuIndex]?.act){
       this.menuIndex=items.findIndex(it=>it.act&&!it.disabled);
       if(this.menuIndex<0)this.menuIndex=items.findIndex(it=>it.divider===undefined);
     }
     if(this.menuIndex>=0&&this.menuRevealed!==this.menuIndex){this.menuScroll?.scroll_to_item(this.menuIndex);this.menuRevealed=this.menuIndex;}
-    // Nothing that sets the list's size or the footer's may depend on which row is selected: hovering a row selects it, and in a bottom-anchored popup
-    // any change of height moves the rows under a pointer that did not move, so the next click would run another item. The reasons are always listed,
-    // and the selected item's reason has a one-line slot that is there whenever any item has a reason.
-    const selectedReason=items[this.menuIndex]?.reason;
-    const anyReason=items.some(it=>it.reason);
-    const rawReasons=[...new Set(items.map(it=>it.reason).filter(Boolean))];
-    const workerReasons=rawReasons.filter(r=>workerCapabilityText(r)!==r);
-    const reasons=rawReasons.filter(r=>!workerReasons.includes(r));
-    if(workerReasons.length)reasons.push(workerReasons.join('\n')); // one summary line for every worker-view reason (its tooltip lists them)
-    return v_flex().id("rig-menu").size_full().min_h(0).p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
+    // Herdr fits the popup to its content. A separate scrollbar lets the list
+    // measure its own rows before shrinking to the popup's height cap.
+    const actions = v_flex().id('rig-action-list').min_h(0).overflow_y_scroll().track_scroll(this.menuScroll)
+      .on_size_change((_size,cx)=>{if(this.menuIndex>=0)this.menuScroll?.scroll_to_item(this.menuIndex);cx.notify();})
+      .children(items.map((it, i) => {
+        if (it.divider !== undefined) return v_flex().flex_none().child(div().h(1).bg(t.border).my(3))
+          .when(!!it.divider, el => el.child(div().px(8).py(2).text_size(11).text_color(t.dim).child(it.divider)));
+        // The explanation stays with its row, keeping pointer targets stable as focus changes.
+        const reason = it.reason ? workerCapabilityText(it.reason, this.caps(target)) : "";
+        const tip = it.reason && it.reason !== reason ? it.reason : it.tip;
+        return v_flex().id(`rig-menu-${i}`).flex_none().px(8).rounded(5).text_color(it.disabled ? t.dim : t.foreground)
+          .when(i===this.menuIndex,el=>el.bg(t.selection??t.hover)).hover(s=>s.bg(t.hover))
+          .on_mouse_move((_e,cx)=>{if(this.menuIndex!==i){this.menuIndex=i;cx.notify();}})
+          .when(!!tip && tip !== reason, el => el.tooltip(plainError(tip).text))
+          .on_click((_e, cx) => this.choose(it, cx))
+          .child(h_flex().h(26).gap(8).items_center()
+            .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
+            .child(div().flex_1().truncate().when(!!it.dynamicLabel, el => el.tooltip(String(it.label ?? ""))).child(it.label)))
+          .when(!!reason, el => el.child(div().id(`rig-menu-reason-${i}`).pl(21).pb(4).min_w(0)
+            .whitespace_normal().text_size(11).text_color(t.dim).child(reason)));
+      }));
+    return v_flex().id("rig-menu").w_full().min_h(0).p(4).bg(t.raised).border(1).border_color(t.border).rounded(8).text_size(12.5)
       .when(!!this.handle,el=>el.track_focus(this.handle))
       .on_key_down((e,cx)=>this.menuKey(e,cx,items))
       .child(div().flex_none().px(8).py(4).text_size(11).text_color(t.dim).child(target.kind === "seat" || target.kind === "cell" ? `Seat ${target.logicalId ?? target.session} · ${target.rig}`
         : target.kind === "sidebar-row" ? `${(target.rowKind ?? "row").replace(/^./, c => c.toUpperCase())} ${target.name ?? ""}`
-        : target.kind === "need" ? (target.summary ?? "Needs you") : target.kind === "tui" ? "Rig TUI" : target.kind === "spec" ? `Spec ${target.name}`
+        : target.kind === "need" ? (check ? checkLabel(check, shared("rig.data")?.attentionItems) : target.summary ?? "Needs you") : target.kind === "tui" ? "Rig TUI" : target.kind === "spec" ? `Spec ${target.name}`
         : target.kind === "slice" ? `Slice ${target.name}` : target.kind === "strip-view" || target.kind === "following" ? `View ${target.name ?? target.viewId}`
         : target.kind === "cell-split" ? `Split ${target.logicalId ?? target.seat}` : target.kind === "pod" ? `Pod ${target.pod} · ${target.rig}`
         : target.kind === "host" ? `Host ${target.name}` : target.kind === "mission" ? `Mission ${target.name}` : target.kind === "branch" ? target.name
         : target.kind === "specs-group" ? `${target.name} specs` : target.kind === "system-config" || target.kind === "system" ? target.name
         : target.kind === 'assistant' ? `Connected assistant ${target.logicalId ?? target.name}`
         : target.kind === "saved-view" || target.kind === "terminal" ? `View ${target.name ?? target.view}` : `Rig ${target.rig ?? ""}`))
-      .child(v_flex().id('rig-action-list').min_h(0).h(Math.min(260,items.length*26+reasons.length*40)).overflow_y_scrollbar().track_scroll(this.menuScroll)
-        .on_size_change((_size,cx)=>{if(this.menuIndex>=0)this.menuScroll?.scroll_to_item(this.menuIndex);cx.notify();})
-      .children(items.map((it, i) => it.divider !== undefined
-        ? v_flex().child(div().h(1).bg(t.border).my(3)).when(!!it.divider, (el) => el.child(div().px(8).py(2).text_size(11).text_color(t.dim).child(it.divider)))
-        : h_flex().id(`rig-menu-${i}`).flex_none().px(8).h(26).gap(8).rounded(5).items_center().text_color(it.disabled ? t.dim : t.foreground)
-          .when(i===this.menuIndex,el=>el.bg(t.selection??t.hover)).hover(s=>s.bg(t.hover))
-          .on_mouse_move((_e,cx)=>{if(this.menuIndex!==i){this.menuIndex=i;cx.notify();}})
-          .when(!!it.reason, (el) => el.tooltip(plainError(it.reason).text))
-          .on_click((_e, cx) => this.choose(it, cx))
-          .child(it.icon ? svg(icon(it.icon)).size(13).flex_none().text_color(it.disabled ? t.dim : t.muted) : div().w(13).flex_none())
-          .child(div().flex_1().truncate().when(!!(it.dynamicLabel || it.reason), el=>el.tooltip([String(it.label ?? ""), it.reason].filter(Boolean).join("\n"))).child(it.label))))
-        // One line each, always the same rows: the selected item's reason keeps its row (blank), since its text is in the footer below.
-        .when(reasons.length>0,el=>el.child(v_flex().id('rig-menu-reasons').flex_none().px(8).py(4).gap(2).children(reasons.map((r,i)=>h_flex().id(`rig-menu-reason-${i}`).flex_none().h(18).text_size(11).text_color(t.dim).when(r!==selectedReason,d=>d.tooltip(r))
-          .child(div().truncate().child(r===selectedReason?"":workerCapabilityText(r,this.caps(target)))))))))
-      // A constant three lines (reasons run to about 110 characters, three lines at this width): the reason wraps inside, and the height never changes.
-      .when(anyReason,el=>el.child(div().id('rig-menu-selected-reason').flex_none().h(52).overflow_hidden().border_t(1).border_color(t.border).px(8).py(4)
-        .text_size(11).line_height(1.3).text_color(t.dim).when(!!selectedReason,d=>d.tooltip(String(selectedReason))).child(selectedReason?workerCapabilityText(selectedReason,this.caps(target)):"")));
+      .child(v_flex().relative().min_h(0)
+        .child(actions)
+        .child(Scrollbar.vertical('rig-action-list').absolute().inset_0()));
   }
 
   resultView(t, cx, target, step) {
@@ -1524,7 +1856,8 @@ export default class RigMenu extends View {
     }
     if (step.action === "resume" && r.json) {
       const out = resumeOutcome(r.json, r.ok);
-      const headline = out.ok ? `Resumed ${target.rig}` : out.partial ? `Resumed ${target.rig} · partially` : `${target.rig} wasn't resumed`;
+      const missing=this.resumeRollCall?.didNotStart??0;
+      const headline = missing>0&&r.json.status==='restored'?`Resumed ${target.rig} · ${missing} seat${missing===1?'':'s'} didn't start`:out.ok ? `Resumed ${target.rig}` : out.partial ? `Resumed ${target.rig} · partially` : `${target.rig} wasn't resumed`;
       return v_flex().gap(6)
         .child(div().text_size(13).font_semibold().child(headline))
         .when(!!out.error, (el) => el.child(errorBlock(this,t,"resume-error",out.error?.fact ?? out.error?.message ?? out.error,{where})))
@@ -1536,11 +1869,13 @@ export default class RigMenu extends View {
             .child(div().flex_1().truncate().text_color(t.muted).tooltip(String(s.label??"")).child(s.label))
             .when(s.needsFresh, (el) => el.child(this.dialogButton(t,div().id(`fresh-${i}`).px(8).h(22).rounded(5).bg(t.raised).flex().items_center().hover((x) => x.bg(t.hover)),null,
               () => dialog({ ...target, logicalId: s.logicalId }, { action: "fresh", confirm: true }, RESULT_HEIGHT),false,"Start fresh…"))))
-          .when(!s.ok && !!s.error, (el) => el.child(errorBlock(this,t,`resume-seat-error-${i}`,s.error,{where})))));
+          .when(!s.ok && !!s.error, (el) => el.child(errorBlock(this,t,`resume-seat-error-${i}`,s.error,{where})))))
+        .when(r.json.status==='restored',el=>el.child(this.resumeReadView(t,cx,target,'rollcall')));
     }
     const replyAlreadyWorded = step.action === "reply" && Boolean(r.conflict || r.tokenProtected || r.daemonRefused || r.networkError || r.unconfirmed);
+    const knownHold = ["send","queue","reply"].includes(step.action) && r.undelivered === true && !r.uncertain && !r.outcomeUnknown && !r.json?.uncertain && !r.json?.outcomeUnknown;
     return v_flex().gap(6)
-      .child(r.ok ? div().text_size(12.5).text_color(t.foreground).child(r.text || this.doneWords(target, step.action)) : errorBlock(this,t,"menu-result-error",r.text || "It didn't work, and the CLI gave no reason.",{where,outcomeUnknown:r.outcomeUnknown || r.uncertain}))
+      .child(r.ok ? div().text_size(12.5).text_color(t.foreground).child(r.text || this.doneWords(target, step.action)) : errorBlock(this,t,"menu-result-error",r.text || "It didn't work, and the CLI gave no reason.",{where,outcomeUnknown:r.outcomeUnknown || r.uncertain,tone:knownHold?t.ansi3:undefined}))
       .when(!!r.warning, (el) => el.child(div().text_size(11).text_color(t.dim).child(r.warning)))
       // A refusal that happened before anything left says so, for EVERY action; the uncertain line is only for a request that did leave (the CLI ran, or a refusal came after the send).
       .when(!r.ok && r.notSent && !/nothing was sent/i.test(String(r.text ?? "")),
@@ -1584,12 +1919,17 @@ export default class RigMenu extends View {
   }
 
   /** What a success says when the CLI printed no message of its own. */
-  doneWords(target, action) { return doneWords(target, action); }
+  doneWords(target, action) {
+    return action === "change-model" && this.changeQueuedFor
+      ? `Queued for ${this.changeQueuedFor}.` : doneWords(target, action);
+  }
 
   /** Run again: lifecycle actions re-read the rig first; a message or answer has no Retry; the rest re-run. */
   retry(cx, target, step) {
     if (RESEND_UNSAFE.has(step.action)) return;
+    if(step.action==='resume')this.resetResumeRollCall();
     if (step.action === "delete-rig") { if (this.retryable(step)) this.retryDelete(cx, target, step); return; } // only the delete step has a Retry here (see retryable)
+    if(step.action==='resume'&&this.resumePlan?.supported){this.result=null;this.requestResumeRead(cx,'plan');return;}
     if (step.action === "pause" || step.action === "resume") {
       const reviewedSeats = this.pauseSeatIds;
       this.run(cx, "Re-reading the rig", async () => {
@@ -1609,7 +1949,30 @@ export default class RigMenu extends View {
   }
 
   inputCanSend(step) {
-    return !this.result || (["send", "queue", "reply"].includes(step?.action) && !this.result.ok && this.result.notSent === true);
+    return !this.result || (["send", "queue", "reply"].includes(step?.action) && !this.result.ok && !this.result.uncertain && !this.result.outcomeUnknown && this.result.notSent === true);
+  }
+
+  waitForCompactionStart(cx,step){
+    const poll=next=>{
+      this.compactionStartTimer=null;
+      if(this.gone)return;
+      const all={...(shared('rig.compactionDecisions')??{})},record=all[step.token];
+      if(record?.status==='started'){
+        delete all[step.token];setShared('rig.compactionDecisions',all);
+        this.compactionStarting=false;this.dismiss();return;
+      }
+      if(record?.status==='error'||Date.now()>=this.compactionDeadline){
+        this.compactionStarting=false;
+        this.compactionStartMessage=record?.text??(record?.dispatched?step.start.uncertain:step.start.unsent);
+        if(record?.status==='allow'||record?.status==='checking')all[step.token]={...record,status:'expired'};
+        else delete all[step.token];
+        setShared('rig.compactionDecisions',all);
+        this.dialogCancelHandle?.focus?.();next.notify();return;
+      }
+      this.compactionStartTimer=next.timer.after(250,poll,{owner:null});
+    };
+    // close() cancels this wait even when the host drains a promise in another view.
+    this.compactionStartTimer=cx.timer.after(250,poll,{owner:null});
   }
 
   oldStripCloseAvailable(){
@@ -1630,11 +1993,47 @@ export default class RigMenu extends View {
   }
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
+    if(step.action==='typing-guard'){
+      if(!this.typingGuard||this.busy)return;
+      this.busy='Updating typing guard';cx.notify();
+      cx.spawn(async taskCx=>{
+        if(this.gone)return;
+        const result=await this.typingGuard.set(step.mode,{reviewedLevel:step.previous});
+        if(this.gone)return;
+        this.busy=null;this.result={...result,kind:'typing-guard'};taskCx.notify();
+      },{owner:null});
+      return;
+    }
     if (this.gone || this.busy) return;
+    if(step.action==='confirm-seat-compaction'){
+      if(!step.token||this.compactionConfirmed)return;
+      this.compactionConfirmed=true;
+      const now=Date.now();
+      const decisions=Object.fromEntries(Object.entries(shared('rig.compactionDecisions')??{})
+        .filter(([,record])=>!(record?.deadline<now)));
+      if(step.start){
+        this.compactionStarting=true;
+        this.compactionDeadline=now+step.start.waitMs;
+        decisions[step.token]={status:'allow',deadline:this.compactionDeadline};
+        setShared('rig.compactionDecisions',decisions);
+        this.waitForCompactionStart(cx,step);cx.notify();
+      }else{
+        setShared('rig.compactionDecisions',{...decisions,[step.token]:'allow'});
+        this.dismiss();
+      }
+      return;
+    }
+    if(step.action==='resume'&&(this.resumePlan?.ready!==true||this.result))return;
+    if(step.action==='resume')this.resetResumeRollCall();
     if(step.action==="close-old-views"){
       step={...step,views:(step.views??[]).filter(view=>!oldViewsGone(shared,this.config).includes(view.id))};
       if(this.cleanupQueued)return;
-      if(!layoutHasMod(layout(),MOD_IDS.sidebar)){this.result={ok:false,notSent:true,text:"Open the Rig sidebar, then try again. Nothing was closed."};cx.notify();return;}
+      if(oldStripCleanupBusy(shared)){
+        this.cleanupQueued=true;
+        this.result={ok:false,text:'A cleanup is already running in this window. Wait for its result.'};
+        cx.notify();return;
+      }
+      if(!layoutShowsMod(layout(),MOD_IDS.sidebar)){this.result={ok:false,notSent:true,text:"Open the Rig sidebar, then try again. Nothing was closed."};cx.notify();return;}
       const closeOnly=this.oldStripCloseOnly(step);
       if(!closeOnly&&!this.oldStripChoices?.some(choice=>choice.name===this.oldStripLayout))return;
       this.cleanupQueued=true;
@@ -1642,7 +2041,7 @@ export default class RigMenu extends View {
       const id=`old-views-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       setShared('rig.oldViewsClose',{...(shared('rig.oldViewsClose')??{}),[id]:{createdAt:Date.now(),config:this.openedOn??this.config,views:step.views??[],...(!closeOnly?{returnLayout:this.oldStripLayout}:{})}});
       run('rig.close-old-views');
-      this.result={ok:true,text:closeOnly?"Closing OpenRig's old views… The Rig sidebar will report the result; you can close this dialog. The strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout). Your seats keep running.":"Leaving OpenRig's old strip… The Rig page will report the result; you can close this dialog. Your seats keep running."};cx.notify();return;
+      this.result={ok:true,text:closeOnly?`Closing OpenRig's old view${step.views.length===1?'':'s'}… The Rig sidebar will report the result; you can close this dialog. The strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout). Your seats keep running.`:"Leaving OpenRig's old strip… The result will show when it finishes; you can close this dialog. Your seats keep running."};cx.notify();return;
     }
     if (["send", "queue", "reply"].includes(step?.action) && !this.inputCanSend(step)) return;
     if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.uncertainAttempt) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
@@ -1650,7 +2049,7 @@ export default class RigMenu extends View {
     const assistantReason=assistantActionRefusal(target,step.action);
     if(assistantReason){this.result={ok:false,notSent:true,text:assistantReason};cx.notify();return;}
     if(['open-view','open-seat','follow','unfollow','prune'].includes(step.action)){
-      if(layoutHasMod(layout(),MOD_IDS.sidebar)){oneClick(target,step.action);this.dismiss();}
+      if(layoutShowsMod(layout(),MOD_IDS.sidebar)){oneClick(target,step.action);this.dismiss();}
       else{this.result={ok:false,notSent:true,text:"Worker view needs Herdrig's Rig sidebar. Open it, then try again. Nothing was opened."};cx.notify();}
       return;
     }
@@ -1674,6 +2073,7 @@ export default class RigMenu extends View {
     if (step.action === "unarchive-rig") { this.unarchive(cx, target); return; }
     if (step.action === "confirm-machine") {
       if (!step.token) return;
+      if (!sidebarShownOrGuidance("rig.confirm-machine")) return;
       setShared("rig.machineConfirmation", step.token);
       run("rig.confirm-machine"); this.dismiss(); return;
     }
@@ -1698,12 +2098,14 @@ export default class RigMenu extends View {
     }
     if (step.action === "rebuild-space") {
       if (!step.recovery?.tiles?.length || !step.token) return;
+      if (!sidebarShownOrGuidance("rig.rebuild-space")) return;
       this.busy = "Rebuilding";
       setShared("rig.rebuildRequest", { rigId: target.rigId, token: step.token });
       run("rig.rebuild-space"); this.dismiss(); return;
     }
     if(step.action==="move-grid") {
       if(!step.token||!step.relocation?.source)return;
+      if(!sidebarShownOrGuidance("rig.move-grid"))return;
       setShared("rig.gridMoveRequest",{rigId:target.rigId,token:step.token});
       run("rig.move-grid");this.dismiss();return;
     }
@@ -1796,12 +2198,14 @@ export default class RigMenu extends View {
       return;
     }
     if (step.action === "change-model") {
-      const seats = this.rigSeats(target);
-      const plan = changeModelPlan(
-        { ...target, runtime: this.swapCurRuntime, model: this.swapCurModel, effort: this.swapCurEffort },
-        { runtime: this.swapRuntime, model: this.swapModel, effort: this.swapEffort },
-        { seats },
-      );
+      if (this.swapRuntime !== "agy" && this.swapCatalog?.status === "loading") return;
+      const seats = this.swapSeats ?? this.rigSeats(target);
+      const plan = this.swapPlan(target);
+      if (plan.error || !plan.isAgy && !plan.nextModel) {
+        this.swapError = plan.error ?? "Pick or type a model first.";
+        cx.notify();
+        return;
+      }
       if (!plan.recipient) {
         this.result = { ok: false, notSent: true, text: plan.routingError ?? "No lead or advisor seat found to route the change." };
         cx.notify();
@@ -1822,7 +2226,9 @@ export default class RigMenu extends View {
         nextRuntime: this.swapRuntime,
         nextModel: this.swapModel,
         nextEffort: this.swapEffort,
+        representative: this.swapRepresentative,
         seats,
+        catalog: this.swapCatalog,
       }, "change-model");
       this.run(cx, "Queueing", async () => {
         const r = await this.write(args);
@@ -1832,6 +2238,7 @@ export default class RigMenu extends View {
       return;
     }
     const text = this.input ? this.input.value().trim() : "";
+    if (["send","queue","reply"].includes(step.action)) this.submittedText=text;
     if (step.input && !text) return;
     if (step.action === "reply") {
       this.run(cx, "Sending", async () => {
@@ -1840,11 +2247,14 @@ export default class RigMenu extends View {
         if (!conn.ok) return { ok: false, notSent: true, text: conn.reason };
         const cfg = conn.config;
         if (!cfg.daemonUrl) return { ok: false, notSent: true, text: cfg.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up')." };
+        const op = gatedOperation(cfg.connectionId);
+        const refused = await missionActionPreflight(cfg, op);
+        if (refused) return refused;
         const r = await submitMissionActions(cfg, target, {
           kind: target.reply === "resolve" ? "resolve" : "answer-text",
           text,
           revision: target.decisionRevision ?? null,
-        }, gatedFetch);
+        }, { fetch: op.fetch });
         if (r.ok) refreshSidebar();
         if (!r.ok && r.code === "decision_revision_changed" && !r.partial) {
           const msg = "The request changed since you opened it. Open it in Needs-You to read the latest version before answering.";
@@ -1887,17 +2297,25 @@ export default class RigMenu extends View {
   }
 
   changeModelView(t, cx, target) {
-    const seats = this.rigSeats(target);
-    const plan = changeModelPlan(
-      { ...target, runtime: this.swapCurRuntime, model: this.swapCurModel, effort: this.swapCurEffort },
-      { runtime: this.swapRuntime, model: this.swapModel, effort: this.swapEffort },
-      { seats },
-    );
-    const models = filterAllowedModels(SWAP_MODELS_BY_RUNTIME[this.swapRuntime] ?? []);
-    const efforts = SWAP_EFFORTS_BY_RUNTIME[this.swapRuntime] ?? [];
-    const pill = (id, label, active, onClick) => this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
+    const plan = this.swapPlan(target);
+    const catalog = this.swapCatalog ?? { status: "loading" };
+    const same = this.swapRuntime === this.swapCurRuntime;
+    const load = catalog.status === "loading";
+    const failed = catalog.status === "unavailable";
+    const failureReason = catalog.reason?.replace(/[.!?]+$/, "") ?? "the list does not report effort levels for this model";
+    const models = [...plan.allowedModels];
+    if (same && filterAllowedModels([this.swapCurModel]).length && !models.includes(this.swapCurModel)) models.unshift(this.swapCurModel);
+    const efforts = [...plan.allowedEfforts];
+    if (same && this.swapCurEffort && !efforts.includes(this.swapCurEffort)) efforts.unshift(this.swapCurEffort);
+    const pill = (id, label, active, onClick, tooltip) => this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).flex().items_center().text_size(12).cursor_pointer()
       .bg(active ? t.accent : t.raised).text_color(active ? (t.solid_foreground ?? t.background) : t.muted).border_1().border_color(active ? t.accent : t.border)
-      .hover((s) => s.bg(active ? t.accent : t.hover)),null,(_e,cx)=>{onClick();cx.notify();},false,label);
+      .hover((s) => s.bg(active ? t.accent : t.hover)).when(!!tooltip, el=>el.tooltip(tooltip)),null,(_e,cx)=>{onClick(cx);cx.notify();},false,label);
+    const currentLabel = (value, current, listed) => same && value === current
+      ? `${value} · current${listed || load ? "" : " · not listed"}` : value;
+    const sourceAge = catalog.fetchedAt && catalog.fetchedAt <= Date.now()
+      ? `updated ${Math.floor((Date.now()-catalog.fetchedAt)/60000)} min ago` : "may be out of date";
+    const effortKnown = Array.isArray(catalog.runtimeEfforts) || Array.isArray(catalog.models?.find(model => model.id === this.swapModel)?.efforts);
+    const muted = (id, text) => div().id(id).text_size(11.5).text_color(t.muted).child(text);
     const toneColor = plan.tone === "working" ? (t.working ?? t.accent) : plan.tone === "warn" ? (t.ansi3 ?? t.blocked) : (t.blocked ?? t.foreground);
     return v_flex().id("change-model-view").gap(10)
       // With several OpenRigs the dialog says which one the seat is on: a name two boxes share must never be changed on the wrong one unseen.
@@ -1907,40 +2325,61 @@ export default class RigMenu extends View {
       ))
       .child(v_flex().gap(4)
         .child(div().text_size(11).font_semibold().text_color(t.dim).child("Harness"))
-        .child(h_flex().id("swap-runtimes").gap(4).flex_wrap().children(SWAP_RUNTIMES.map((r) => pill(`swap-runtime-${r}`, r, this.swapRuntime === r, () => {
+        .child(h_flex().id("swap-runtimes").gap(4).flex_wrap().children(SWAP_RUNTIMES.map((r) => pill(`swap-runtime-${r}`, r, this.swapRuntime === r, next => {
+          if (this.swapRuntime === r) return;
           this.swapRuntime = r;
-          const nextModels = filterAllowedModels(SWAP_MODELS_BY_RUNTIME[r] ?? []);
-          this.swapModel = nextModels.includes(this.swapModel) ? this.swapModel : (nextModels[0] ?? null);
-          const nextEfforts = SWAP_EFFORTS_BY_RUNTIME[r] ?? [];
-          this.swapEffort = nextEfforts.includes(this.swapEffort) ? this.swapEffort : (nextEfforts[0] ?? null);
+          this.swapModelInput.set_value("");
+          this.swapManual = false;
+          this.swapModel = r === this.swapCurRuntime ? this.swapCurModel : null;
+          this.swapEffort = r === this.swapCurRuntime ? this.swapCurEffort : null;
           this.swapConfirmed = false;
           this.swapError = null;
+          this.refreshSwapCatalog(next, target);
         })))))
       .child(this.swapRuntime === "agy"
         ? div().id("swap-agy-note").p(8).rounded(6).bg(t.raised).text_size(12).text_color(t.muted).child("agy's model and effort live in agy's own settings")
         : v_flex().gap(8)
             .child(v_flex().gap(4)
               .child(div().text_size(11).font_semibold().text_color(t.dim).child("Model"))
-              .child(h_flex().id("swap-models").gap(4).flex_wrap().children(models.map((m) => pill(`swap-model-${m}`, m, this.swapModel === m, () => {
-                this.swapModel = m;
-                this.swapError = null;
-              })))))
-            .when(efforts.length > 0, (el) => el.child(v_flex().gap(4)
-              .child(div().text_size(11).font_semibold().text_color(t.dim).child("Effort"))
-              .child(h_flex().id("swap-efforts").gap(0).rounded(5).border_1().border_color(t.border).children(efforts.map((ef) =>
-                div().id(`swap-effort-${ef}`).px(8).h(24).flex().items_center().text_size(12).cursor_pointer()
-                  .bg(this.swapEffort === ef ? t.accent : t.raised).text_color(this.swapEffort === ef ? (t.solid_foreground ?? t.background) : t.muted)
-                  .hover((s) => s.bg(this.swapEffort === ef ? t.accent : t.hover))
-                  .on_click((_e, cx) => { this.swapEffort = ef; this.swapError = null; cx.notify(); })
-                  .child(ef)
-              ))))))
+              .when(!same && !!this.swapCurModel, el=>el.child(muted("swap-old-model", `The current model (${this.swapCurModel}) is ${this.swapCurRuntime}'s; pick one for ${this.swapRuntime}.`)))
+              .when(load, el=>el.child(muted("swap-catalog-loading", `Reading ${this.swapRuntime}'s models…`)))
+              .when(failed, el=>el.child(muted("swap-catalog-error", `Couldn't read ${this.swapRuntime}'s model list: ${failureReason}. Type a model ID instead.`))
+                .child(pill("swap-read-again","Read again",false,next=>this.refreshSwapCatalog(next,target))))
+              .when(catalog.source === "codex-local-model-list", el=>el.child(muted("swap-catalog-source", `From Codex's local model list · ${sourceAge}`)))
+              .child(h_flex().id("swap-models").gap(4).flex_wrap().children(models.map(model => {
+                const listed = plan.allowedModels.includes(model);
+                const tooltip = !listed && !load ? `${model} isn't in ${this.swapRuntime}'s list right now. Keep it, or pick another.`
+                  : catalog.source === "claude-help" && listed ? "An alias from Claude's own help; Claude picks the model it names." : null;
+                return pill(`swap-model-${model}`, currentLabel(model,this.swapCurModel,listed), this.swapModel===model, () => {
+                  this.swapManual=false;
+                  this.selectSwapModel(model);
+                }, tooltip);
+              })).when(!failed&&!load,el=>el.child(pill("swap-other-model","Other model…",this.swapManual,()=>{
+                this.swapManual=true;
+                this.selectSwapModel(this.swapModelInput.value().trim()||null);
+                this.swapModelInput.focus();
+              }))))
+              .when(failed||this.swapManual,el=>el.child(div().id("swap-manual-model").child(this.dialogField(this.swapModelInput,Input)))
+                .child(muted("swap-model-id-help", `Sent to ${this.swapRuntime} as you type it; ${this.swapRuntime} checks the name when the seat starts.`))))
+            .child(v_flex().gap(4)
+              .when(efforts.length>0,el=>el.child(div().text_size(11).font_semibold().text_color(t.dim).child("Effort"))
+                .child(h_flex().id("swap-efforts").gap(4).flex_wrap().children(efforts.map(level=>pill(
+                  `swap-effort-${level}`,currentLabel(level,this.swapCurEffort,plan.allowedEfforts.includes(level)),this.swapEffort===level,
+                  ()=>{this.swapEffort=level;this.swapError=null;},
+                  plan.allowedEfforts.includes(level)||load?null:`${level} isn't in ${this.swapRuntime}'s effort list right now. Keep it, or pick another.`,
+                )))))
+              .when(!load&&!effortKnown&&(failed||!!this.swapModel),el=>el.child(muted("swap-effort-unavailable",
+                `Couldn't read ${this.swapRuntime}'s effort levels: ${failureReason}. ${same?"The seat keeps its current effort.":"Its default effort applies."}`)))
+              .when(!load&&effortKnown&&!plan.allowedEfforts.length,el=>el.child(muted("swap-effort-unsupported",`${this.swapRuntime} has no effort setting.`)))))
+      .when(plan.nextRuntime!==this.swapCurRuntime||plan.nextModel!==this.swapCurModel||plan.nextEffort!==this.swapCurEffort,
+        el=>el.child(muted("swap-will-use", `Will use: ${[plan.nextRuntime,plan.nextModel,plan.nextEffort].filter(Boolean).join(" · ")}`)))
       .child(v_flex().id("swap-continuity").p(8).gap(4).rounded(6).bg(t.raised).border(1).border_color(t.border)
         .child(div().text_size(12).font_semibold().text_color(toneColor).child(plan.badge))
         .child(div().text_size(11.5).text_color(t.muted).child(plan.detail))
         .child(div().id("swap-routing").text_size(11).text_color(t.dim).child(
           plan.recipient
             ? `Routes via ${plan.recipientLogicalId} (${plan.recipient}) · OpenRig runs ${plan.cliPreview}`
-            : plainError(plan.routingError ?? "No lead or advisor seat found.").text
+            : this.swapLeadPending ? "Reading the rig's lead…" : plainError(plan.routingError ?? "No lead or advisor seat found.").text
         )))
       .when(plan.requiresConfirm, (el) => el.child(h_flex().id("swap-confirm").gap(6).items_center().cursor_pointer()
         .on_click((_e, cx) => { this.swapConfirmed = !this.swapConfirmed; this.swapError = null; cx.notify(); })
@@ -2276,6 +2715,8 @@ export default class RigMenu extends View {
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
+      : step.action === 'confirm-seat-compaction' ? step.copy?.title??'Compact this seat?'
+      : step.action === "typing-guard" ? "Typing guard"
       : step.action === "close-old-views" ? "Leave OpenRig's old strip?"
       : step.action === "spaces-list" ? (step.copy?.title ?? "Spaces list")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? `Copy built-in specs on ${step.confirmation?.machine}?` : `Save specs on ${step.confirmation?.machine}?`)
@@ -2286,16 +2727,23 @@ export default class RigMenu extends View {
       : step.action === "rebuild-space" ? `Rebuild ${target.rig}'s tiles?` : actionTitle(target, step.action);
     const go = (cx) => this.go(cx, target, step);
     let body = null;
-    if(step.action==="close-old-views"){
+    if(step.action==='confirm-seat-compaction')body=div().text_size(12).text_color(this.compactionStartMessage?t.blocked:t.muted)
+      .child(this.compactionStartMessage??(this.compactionStarting?step.start.starting:step.copy?.body??''));
+    else if(step.action==='typing-guard')body=this.result?null:div().child(step.confirmationText??TYPING_GUARD_TIP);
+    else if(step.action==="close-old-views"){
       const choices=this.oldStripChoices;
+      const count=step.views?.length??0,available=this.oldStripCloseAvailable(),canClose=available===true;
+      const switchText='This switches this window to the layout you pick.';
+      const intro=!count||available===null?switchText:canClose?`This closes OpenRig's ${count} old worker view${count===1?'':'s'} and switches this window to the layout you pick.`:
+        `${switchText} ${count===1?"The old view can't be closed from here, so it may stay open.":`The ${count} old views can't be closed from here, so they may stay open.`}`;
       if(choices?.length===1&&choices[0].name==='main'&&!this.oldStripLayout)this.oldStripLayout='main';
       body=v_flex().gap(8).text_size(12).text_color(t.muted)
-        .child(div().child((step.views?.length&&this.oldStripCloseAvailable()!==null?`This closes OpenRig's ${step.views.length} old worker views and switches this window to the layout you pick.`:'This switches this window to the layout you pick.')+' Your seats keep running, and the Rig page stays open.'));
+        .child(div().child(intro+' Your seats keep running, and the Rig page stays open.'));
       if(!choices)body.child(div().child('Reading layouts…'));
       else if(!choices.length){
         const count=step.views?.length??0,closeOnly=this.oldStripCloseOnly(step);
         const text=closeOnly?`herdrig couldn't find a layout to switch to, so this window stays in OpenRig's old layout. You can still close ${count===1?'the old view':`the ${count} old views`}; the strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout). Your seats keep running.`
-          :`herdrig couldn't find a layout to switch to${count&&this.oldStripCloseAvailable()===false?", and the old views can't be closed from here":''}. Open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running.`;
+          :`herdrig couldn't find a layout to switch to${count&&available===false?`, and the old view${count===1?'':'s'} can't be closed from here`:''}. Open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running.`;
         body=v_flex().gap(8).text_size(12).text_color(t.muted).child(div().child(text));
       }
       else body.child(div().child('Switch to')).children(choices.map(choice=>this.dialogButton(t,
@@ -2381,7 +2829,7 @@ export default class RigMenu extends View {
     } else if (step.action === "info") {
       body = errorBlock(this,t,"menu-info",step.text ?? "",{where:"this computer"});
     } else if (step.action === "reply" && this.inputCanSend(step) && target.summary && target.summary !== target.id) {
-      body = div().text_color(t.muted).child(target.summary);
+      body = div().id("rig-reply-summary").flex_none().h(20).truncate().tooltip(rowTip(target.summary)).text_color(t.muted).child(rowText(target.summary));
     } else if (step.action === "pause" && !this.result && !this.busy) {
       const p = this.pause;
       body = !p ? div().text_color(t.muted).child("Reading the rig…") : p.error ? errorBlock(this,t,"pause-error",p.error)
@@ -2415,18 +2863,14 @@ export default class RigMenu extends View {
         .child(div().id("launch-folder-machine").text_size(11.5).text_color(t.dim).child(`This folder must exist on ${launchConnection.ok && launchConnection.config.daemonMachine || "the machine running OpenRig"}.`))
         .child(field("Host (optional)", this.host));
     } else if (step.action === "resume" && !this.result && !this.busy) {
-      body = div().child(`Each seat of ${target.rig} comes back from the saved conversation where the harness allows. Any that can't is listed; none starts fresh by itself.`);
+      body = this.resumeReadView(t,cx,target,'plan');
     }
-    const swapPlan = step.action === "change-model"
-      ? changeModelPlan(
-          { ...target, runtime: this.swapCurRuntime, model: this.swapCurModel, effort: this.swapCurEffort },
-          { runtime: this.swapRuntime, model: this.swapModel, effort: this.swapEffort },
-          { seats: this.rigSeats(target) },
-        )
-      : null;
+    const swapPlan = step.action === "change-model" ? this.swapPlan(target) : null;
     const confirmLabel = step.action === "change-model"
-      ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
-      : step.action === "close-old-views" ? (this.oldStripChoices?.length===0?(this.oldStripCloseOnly(step)?"Close the old views":null):"Leave the strip")
+      ? swapPlan.buttonLabel
+      : step.action === 'confirm-seat-compaction' ? step.copy?.confirm??'Compact now'
+      : step.action === "typing-guard" ? (step.mode==='off'?'Turn it off':'Replace')
+      : step.action === "close-old-views" ? (this.oldStripChoices?.length===0?(this.oldStripCloseOnly(step)?`Close the old view${step.views.length===1?'':'s'}`:null):"Leave the strip")
       : step.action === "spaces-list" ? (step.copy?.confirm ?? "Change")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? "Allow built-in copies" : "Allow spec saves")
       : step.action === "adopt-address-space" ? "Use it"
@@ -2440,13 +2884,24 @@ export default class RigMenu extends View {
       : { pause: "Pause rig", resume: "Resume rig", fresh: "Start fresh", "design-view": "Open", send: "Send", queue: "Queue", reply: "Reply", "launch-spec": "Launch" }[step.action];
     const done = !!this.result?.ok;
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
-    const reviewFailed = (step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady()
+    const swapProblem = swapPlan?.error || (swapPlan && !swapPlan.isAgy
+      ? this.swapCatalog?.status === "loading" ? "Wait for the model list" : !swapPlan.nextModel ? "Pick or type a model first" : null
+      : null);
+    const swapTooltip = (!this.swapLeadPending && swapPlan?.routingError) || swapProblem;
+    const reviewFailed = !!swapProblem || Boolean(swapPlan && !swapPlan.recipient) || step.action==='resume'&&this.resumePlan?.ready!==true
+      ||(step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady()
       ||step.action==='close-old-views'&&!this.oldStripCloseOnly(step)&&!this.oldStripChoices?.some(choice=>choice.name===this.oldStripLayout); // No implicit layout choice.
     // change-model: after a failure that MAY have left, no second queue button (RESEND_UNSAFE); after a refusal that sent nothing it stays (nothing could have arrived).
-    const canConfirm = !!confirmLabel && (step.action === "change-model" ? (!this.result || (!this.result.ok && this.result.notSent)) : (step.action === "launch-spec" || step.action === "new-rig" ? (!this.result?.ok && !this.uncertainAttempt) : step.action === "design-view" ? !this.result?.ok : this.inputCanSend(step))) && !this.busy && !step.run;
+    const canConfirm = !!confirmLabel && !(step.action==='close-old-views'&&this.cleanupQueued) && !(step.action==='confirm-seat-compaction'&&this.compactionConfirmed)
+      && (step.action === "change-model" ? (!this.result || (!this.result.ok && this.result.notSent)) : (step.action === "launch-spec" || step.action === "new-rig" ? (!this.result?.ok && !this.uncertainAttempt) : step.action === "design-view" ? !this.result?.ok : this.inputCanSend(step))) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps(target)) : null;
+    const heldUncertain = this.result?.uncertain === true || this.result?.outcomeUnknown === true || this.result?.json?.uncertain === true || this.result?.json?.outcomeUnknown === true;
+    const heldDraft = !!this.input && ["send","queue","reply"].includes(step.action) && this.result?.undelivered === true && !heldUncertain;
+    const fixedResumePlan=step.action==='resume'&&!this.result&&!this.busy&&!!body&&this.resumePlan?.supported===true&&this.resumePlan?.ready===true;
+    this.heldFocusControls=null;
+    const messageComposer = !!this.input && (this.inputCanSend(step) || ["send","queue","reply"].includes(step.action) && heldUncertain);
     const mac = window()?.platform === "macos";
-    return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).text_size(12.5)
+    return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12.5)
       .key_context('RigDialog')
       .on_action('rig-dialog-next',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{}},cx))
       .on_action('rig-dialog-prev',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{shift:true}},cx))
@@ -2460,6 +2915,7 @@ export default class RigMenu extends View {
         }
         if (key === "escape") {
           cx.stop_propagation();
+          if(this.compactionStarting)return;
           if (step.action === "design-view" && (this.draggingSeat || this.pressedSeat || this.draggingDivider)) {
             this.draggingSeat = null;
             this.pressedSeat=null;
@@ -2494,26 +2950,74 @@ export default class RigMenu extends View {
         }
       })
       .child(div().id("rig-dialog-title").flex_none().text_size(14).font_semibold().child(title))
-      .when(!!body && !["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","close-old-views"].includes(step.action), (el) => el.child(body))
-      .when(!!this.input && this.inputCanSend(step), (el) => el.child(div().flex_1().border(1).border_color(t.border).rounded(6).p(6).child(this.dialogField(this.input,Textarea).h(96)))
-        .child(div().text_size(11).text_color(t.dim).child(`${mac ? "⌘ Return" : "Ctrl+Enter"} sends · Esc or a click outside closes; your text is kept until you send or cancel`)))
+      // Read why the send was refused before editing it. This viewport is bounded; the draft owns spare height.
+      .when((messageComposer || heldDraft) && (!!this.result || !!this.busy), el => el.child(v_flex().id("rig-dialog-body").flex_none().max_h(96).min_h(24)
+        // The native scrollbar helper adds a size-full area. A plain capped scroll keeps short held receipts intrinsic.
+        .when(heldDraft, content=>content.overflow_y_scroll()).when(!heldDraft, content=>content.overflow_y_scrollbar())
+        .child(this.resultView(t, cx, target, step) ?? div())))
+      .when(!!body && !["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","resume","close-old-views"].includes(step.action), (el) => el.child(body))
+      .when(typeof step.note === "string" && !!step.note, (el) => el.child(div().id("rig-dialog-note").text_size(12).text_color(t.blocked).child(step.note)))
+      .when(messageComposer, (el) => el.child(div().flex_1().min_h(108).border(1).border_color(t.border).rounded(6).p(6).child(this.dialogField(this.input,Textarea).size_full().min_h(96)))
+        .child(div().text_size(11).text_color(t.dim).child(this.inputCanSend(step) ? `${mac ? "⌘ Return" : "Ctrl+Enter"} sends · Esc or a click outside closes; your text is kept until you send or cancel` : "Check whether it arrived before sending again. Your draft is kept.")))
+      .when(heldDraft, el => el.child(this.heldDraftView(t,cx,target,step)))
+      // Resume's explanation stays above its own scrolling seat rows, never inside another scroll area.
+      .when(fixedResumePlan,el=>el.child(v_flex().id('rig-resume-review').flex_1().min_h(0).child(body)))
       // Long results and the model/harness form scroll; the action footer never shrinks into the body.
-      .when(step.action !== "design-view" || !!this.result || !!this.busy, (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
-        .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","close-old-views"].includes(step.action) && !!body&&(step.action!=='close-old-views'||!this.result), (content) => content.child(body))
+      .when(!messageComposer && !heldDraft && !fixedResumePlan && (step.action !== "design-view" || !!this.result || !!this.busy), (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
+        .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","resume","close-old-views"].includes(step.action) && !!body&&(step.action!=='close-old-views'||!this.result), (content) => content.child(body))
         .child(this.resultView(t, cx, target, step) ?? div())))
       .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
         .child(this.dialogButton(t,div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),this.dialogCancelHandle,
-          () => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); },false,done||step.action==='close-old-views'&&this.oldStripChoices?.length===0&&!this.oldStripCloseOnly(step) ? "Close" : "Cancel"))
+          () => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); },!!this.compactionStarting,
+          done || heldDraft || this.compactionConfirmed || step.action==='resume'&&this.result&&!this.result.notSent || step.action==='close-old-views'&&(this.cleanupQueued||this.oldStripChoices?.length===0&&!this.oldStripCloseOnly(step)) ? "Close"
+            : step.action==='confirm-seat-compaction' ? step.copy?.dismiss??'Cancel' : step.action==='typing-guard'&&step.treatedAsHold ? "Keep" : "Cancel"))
         .when(done && step.action === "new-rig" && typeof result.createdRig === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(result.createdRig), el => el.child(
           this.dialogButton(t,div().id("new-rig-open-space").px(12).h(26).rounded(6).bg(t.accent).text_color(t.background ?? "#fff").flex().items_center().cursor_pointer(),this.dialogOpenSpaceHandle,
             () => { const command = this.spaceCommand(target, result.createdRig); if (command) { run(command); this.dismiss(); } },false,"Open rig space")))
+        .when(heldDraft, el => el.child(div().id("rig-held-send").px(12).h(26).rounded(6).opacity(0.45).tooltip(step.action === "queue" ? "This row is already recorded." : "OpenRig already holds this message. Sending again would deliver it twice.").child(step.action === "queue" ? "Queue" : "Send")))
         .when(canConfirm && step.action === "delete-rig" && !target?.archived, (el) => el.child(this.dialogButton(t,div().id("rig-archive").px(12).h(26).rounded(6).bg(t.raised).border_1().border_color(t.border)
           .flex().items_center().hover((s) => s.bg(t.hover)).when(!!archiveReason, (b) => b.opacity(0.45).tooltip(archiveReason))
           ,this.dialogArchiveHandle,(_e,cx)=>this.archive(cx,target),!!archiveReason||reviewFailed,this.rigRunning(target) ? "Pause and archive" : "Archive")))
         .when(canConfirm, (el) => el.child(this.dialogButton(t,div().id("rig-confirm").px(12).h(26).rounded(6).when(reviewFailed, (b) => b.opacity(0.45).when(step.action==='close-old-views',el=>el.tooltip('Pick a layout first')))
+          .when(!!swapTooltip, el=>el.tooltip(swapTooltip))
           .bg(step.action === "pause" || step.action === "fresh" || step.action === "delete-rig" ? t.blocked : t.accent)
           .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center(),this.dialogConfirmHandle,
           (_e,cx)=>go(cx),reviewFailed,confirmLabel))));
+  }
+
+  heldDraftView(t,cx,target,step) {
+    this.dialogFirstControl??=this.heldTextHandle;
+    const receipt=this.result?.json??{};
+    // Released receipts describe custody, not the message body. Never mistake a status sentence for held text.
+    const held=this.submittedText??this.input.value();
+    const row=receipt.qitemId??receipt.qitem?.qitemId??receipt.qitem?.id??receipt.row?.id??null;
+    this.heldFocusControls=[this.heldTextHandle,this.heldCopyHandle,...(step.action==="queue"&&row?[this.heldRowCopyHandle]:[]),this.dialogCancelHandle].filter(Boolean);
+    const label=step.action==="queue" ? `Recorded${row?` as ${row}`:""} · its notice wasn't delivered`
+      : step.action==="reply" ? `Your answer is recorded · not delivered to ${receipt.sessionName??target.session??target.asker??"the seat"} yet`
+      : "Held by OpenRig · not delivered yet";
+    // A fence longer than any submitted run makes all text literal, while native code text keeps real lines and spaces.
+    const fence='`'.repeat(Math.max(3,...(String(held).match(/`+/g)??[]).map(run=>run.length+1)));
+    const document=`${fence}\n${held}\n${fence}`;
+    const leaveText=(backward,eventCx)=>{
+      eventCx.stop_propagation();const target=backward?this.dialogCancelHandle:this.heldCopyHandle;
+      this.dialogBoundaryTask?.cancel?.();
+      this.dialogBoundaryTask=eventCx.timer.after(16,nextCx=>{if(!this.gone){target?.focus?.();nextCx.notify();}});
+    };
+    const copy=(value,key,eventCx)=>{
+      eventCx.write_to_clipboard(value);this.heldCopied=key;this.heldCopyTimer?.cancel?.();
+      this.heldCopyTimer=eventCx.timer.after(2000,nextCx=>{if(!this.gone){this.heldCopied=null;nextCx.notify();}});eventCx.notify();
+    };
+    return v_flex().id("rig-held-draft").flex_1().min_h(108).gap(6)
+      .child(h_flex().gap(8).child(div().flex_1().text_size(11).text_color(t.dim).child(label))
+        .child(this.dialogButton(t,div().id("rig-held-copy").px(6).h(24),this.heldCopyHandle,(_e,eventCx)=>copy(held,"text",eventCx),false,this.heldCopied==="text"?"Copied":"Copy"))
+        .when(step.action==="queue"&&!!row,el=>el.child(this.dialogButton(t,div().id("rig-held-row-copy").px(6).h(24),this.heldRowCopyHandle,(_e,eventCx)=>copy(String(row),"row",eventCx),false,this.heldCopied==="row"?"Copied":"Copy row id"))))
+      .child(div().id('rig-held-text-focus').flex_1().min_h(0).p(2).border(2).border_color('#00000000').rounded(6)
+        .when(!!this.heldTextHandle,el=>el.track_focus(this.heldTextHandle)).tab_stop(true).focus(el=>el.border_color(t.accent))
+        .key_context('RigHeldText').on_action('rig-held-next',(_event,eventCx)=>leaveText(false,eventCx))
+        .on_action('rig-held-prev',(_event,eventCx)=>leaveText(true,eventCx))
+        .on_action('rig-held-close',(_event,eventCx)=>{eventCx.stop_propagation();this.dismiss();})
+        .on_key_down((event,eventCx)=>{if(String(event.key).toLowerCase()==='tab')leaveText(Boolean(event.modifiers?.shift),eventCx);})
+        .child(TextView.markdown('rig-held-text',document).size_full().selectable(true).scrollable(true)));
   }
 
   /** Delete's confirmation: what stops (every seat, with its state and owned work), the command, and Archive instead. */
@@ -2580,10 +3084,30 @@ export default class RigMenu extends View {
       .child(div().id("new-rig-command").text_size(11.5).text_color(t.dim).child(commandLine(this.newRigPreview())));
   }
 
+  localSetupHost(){
+    const path=`${appHome()}/openrig/config.json`;
+    return{
+      readDaemonState:home=>readTextFile(`${home}/daemon.json`).catch(()=>null),
+      writeConfig:async(text,before,validate)=>{
+        const current=await readTextFile(path).catch(()=>null);
+        if(current!==before)throw Object.assign(new Error("OpenRig's settings changed while this was open. Check again. Nothing was saved."),{code:'CONFIG_CHANGED'});
+        validate?.(); // a close, field edit or config change during the read refuses before the CAS write
+        try{await writeTextFile(path,text,before);}
+        catch(error){
+          const actual=await readTextFile(path).catch(()=>null);
+          if(actual===text)return; // a lost acknowledgement, but the exact intended file is present
+          throw Object.assign(new Error("Couldn't confirm whether the connection was saved. Check Connections before trying again."),{uncertain:true,cause:error});
+        }
+      },
+      closedOutcome:result=>notify(result.ok?{title:'Connection saved',body:"It finished saving after the dialog closed. Check it in Connections.",level:'info'}
+        :{title:'Connection save not confirmed',body:'The dialog closed before Herdr heard back. Check Connections before adding it again.',level:'warning'}),
+    };
+  }
   machineSetupHost(cx,config=this.config){
     const configPath=`${appHome()}/openrig/config.json`,consentPath=`${appHome()}/openrig/machine-consent.json`;
     let completedConfig=this.openedOn;
     const beforeApprove=()=>{
+      if(this.gone)throw new Error('This machine setup was closed. No further action was started.');
       const token=props()?.step?.token;
       if(token&&shared("rig.machineSetupToken")!==token)throw new Error("This setup was replaced by a newer request. Close it and use the newer screen.");
     };
@@ -2591,16 +3115,33 @@ export default class RigMenu extends View {
       const fresh=await freshFileConfig();beforeApprove();
       if(!completedConfig||fresh.configInvalid||fresh.connectionsRefused||!sameDialogConfig(completedConfig,fresh,config.connectionId))throw new Error(CONFIG_CHANGED_OPEN);
     };
-    return {exec:execFor(config),hc:hcFor(config),machines,beforeApprove,setupFetch:loopbackHealthFetch(globalThis.fetch.bind(globalThis),(ms,fn)=>cx.timer.after(ms,fn)),relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:waitWith(cx),
+    const exec=execFor(config),hc=hcFor(config);
+    return {exec:(...args)=>{beforeApprove();return exec(...args);},hc:(...args)=>{beforeApprove();return hc(...args);},machines,beforeApprove,
+      cancelled:()=>this.gone,
+      registerBarrier:release=>{
+        if(this.gone){release();return()=>{};}
+        (this.machinePreparationReleases??=new Set()).add(release);
+        return()=>this.machinePreparationReleases?.delete(release);
+      },
+      deadline:ms=>new Promise(resolve=>cx.timer.after(ms,resolve,{owner:null})),
+      waitQueue:read=>new Promise((resolve,reject)=>{
+        beforeApprove();
+        const ticket={resolve,reject,ready:false};
+        (this.machineQueueWaits??=new Set()).add(ticket);
+        Promise.resolve().then(read).then(value=>{ticket.value=value;ticket.ready=true;},error=>{ticket.error=error;ticket.failed=true;ticket.ready=true;});
+        cx.notify();
+      }),
+      setupFetch:loopbackHealthFetch(globalThis.fetch.bind(globalThis),(ms,fn)=>cx.timer.after(ms,fn,{owner:null})),relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:waitWith(cx),
       stillChosen:currentChoice, // Approve helper: the settings still name the connection this dialog opened on
       localFolderExists:localDirectoryProbe(execFor(config)),localHome:()=>home(),
       machineFolders:name=>[...(spaces()??[]).filter(s=>s?.machine===name).map(s=>s.folder),...(panes()??[]).filter(p=>typeof p?.pane==="string"&&p.pane.startsWith(`${name}/`)).map(p=>p.cwd)],
       health:async url=>{const r=await fetchFor(config)(`${url}/healthz`);if(!r.ok)throw new Error("Cannot read the tunnel's OpenRig health.");return r.json();},
-      readConfig:()=>readTextFile(configPath).catch(()=>null),writeConfig:async(text,previous)=>{
+      readConfig:()=>{beforeApprove();return readTextFile(configPath).catch(()=>null);},writeConfig:async(text,previous)=>{
+        beforeApprove();
         try{await writeTextFile(configPath,text,previous);}
         catch(error){const now=await readTextFile(configPath).catch(()=>null);if(now!==previous)throw Object.assign(new Error("OpenRig's settings changed while this was open."),{code:"CONFIG_CHANGED"});throw error;} // the file is not what was read: say so plainly
         completedConfig=parseConfig(text);},
-      readConsentText:()=>readTextFile(consentPath).catch(()=>null),writeConsentText:(text,previous)=>writeTextFile(consentPath,text,previous),
+      readConsentText:()=>{beforeApprove();return readTextFile(consentPath).catch(()=>null);},writeConsentText:(text,previous)=>{beforeApprove();return writeTextFile(consentPath,text,previous);},
       saved:async(result,stop)=>{
         await currentChoice();
         let declined,search;
@@ -2619,9 +3160,41 @@ export default class RigMenu extends View {
         setShared("rig.machineSetup",stop?null:result.receipt);refreshSidebar();}};
   }
 
-  render(cx) {
+  consumeMachineQueue(cx) {
+    if(this.gone||this.machineQueueTimer||!this.machineQueueWaits?.size)return;
+    // Arm from this view's draw; resolving in its timer drains the preparation
+    // continuation under the successor, never the predecessor's close/task.
+    const poll=next=>{
+      this.machineQueueTimer=null;
+      if(this.gone)return;
+      for(const ticket of this.machineQueueWaits){
+        if(!ticket.ready)continue;
+        this.machineQueueWaits.delete(ticket);
+        if(ticket.failed)ticket.reject(ticket.error);else ticket.resolve(ticket.value);
+      }
+      if(this.machineQueueWaits.size)this.machineQueueTimer=next.timer.after(100,poll);
+    };
+    this.machineQueueTimer=cx.timer.after(100,poll);
+  }
+
+  render(cx) {return withFocusContext(this,cx,()=>this.renderFocused(cx));}
+  renderFocused(cx) {
+    this.consumeMachineQueue(cx);
+    if(this.resumeRollCallAutoPending&&!this.resumeRollCallTimer&&!this.gone){
+      this.resumeRollCallAutoPending=false;this.resumeRollCallAutoUsed=true;
+      const epoch=this.resumeRollCallEpoch;
+      this.resumeRollCallTimer=cx.timer.after(10000,next=>{if(this.gone||this.resumeRollCallEpoch!==epoch)return;this.resumeRollCallTimer=null;this.requestResumeRead(next,'rollcall');});
+    }
     const t = theme();
     const p = props() ?? {};
+    if (p.step?.action === "change-model") this.watchSwapCatalog(cx, complete(p.target, this.config));
+    if(this.pendingLocalPanel&&!this.localPanelPending){
+      this.localPanelPending=true;cx.timer.after(0,next=>{
+        this.localPanelPending=false;const make=this.pendingLocalPanel;this.pendingLocalPanel=null;
+        if(!make||this.gone||this.setupPanel)return;
+        this.setupPanel=make(next);next.spawn(task=>this.setupPanel.open(task));next.notify();
+      });
+    }
     // Async completions request focus; only the dialog's own draw creates its timer.
     if(this.pendingDialogFocus){const focus=this.pendingDialogFocus;this.pendingDialogFocus=null;this.dialogFocusTask?.cancel?.();this.dialogFocusTask=cx.timer.after(0,next=>{this.dialogFocusTask=null;if(this.gone)return;focus();next.notify();});}
     if(this.setupPanel)return this.setupPanel.render(t,cx);
@@ -2637,8 +3210,7 @@ export default class RigMenu extends View {
     const target = complete(p.target, this.config);
     this.capsDraw = new Map();
     let tree;
-    try { tree = p.step ? this.dialogView(t, cx, target, p.step) : this.popup(t, target); } finally { this.capsDraw = null; }
-    this.dialogRenderCx=null;
+    try { tree = p.step ? this.dialogView(t, cx, target, p.step) : this.popup(t, target); } finally { this.capsDraw = null;this.dialogRenderCx=null; }
     return tree;
   }
 }

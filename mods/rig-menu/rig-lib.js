@@ -34,6 +34,13 @@ export function stampRows(spec, identity) {
   if (!identity || spec?.mod !== MOD_IDS.menu || !spec.props?.target || typeof spec.props.target !== "object" || spec.props.target.rowsConfig) return spec;
   return { ...spec, props: { ...spec.props, target: { ...spec.props.target, rowsConfig: identity } } };
 }
+/** A message's editor and refusal stay together in one host dialog. At 260px the editor, title, hint and footer
+ * leave no result viewport, even with flex_none. Apply it wherever the dialog opens, before the host fixes its size. */
+export function messageDialogSpace(spec) {
+  if (spec?.mod !== MOD_IDS.menu || spec.kind !== "dialog" || !spec.props?.step?.input
+    || !["send", "queue", "reply"].includes(spec.props.step.action)) return spec;
+  return { ...spec, height: Math.max(440, Number(spec.height) || 0) };
+}
 export function registerRigRouting(cx, environment) {
   // init/render contexts expire when their call returns. Keep waits on a view-owned asynchronous task instead.
   cx.spawn(async context => {
@@ -102,7 +109,8 @@ export function requestFirstSentence(source, max = 140) {
     let k = i;
     while (k > 0 && !space(s[k - 1])) k--;
     const token = s.slice(k, i + 1);
-    if (/^(?:e\.g\.|i\.e\.|[A-Z]\.)$/i.test(token)) continue;
+    // Abbreviations that are never a sentence end ("vs. B", "Acme Inc. Then"); "no.", "st." and "co." are left out, as they also end real sentences.
+    if (/^(?:e\.g\.|i\.e\.|[A-Z]\.|(?:vs|etc|inc|ltd|corp|mr|mrs|ms|dr|approx|cf)\.)$/i.test(token)) continue;
     return requestCap(singleLineText(s.slice(0, i + 1)), max);
   }
   return requestCap(singleLineText(s), max);
@@ -128,10 +136,10 @@ const HEADLINE_SCAN = 4096;
  *  request whose first sentence starts after HEADLINE_SCAN characters (then it says who asked). */
 export function requestHeadline(item = {}, body = "") {
   const raw = item.summaryIsFallback && item.summary === item.id ? "" : item.summary ?? item.title ?? "";
-  const summary = requestPlain(String(raw ?? "").slice(0, HEADLINE_SCAN));
+  const summary = rowText(requestPlain(String(raw ?? "").slice(0, HEADLINE_SCAN)));
   const headline = summary
-    ? summary.length <= 140 ? singleLineText(summary) : requestFirstSentence(summary)
-    : requestFirstSentence(String(body || item.body || item.bodyPreview || "").slice(0, HEADLINE_SCAN).replace(/\r\n?/g, "\n").replace(/^\n+/, "").trimEnd());
+    ? summary.length <= 140 ? summary : requestFirstSentence(summary)
+    : requestFirstSentence(withoutRowIds(String(body || item.body || item.bodyPreview || "").slice(0, HEADLINE_SCAN).replace(/\r\n?/g, "\n").replace(/^\n+/, "").trimEnd()));
   return headline || `Request from ${item.asker ?? item.sourceSession ?? "the asking seat"}`;
 }
 
@@ -141,13 +149,14 @@ const CARD_CACHE = new Map(), CARD_CACHE_MAX = 64;
 
 /** Presentation only: never rewrites ids, generates a decision, or drops the original body from Details. The result is shared
  *  between redraws and callers (frozen): read it, don't change it. */
-export function requestCardText(item = {}, body = "", { openingLimit = 320 } = {}) {
+export function requestCardText(item = {}, body = "", { openingLimit = 320, perRow = null } = {}) {
+  const rowChars = perRow ?? Math.floor(Math.min(320, Math.max(40, openingLimit)) / REQUEST_OPENING_LINES);
   const text = body || item.body || item.bodyPreview || "";
   const inputs = [item.summary, item.title, item.summaryIsFallback, item.asker, item.sourceSession, text];
-  const key = typeof item.id === "string" && item.id ? `${item.id}\u0000${openingLimit}\u0000${String(text).length}` : null;
+  const key = typeof item.id === "string" && item.id ? `${item.id}\u0000${rowChars}\u0000${String(text).length}` : null;
   const hit = key ? CARD_CACHE.get(key) : null;
   if (hit && hit.inputs.every((value, i) => value === inputs[i])) return hit.result;
-  const result = Object.freeze(parseRequestCard(item, text, openingLimit));
+  const result = Object.freeze(parseRequestCard(item, text, rowChars));
   if (key) {
     CARD_CACHE.delete(key);
     CARD_CACHE.set(key, { inputs, result });
@@ -156,28 +165,59 @@ export function requestCardText(item = {}, body = "", { openingLimit = 320 } = {
   return result;
 }
 
-function parseRequestCard(item, body, openingLimit) {
+function parseRequestCard(item, body, rowChars) {
   const source = String(body || item.body || item.bodyPreview || "").replace(/\r\n?/g, "\n").replace(/^\n+/, "").trimEnd();
   const summary = requestPlain(item.summaryIsFallback && item.summary === item.id ? "" : item.summary ?? item.title ?? "");
-  const headline = (summary ? summary.length <= 140 ? singleLineText(summary) : requestFirstSentence(summary) : requestFirstSentence(source))
+  // Shown text carries no queue row ids; the full summary and the rest of the message, ids included, stay in Details.
+  const shownSummary = rowText(summary), summaryHadIds = shownSummary !== singleLineText(summary);
+  const headline = (shownSummary ? shownSummary.length <= 140 ? shownSummary : requestFirstSentence(shownSummary) : requestFirstSentence(withoutRowIds(source.slice(0, HEADLINE_SCAN))))
     || `Request from ${item.asker ?? item.sourceSession ?? "the asking seat"}`;
   const match = detailsLine(source);
   let opening = match ? source.slice(0, match.index).trim() : source.split(/\n\s*\n/)[0] ?? "";
   let rest = match ? source.slice(match.index + match[0].length).trim() : source.slice(opening.length).trim();
   const first = requestFirstSentence(opening, 10000);
   const sameProse = s => requestPlain(s).toLowerCase().replace(/[.!?:]+$/, "");
-  if (sameProse(first) === sameProse(headline)) {
+  if (sameProse(rowText(first)) === sameProse(headline)) {
     // Compare plain text but remove the original sentence, including its Markdown wrappers.
     const sentenceEnd = opening.search(/[.!?](?=\**(?:\s|$))/);
     opening = sentenceEnd >= 0 ? opening.slice(sentenceEnd + 1).replace(/^\*+/, "").trim() : "";
   }
-  const beforeCap = opening;
-  const fourLines = opening.split("\n").slice(0, 4).join("\n");
-  opening = requestCap(fourLines, Math.min(320, Math.max(40, openingLimit)));
-  if (opening !== beforeCap) rest = [beforeCap.slice(opening.replace(/…$/, "").length).trim(), rest].filter(Boolean).join("\n\n");
-  const details = [summary.length > 140 ? `Full summary:\n${String(item.summary ?? item.title)}` : "", rest].filter(Boolean).join("\n\n");
+  // The opening is cut to what its box shows (three rows at the card's width), so nothing is hidden: the rest of a cut line
+  // and every later line start Details, and the card says how many lines moved, or "More in Details".
+  const cut = cutToRows(opening, REQUEST_OPENING_LINES, rowChars);
+  if (cut.rest) rest = [cut.rest, rest].filter(Boolean).join("\n\n");
+  opening = withoutRowIds(cut.shown);
+  const openingMoreLines = cut.moreLines, openingCut = cut.cut;
+  const details = [summary.length > 140 || summaryHadIds ? `Full summary:\n${String(item.summary ?? item.title)}` : "", rest].filter(Boolean).join("\n\n");
   const headings = [...details.matchAll(/^(?:#{1,6}\s+(.+)|\*\*(.+?)\*\*)\s*$/gm)].map(m => requestPlain(m[1] ?? m[2])).slice(0, 3);
-  return { headline, opening, details, detailHint: headings.join(" · ") || "the full message", source };
+  return { headline, opening, openingMoreLines, openingCut, details, detailHint: headings.join(" · ") || "the full message", source };
+}
+/** How many rows (and so at most how many source lines) a request card's opening shows before "<n> more lines in Details". */
+export const REQUEST_OPENING_LINES = 3;
+/** Characters a row of the opening holds at a card width: a deliberately wide 7.5 px a character (Geist at 12.5 px averages
+ *  about 6.3, and wrapping breaks at words), so the estimate never fits more than the box shows; at most 106 (a 320 cap). */
+export function openingRowChars(width, narrow = width < 480) {
+  return Math.max(20, Math.min(106, Math.floor((width - (narrow ? 32 : 40)) / 7.5)));
+}
+/** The first `rows` rows of `text` at `perRow` characters a row: whole lines while they fit, then the start of the next line
+ *  at a word with "…". `rest` is exactly what was not shown (the cut line's remainder, then the later lines). */
+function cutToRows(text, rows, perRow) {
+  const lines = text.split("\n"), shown = [];
+  let left = rows, i = 0, tail = "";
+  for (; i < lines.length && left > 0; i++) {
+    const need = Math.max(1, Math.ceil(lines[i].length / perRow));
+    if (need <= left) { shown.push(lines[i]); left -= need; continue; }
+    const room = left * perRow - 1, head = lines[i].slice(0, room), space = head.lastIndexOf(" ");
+    const keep = space > room / 2 ? head.slice(0, space) : head;
+    shown.push(`${keep.trimEnd()}…`); tail = lines[i].slice(keep.length).trimStart(); i++;
+    break;
+  }
+  const after = lines.slice(i);
+  return { shown: shown.join("\n"), rest: [tail, ...after].filter((line, j) => j > 0 || line).join("\n"), moreLines: after.length, cut: Boolean(tail) };
+}
+/** The muted line under a cut opening: "<n> more lines in Details", or "More in Details" when only wrapping overflows. */
+export function openingMoreText(moreLines, wrapsOver) {
+  return moreLines > 0 ? `${moreLines} more ${moreLines === 1 ? "line" : "lines"} in Details` : wrapsOver ? "More in Details" : null;
 }
 
 /** One request id each, plus prompt-only seats. A seat's attributed asks replace its extra prompt count. */
@@ -185,6 +225,7 @@ export function needsRequestCount(topology = [], items = []) {
   const ids = new Set(), attributed = new Set();
   for (const item of filterAttentionHealth(items)) {
     if (!item?.id || isUpdateNeed(item) || ["done", "closed", "denied", "canceled", "handed-off"].includes(item.state)) continue;
+    if (sweepFinding(item)) continue; // OpenRig's check on another row: counted apart (needsCheckCount), and its sender asked nothing
     ids.add(item.id);
     const session = item.answer?.verb === "resolve" || item.reply === "resolve" ? item.waiting?.owner ?? item.destinationSession : item.asker ?? item.sourceSession;
     if (session) attributed.add(session);
@@ -197,6 +238,69 @@ export function needsRequestCount(topology = [], items = []) {
   return ids.size;
 }
 
+/** The height of one line of page text (12.5 px type), and of the empty line a blank source line draws. */
+export const TEXT_LINE_HEIGHT = 20;
+const escapeHtml = (text) => String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+/** Already-escaped line HTML with its leading and repeated spaces visible; an empty line keeps its row. */
+const visibleSpaces = (html) => html.replace(/^ +/, (s) => "&nbsp;".repeat(s.length)).replace(/ {2,}/g, (s) => ` ${"&nbsp;".repeat(s.length - 1)}`) || "&nbsp;";
+/** A text's lines as people wrote them; one trailing line ending ends the last line rather than starting an empty one. */
+export function sourceLines(text) {
+  return String(text).replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n");
+}
+/** Daemon text escaped for TextView.html, one entry per source line. A single line stays exactly one escaped run. */
+export function escapedLines(text) {
+  const lines = sourceLines(text);
+  return lines.length === 1 ? [escapeHtml(lines[0])] : lines.map((line) => visibleSpaces(escapeHtml(line)));
+}
+/** Lines as people wrote them: one selectable TextView per line, stacked with no gap at TEXT_LINE_HEIGHT. Herdr's HTML view
+ *  draws <br> as an empty block and runs the lines around it together, and gives separate HTML blocks a paragraph gap, so
+ *  neither keeps the source's lines. A blank source line is one empty line, the only paragraph break. The column carries no
+ *  text style of its own: callers style it (title, dim, a colour or font) and every line inherits that. */
+export function textLinesView(lines, { TextView, v_flex, id }) {
+  return v_flex().id(id).gap(0).min_w(0).line_height(`${TEXT_LINE_HEIGHT}px`)
+    .children(lines.map((html, i) => TextView.html(`${id}-line-${i}`, html).selectable(true).scrollable(false)));
+}
+/** OpenRig's stuck-sweep finding: its check on another row, not a new request. Known only by the daemon's own tags (`stuck-sweep-finding`,
+ *  with `recovery-for:<row>` for one stuck row, or `stuck-sweep:unclaimed-backlog:<seat>` for a seat's unclaimed rows), never by its summary
+ *  text, and never by its sender (the stuck row's own creator). Null for anything else. */
+export const SWEEP_FINDING_TAG = "stuck-sweep-finding";
+const RECOVERY_FOR = "recovery-for:", BACKLOG_OF = "stuck-sweep:unclaimed-backlog:";
+export function sweepFinding(item) {
+  const tags = Array.isArray(item?.tags) ? item.tags.filter((tag) => typeof tag === "string") : [];
+  if (!tags.includes(SWEEP_FINDING_TAG)) return null;
+  const about = tags.find((tag) => tag.startsWith(RECOVERY_FOR))?.slice(RECOVERY_FOR.length) || null;
+  const backlogSeat = about ? null : tags.find((tag) => tag.startsWith(BACKLOG_OF))?.slice(BACKLOG_OF.length) || null;
+  return { about, backlogSeat, ...(item.conn?{conn:item.conn}:{}) };
+}
+/** A seat as people read it: the logical id from its session (`api-worker@demo` reads `api.worker`). */
+const seatWord = (session) => String(session ?? "").split("@")[0].replace(/-/g, ".") || "a seat";
+/** The seat a backlog notice is about, as people read it, with its rig (from `<seat>@<rig>`). */
+export function checkSeat(finding) {
+  const session = String(finding?.backlogSeat ?? ""), at = session.lastIndexOf("@");
+  return { name: seatWord(session), session: session || null, rig: at > 0 ? session.slice(at + 1) : null };
+}
+/** The row a check names, as its headline (id-free, like any row text), from the rows at hand; "a stalled row" when it isn't loaded. */
+export function checkedRowHeadline(finding, rows = []) {
+  const row = finding?.about ? (rows ?? []).find((r) => r && (!finding.conn||r.conn===finding.conn) && (r.qitemId === finding.about || r.id === `queue:${finding.about}` || r.id === finding.about)) : null;
+  return row ? requestHeadline(row) : "a stalled row";
+}
+/** A check's label in every list: "Check on: <row>", or for a seat's unclaimed rows "Check on: <seat>'s unclaimed rows". */
+export function checkLabel(finding, rows = []) {
+  return finding?.backlogSeat ? `Check on: ${seatWord(finding.backlogSeat)}'s unclaimed rows` : `Check on: ${checkedRowHeadline(finding, rows)}`;
+}
+/** Why OpenRig made the check: its summary after the first colon ("it stalled after it was picked up (63 minutes)"), id-free. */
+export function checkReason(item) {
+  const text = rowText(item?.summary ?? ""), at = text.indexOf(":");
+  return at >= 0 ? text.slice(at + 1).trim() : "";
+}
+/** The open checks among Needs items, each once. */
+export function needsCheckCount(items = []) {
+  return new Set((items ?? []).filter((item) => item?.id && !isUpdateNeed(item) && sweepFinding(item)
+    && !["done", "closed", "denied", "canceled", "handed-off"].includes(item.state)).map((item) => item.id)).size;
+}
+/** " · 1 check" / " · 3 checks" after a requests count, and nothing when there are none. */
+export const checksSuffix = (n) => n > 0 ? ` · ${n} ${n === 1 ? "check" : "checks"}` : "";
+
 /** Small request-detail Markdown view. Host constructors are injected to keep this library host-independent.
  * Daemon text is escaped FIRST. Only our p/br/strong/code/ul/ol/li tags can enter TextView.html;
  * links, images, raw HTML and entities never become active content. TextView paragraphs stay selectable;
@@ -207,31 +311,40 @@ export function requestMarkdownView(text, { TextView, div, v_flex, id = "request
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const inline = (s) => s.split(/(`[^`\n]+`)/g).map((part) => part.startsWith("`") && part.endsWith("`")
     ? `<code>${part.slice(1, -1)}</code>` : part.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")).join("");
-  let html = "", paragraph = [], list = null;
+  // Each block remembers whether a blank source line came before it: that, and only that, is a paragraph break.
+  let html = "", paragraph = [], list = null, blank = false, htmlBlank = false, paraBlank = false;
   const blocks = [];
-  const flushHtml = () => { if (html) { blocks.push({ html }); html = ""; } };
-  const flushParagraph = () => { if (paragraph.length) { html += `<p>${paragraph.map(inline).join("<br>")}</p>`; paragraph = []; flushHtml(); } };
+  const flushHtml = () => { if (html) { blocks.push({ html, afterBlank: htmlBlank }); html = ""; } };
+  // A paragraph of several lines keeps them, one TextView per line with no gap (see textLinesView); one line stays one <p>.
+  const flushParagraph = () => { if (paragraph.length) { if (paragraph.length === 1) { htmlBlank = paraBlank; html += `<p>${inline(paragraph[0])}</p>`; } else { flushHtml(); blocks.push({ lines: paragraph.map((line) => visibleSpaces(inline(line))), afterBlank: paraBlank }); } paragraph = []; flushHtml(); } };
   const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
   for (const line of escaped.replace(/\r\n?/g, "\n").split("\n")) {
-    if (!line.trim()) { flushParagraph(); closeList(); flushHtml(); continue; }
+    if (!line.trim()) { flushParagraph(); closeList(); flushHtml(); blank = true; continue; }
     const heading = /^\s*(?:\*\*([^*]+)\*\*\s*|#{1,6}\s+(.+?))\s*$/.exec(line);
     if (heading) {
       flushParagraph(); closeList(); flushHtml();
       // Decode only the entities we introduced, once; div.child is plain text, never HTML.
       const plain = (heading[1] ?? heading[2]).replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
-      blocks.push({ heading: plain, size: /^\s*#\s/.test(line) ? 15 : 14 }); continue;
+      blocks.push({ heading: plain, size: /^\s*#\s/.test(line) ? 15 : 14, afterBlank: blank }); blank = false; continue;
     }
     const bullet = /^\s*(?:([-*])\s+|(\d+)\.\s+)(.*)$/.exec(line);
     if (bullet) {
       flushParagraph(); const kind = bullet[1] ? "ul" : "ol";
+      if (!html) { htmlBlank = blank; blank = false; }
       if (list !== kind) { closeList(); html += kind === "ol" ? `<ol start="${Number(bullet[2]) || 1}">` : "<ul>"; list = kind; }
       html += `<li>${inline(bullet[3])}</li>`;
-    } else { closeList(); flushHtml(); paragraph.push(line); }
+    } else { closeList(); flushHtml(); if (!paragraph.length) { paraBlank = blank; blank = false; } paragraph.push(line); }
   }
   flushParagraph(); closeList(); flushHtml();
-  return v_flex().id(id).gap(6).children(blocks.map((block, i) => block.heading !== undefined
-    ? div().id(`${id}-${i}`).font_semibold().text_size(block.size).pt(8).pb(2).child(block.heading)
-    : TextView.html(`${id}-${i}`, block.html).selectable(true).scrollable(false)));
+  // A blank source line is one empty line (TEXT_LINE_HEIGHT), as in plain() text; blocks with no blank line between them keep 6 px.
+  // The space sits on the block itself (a top margin); only a native TextView, which takes no margin, gets a wrapper.
+  return v_flex().id(id).gap(0).children(blocks.map((block, i) => {
+    const space = i === 0 ? 0 : block.afterBlank ? TEXT_LINE_HEIGHT : 6;
+    if (block.heading !== undefined) return div().id(`${id}-${i}`).font_semibold().text_size(block.size).pt(8).pb(2).mt(space).child(block.heading);
+    if (block.lines) return textLinesView(block.lines, { TextView, v_flex, id: `${id}-${i}` }).mt(space);
+    const view = TextView.html(`${id}-${i}`, block.html).selectable(true).scrollable(false);
+    return space ? div().mt(space).child(view) : view;
+  }));
 }
 
 /** The current parked work belongs to its destination, independently of who asked or answers. */
@@ -1095,6 +1208,45 @@ export function cliEnv(config) {
  * Open view / Follow / Prune / Close (`terminal open | close | keyboard`), and Start OpenRig (`daemon start`)
  * do not attribute an actor and are allowed without `person`.
  */
+/** Released guards store interruption levels over coarse hold, not in a `mode` field. */
+export function typingGuardState(value) {
+  if (!value || typeof value !== "object" || !["off","draft-aware","hold"].includes(value.desiredMode) || !["off","draft-aware","hold"].includes(value.effectiveMode)) return null;
+  const level = value.effectiveLevel ?? value.desiredLevel ?? value.effectiveMode ?? value.desiredMode;
+  return { word: level === "queue-only" ? "Quiet while I type" : level === "off" ? "Off" : String(level ?? "not reported"),
+    checked: value.desiredLevel === "queue-only" && value.effectiveLevel === "queue-only" && !value.pending,
+    pending: value.pending === true, heldCount: Number.isSafeInteger(value.heldCount) && value.heldCount > 0 ? value.heldCount : 0,
+    treatedAsHold: value.desiredMode === "hold" && !value.desiredLevel };
+}
+
+export function heldMessageText(value, limit = 65536, {body=false,maxLines=400} = {}) {
+  const raw=String(value??"");
+  const clean = body ? raw.replace(/\r\n?|[\u2028\u2029]/g,"\n").replace(/\t/g," ").replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, "").replace(/\n(?: *\n){3,}/g,"\n\n\n")
+    : raw.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, "");
+  let text = "", bytes = 0, lines = 1;
+  for (const char of clean) {
+    if(body&&char==='\n'&&lines>=maxLines)return{text,truncated:true,lineLimit:true};
+    const point = char.codePointAt(0);
+    if (point >= 0xd800 && point <= 0xdfff) continue;
+    const width = point < 128 ? 1 : point < 2048 ? 2 : point < 65536 ? 3 : 4;
+    if (bytes + width > limit) return { text, truncated: true };
+    bytes += width; text += char;if(char==='\n')lines++;
+  }
+  return { text, truncated: false };
+}
+
+export function heldMessagePage(total, shown = 0) {
+  const remaining = Math.max(0, (Number.isSafeInteger(total) ? total : 0) - shown);
+  const limit = Math.min(20, remaining);
+  return { offset: Math.max(0, remaining - limit), limit };
+}
+
+/** Deliberately unattributed: unlike a send, a preference must never impersonate an inherited seat or the person. */
+export function typingGuardCommand(config, seat, mode) {
+  if (!config || config.configInvalid || !["off", "queue-only"].includes(mode) || !isValidSessionName(seat) || String(config?.daemonUrl ?? "").startsWith("herdr://")) return null;
+  return writeCommand({ ...config, person: null }, ["seat", "set-typing-guard", "--mode", mode, "--reason",
+    mode === "queue-only" ? "Quiet while typing (set from Herdrig)" : "Quiet while typing turned off (set from Herdrig)", "--", seat]);
+}
+
 export function requiresPersonForWrite(args = []) {
   const first = String(args?.[0] ?? "");
   const second = String(args?.[1] ?? "");
@@ -1649,31 +1801,14 @@ export const followName = (view) => String(view ?? "").replace(/^rig:/, "");
 /** Harnesses offered in the seat hot-swap dialog. */
 export const SWAP_RUNTIMES = Object.freeze(["claude-code", "codex", "copilot", "agy", "omp", "pi"]);
 
-/** Known models per harness (`Fable` is strictly excluded everywhere). */
-export const SWAP_MODELS_BY_RUNTIME = Object.freeze({
-  "claude-code": Object.freeze(["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]),
-  codex: Object.freeze(["gpt-5.4", "gpt-5.3-codex", "gpt-5.2-codex", "o3"]),
-  copilot: Object.freeze(["claude-sonnet-4.6", "claude-opus-4.6", "gpt-5.4", "gemini-2.5-pro"]),
-  omp: Object.freeze(["claude-sonnet-4-6", "gpt-5.4", "kimi-k2.5", "gemini-2.5-pro"]),
-  pi: Object.freeze(["claude-sonnet-4-6", "gpt-5.4", "gemini-2.5-pro"]),
-  agy: Object.freeze([]),
-});
-
-/** Effort levels per harness (`agy` has none — lives in `agy`'s own settings). */
-export const SWAP_EFFORTS_BY_RUNTIME = Object.freeze({
-  "claude-code": Object.freeze(["low", "medium", "high", "max"]),
-  codex: Object.freeze(["low", "medium", "high", "max"]),
-  copilot: Object.freeze(["low", "medium", "high"]),
-  omp: Object.freeze(["low", "medium", "high"]),
-  pi: Object.freeze(["low", "medium", "high"]),
-  agy: Object.freeze([]),
-});
+const SWAP_EFFORT_TOKENS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const swapModelId = value => typeof value === "string" && /^[a-z0-9][a-z0-9._:/-]{0,159}$/i.test(value);
 
 /** Filter a model list so `Fable` is never offered in the UI or any launcher path. */
 export function filterAllowedModels(models) {
   return (Array.isArray(models) ? models : [])
     .map((m) => String(m ?? "").trim())
-    .filter((m) => m.length > 0 && !/fable/i.test(m));
+    .filter((m) => swapModelId(m) && !/fable/i.test(m));
 }
 
 /**
@@ -1700,46 +1835,55 @@ export function changeModelPlan(target = {}, pick = {}, extra = null) {
   const logicalId = oneLine(target.logicalId ?? (typeof target.session === "string" ? target.session.split("@")[0].replace(/-/g, ".") : "seat"));
   const session = oneLine(target.session ?? `${logicalId.replace(/\./g, "-")}@${rig}`);
   const pod = oneLine(String(target.pod ?? (logicalId.includes(".") ? logicalId.split(".")[0] : "dev")).trim() || "dev");
-  const isLeadTarget = logicalId === "orch.lead" || session.startsWith("orch-lead@");
+  const representative = Object.hasOwn(extra ?? {}, "representative") ? extra.representative : target.representative;
+  const leadSession = isValidSessionName(representative) && /^[^@]+@[^@]+$/.test(representative) ? representative : null;
+  const isLeadTarget = session === leadSession;
   const seats = Array.isArray(extra)
     ? (extra.find((r) => r.name === rig || r.id === rig)?.pods ?? []).flatMap((p) => p.seats ?? [])
-    : (Array.isArray(extra?.seats) ? extra.seats : []);
-  const hasExplicitSeats = seats.length > 0;
-  const leadSeat = seats.find((s) => s.logicalId === "orch.lead" || String(s.session ?? "").startsWith("orch-lead@"));
+    : (Array.isArray(extra?.seats ?? target.seats) ? (extra?.seats ?? target.seats) : []);
   const advisorSeat = seats.find((s) => s.logicalId === "orch.advisor" || String(s.session ?? "").startsWith("orch-advisor@"));
   const destinationRole = isLeadTarget ? "advisor" : "lead";
-  const destinationLogicalId = isLeadTarget ? "orch.advisor" : "orch.lead";
+  const destinationLogicalId = isLeadTarget ? advisorSeat?.logicalId ?? "advisor"
+    : seats.find((s) => s.session === leadSession)?.logicalId ?? "lead";
   const destinationSession = isLeadTarget
-    ? (target.advisorSession ?? advisorSeat?.session ?? (hasExplicitSeats ? null : `orch-advisor@${rig}`))
-    : (target.leadSession ?? leadSeat?.session ?? (hasExplicitSeats ? null : `orch-lead@${rig}`));
+    ? advisorSeat?.session ?? null
+    : leadSession;
   const routingError = destinationSession
     ? null
+    : typeof representative === "string" && representative && !leadSession
+      ? `OpenRig reported a lead herdrig can't address (${oneLine(representative).slice(0, 200)}). Nothing was queued.`
+    : !isLeadTarget ? `OpenRig didn't report a lead for ${rig}. Nothing was queued.`
     : `No running ${destinationLogicalId} seat found in ${rig} to route the swap.`;
   const buttonLabel = isLeadTarget ? "Queue for advisor" : "Queue for lead";
   const routeNote = routingError
     ? routingError
     : isLeadTarget
-      ? `Routes to ${destinationSession}; the advisor applies the swap because orch.lead cannot safely swap mid-turn.`
+      ? `Routes to ${destinationSession}; the advisor applies the swap because the lead cannot safely swap mid-turn.`
       : `Routes to ${destinationSession}; the lead applies the swap around in-flight work.`;
 
   const curRuntime = String(target.runtime || target.currentRuntime || "claude-code").trim();
   const curModel = target.model ?? target.currentModel ?? null;
   const curEffort = target.effort ?? target.currentEffort ?? null;
   const nextRuntime = String(pick.runtime || curRuntime).trim();
+  const sameHarness = nextRuntime === curRuntime;
   const isAgy = nextRuntime === "agy";
-  const requestedModel = pick.model !== undefined ? String(pick.model ?? "").trim() : null;
+  const requestedModel = pick.model === undefined ? (sameHarness ? curModel : null) : pick.model;
   const error = requestedModel && /fable/i.test(requestedModel)
     ? "Fable is not offered in the model picker or launcher."
-    : null;
-  const allowedModels = filterAllowedModels(SWAP_MODELS_BY_RUNTIME[nextRuntime] ?? []);
-  const rawModel = isAgy ? null : String(pick.model ?? curModel ?? allowedModels[0] ?? "").trim();
-  const nextModel = rawModel && !/fable/i.test(rawModel) ? rawModel : (allowedModels[0] ?? null);
-  const allowedEfforts = SWAP_EFFORTS_BY_RUNTIME[nextRuntime] ?? [];
-  const nextEffort = isAgy ? null : (allowedEfforts.includes(pick.effort) ? pick.effort : (allowedEfforts.includes(curEffort) ? curEffort : (allowedEfforts[2] ?? allowedEfforts[0] ?? null)));
+    : requestedModel && !swapModelId(requestedModel) ? "Enter a model ID with letters, numbers, or model ID punctuation."
+    : !SWAP_RUNTIMES.includes(nextRuntime) ? "This harness isn't available for a swap." : null;
+  const models = Array.isArray(extra?.catalog?.models) ? extra.catalog.models : [];
+  const allowedModels = filterAllowedModels(models.map(model => model?.id));
+  const nextModel = isAgy || error ? null : requestedModel || null;
+  const reportedEfforts = models.find(model => model?.id === nextModel)?.efforts ?? extra?.catalog?.runtimeEfforts;
+  const allowedEfforts = Array.isArray(reportedEfforts) ? reportedEfforts.filter(level => SWAP_EFFORT_TOKENS.has(level)) : [];
+  const requestedEffort = pick.effort === undefined ? (sameHarness ? curEffort : null) : pick.effort;
+  const knownEffort = SWAP_EFFORT_TOKENS.has(requestedEffort)
+    && (!Array.isArray(reportedEfforts) || allowedEfforts.includes(requestedEffort) || sameHarness && requestedEffort === curEffort);
+  const nextEffort = isAgy || !knownEffort ? null : requestedEffort;
   const reason = String(pick.reason ?? target.reason ?? "").trim() || "hot-swap from the Rig mod";
   const updateSpec = pick.updateSpec !== false;
 
-  const sameHarness = nextRuntime === curRuntime;
   const isNativePair = (curRuntime === "codex" && nextRuntime === "claude-code") || (curRuntime === "claude-code" && nextRuntime === "codex");
   const isFreshCross = !sameHarness && (isAgy || curRuntime === "agy");
 
@@ -1786,15 +1930,15 @@ export function changeModelPlan(target = {}, pick = {}, extra = null) {
   const tierLabel = `Tier ${tier} · ${badge}`;
   const setCmd = `rig seat set ${shq(`${logicalId}@${rig}`)} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""}`;
   const summary = `[model-swap] ${logicalId}: Seat hot-swap (${tierShort}) → ${pickDesc}`;
-  const fallbackRecipient = destinationSession ?? `orch-lead@${rig}`;
+  const fallbackRecipient = destinationSession;
   const procedureLines = tier === 1
     ? [
         ...(nextEffort ? [`rig seat set-effort ${shq(session)} --effort ${nextEffort}`] : []),
-        ...(nextModel ? [`rig seat set-model ${shq(session)} --model ${nextModel}`, `rig send ${shq(session)} "/model ${nextModel}"`] : []),
+        ...(nextModel ? [`rig seat set-model ${shq(session)} --model ${nextModel}`, `rig send ${shq(session)} ${shq(`/model ${nextModel}`)}`] : []),
       ]
     : tier === 2
       ? [
-          `rig seat set-runtime ${shq(session)} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""} --reason ${JSON.stringify(reason)}`,
+          `rig seat set-runtime ${shq(session)} --runtime ${nextRuntime}${nextModel ? ` --model ${nextModel}` : ""}${nextEffort ? ` --effort ${nextEffort}` : ""} --reason ${shq(reason)}`,
         ]
       : [
           `1. Save handover packet: rig transcript ${shq(session)} --tail 120 > ${shq(`workspace/handover/${logicalId}-${nextRuntime}.md`)}`,
@@ -1892,12 +2036,12 @@ export function actionArgs(target, action, text, home) {
     case "change-model": {
       const plan = changeModelPlan(target, {
         runtime: target.nextRuntime ?? target.swapRuntime ?? target.runtime,
-        model: target.nextModel ?? target.swapModel ?? target.model,
-        effort: target.nextEffort ?? target.swapEffort ?? target.effort,
+        model: target.nextModel !== undefined ? target.nextModel : target.swapModel,
+        effort: target.nextEffort !== undefined ? target.nextEffort : target.swapEffort,
         reason: text || target.reason,
         updateSpec: target.updateSpec,
-      });
-      if (!isValidSessionName(plan.destinationSession)) return null;
+      }, { seats: target.seats, catalog: target.catalog });
+      if (plan.error || !isValidSessionName(plan.destinationSession)) return null;
       return ["queue", "create", "--destination", plan.destinationSession, "--summary", plan.summary, "--body", plan.body];
     }
     case "open-view": case "open-seat": case "follow": case "unfollow": case "prune": case "open-designed-view": return null;
@@ -1934,12 +2078,20 @@ export function writeOutcome(r) {
     || !json && /^(?:Recorded|Retained), not delivered to /u.test(String(r?.stdout ?? "").trimStart());
   const consequence = typeof json?.error?.consequence === "string" ? json.error.consequence.trim() : "";
   const stderrText = String(r?.stderr ?? "");
+  const reason = json?.error?.fact ?? json?.error?.message ?? (typeof json?.error === "string" ? json.error : null) ?? json?.message;
+  // Installed OpenRig 0.7.19's session/transport refusals carry this pair. Older receipts may only carry its exact
+  // sentence. Neither proof can override custody, a reached input phase, or an explicitly uncertain outcome.
+  const cannotRetry = r?.outcomeUnknown === true || json?.outcomeUnknown === true || json?.uncertain === true
+    || ["recorded", "retained"].includes(json?.outcome) || json?.sent === true
+    || (typeof json?.inputPhase === "string" && json.inputPhase !== "not_reached");
+  const inputNotReached = json?.ok === false && json?.sent === false && json?.inputPhase === "not_reached";
+  const noTextReceipt = Number.isInteger(r?.code) && r.code > 0 && (json?.ok === false || !json)
+    && /(?:^|[.!?]\s+)No text was sent\.(?:\s|$)/u.test(String(json ? reason ?? "" : stderrText));
   const cliUnsent = /^(?:The message was not sent\.|The command was not delivered\.(?:\s|$)|This command needs a running daemon\.|(?:The (?:queue|coordination) command|rig [a-z -]+) did not run[;,] (?:the )?daemon was not contacted(?:, and nothing was persisted)?\.)$/i.test(consequence)
     || (!json && /^Error: Daemon not running\.\s+This command needs a running daemon\./m.test(stderrText))
     || /^No row was created:/m.test(stderrText);
-  const notSent = cliUnsent && !undelivered;
+  const notSent = (inputNotReached || noTextReceipt || cliUnsent) && !undelivered && !cannotRetry;
   const failed = r?.code !== 0 || json?.ok === false || notSent || undelivered;
-  const reason = json?.error?.fact ?? json?.error?.message ?? (typeof json?.error === "string" ? json.error : null) ?? json?.message;
   const text = undelivered ? (json ? [`${json.outcome === "retained" ? "Retained" : "Recorded"}, not delivered to ${json.sessionName ?? json.destinationStatus?.destinationSession ?? "the destination"}.`, json.destinationStatus?.message].filter(Boolean).join("\n") : r.stdout)
     : failed ? (reason ?? (json ? rigStoppedMaybeDone(r?.code) : (r?.stderr || r?.stdout || rigStoppedMaybeDone(r?.code)))) : (json ? json.message ?? "" : plainOutcome(r?.stdout));
   // Queue creation is successful when its row persists even if the destination cannot be nudged. Keep that success,
@@ -2003,7 +2155,7 @@ export function oneClickBusyKey(target, action, actionKey = null) {
  * `shared("rig.oneclick")`, keyed by a request id so two senders never drop each other's.
  */
 export function startOneClick(host, target, action, actionKey = null) {
-  if (!layoutHasMod(host.layout(), MOD_IDS.sidebar)) {
+  if (!layoutShowsMod(host.layout(), MOD_IDS.sidebar)) {
     return host.openOverlay({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height: 240, props: { target, step: { action, run: true } } });
   }
   const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -2080,9 +2232,92 @@ export function isTerminalSeat(node) {
   return node?.nodeKind === "infrastructure" || node?.runtime === "terminal";
 }
 
+/** The tmux socket a seat's node names with `-S` in `tmuxServerArgs` (OpenRig 0.7.20 nodes), else null (`-L name` or the default server). */
+export function tmuxSocketOf(node) {
+  const args = Array.isArray(node?.tmuxServerArgs) ? node.tmuxServerArgs : [];
+  const at = args.indexOf("-S");
+  return at >= 0 && typeof args[at + 1] === "string" && args[at + 1] ? args[at + 1] : null;
+}
+/** The tmux servers an OpenRig reports unreachable (`/healthz.terminals`, 0.7.20), each with the seats on it, or null when there is none: an
+ *  older OpenRig (no `terminals`), its healthy readings, and a server back to `reachable` (OpenRig keeps a recovered server listed) all read null.
+ *  A seat is on a server when its node's `-S` socket is the server's socket; a seat with no `-S` only when exactly one server is listed (else
+ *  no seat is guessed, and the server is still reported). `nodesByRig`: rig id -> nodes. */
+export function terminalOutage(healthz, nodesByRig = {}) {
+  const servers = Array.isArray(healthz?.terminals?.servers) ? healthz.terminals.servers.filter((s) => s && typeof s.socket === "string") : [];
+  const gone = servers.filter((s) => s.state === "unreachable");
+  if (!gone.length) return null;
+  const nodes = Object.values(nodesByRig ?? {}).flatMap((list) => (Array.isArray(list) ? list : []));
+  const only = servers.length === 1;
+  const nameOf = (socket) => (only ? "this OpenRig's tmux server" : socket.split("/").filter(Boolean).slice(-2).join("/"));
+  return { servers: gone.map((s) => ({ socket: s.socket, name: nameOf(s.socket), since: s.since ?? null, cause: s.cause ?? null,
+    // A tmux seat with no -S: attachmentType "tmux" (OpenRig omits tmuxServerArgs on its default server), or args with no attachment named
+    // (never another attachment type's node). A paused or downed seat has no attachment and no args, so it is never marked.
+    seats: [...new Set(nodes.filter((n) => n?.canonicalSessionName
+      && (tmuxSocketOf(n) ? tmuxSocketOf(n) === s.socket : only && (n.attachmentType === "tmux" || (!n.attachmentType && Array.isArray(n.tmuxServerArgs))))).map((n) => n.canonicalSessionName))] })) };
+}
+/** `nodes` with the seats of `outage` marked `terminalServerGone`: the same array when none is affected (so what is built from it stays as it
+ *  was), else a new one where only the affected nodes are copies. */
+export function withTerminalOutage(nodes, outage) {
+  if (!outage || !Array.isArray(nodes)) return nodes;
+  const gone = new Set(outage.servers.flatMap((s) => s.seats));
+  if (!nodes.some((n) => gone.has(n?.canonicalSessionName))) return nodes;
+  return nodes.map((n) => (gone.has(n?.canonicalSessionName) ? { ...n, terminalServerGone: true } : n));
+}
+/** `/healthz` as herdrig keeps it: the terminal servers without `lastCheckedAt`, which OpenRig moves on every probe (every 5 s during an outage)
+ *  and herdrig never shows. What is kept (state, since, cause, transitions) changes only when something did, so a refresh that read the same
+ *  outage publishes nothing new and what is built from it is reused. Everything else is as read. */
+export function steadyHealthz(healthz) {
+  const servers = healthz?.terminals?.servers;
+  if (!Array.isArray(servers)) return healthz;
+  return { ...healthz, terminals: { ...healthz.terminals, servers: servers.map((s) => { if (!s || typeof s !== "object") return s; const { lastCheckedAt: _probe, ...kept } = s; return kept; }) } };
+}
+/** The words an "unreachable" seat's status carries on hover. */
+export const TERMINAL_GONE_TOOLTIP = "This seat's tmux server stopped answering. OpenRig holds automatic messages to it and checks again on its own; it doesn't restart the server.";
+/** Why Focus pane, Attach and Open terminal are off for an unreachable seat. */
+export const TERMINAL_GONE_REASON = "Its terminal server isn't answering.";
+/** The line Send's dialog adds for an unreachable seat: OpenRig holds only automatic delivery, so an explicit send is still tried. */
+export const TERMINAL_GONE_SEND_NOTE = "Its terminal isn't answering. OpenRig will try once, but it may not arrive.";
+/** The Rig page's notice for `n` unreachable seats; on another machine it says where to run `rig doctor`. */
+export function terminalOutageNotice(n, machine = null) {
+  const lead = n === 1 ? "1 seat can't be reached: its terminal server stopped answering. OpenRig is holding automatic messages to it and checking again on its own."
+    : `${counted(n, "seat", "seats")} can't be reached: their terminal server stopped answering. OpenRig is holding automatic messages to them and checking again on its own.`;
+  return machine ? `${lead} Run rig doctor on ${machine}.` : lead;
+}
+/** System › Health's row for one unreachable server of terminalOutage (its socket goes in the tooltip, never in the text). */
+export function terminalServerRowText(server) {
+  const who = server.name === "this OpenRig's tmux server" ? "This OpenRig's tmux server" : `Terminal server ${server.name}`;
+  return `${who} isn't answering · ${counted(server.seats.length, "seat", "seats")} · OpenRig keeps checking on its own`;
+}
+/** The seat page's line under its heading while its server isn't answering. */
+export function terminalGoneSeatLine(session) {
+  return `The terminal server holding ${session} stopped answering. OpenRig holds automatic messages to it and checks again on its own. Its conversation may still be there once the server is back.`;
+}
+/** The one notification when a server's seats stop being reachable: a short title (a toast truncates it), and a body naming the rigs and,
+ *  for a connection on another machine, where. */
+export function terminalLossTitle(n) {
+  return `${counted(n, "seat", "seats")} can't be reached`;
+}
+/** One toast line of about 45 characters, the cause first so only a long rig name is cut: "tmux not answering: demo", "… demo and lab", or
+ *  "… demo and 2 more", in the order given. A connection on another machine names it ("tmux on box2 not answering: …"). The Rig page notice
+ *  says what OpenRig does meanwhile. */
+export function terminalLossBody(rigs, machine = null) {
+  const names = (Array.isArray(rigs) ? rigs : [rigs]).filter(Boolean);
+  const list = names.length <= 1 ? (names[0] ?? "") : names.length === 2 ? `${names[0]} and ${names[1]}` : `${names[0]} and ${names.length - 1} more`;
+  return `tmux ${machine ? `on ${machine} ` : ""}not answering: ${list}`;
+}
+/** Why a rig's Worker view and Follow are off: every one of its seats sits on a tmux server that stopped answering. */
+export const TERMINAL_GONE_RIG_REASON = "This rig's terminal server isn't answering.";
+/** Whether every seat of a rig (a topology entry with pods of seats) reads unreachable; false for a rig with no seats. */
+export function rigTerminalsGone(rig) {
+  const seats = (rig?.pods ?? []).flatMap((pod) => pod?.seats ?? []);
+  return seats.length > 0 && seats.every((seat) => seat?.status === "terminal_gone");
+}
+
 /** The TUI's seat status (tui/src/hydrate.ts, the maintained web projection), from one `/api/rigs/:id/nodes` row. A
- *  running terminal seat is `terminal`, never `active`: its attention and lifecycle states still show. */
+ *  running terminal seat is `terminal`, never `active`: its attention and lifecycle states still show. A seat whose tmux server OpenRig reports
+ *  unreachable (`terminalServerGone`, see withTerminalOutage) is `terminal_gone`, over every other state: it says why nothing reaches it. */
 export function seatStatus(node) {
+  if (node?.terminalServerGone === true) return "terminal_gone";
   const act = node.activityState ?? {};
   if (node.identityVerdict?.reason === "session_missing" && node.sessionStatus === "detached" && node.lifecycleState !== "attention_required") return "detached";
   if (node.startupStatus === "failed") return "failed";
@@ -2111,6 +2346,8 @@ export function statusLook(status) {
     case "blocked": return { tone: "blocked", word: "blocked" };
     case "active": return { tone: "working", word: "working" };
     case "idle": return { tone: "idle", word: "idle" };
+    // Its own tone: drawn in the needs colour, never counted as needs you (it isn't a request) nor as idle.
+    case "terminal_gone": return { tone: "gone", word: "unreachable" };
     case "unknown": return { tone: "done", word: "not reported" };
     // Neutral: not counted as working, needs you or idle, and never raises a rig's dot.
     case "terminal": return { tone: "done", word: "terminal" };
@@ -2158,6 +2395,7 @@ export function statusMark(key) {
     case "active": case "working": return { shape: "glow", color: "ansi2", word: "ansi2" };
     case "needs_input": case "attention_required": case "blocked": return { shape: "diamond", color: "blocked", word: "blocked" };
     case "failed": return { shape: "cross", color: "blocked", word: "blocked" };
+    case "terminal_gone": case "gone": return { shape: "cross", color: "blocked", word: "blocked" };
     case "completed": return { shape: "check", color: "done", word: "done" };
     // The tone "done" is statusLook's for every seat that isn't running, so as a tone it reads stopped, not finished.
     case "done": case "stopped": case "detached": case "exited": return { shape: "square", color: "muted", word: "muted" };
@@ -2186,7 +2424,7 @@ export function statusMarkElement(ui, t, key, { cell = 14, iconOf, pulse = null 
           .when(pulse?.kind==="working",e=>e.id(pulse.elementId).transition("opacity",{duration:WORKING_STATUS_PULSE_MS,easing:"ease-out"})))
         .child(div().size(dot).rounded(dot).bg(c));
     case "diamond": return box.child(svg(iconOf("rig-diamond")).size(Math.round(cell * 0.64)).text_color(c));
-    case "cross": return box.child(div().text_size(Math.round(cell * 0.75)).text_color(c).child("✕"));
+    case "cross": return (key === "terminal_gone" || key === "gone" ? box.tooltip(TERMINAL_GONE_TOOLTIP) : box).child(div().text_size(Math.round(cell * 0.75)).text_color(c).child("✕"));
     case "check": return box.child(svg(iconOf("check")).size(Math.round(cell * 0.8)).text_color(c));
     case "square": return box.child(div().size(Math.round(cell / 2)).rounded(1).border(1.5).border_color(c));
     case "prompt": return box.child(svg(iconOf("rig-terminal-prompt")).size(Math.round(cell * 0.8)).text_color(c));
@@ -2232,7 +2470,8 @@ export function isRigStopped(lifecycle, seats = []) {
 
 /** The worst status among seats, for a rig's dot. */
 export function worstTone(tones) {
-  const rank = { blocked: 3, working: 2, idle: 1, done: 0 };
+  // A seat whose tmux server stopped answering is worse than working or idle (nothing reaches it), though not a request.
+  const rank = { blocked: 4, gone: 3, working: 2, idle: 1, done: 0 };
   return tones.reduce((worst, t) => (rank[t] ?? 0) > (rank[worst] ?? -1) ? t : worst, "done");
 }
 
@@ -2242,6 +2481,8 @@ export function rigTone(seats) {
   const list = seats ?? [];
   const agents = list.filter((s) => !s.terminal);
   const worst = agents.length ? worstTone(agents.map((s) => s.tone)) : "done";
+  // Terminal seats count here too: a terminal-only rig whose tmux server is gone reads gone, not stopped.
+  if (worst !== "blocked" && list.some((s) => s.tone === "gone")) return "gone";
   return worst === "done" && list.some((s) => s.terminal && s.status === "terminal") ? "terminal" : worst;
 }
 
@@ -2249,7 +2490,22 @@ export function rigTone(seats) {
 export const hostOf = (n) => n?.host ?? n?.hostSelfId ?? n?.hostId ?? null;
 
 /** Rigs → pods → seats, from `/api/rigs/summary` and each rig's `/api/rigs/:id/nodes`. */
-export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null) {
+/** OpenRig's representative can change with the rig roster, not with seat activity. */
+export async function readRigRepresentative(feed, get, rigId, nodes) {
+  if (!Array.isArray(nodes)) return null;
+  const roster = nodes.map((node) => JSON.stringify([node.nodeId, node.canonicalSessionName])).sort();
+  const key = JSON.stringify([feed.config?.daemonUrl, feed.config?.daemonMachine, feed.config?.openrigHome, roster]);
+  const cache = feed.rigRepresentatives ??= new Map();
+  const hit = cache.get(rigId);
+  if (hit?.key === key) return hit.session;
+  const detail = await get(`/api/rigs/${encodeURIComponent(rigId)}`).catch(rethrowGate(null));
+  if (detail?.rig?.id !== rigId || (detail.representative !== null && !isValidSessionName(detail.representative))) return null;
+  const session = detail.representative;
+  cache.set(rigId, { key, session });
+  return session;
+}
+
+export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null, representatives = {}) {
   // Native seats (placement: herdr) by session, with their live `hc run` children.
   const native = new Map((Array.isArray(nativeSeats) ? nativeSeats : []).map((s) => [s.sessionName, s]));
   return (summary ?? []).filter((r) => !r.archivedAt).map((rig) => {
@@ -2266,6 +2522,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null
         logicalId: n.logicalId,
         member: n.logicalId.includes(".") ? n.logicalId.slice(n.logicalId.indexOf(".") + 1) : n.logicalId,
         session: n.canonicalSessionName,
+        ...(representatives[rig.id] && n.canonicalSessionName === representatives[rig.id] ? { isRepresentative: true } : {}),
         sessionStatus: n.sessionStatus ?? null,
         runtime: n.runtime ?? null,
         terminal: isTerminalSeat(n),
@@ -2387,7 +2644,7 @@ export const needsYouText = (n) => `${n} ${needsYouWord(n)}`;
 /** Seat counts by status for a header or pod line: working, needs you (blocked), idle. */
 export function statusCounts(seats) {
   const n = (tone) => seats.filter((s) => s.tone === tone).length;
-  return { working: n("working"), needs: n("blocked"), idle: n("idle"), unreported: seats.filter(s=>s.status==="unknown").length };
+  return { working: n("working"), needs: n("blocked"), idle: n("idle"), unreported: seats.filter(s=>s.status==="unknown").length, ...(n("gone") ? { gone: n("gone") } : {}) };
 }
 
 /** What herdrig's Spaces list shows for rig spaces, published as the shared key `herdrig.spaces`: space id -> `{ home: true }` for the
@@ -3021,6 +3278,27 @@ export function asOf(date,timezone=null) {
   return `as of ${formatAbsoluteTime(date,{timezone})}`;
 }
 
+/** How the marker names the followed OpenRig when there are several: its machine, "This computer" for a local (or empty) address, and
+ *  "OpenRig's machine" for an unnamed remote one, as worker views name it. */
+export function followedOpenRigName(config) {
+  return config?.daemonMachine || (!config?.daemonUrl || isLoopbackDaemonUrl(config.daemonUrl) ? "This computer" : "OpenRig's machine");
+}
+
+/** The always-visible sidebar marker after a failed refresh while the sidebar still holds data: a fixed clock time from the last good
+ *  read (never "N min ago", so an outage never redraws it), the followed OpenRig's name when there are several, and a tooltip whose
+ *  first sentence is the failure's own plain reason when it has one. No good read yet: null (the cold-start state speaks instead). */
+export function notAnsweringMarker({at,timezone=null,name=null,reason=null}={}) {
+  if (!at) return null;
+  const time=formatAbsoluteTime(at,{timezone});
+  const first=String(reason??"").trim().match(/^[^.!?]*[.!?]/)?.[0]?.trim()??"";
+  const plain=first&&!/^Couldn't refresh OpenRig\b/i.test(first)?`${first} `:"";
+  return {
+    text:`${name?`${name} isn't answering`:"Not answering"} · as of ${time}`,
+    time,
+    tooltip:`${plain}OpenRig hasn't answered since ${time}. The rows below show what it said then. herdrig keeps checking on its own; Retry checks now.`,
+  };
+}
+
 /** Relative UI time with the exact source timestamp retained by the caller's tooltip. */
 export function relativeTimeText(at, now = Date.now()) {
   const stamp = typeof at === "number" ? at : Date.parse(at ?? "");
@@ -3353,8 +3631,7 @@ export function needSummary(item) {
  *  view renders), a Tab stop, a press that focuses it, and Enter, Space or " " that act only while it holds focus. `focusedStyle` draws the
  *  focus. The owner calls releaseFocusTargets(owner) in its close(). */
 // Owns BOTH activation handlers. Callers must not replace on_click afterward.
-export function focusTarget(owner, cx, id, el, act, focusedStyle = null, tip = null) {
-  const activation=activationPair(owner,id);
+export function focusHandleFor(owner,cx,id){
   const handles = (owner.focusTargets ??= new Map());
   let handle = handles.get(id);
   if (handle && !liveFocus(handle)) { handles.delete(id); handle = undefined; } // released elsewhere: made again below
@@ -3363,13 +3640,18 @@ export function focusTarget(owner, cx, id, el, act, focusedStyle = null, tip = n
     // Set from the draw, so the timer and the handle it makes are this view's own (see liveFocus).
     cx.timer.after(0, (next) => {
       owner.focusTargetsPending.delete(id);
-      if (owner.closed || owner.gone || handles.has(id) || !next?.focus_handle) return; // the owner closed while the handle was on its way
+      if (owner.closed || owner.gone || owner.expired || owner.disposed || owner.left || handles.has(id) || !next?.focus_handle) return; // the owner closed while the handle was on its way
       handles.set(id, next.focus_handle()); next.notify?.();
     });
   }
+  return handle;
+}
+export function focusTarget(owner, cx, id, el, act, focusedStyle = null, tip = null) {
+  const activation=activationPair(owner,id),handle=focusHandleFor(owner,cx,id);
+  owner.focusTargetDrawn?.(id,handle);
   return el.when(!!tip, e => e.tooltip(tip)).when(!!handle, e => e.track_focus(handle).tab_stop(true).tab_index(0))
     .when(Boolean(focusedStyle && handle?.is_focused?.()), e => focusedStyle(e))
-    .on_mouse_down("left", activation.pointer(() => { liveFocus(handle)?.focus?.(); }))
+    .on_mouse_down("left", activation.pointer((_event,cx) => { cx.stop_propagation?.(); liveFocus(handle)?.focus?.(); }))
     .on_click(activation.click((_event,cx)=>act(cx)))
     .on_key_down(activation.key((e, cx) => { if (handle?.is_focused?.() && ["enter", "space", " "].includes(e.key)) { cx.stop_propagation(); act(cx); } }));
 }
@@ -3387,6 +3669,13 @@ export function liveFocus(handle) {
 export function releaseFocusTargets(owner) {
   for (const handle of owner.focusTargets?.values() ?? []) { try { handle?.release?.(); } catch (_) {} }
   owner.focusTargets?.clear();
+}
+
+/** Error builders can run several helpers below render(). Expose only that
+ * synchronous draw's context; never retain it for an async continuation. */
+export function withFocusContext(owner,cx,draw){
+  const previous=owner.focusRenderCx;owner.focusRenderCx=cx;
+  try{return draw();}finally{owner.focusRenderCx=previous;}
 }
 
 export function needTarget(item) {
@@ -3467,11 +3756,12 @@ export function needsToastFor(rawItem) {
   if (isHealthAttention(rawItem)) {
     if (!filterAttentionHealth([rawItem]).length) return null;
     return { id: rawItem.id, at: "", tier: "alert", isUrgent: true, isEscalation: false,
-      toast: { title: "Critical problem in System → Health", body: rawItem.summary, level: "warning", timeout: 12000,
+      toast: { title: "Critical problem in System → Health", body: rowHeadline(rawItem.summary) || rawItem.summary, level: "warning", timeout: 12000,
         action: { name: `rig.open-need:${rawItem.id}`, args: { id: rawItem.id } } } };
   }
   const target = needTarget(rawItem);
   if (!target.id || target.update) return null;
+  if (sweepFinding(rawItem)) return null; // a check toasts nothing: the row it names has its own toast if it's the person's
   const reply = target.native || rawItem.reply === "native"
     ? "native"
     : (target.reply === "answer" || target.reply === "resolve")
@@ -3628,7 +3918,8 @@ export function openNeed(id, { shared, setShared, run, items = null, layout = un
     return { opened: "needs", id: targetId, expired: true };
   }
   const hit = Array.isArray(items) ? items.find((x) => String(x?.id ?? "") === targetId) : null;
-  const name = hit?.summary ?? hit?.title ?? targetId;
+  const check = sweepFinding(hit);
+  const name = check ? checkLabel(check, items) : hit?.summary ?? hit?.title ?? targetId;
   setShared?.("rig.open.page", { ...(shared?.("rig.open.page") ?? {}), [`needs:${targetId}`]: true });
   setShared?.("rig.focusNeed", targetId);
   const owner=conn??hit?.conn;
@@ -3866,6 +4157,23 @@ export function formatMissionActionOutcome(item, act = {}, resData = {}, config 
     return `Recorded as ${actorLabel}: your answer.${answerMessage}`;
   }
   return `Recorded as ${actorLabel}.`;
+}
+
+/** A read-only check before any Reply POST. Herdr's native fetch error cannot distinguish a refused connection from a
+ * written request whose answer was lost. A failed GET proves only that we have not attempted the Reply POST yet.
+ * Keep the caller's operation for both check and write; never repeat this check between multipart steps. */
+export async function missionActionPreflight(config, op) {
+  const base = String(config?.daemonUrl ?? "").replace(/\/$/, "");
+  if (/^herdr:\/\//i.test(base)) return null; // the dormant machine-helper route retains its own preparation/receipts
+  try {
+    const response = await op.fetch(`${base}/healthz`, { method: "GET" });
+    if (response?.ok) return null;
+    const status = Number.isInteger(response?.status) ? ` (HTTP ${response.status})` : "";
+    return { ok: false, notSent: true, text: `OpenRig's check failed${status} before sending this reply. Nothing was sent.` };
+  } catch (error) {
+    const reason = error?.code === "GATE_REFUSED" ? String(error.message).trim() : "OpenRig couldn't be checked before sending this reply.";
+    return { ok: false, notSent: true, text: /nothing was sent/i.test(reason) ? reason : `${reason} Nothing was sent.` };
+  }
 }
 
 /**
@@ -4168,10 +4476,11 @@ export function sinceYouWereAwaySummary(items = [], {
     return null;
   }
 
-  const requests = sorted.filter((i) => tierOf(i) !== "update").length;
+  const checks = sorted.filter((i) => tierOf(i) !== "update" && sweepFinding(i)).length;
+  const requests = sorted.filter((i) => tierOf(i) !== "update").length - checks;
   const updates = sorted.filter((i) => tierOf(i) === "update").length;
   const sinceTime = formatShortTime(stamp,timezone) ?? "you were away";
-  const header = `Since ${sinceTime}: ${requests} request${requests === 1 ? "" : "s"}, ${updates} update${updates === 1 ? "" : "s"}`;
+  const header = `Since ${sinceTime}: ${requests} request${requests === 1 ? "" : "s"}${checksSuffix(checks)}, ${updates} update${updates === 1 ? "" : "s"}`;
 
   const groups = {
     escalation: sorted.filter((i) => tierOf(i) === "escalation"),
@@ -4208,6 +4517,7 @@ export function sinceYouWereAwaySummary(items = [], {
     sinceTime,
     header,
     requests,
+    checks,
     updates,
     items: sorted,
     groups,
@@ -4574,7 +4884,7 @@ export function crumbsFor(entry) {
     return [section("terminals")];
   }
   if (e.section === "needs") {
-    if (e.id) return [section("needs"), { text: e.name ?? e.id, entry: e }];
+    if (e.id) return [section("needs"), { text: rowTitle(e.name ?? e.id), entry: e }];
     if (e.category) return [section("needs"), { text: e.name ?? e.category, entry: e }];
     return [section("needs")];
   }
@@ -4762,6 +5072,25 @@ export function layoutHasMod(node, mod) {
   return !!node && typeof node === "object" && (node.content?.mod === mod || (node.children ?? []).some((c) => layoutHasMod(c, mod)) || layoutHasMod(node.header, mod));
 }
 
+/** Command recipients in the published layout: hidden ancestors and inactive stack children do not receive commands.
+ * Stack headers and non-hidden floats on shown nodes do. An absent or malformed layout is not evidence of a recipient. */
+export function layoutShowsMod(node, mod) {
+  const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!object(node) || (node.hidden !== undefined && typeof node.hidden !== "boolean") || node.hidden) return false;
+  if (!["block", "row", "column", "stack"].includes(node.type)) return false;
+  if (node.type === "block" ? !object(node.content) : !Array.isArray(node.children)) return false;
+  if (node.floating !== undefined && !Array.isArray(node.floating)) return false;
+  const floating = (node.floating ?? []).some(item => object(item) && (item.hidden === undefined || item.hidden === false) && item.content?.mod === mod);
+  if (node.type === "block") return floating || node.content.mod === mod;
+  if (node.type === "stack") {
+    if (node.active !== undefined && node.active !== null && typeof node.active !== "string") return false;
+    const visible = node.children.filter(child => object(child) && child.hidden !== true);
+    const child = visible.find(item => item.id === node.active) ?? visible[0];
+    return floating || node.header?.content?.mod === mod || layoutShowsMod(child, mod);
+  }
+  return floating || node.children.some(child => layoutShowsMod(child, mod));
+}
+
 /** herdr delivers a mod command ("<mod>.<command>") only to that mod's nextCommand(): every `rig.<command>` is the Rig sidebar's.
  *  With no Rig sidebar in the layout, herdr answers one with a raw "unknown command" toast, and `commands()` never lists a mod's own
  *  commands, so only the layout can tell whether it would arrive. */
@@ -4791,7 +5120,7 @@ export function sidebarNeeded(name) {
 
 /** Why a Rig sidebar command can't run from here (the layout has no Rig sidebar), or null when it can. */
 export function sidebarRefusal(node, name) {
-  return isSidebarCommand(name) && !layoutHasMod(node, MOD_IDS.sidebar) ? sidebarNeeded(name) : null;
+  return isSidebarCommand(name) && !layoutShowsMod(node, MOD_IDS.sidebar) ? sidebarNeeded(name) : null;
 }
 
 /** A page's, menu's or palette's `run`: a Rig sidebar command is sent only while the Rig sidebar is in the layout. Without it, a
@@ -5106,6 +5435,55 @@ export function singleLineText(value) {
   return String(value ?? "").replace(/[\s\u0000-\u001f\u007f]+/g, " ").trim();
 }
 
+/** The prefix of OpenRig's queue row ids, as people paste them into a row's text (the full id, or one shortened with an ellipsis). */
+const ROW_ID_PREFIX = "qitem-";
+const ROW_ID_SOURCE = `${ROW_ID_PREFIX}(?:[0-9A-Za-z]+(?:-[0-9A-Za-z]+)*(?:…|\\.\\.\\.)?|…|\\.\\.\\.)`;
+const ROW_ID = new RegExp(`\\b(?:queue(?:-update)?:)?${ROW_ID_SOURCE}`, "g"); // a pasted page id (queue:<id>) goes whole
+/** An id in the sentence itself reads as "a row" ("see <id> for the trace" → "see a row for the trace"); after "row" or "item" it just goes. */
+const BARE_ROW_ID = new RegExp(`(\\b(?:rows?|items?|qitems?)\\s+)?\\b(?:queue(?:-update)?:)?${ROW_ID_SOURCE}`, "gi");
+/** "a row" starts with a capital at the start of the text or after a sentence end ("<id> is blocked" → "A row is blocked"). */
+const sentenceStart = (text, at) => at === 0 || /[.!?]["')\]]*\s+$/.test(text.slice(Math.max(0, at - 8), at)); // only the few characters before the id: constant per id
+const bareRowIds = (s) => s.replace(BARE_ROW_ID, (_m, lead, at, whole) => lead ? lead.trimEnd() : sentenceStart(whole, at) ? "A row" : "a row")
+  // Ids joined only by "and", "or", "," or "/" read as a count: "a row and a row" → "two rows", three or more → "rows".
+  .replace(/\b([Aa]) row((?:\s*(?:,|\/|\band\b|\bor\b)\s*a row)+)/g, (_m, a, more) => { const n = 1 + (more.match(/a row/g) ?? []).length; const word = n === 2 ? "two rows" : "rows"; return a === "A" ? word[0].toUpperCase() + word.slice(1) : word; });
+/** Text without queue row ids, line breaks kept: a parenthetical that holds only ids (and a few joining words such as "row", "see" or "and")
+ *  goes whole, and an id elsewhere reads as "a row". The row's id stays in its Details and its menu's Copy row id. */
+export function withoutRowIds(value) {
+  let s = String(value ?? "");
+  if (!s.includes(ROW_ID_PREFIX)) return s;
+  // Every whitespace pass starts only at the start of a horizontal run ((?<![^\S\n])), so a long run of spaces or tabs is scanned once, not once per space.
+  s = s.replace(/(?<![^\S\n])[^\S\n]*\(([^()\n]*)\)/g, (whole, inner) => {
+    if (!inner.includes(ROW_ID_PREFIX)) return whole;
+    const rest = inner.replace(ROW_ID, " ").replace(/\b(?:rows?|items?|qitems?|see|was|is|and|or|from|in|by|of)\b/gi, " ").replace(/[\s,;:·/&+-]+/g, "");
+    return rest ? ` (${bareRowIds(inner).trim()})` : "";
+  });
+  s = bareRowIds(s);
+  return s.replace(/\([^\S\n]*\)/g, "").replace(/(?<![^\S\n])[^\S\n]+(?=[.,;:!?])/g, "").replace(/(?<![^\S\n])[^\S\n]{2,}/g, " ").replace(/^[^\S\n]+|(?<![^\S\n])[^\S\n]+$/gm, "");
+}
+/** The first whole queue row id in a text (a need's id such as `queue:<id>`), or null. */
+export function rowIdIn(value) { return String(value ?? "").match(new RegExp(`${ROW_ID_PREFIX}[0-9A-Za-z]+(?:-[0-9A-Za-z]+)*`))?.[0] ?? null; }
+/** A row's text for display on one line, without queue row ids (see `withoutRowIds`). */
+export function rowText(value) { return withoutRowIds(singleLineText(value)).trim(); }
+/** A row's text where only a line fits (a sidebar row, its tooltip, a toast, a list row): the first sentence of `rowText`. */
+/** True when a text holds queue row ids and nothing else worth showing (only joining words or punctuation besides them). */
+export function rowIdOnly(value) {
+  const text = singleLineText(value);
+  if (!text.includes(ROW_ID_PREFIX)) return false;
+  return !text.replace(ROW_ID, " ").replace(/\b(?:rows?|items?|qitems?|see|and|or)\b/gi, " ").replace(/[\s,;:·/&+().!?-]+/g, "").length;
+}
+/** A row's title where only a line fits: its first sentence without ids; for an id-only text, the body's first line, then "Untitled row".
+ *  Never the raw id: that stays in the tooltip (rowTip), Details and Copy request id. */
+export function rowTitle(value, body = "") {
+  return rowHeadline(value) || rowHeadline(String(body ?? "").split(/\r\n|[\n\r\u2028\u2029]/).map(singleLineText).find(Boolean) ?? "") || "Untitled row";
+}
+/** The tooltip for a row title: the plain text without ids, or for an id-only text the original (so the id is still one hover away). */
+export function rowTip(value) { return rowIdOnly(value) ? singleLineText(value) : rowText(value); }
+export function rowHeadline(value) {
+  if (rowIdOnly(value)) return "";
+  const text = rowText(value);
+  return requestFirstSentence(text) || text;
+}
+
 export function recentTransitionRows(data, topologyOrOpts = [], extraOpts = {}) {
   const list = Array.isArray(data) ? data : (data?.transitions ?? data?.entries ?? data?.items ?? []);
   return (Array.isArray(list) ? list : []).slice(0, 10).map((tr) => {
@@ -5115,7 +5493,7 @@ export function recentTransitionRows(data, topologyOrOpts = [], extraOpts = {}) 
     const actor = singleLineText(tr?.actorSession ?? tr?.actor ?? "—");
     const change = singleLineText(tr?.change ? String(tr.change).split(/\s*→\s*/).map(value => statusWord(value, "queue")).join(" → ") : tr?.fromState && tr?.toState ? `${statusWord(tr.fromState, "queue")} → ${statusWord(tr.toState, "queue")}` : statusWord(tr?.toState ?? tr?.state ?? "", "queue"));
     const bodyLine = String(tr?.bodyPreview ?? "").split(/\r\n|[\n\r\u2028\u2029]/).map(singleLineText).find(Boolean);
-    const label = singleLineText(tr?.summary) || bodyLine || singleLineText(tr?.qitemId || tr?.transitionId || "—");
+    const label = rowHeadline(tr?.summary) || (bodyLine && rowHeadline(bodyLine)) || (tr?.qitemId || tr?.transitionId ? "Untitled row" : "—"); // never the raw id (it stays in qitemId)
     return {
       transitionId: tr?.transitionId ?? null,
       qitemId: tr?.qitemId ?? null,
@@ -5155,7 +5533,7 @@ function isPulseBlockedSeat(s) {
 export function computePulseCounts(models, attentionItems = []) {
   const modelList = Array.isArray(models) ? models : [];
   const allSeats = modelList.flatMap((m) => m?.seats ?? []);
-  let working = 0, blocked = 0, needs = 0, idle = 0, unreported = 0;
+  let working = 0, blocked = 0, needs = 0, idle = 0, unreported = 0, gone = 0;
   for (const m of modelList) {
     const rigObj = { ...(m?.rig ?? {}), ...m, name: m?.name ?? m?.rig?.name ?? m?.id ?? "" };
     // Pod headers may count a subset while retaining the whole rig for ask attribution/fallback.
@@ -5165,9 +5543,10 @@ export function computePulseCounts(models, attentionItems = []) {
       if (matchesPulseFilter(s, rigObj, "needs", attentionItems, allSeats)) needs++;
       if (matchesPulseFilter(s, rigObj, "idle", attentionItems, allSeats)) idle++;
       if (matchesPulseFilter(s, rigObj, "unreported", attentionItems, allSeats)) unreported++;
+      if (matchesPulseFilter(s, rigObj, "gone", attentionItems, allSeats)) gone++;
     }
   }
-  return { working, blocked, needs, idle, unreported };
+  return { working, blocked, needs, idle, unreported, ...(gone ? { gone } : {}) }; // `gone` only when a tmux server is gone: otherwise the counts are as they always were
 }
 
 /** The requests among a list of attention items (updates dropped). A Topology draw asks this for every seat and every pulse bucket with the same
@@ -5205,6 +5584,12 @@ export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], 
   if (["detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
   const actionableNeeds = actionableNeedsOf(attentionItems);
   const rigName = rig?.name ?? rig?.id ?? "";
+  // A seat whose tmux server stopped answering has its own bucket: never idle or working. A request it owns still needs the person.
+  if (seat.status === "terminal_gone") {
+    const needs = isSeatNeedsYou({ ...seat, status: "idle", word: "idle" }, rigName, actionableNeeds);
+    return pulseFilter === "needs" ? needs : pulseFilter === "gone" && !needs;
+  }
+  if (pulseFilter === "gone") return false; // only a terminal-gone seat is in that bucket
   // A live terminal can own a human request even when its activity word is idle. Keep counts aligned with its row.
   if(seat.terminal||seat.status==="terminal"){
     const needs=isSeatNeedsYou({...seat,status:"terminal",word:"terminal"},rigName,actionableNeeds);
@@ -6817,7 +7202,7 @@ export async function attachToSeat(first = {}, second = {}, config = null, optio
   if (crossesConnections(config, seat)) return { ok: false, reason: OTHER_CONNECTION_REFUSAL };
   const notReady = routingNotReady(host, config);
   if (notReady) return { ok: false, reason: notReady };
-  if (!host.routeOwner && !host.prepareRemote && typeof host.layout === "function" && layoutHasMod(host.layout(), MOD_IDS.sidebar)) {
+  if (!host.routeOwner && !host.prepareRemote && typeof host.layout === "function" && layoutShowsMod(host.layout(), MOD_IDS.sidebar)) {
     const session = seat.session ?? seat.canonicalSessionName;
     if (!isValidSessionName(session)) return { ok: false, reason: sessionNameRefusal(session) };
     return routeRigOpen(host, config, { kind: "attach", seat, options });
@@ -6869,7 +7254,14 @@ async function attachSeatOnce(host, seat, config, options) {
     if (!found || found.role !== "attach" || !expectedArgv) return null;
     const record = tm.find((t) => t.address === found.terminal);
     const known = relayIdentity(record?.argv);
-    return known !== null && known !== relayIdentity(expectedArgv) ? found : null;
+    if (known === null || known === relayIdentity(expectedArgv)) return null;
+    // The mod entry points ship identical relay copies.
+    // Compare the full payload when Attach came through another copy in that same app home.
+    const copies = Object.values(MOD_IDS).map((id) => `/mods/${id}/rig-attach-relay.cjs`);
+    const expectedPath = expectedArgv[1];
+    const suffix = copies.find((copy) => expectedPath.endsWith(copy));
+    const sameInstall = suffix && copies.some((copy) => record.argv[1] === expectedPath.slice(0, -suffix.length) + copy);
+    return sameInstall && known === relayIdentity([expectedArgv[0], record.argv[1], expectedArgv[2]]) ? null : found;
   };
   /** The person's replace: stop that viewer and close its tab — only on their click — then Attach
    *  starts a fresh one below. Never closes a tab the person didn't ask to close: this runs solely from the offer's button. */
@@ -7161,15 +7553,27 @@ export function groupSpecLibrary(specs, filter = "") {
   }).filter(g => g.items.length);
 }
 
+/** Ignore only known state-only folder batches. Roots, mixed and unknown batches
+ * remain conservative so config/approval changes and watch overflow still reload. */
+export function configWatchChanged(paths, appDir) {
+  if (!Array.isArray(paths) || !paths.length) return true;
+  const state = `${String(appDir).replace(/\/+$/, "")}/openrig/state.json`;
+  return !paths.every(path => typeof path === "string" && path === state);
+}
+
 /** A read-modify-write of one state file with compare-and-write: a write that lost a race (the file changed since it was read) is tried again from a
  *  fresh read, up to `tries` times. `build(previousText)` makes the new text from what was just read, so every attempt merges the latest. Returns null
- *  when it was saved, else the last error. */
+ *  when it was saved or already byte-identical after a successful read, else the last error. */
 export async function saveStateFile({ path, read, write, build, tries = 3 }) {
   let last = null;
   for (let attempt = 0; attempt < tries; attempt++) {
     let previous = null, readError = null;
     try { previous = (await read(path)) ?? null; } catch (error) { previous = null; readError = error; }
-    try { await write(path, build(previous), previous); return null; }
+    try {
+      const next = build(previous);
+      if (!readError && next === previous) return null;
+      await write(path, next, previous); return null;
+    }
     // A read that failed leaves the write expecting a file that isn't there, which reads as a lost race: when the last attempt's READ failed, that is the cause.
     catch (error) { last = readError ? { message: String(readError?.message ?? readError), during: "read" } : error; }
   }
