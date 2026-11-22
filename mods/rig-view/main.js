@@ -36,7 +36,9 @@ import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea,
 import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, shared, setShared as rawSetShared, settings, openOverlay as rawOpenOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify as rawNotify, machines } from "herdr";
 const notify = value => errorNotice(rawNotify, value);
 import { installHerdrTransport } from "./rig-openrig-wire.js";
-import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal, numberedConfigReads } from "./rig-gate.js";
+import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal, numberedConfigReads, gateSameConfig } from "./rig-gate.js";
+import {leaveOldStrip} from './rig-old-views.js';
+import {connectionCapabilities} from './rig-lib.js';
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 // A read for one connection names that connection: with several, the gate refuses a bare request (it never defaults to the first OpenRig).
 const fetchFor = (config) => (url, init) => gatedFetch(url, init, undefined, config?.connectionId);
@@ -266,7 +268,7 @@ export default class RigView extends View {
       cx.notify();
     });
     // The header's status line and a reply's confirmation come and go by time: redraw while one shows or a new one arrives.
-    cx.timer.every(1000, (cx) => { if (this.ticking || shared("rig.status")?.at !== this.statusAt) cx.notify(); });
+    cx.timer.every(1000, (cx) => { this.consumeStripRecovery(cx);if (this.ticking || shared("rig.status")?.at !== this.statusAt) cx.notify(); });
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -276,6 +278,54 @@ export default class RigView extends View {
         cx.notify();
       }
     });
+  }
+
+  publishStripRecovery(job,result,cx=null){
+    setShared('rig.oldViewsCloseResult',{id:job.id,session:job.session,tab:job.tab,recovery:true,expiresAt:Date.now()+120000,title:result.title??"Still in OpenRig's old strip",...result});
+    setShared('rig.status',{id:job.id,busy:false,...result,at:Date.now()});
+    notify({title:result.title??"Still in OpenRig's old strip",body:result.text,level:result.ok?'info':'warning'});
+    if(cx&&!this.closed)cx.notify();
+  }
+  stripRecoveryNotice(t){
+    const result=shared('rig.oldViewsCloseResult');
+    if(!result?.recovery||result.busy||result.tab!==this.tabId||result.expiresAt<=Date.now())return null;
+    this.ticking=true;
+    return v_flex().id('strip-recovery-result').gap(4).p(10).rounded(8).bg(t.raised).border_1().border_color(t.border)
+      .child(div().font_semibold().text_size(12.5).child(result.title))
+      .children(String(result.text??'').split('\n').map(line=>div().text_size(12).text_color(result.ok===false?t.blocked:t.muted).child(line)));
+  }
+  /** Called by this native page's init-owned timer, before any await: its application survives layout replacement. */
+  consumeStripRecovery(cx){
+    if(this.closed||!this.tabId||this.stripRecoveryJob)return;
+    const pending=shared('rig.stripRecovery')??{},match=Object.entries(pending).find(([,request])=>request.tab===this.tabId);
+    if(!match)return;
+    const [id,request]=match,next={...pending};delete next[id];setShared('rig.stripRecovery',next);
+    const job={...request,id,deadline:Date.now()+300000};this.stripRecoveryJob=job;
+    if(!Number.isFinite(request.createdAt)||Date.now()-request.createdAt>120000||request.createdAt>Date.now()+1000){
+      this.publishStripRecovery(job,{ok:false,text:'This cleanup confirmation expired. Nothing was started. Check the old views, then confirm again.'},cx);this.stripRecoveryJob=null;return;
+    }
+    setShared('rig.oldViewsCloseResult',{id,session:job.session,recovery:true,expiresAt:job.deadline,busy:true,text:"Leaving OpenRig's old strip…"});
+    const deadline=cx.timer.after(300000,next=>{
+      if(this.stripRecoveryJob!==job)return;job.expired=true;
+      this.publishStripRecovery(job,{ok:false,text:'The result was not confirmed in time. Some views may have closed. Check the layout before trying again. Your seats keep running.'},next);
+    },{owner:null});
+    cx.spawn(async(cx)=>{
+      const fresh=async()=>{
+        if(this.closed||job.expired||Date.now()>=job.deadline)throw Error('The recovery result was not confirmed in time.');
+        const current=await configReads(async()=>parseConfig(await readTextFile(CONFIG())));
+        if(this.closed||job.expired||Date.now()>=job.deadline)throw Error('The recovery result was not confirmed in time.');
+        if(current.configInvalid||!gateSameConfig(job.config,current)||(job.config.person??null)!==(current.person??null)||JSON.stringify(job.config.rig??null)!==JSON.stringify(current.rig??null))throw Error('OpenRig settings changed. Reopen this confirmation.');
+        return current;
+      };
+      try{
+        await fresh();
+        const result=await leaveOldStrip({layout,layouts,readTextFile,currentConfig:fresh,execFor,run,spaces,panes,shared,setShared,
+          currentLayout:()=>shared('layout'),wait:ms=>new Promise(done=>cx.timer.after(ms,done,{owner:null})),beforeSwitch:fresh},
+          job.config,job.views??[],appHome(),conn=>connectionCapabilities(shared,job.config,conn,terminals()),job.returnLayout);
+        if(!this.closed&&!job.expired)this.publishStripRecovery(job,result,cx);
+      }catch(error){if(!this.closed&&!job.expired)this.publishStripRecovery(job,{ok:false,text:`${String(error?.message??error)} Your seats keep running.`},cx);}
+      finally{deadline.cancel();if(this.stripRecoveryJob===job)this.stripRecoveryJob=null;}
+    },{owner:null});
   }
 
   async forgetInPlaceOpen() {
@@ -322,7 +372,7 @@ export default class RigView extends View {
       setShared("rig.pageOnScreen", next);
     } catch (_) {}
   }
-  async close() { try { this.herdr?.release?.(); } catch (_) {} this.forgetOnScreen(); this.configPanel?.close(); for (const h of Object.values(this.pagerHandles ?? {})) h?.release?.(); releaseFocusTargets(this); for (const h of this.connHandles ?? []) h?.release?.(); this.closed = true; for(const box of Object.values(this.specBoxes??{}))box.secondaryEnterTask?.cancel?.();this.statusMotion.close(); this.nowTails?.close(); for(const graph of this.graphs?.values()??[])graph.reset(); if (this.previousNeedsScope) requestDismissal({ shared, setShared, run, scope: this.previousNeedsScope }, "leave"); else this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); await this.forgetInPlaceOpen(); }
+  async close() { try { this.herdr?.release?.(); } catch (_) {} this.forgetOnScreen(); this.configPanel?.close(); for (const h of Object.values(this.pagerHandles ?? {})) h?.release?.(); releaseFocusTargets(this); for (const h of this.connHandles ?? []) h?.release?.(); this.closed = true;if(this.stripRecoveryJob){this.publishStripRecovery(this.stripRecoveryJob,{ok:false,text:'The Rig page closed before the result was confirmed. Some views may have closed. Check the layout before trying again. Your seats keep running.'});this.stripRecoveryJob=null;} for(const box of Object.values(this.specBoxes??{}))box.secondaryEnterTask?.cancel?.();this.statusMotion.close(); this.nowTails?.close(); for(const graph of this.graphs?.values()??[])graph.reset(); if (this.previousNeedsScope) requestDismissal({ shared, setShared, run, scope: this.previousNeedsScope }, "leave"); else this.updateAction("leave"); for (const box of Object.values(this.replies)) this.keepDraft(box); await this.forgetInPlaceOpen(); }
 
   dismissalConfig() {
     const cfg = this.activeConfig();
@@ -6352,6 +6402,7 @@ export default class RigView extends View {
     const inPlaceNote = file ? null : this.inPlaceBanner(t, entry);
     // After the body: its reads are what the note checks.
     const note = file ? null : this.refreshNote(t);
+    const recoveryNotice=file?null:this.stripRecoveryNotice(t);
     this.refreshNowTails(cx);
     return v_flex().id("rig-view-root").size_full().bg(t.surface ?? t.panel ?? t.bg).text_color(t.foreground).track_focus(this.handle)
       .when(entry?.section==='system'&&entry.subview==='config',el=>el.key_context('HerdrigSettings')
@@ -6383,7 +6434,7 @@ export default class RigView extends View {
       .when(!file, (el) => {const resolved=this.pageSpec?{...entry,id:this.pageSpec.id}:entry;
         const tabs=this.objectTabs(t,resolved??{section:"topology"},this.pageSpec??spec,{cx});return tabs?el.child(tabs):el;})
       .child(file ? v_flex().id("rig-view-body").flex_1().min_h(0).child(body)
-        : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(pageBodyLayout(this.pageWidth).padding).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!inPlaceNote, (el) => el.child(inPlaceNote)).when(!!note, (el) => el.child(note)).child(body)));
+        : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(pageBodyLayout(this.pageWidth).padding).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!inPlaceNote, (el) => el.child(inPlaceNote)).when(!!note, (el) => el.child(note)).when(!!recoveryNotice,el=>el.child(recoveryNotice)).child(body)));
   }
 }
 

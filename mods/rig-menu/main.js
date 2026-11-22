@@ -22,7 +22,7 @@ import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { workerCapabilityText } from "./rig-lib.js";
-import {knownOldProviderViews,readOldProviderViews,oldViewsLocationText,oldViewCandidates} from './rig-old-views.js';
+import {knownOldProviderViews,readOldProviderViews,oldViewCandidates,hasOldProviderStrip,oldStripLayouts} from './rig-old-views.js';
 import {layouts} from 'herdr';
 import { rigOrigin, syncRetainedOrigins } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
@@ -320,6 +320,11 @@ export default class RigMenu extends View {
       this.config = await configNow();
       if (this.gone) return;
       setShared("rig.oldProviderViews",await readOldProviderViews({layout,layouts,readTextFile,currentLayout:()=>shared("layout")},appHome()));
+      if(step?.action==='close-old-views'){
+        this.oldStripChoices=await oldStripLayouts({layouts,readTextFile},appHome());
+        if(this.gone)return;
+        this.pendingDialogFocus=()=>this.dialogCancelHandle?.focus?.();cx.notify();
+      }
       if(step?.action==="confirm-machine"||step?.action==="setup-machine"||step?.action==="stop-machine"){
         const setupConfig=step.conn?configOfConnection(this.config,step.conn):this.config; // the dialog acts for the connection the review was for
         if(!setupConfig){notify({title:"Machine setup",body:"That OpenRig is no longer in the configuration. Nothing was changed.",level:"warning"});this.dismiss();return;}
@@ -997,8 +1002,8 @@ export default class RigMenu extends View {
     }
     if(target.kind==="sidebar-header"){
       const old=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
-      if(old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
-        item("x","Close OpenRig's old views",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},340));
+      if(hasOldProviderStrip(layout())||old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
+        item("x","Leave OpenRig's old strip…",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},480));
       const enabled=(shared("rig.settings")?.notifications??true)!==false;
       item("rig-bell",enabled?"Turn notifications off":"Turn notifications on",()=>{
         setShared("rig.settings",{...(shared("rig.settings")??{}),notifications:!enabled});
@@ -1179,8 +1184,8 @@ export default class RigMenu extends View {
     }
     if (target.kind === "strip-view") {
       const old=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
-      if(old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
-        item("x","Close OpenRig's old views",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},340));
+      if(hasOldProviderStrip(layout())||old.length&&oldViewCandidates(this.config,conn=>this.caps({conn})).length)
+        item("x","Leave OpenRig's old strip…",()=>dialog({kind:"old-views"},{action:"close-old-views",views:old,confirm:true},480));
       // A worker view's strip pill: close it, follow its rig's active workers, or reach the rig.
       item("rig-view", "Edit layout…", () => openDesigner(this.editTarget(target)), "design-view");
       if (target.rig) item("rig-follow", "Follow active workers", () => oneClick({ ...target, view: `rig:${target.rig}` }, "follow"), "follow");
@@ -1613,12 +1618,13 @@ export default class RigMenu extends View {
     if(step.action==="close-old-views"){
       if(this.cleanupQueued)return;
       if(!layoutHasMod(layout(),MOD_IDS.sidebar)){this.result={ok:false,notSent:true,text:"Open the Rig sidebar, then try again. Nothing was closed."};cx.notify();return;}
+      if(!this.oldStripChoices?.some(choice=>choice.name===this.oldStripLayout))return;
       this.cleanupQueued=true;
       // Hand off before any await: closing this result must not cancel the confirmed operation or release its transport.
       const id=`old-views-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      setShared('rig.oldViewsClose',{...(shared('rig.oldViewsClose')??{}),[id]:{createdAt:Date.now(),config:this.openedOn??this.config,views:step.views??[]}});
+      setShared('rig.oldViewsClose',{...(shared('rig.oldViewsClose')??{}),[id]:{createdAt:Date.now(),config:this.openedOn??this.config,views:step.views??[],returnLayout:this.oldStripLayout}});
       run('rig.close-old-views');
-      this.result={ok:true,text:"Closing old views. The Rig sidebar and System will report the result; you can close this dialog. If no result appears, check the old views before confirming again."};cx.notify();return;
+      this.result={ok:true,text:"Leaving OpenRig's old strip… The Rig page will report the result; you can close this dialog. Your seats keep running."};cx.notify();return;
     }
     if (["send", "queue", "reply"].includes(step?.action) && !this.inputCanSend(step)) return;
     if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.uncertainAttempt) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
@@ -2251,7 +2257,7 @@ export default class RigMenu extends View {
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
-      : step.action === "close-old-views" ? "Close OpenRig's old worker views?"
+      : step.action === "close-old-views" ? "Leave OpenRig's old strip?"
       : step.action === "spaces-list" ? (step.copy?.title ?? "Spaces list")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? `Copy built-in specs on ${step.confirmation?.machine}?` : `Save specs on ${step.confirmation?.machine}?`)
       : step.action === "adopt-address-space" ? "Use this existing rig space?"
@@ -2261,7 +2267,19 @@ export default class RigMenu extends View {
       : step.action === "rebuild-space" ? `Rebuild ${target.rig}'s tiles?` : actionTitle(target, step.action);
     const go = (cx) => this.go(cx, target, step);
     let body = null;
-    if(step.action==="close-old-views")body=div().text_size(12).text_color(t.muted).child(oldViewsLocationText(step.views??[]));
+    if(step.action==="close-old-views"){
+      const choices=this.oldStripChoices;
+      if(choices?.length===1&&choices[0].name==='main'&&!this.oldStripLayout)this.oldStripLayout='main';
+      body=v_flex().gap(8).text_size(12).text_color(t.muted)
+        .child(div().child((step.views?.length?`This closes OpenRig's ${step.views.length} old worker views and switches this window to the layout you pick.`:'This switches this window to the layout you pick.')+' Your seats keep running, and the Rig page stays open.'));
+      if(!choices)body.child(div().child('Reading layouts…'));
+      else if(!choices.length)body.child(div().child("Every layout here holds OpenRig's strip, so there's nothing to switch to. Open the palette (Ctrl+Shift+P) and choose Layout: Herdr."));
+      else body.child(div().child('Switch to')).children(choices.map(choice=>this.dialogButton(t,
+        v_flex().id(`old-strip-layout-${choice.name}`).gap(2).p(6).rounded(5).bg(this.oldStripLayout===choice.name?t.selected:t.raised),null,
+        (_e,cx)=>{this.oldStripLayout=choice.name;cx.notify();},false,
+        v_flex().gap(2).child(div().child(choice.label)).when(choice.name==='main',el=>el.child(div().text_size(11).child("Herdr's standard layout, without the Rig sidebar"))))))
+        .child(div().child("Pick the layout you used before. herdrig can't tell which one that was."));
+    }
     else if(step.action==="confirm-spec-write"){
       const c=step.confirmation??{};
       const exact=(label,value,id)=>h_flex().gap(8).items_center()
@@ -2384,7 +2402,7 @@ export default class RigMenu extends View {
       : null;
     const confirmLabel = step.action === "change-model"
       ? (swapPlan?.isLeadSelf ? "Queue for advisor" : "Queue for lead")
-      : step.action === "close-old-views" ? "Close old views"
+      : step.action === "close-old-views" ? (this.oldStripChoices?.length===0?null:"Leave the strip")
       : step.action === "spaces-list" ? (step.copy?.confirm ?? "Change")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? "Allow built-in copies" : "Allow spec saves")
       : step.action === "adopt-address-space" ? "Use it"
@@ -2398,7 +2416,8 @@ export default class RigMenu extends View {
       : { pause: "Pause rig", resume: "Resume rig", fresh: "Start fresh", "design-view": "Open", send: "Send", queue: "Queue", reply: "Reply", "launch-spec": "Launch" }[step.action];
     const done = !!this.result?.ok;
     // Only while the dialog offers its button: never re-runs a one-click action or a finished one; launch-spec keeps its fields and Launch button after a validation error.
-    const reviewFailed = (step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady(); // Loading and failed reviews both leave the visible action disabled.
+    const reviewFailed = (step.load === "pause" || ["pause", "archive-rig", "delete-rig"].includes(step.action)) && !this.reviewReady()
+      ||step.action==='close-old-views'&&!this.oldStripChoices?.some(choice=>choice.name===this.oldStripLayout); // No implicit layout choice.
     // change-model: after a failure that MAY have left, no second queue button (RESEND_UNSAFE); after a refusal that sent nothing it stays (nothing could have arrived).
     const canConfirm = !!confirmLabel && (step.action === "change-model" ? (!this.result || (!this.result.ok && this.result.notSent)) : (step.action === "launch-spec" || step.action === "new-rig" ? (!this.result?.ok && !this.uncertainAttempt) : step.action === "design-view" ? !this.result?.ok : this.inputCanSend(step))) && !this.busy && !step.run;
     const archiveReason = step.action === "delete-rig" ? capabilityDisableReason("archive-rig", this.caps(target)) : null;
@@ -2451,23 +2470,23 @@ export default class RigMenu extends View {
         }
       })
       .child(div().id("rig-dialog-title").flex_none().text_size(14).font_semibold().child(title))
-      .when(!!body && !["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec"].includes(step.action), (el) => el.child(body))
+      .when(!!body && !["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","close-old-views"].includes(step.action), (el) => el.child(body))
       .when(!!this.input && this.inputCanSend(step), (el) => el.child(div().flex_1().border(1).border_color(t.border).rounded(6).p(6).child(this.dialogField(this.input,Textarea).h(96)))
         .child(div().text_size(11).text_color(t.dim).child(`${mac ? "⌘ Return" : "Ctrl+Enter"} sends · Esc or a click outside closes; your text is kept until you send or cancel`)))
       // Long results and the model/harness form scroll; the action footer never shrinks into the body.
       .when(step.action !== "design-view" || !!this.result || !!this.busy, (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
-        .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec"].includes(step.action) && !!body, (content) => content.child(body))
+        .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","close-old-views"].includes(step.action) && !!body&&(step.action!=='close-old-views'||!this.result), (content) => content.child(body))
         .child(this.resultView(t, cx, target, step) ?? div())))
       .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
         .child(this.dialogButton(t,div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),this.dialogCancelHandle,
-          () => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); },false,done ? "Close" : "Cancel"))
+          () => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); },false,done||step.action==='close-old-views'&&this.oldStripChoices?.length===0 ? "Close" : "Cancel"))
         .when(done && step.action === "new-rig" && typeof result.createdRig === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(result.createdRig), el => el.child(
           this.dialogButton(t,div().id("new-rig-open-space").px(12).h(26).rounded(6).bg(t.accent).text_color(t.background ?? "#fff").flex().items_center().cursor_pointer(),this.dialogOpenSpaceHandle,
             () => { const command = this.spaceCommand(target, result.createdRig); if (command) { run(command); this.dismiss(); } },false,"Open rig space")))
         .when(canConfirm && step.action === "delete-rig" && !target?.archived, (el) => el.child(this.dialogButton(t,div().id("rig-archive").px(12).h(26).rounded(6).bg(t.raised).border_1().border_color(t.border)
           .flex().items_center().hover((s) => s.bg(t.hover)).when(!!archiveReason, (b) => b.opacity(0.45).tooltip(archiveReason))
           ,this.dialogArchiveHandle,(_e,cx)=>this.archive(cx,target),!!archiveReason||reviewFailed,this.rigRunning(target) ? "Pause and archive" : "Archive")))
-        .when(canConfirm, (el) => el.child(this.dialogButton(t,div().id("rig-confirm").px(12).h(26).rounded(6).when(reviewFailed, (b) => b.opacity(0.45))
+        .when(canConfirm, (el) => el.child(this.dialogButton(t,div().id("rig-confirm").px(12).h(26).rounded(6).when(reviewFailed, (b) => b.opacity(0.45).when(step.action==='close-old-views',el=>el.tooltip('Pick a layout first')))
           .bg(step.action === "pause" || step.action === "fresh" || step.action === "delete-rig" ? t.blocked : t.accent)
           .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center(),this.dialogConfirmHandle,
           (_e,cx)=>go(cx),reviewFailed,confirmLabel))));

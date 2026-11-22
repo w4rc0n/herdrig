@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.3
+Version: v0.5.4
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, and busy icons remain still.
@@ -516,9 +516,10 @@ close and reopen; live viewers are never silently replaced or relabelled. Design
 
 API/CLI compatibility was also smoke-tested on OpenRig 0.7.13, which includes attach-command session quoting (#2971). Herdrig still refuses session names outside its own safe charset.
 
-**Older provider views.** Use **Close OpenRig's old views** in the sidebar's System section to close older
-worker views with a pill strip. Its confirmation discovers saved layouts without switching layouts. If no local
-OpenRig can close them, close their Herdr tabs; seats keep running. A focused worker tile stays untouched;
+**Older provider views.** Use **Leave OpenRig's old strip…** in System, the palette or a strip pill's menu.
+Pick your previous layout from Herdr's list; layouts containing a strip are excluded. Viewer closes and the
+layout switch are reported separately, the Rig page stays open and seats keep running. **Herdr** uses its standard
+layout without the Rig sidebar. Closing a space does not remove a strip. A focused worker tile stays untouched;
 rebuilding another may open an additional numbered page, which the result explains. Provider-only grid and cell
 editing remain separate from Herdrig's built-in Follow and prune controls.
 

@@ -16,7 +16,7 @@ import { errorBlock, errorNotice } from "./rig-error-view.js";
 const notify = value => errorNotice(rawNotify, value);
 import { followedConnection, spaceMachine } from "./rig-follow.js";
 import { herdrIdentityOf } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, hasOldProviderStrip } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal, gateSameConfig, CONFIG_CHANGED, numberedConfigReads } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
@@ -467,9 +467,9 @@ export default class RigPalette extends View {
         return (ll.startsWith(q) || q.startsWith(firstWord) || Boolean(label && label.toLowerCase().includes(q))) && notExactUnboxed(hasConn, ll);
       };
       const own = [];
-      if (knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]).length && oldViewCandidates(this.config, conn => this.caps(conn)).length
-        && "close old worker views".includes(q)) {
-        own.push({line:"close-old-worker-views",label:"Close OpenRig's old views",hint:"Only their viewers end; your seats keep running"});
+      if ((hasOldProviderStrip(layout())||knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]).length && oldViewCandidates(this.config, conn => this.caps(conn)).length)
+        && ("leave openrig's old strip".includes(q)||"close old worker views".includes(q))) {
+        own.push({line:"leave-old-strip",label:"Leave OpenRig's old strip…",hint:"Close old views and switch to the layout you pick"});
       }
       for (const o of OWN) {
         if (matchesOwn(o.line, o.line.split(" ")[0], o.label, Boolean(o.conn))) {
@@ -559,13 +559,13 @@ export default class RigPalette extends View {
     }
     // The TUI's refresh re-reads its own view; here the sidebar re-reads (the page follows it).
     if (verb === "refresh" && !arg) { run("rig.refresh"); this.dismiss(); return true; }
-    if (verb === "close-old-worker-views" && !arg) {
+    if ((verb === "leave-old-strip"||verb === "close-old-worker-views") && !arg) {
       const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[]);
-      if (!views.length || !oldViewCandidates(this.config, conn => this.caps(conn)).length) {
-        this.error = views.length ? "Close OpenRig's old worker views with their Herdr tabs; seats keep running." : "There are no old worker views in this window.";
+      if (!hasOldProviderStrip(layout())&&(!views.length || !oldViewCandidates(this.config, conn => this.caps(conn)).length)) {
+        this.error = "There is no OpenRig strip in this window.";
         cx.notify(); return true;
       }
-      this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:340,
+      this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,
         props:{target:{kind:"old-views"},step:{action:"close-old-views",views,confirm:true}}});
       this.dismiss(); return true;
     }

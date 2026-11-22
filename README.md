@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.3
+Version: v0.5.4
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -171,10 +171,12 @@ Idle tiles stay until you set a prune time: optional **herdrig prune**, off by d
 30 minutes. Worker views work for this computer's OpenRig and a configured machine's alike. Saved views and
 Follow need an OpenRig that can plan worker views (0.7.12 or later); without one, Worker view opens the Seats tab.
 
-Older versions opened OpenRig's own worker views, with a pill strip. To close those, use **Close OpenRig's old
-views** in the sidebar's System section. If no local OpenRig can close them, close their Herdr tabs; seats keep running.
-The confirmation also finds old views in saved Herdr layouts without switching your layout. Afterward, close
-any leftover tab there with Herdr's tab close. A focused worker tile stays untouched; rebuilding another tile
+Older versions opened OpenRig's own worker views, with a pill strip. Use **Leave OpenRig's old strip…** in System,
+the palette or a strip pill's menu. Pick the layout you used before; herdrig cannot tell which it was. The confirmation
+closes the old views where possible, switches to your chosen layout and keeps the Rig page open. It reports those
+results separately; your seats keep running. Choosing **Herdr** uses its standard layout without the Rig sidebar.
+You can also leave the strip with Herdr's palette: Ctrl+Shift+P, type **layout**, choose **Layout: Herdr** or your
+personal layout. Closing a space does not remove the strip. A focused worker tile stays untouched; rebuilding another tile
 may open an additional, numbered page, which the result explains.
 
 Worker views need Herdrig's Rig sidebar. Open it before trying Worker view from a standalone page or palette.
