@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.9
+Version: v0.5.10
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -20,9 +20,9 @@ After updating, Attach again to each seat whose Attach tab you opened before the
 v0.5.0 updates the Attach helper, so Herdr asks you once to approve it again on each configured Herdr machine. Local
 Attach doesn't ask.
 
-Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with this
+Replace `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with this
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
-Restart herdr-app after all five are copied. Folds and settings are kept outside those folders.
+Update `rig-link` too if you use terminal links on Herdr 0.1.17 or later (or pass `--no-links` to the standalone installer to leave it out). Restart herdr-app after copying the folders. Folds and settings are kept outside those folders.
 Check the `Version:` line in the README you copied, or **Herdrig Version** in System.
 
 The sidebar keeps its size and contents on every space: clicking another space never folds it. It folds only when
@@ -405,11 +405,12 @@ need a later restart, and Herdrig never restarts the daemon. Other actions run a
 
 ## Built from
 
-**Blocks.** Four self-contained mods, each a folder in `mods/` with its own `main.js`, `mod.json`, the shared
+**Blocks.** Four self-contained GUI mods, each a folder in `mods/` with its own `main.js`, `mod.json`, the shared
 helpers reachable from its imports, and 41 `rig-*.svg` icons. The packaged JavaScript/CommonJS file counts are
 52 for `rig`, 69 for `rig-view`, 36 for `rig-palette`, and 48 for `rig-menu`; shared files outside a mod's import
-closure are not copied there. The fifth folder, `rig-spaces`, contains three packaged JavaScript files and three SVGs,
-Herdr's own Spaces list with rig marks (below). This repository ships these five mods:
+closure are not copied there. `rig-link` has `link.js`, `mod.json`, and 23 packaged JavaScript files in total (no SVGs),
+and `rig-spaces` contains three packaged JavaScript files and three SVGs, Herdr's own Spaces list with rig marks (below).
+This repository ships these six mods (five are installed on Herdr versions before 0.1.17 or with `--no-links`):
 
 | Mod | `place` | Role |
 |---|---|---|
@@ -417,7 +418,10 @@ Herdr's own Spaces list with rig marks (below). This repository ships these five
 | `rig-view` | `none`, `focusable` | the Page: rig block, seat card, spec editor, files viewer |
 | `rig-palette` | `none`, `overlay` 620×420 | the command palette |
 | `rig-menu` | `none` | right-click menus, dialogs, the worker-view designer |
+| `rig-link` | `none` | open recognized OpenRig terminal links in the Rig page |
 | `rig-spaces` | `none` | an optional Spaces list: Herdr's own list plus rig marks, status and a rig menu; chosen in System → Layout |
+
+**Terminal links (optional).** On Herdr 0.1.17 and later, Herdr enrolls `rig-link` the first time it sees it in a personal layout, and Ctrl-clicking a recognized OpenRig link or `/api/…` address in any terminal opens the matching view on the Rig page. Plain request IDs are not clickable because Herdr does not detect them as links. Leave out `rig-link` on older Herdr versions or pass `--no-links` to the standalone installer to keep native opening (`--herdr-app /path/to/herdr-app` selects a binary outside `PATH`). When the standalone installer cannot verify Herdr 0.1.17 or later, it installs the other five mods and prints `"Skipped the OpenRig link handler. Terminal links require Herdr 0.1.17 or later. Re-run the installer after updating Herdr."` Uninstalling removes `rig-link` with the other mod folders; any saved link-handler entry left in personal layouts is inert and ignored by Herdr, so leave those layout files alone. `rig-link` has no background timers or polls: it inspects only links Herdr hands it on Ctrl-click, reads `<appHome>/openrig/config.json`, and makes local daemon reads (`/api/attention`, `/api/queue/<id>`, `/api/health/<id>`) when resolving or opening the target.
 
 **The Spaces list (optional).** `rig-spaces` is a copy of Herdr's own Spaces list with a few marked lines and a separate `rig.js`:
 a small rig mark on a rig space's avatar, the rig's own status at the row's right (the needs-you diamond or the working dot), the
@@ -431,8 +435,8 @@ list reads only a Herdr shared key (`herdrig.spaces`) that the Rig sidebar fills
 OpenRig. The copy is pinned to a Herdr commit (shown on the row); Herdr's later changes to its own list reach it with a herdrig
 release.
 
-**Fitting it into the layout.** All five mods have `"place": "none"` (Herdr only auto-docks a newly seen mod when
-`place` is not `"none"`, and never into a shipped layout). After copying the five folders into `<appHome>/mods/`,
+**Fitting it into the layout.** All six mods have `"place": "none"` (Herdr only auto-docks a newly seen mod when
+`place` is not `"none"`, and never into a shipped layout). After copying the selected folders into `<appHome>/mods/`,
 the installing agent fits the sidebar into the person's layout in one step (`AGENTS.md` step 3):
 1. Tell the person before changing their layout.
 2. If the person is on **Herdr (`main`)** (check `herdr-app status`), clone it
@@ -454,8 +458,8 @@ sidebar reads `rig-cell-header`'s pane props (`seat`, `title`, `views`) when the
 keeps working when it does not.
 
 **Herdr functions and commands it calls.** `run` (`tab.new`, `tab.select`, `tab.rename`, `layout.select`, `layout.resize`,
-`layout.clone`, `layout.set`, `tab.close`, `pane.close`, `pane.split`, `pane.focus`, `pane.zoom`, `mod.open`),
-`shared` / `setShared`, `layout()`, `layouts()`, `spaces()`, `panes()`, `terminals()`, `machines()`, `settings()`,
+`layout.clone`, `layout.set`, `tab.close`, `pane.close`, `pane.split`, `pane.rename`, `pane.focus`, `pane.zoom`, `mod.open`),
+`shared` / `setShared`, `commands()`, `layout()`, `layouts()`, `spaces()`, `panes()`, `terminals()`, `machines()`, `settings()`,
 `window()`, `home()`, `theme()`, `openOverlay`, `closeOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`, `watchFolder`.
 
 **Programs it runs.** `rig` (the OpenRig CLI — `rig ps`, `rig queue`, `rig gateway human quiet|mode …`, `rig terminal …`,
@@ -481,12 +485,12 @@ local runtime with `claude --help`, `pi --list-models`, or `omp models --json --
 **Network, programs, files — the full disclosure.** It **reaches OpenRig's local address** (`127.0.0.1:7433` unless
 that OpenRig uses another port), configured in the connection or discovered with `rig status --json`, for local HTTP reads (`/healthz`, `/api/kernel/status`,
 `/api/ps`, `/api/rigs/*`, `/api/native-seats*`, `/api/seat/status/*`, `/api/seat/held-messages/*`, `/api/attention*`, `/api/queue/*`, `/api/gateway/connections`,
-`/api/gateway/participants`, `/api/gateway/human/*`, `/api/health`, `/api/scopes*`, `/api/specs/library`,
+`/api/gateway/participants`, `/api/gateway/human/*`, `/api/health*`, `/api/scopes*`, `/api/specs/library`,
 `/api/terminal/*`, `/api/views/execution`, `/api/provider/usage*`, `/api/telemetry/usage/cost`,
 `/api/compaction/state?session=…`, `/api/telemetry/v1/nodes/:nodeId/tenures?limit=1`, `/api/usage*`, `/api/config*`), subscribes to
 `/api/events?replay=0` (with `/api/activity/events` as the fallback) for live state. A quiet sidebar on the full
 stream reconciles once a minute, with more frequent checks when the full stream is unavailable or recovery is
-pending. It sends local HTTP `POST` requests only when you click an action
+pending. `rig-link` reads only links Herdr hands it on Ctrl-click (plus `<appHome>/openrig/config.json`) and makes local `GET` reads (`/api/attention`, `/api/queue/<id>`, `/api/health/<id>`) when resolving or opening the target; naming open Worker view panes on Herdr 0.1.17+ reads `/api/queue/whoami` for visible followed workers when a view opens, reconnects, or sees a seat's active work change, with no idle reads. It sends local HTTP `POST` requests only when you click an action
 (`POST /api/mission-control/action` for **Needs** Decision Card acts — `approve`, `deny`, `answer`, `resolve` —
 and update dismissals after their 10-second Undo window;
 `POST /api/provider/usage/hosts/refresh` when refreshing per-host usage; `POST /api/agents/validate` or
@@ -534,11 +538,11 @@ worker page or the Seats tab. This works for this computer's OpenRig and a confi
 configured machines use the approved helper. Open the Rig sidebar before using a standalone page or palette.
 
 Saved page geometry and read-only seats are preserved; commands in the preview are never run. Follow keeps
-the pages to seats that are working or need you, adding seats without rebuilding existing viewers. Optional **herdrig prune**
+the pages to seats that are working or need you, adding seats without rebuilding existing viewers. On Herdr 0.1.17 and later (`pane.rename`), worker panes are named `<seat> · <slice>` from `/api/queue/whoami` (or `<seat>` when no slice is active), and Follow updates the pane name as work changes, with no idle reads. Optional **herdrig prune**
 (off by default) removes only verified, unfocused inactive viewers after 5, 10 or 30 minutes. Seats keep running;
 personal panes, changed viewers and restored shells stay. Stop following keeps the tiles. Refresh failures
 pause following with Retry and no local fallback. A changed read-only mode on a retained tile needs an explicit
-close and reopen; live viewers are never silently replaced or relabelled. Design and cell editing stay provider-only.
+close and reopen; live viewers are never silently replaced or have their terminal ownership labels rewritten. Design and cell editing stay provider-only.
 
 API/CLI compatibility was also smoke-tested on OpenRig 0.7.13, which includes attach-command session quoting (#2971). Herdrig still refuses session names outside its own safe charset.
 
@@ -603,8 +607,8 @@ Remote pads remain a plain sleep: the grid copies no mod code there, so those pa
 Each of these is something this build really does:
 
 1. `herdr-app check mods/rig mods/rig-view mods/rig-palette mods/rig-menu mods/rig-spaces` → all five pass, from the clone, with no
-   install step.
-2. Copy **all five folders** — `mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`, `mods/rig-spaces` — into a throwaway
+   install step. Check `mods/rig-link` separately with Herdr 0.1.17 or later.
+2. Copy `mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu` and `mods/rig-spaces` (plus `mods/rig-link` for terminal links on Herdr 0.1.17 or later) into a throwaway
    `<appHome>/mods/`, clone `main` (`layout.clone`) and insert the `{ "mod": "rig" }` block as the first child of
    `sidebar-lists` in the `sidebar` column → a sidebar titled **OpenRig** opening on Topology's Priority view
    (Needs you, Working, Idle), with the other branches below it, and a `ctrl-alt-r`

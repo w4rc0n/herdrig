@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.9
+Version: v0.5.10
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -56,6 +56,7 @@ The Rig palette: jump to any rig, seat or page from the keyboard.
   request gets one brief pulse. Action spinners still show work in progress.
 
 - **Archive and Restore:** hide a rig reversibly from its menu, then restore it stopped from Topology's Archived list.
+- **Terminal links (Herdr 0.1.17+):** Ctrl-click a recognized OpenRig link or `/api/…` address in any Herdr terminal to open it on the Rig page. Plain request IDs stay plain text; `--no-links` opts out.
 - **Plain seat activity:** readable status and context, with copyable raw details in **How OpenRig knows**.
 - **Sidebar tree** with six branches: **Topology** (host, rig, pod, seat, helper), **Specs**, **Scopes**,
   **Terminals**, **Needs** and **System**, each seat with its status and context usage.
@@ -96,11 +97,13 @@ Read ~/.config/herdr-app/AGENTS.md, then add this mod: herdr.dev/mods/w4rc0n/her
 ```
 
 Or give [`RECIPE.md`](RECIPE.md) to your agent in Herdr. It checks for OpenRig (and installs it with OpenRig's own guide
-only on your yes), copies the five mod folders (`mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu`, `mods/rig-spaces`)
+only on your yes), copies `mods/rig`, `mods/rig-view`, `mods/rig-palette`, `mods/rig-menu` and `mods/rig-spaces` (plus `mods/rig-link` on Herdr 0.1.17 or later: six folders in all, five on older Herdr)
 into `<appHome>/mods/`, merges `ctrl-alt-r` into `keys.json`, and adds `{ "mod": "rig" }` to your layout after telling
 you.
 
 Herdr doesn't review mods: check what your agent runs and which keys it changes.
+
+On Herdr 0.1.17 and later, Ctrl-click a recognized OpenRig link or `/api/…` address in any Herdr terminal to open it on the Rig page. Herdr enrolls `rig-link` the first time it sees it in a personal layout. Plain request IDs are not clickable because Herdr does not detect them as links. Leave out `rig-link` when copying folders on older Herdr versions. When the standalone installer cannot verify Herdr 0.1.17 or later, it installs the other five mods and prints `"Skipped the OpenRig link handler. Terminal links require Herdr 0.1.17 or later. Re-run the installer after updating Herdr."` Use `--herdr-app /path/to/herdr-app` if the intended binary is outside `PATH`, or `--no-links` to opt out and keep native opening. Uninstalling removes the mod folders (`rig`, `rig-view`, `rig-palette`, `rig-menu`, `rig-link`, `rig-spaces`) after restoring personal layouts; Herdr ignores any saved link-handler entry left in a personal layout after `rig-link` is removed.
 
 ## Updating
 
@@ -108,9 +111,9 @@ After updating, Attach again to each seat whose Attach tab you opened before the
 v0.5.0 updates the Attach helper, so Herdr asks you once to approve it again on each configured Herdr machine. Local
 Attach doesn't ask.
 
-Replace the five folders `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with the new
+Replace `rig`, `rig-view`, `rig-palette`, `rig-menu` and `rig-spaces` in `<appHome>/mods/` with the new
 release's folders, one at a time. Replace only those named folders; never use `--delete` on the whole mods folder.
-Restart herdr-app after all five are copied. Your folds and settings are kept outside those folders.
+Update `rig-link` too if you use terminal links on Herdr 0.1.17 or later (or pass `--no-links` to the standalone installer to leave it out). Restart herdr-app after copying the folders. Your folds and settings are kept outside those folders.
 Check the `Version:` line in the README you copied, or open System and read **Herdrig Version**.
 
 ## Requirements
@@ -126,7 +129,11 @@ Check the `Version:` line in the README you copied, or open System and read **He
 
 - **Network:** only OpenRig's local address (`127.0.0.1:7433` unless your OpenRig uses another port), over HTTP and SSE.
   The sidebar uses OpenRig's full event stream for updates and reconciles once a minute when quiet. It checks more
-  often when the full stream is unavailable or a recovery check is pending. Write requests follow your actions:
+  often when the full stream is unavailable or a recovery check is pending. The terminal link handler (`rig-link`)
+  inspects only links Herdr hands it when you Ctrl-click, reads `<appHome>/openrig/config.json`, and makes local
+  daemon reads (`/api/attention`, `/api/queue/<id>`, `/api/health/<id>`) when resolving or opening the target.
+  Naming open Worker view panes on Herdr 0.1.17+ reads `/api/queue/whoami` for visible followed workers when a view
+  opens, reconnects, or sees a seat's active work change, with no idle reads. Write requests follow your actions:
   - a Decision Card act, or dismissal of your queue updates after the 10-second Undo window;
   - a usage refresh;
   - a restore-plan preview (`POST /api/up` with `plan: true`) when you open **Resume rig**;
@@ -213,6 +220,7 @@ page, named after the page. Close a tile or a whole page with Herdr's own close;
 Choosing Worker view again selects the open pages, and reattaches any tile whose viewer ended.
 **Show in worker view** focuses a seat's tile (in its worker page, or in the Seats tab).
 Saved views open the same way and keep their page layout. **Follow** adds seats as they start working or need you.
+On Herdr 0.1.17 and later, each worker pane is named `<seat> · <slice>` from live OpenRig data (or `<seat>` when no slice is active), and Follow updates the name as work changes.
 Idle tiles stay until you set a prune time: optional **herdrig prune**, off by default, removes unfocused idle tiles after 5, 10 or
 30 minutes. Worker views work for this computer's OpenRig and a configured machine's alike. Saved views and
 Follow need an OpenRig that can plan worker views (0.7.12 or later); without one, Worker view opens the Seats tab.
@@ -315,7 +323,7 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
   modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
 - **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.
 - **The sidebar wants 260 px.** It's cramped between 160 and 260 px, and becomes a rail of rig chips below 160.
-- **The folders go together.** Copying only some leaves menus and the palette opening nothing (and, without `rig-spaces`, System → Layout says herdrig's Spaces list isn't installed). Don't rename them
+- **The folders go together.** Copying only some of the five core folders leaves menus and the palette opening nothing (without `rig-spaces`, System → Layout says herdrig's Spaces list isn't installed; `rig-link` is optional and only handles terminal links). Don't rename them
   without editing the `MOD_IDS` map in each folder's `rig-lib.js` (see **Watch out** in the recipe).
 
 ## Contributing

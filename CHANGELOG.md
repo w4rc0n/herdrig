@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.10
+
+Ctrl-click OpenRig links and API addresses in Herdr terminals to open them on the Rig page, and see "seat · slice" names on worker panes.
+
+- Ctrl-click a recognized OpenRig link or `/api/…` address in any Herdr terminal to open it on the Rig page (requires Herdr 0.1.17 or later; older Herdr skips `rig-link` and says why, and `--no-links` opts out). Plain request IDs are not clickable because Herdr does not detect them as links.
+- Worker panes are named "seat · slice" from live OpenRig data on Herdr 0.1.17 and later, or just the seat when no slice is active. Follow updates the name as work changes.
+- A brief read failure in the Rig sidebar’s Needs list no longer brings answered requests back.
+- Saving an earlier spec draft clears its reminder, including drafts saved by older versions.
+- In the Rig page's Recent activity, an entry whose text is only a request ID reads "Untitled row" instead of "No work served".
+
 ## v0.5.9
 
 Old-view cleanup remembers confirmed closes across restarts, and spec saves and compaction recovery keep the right state when a connection changes or a reply arrives late.

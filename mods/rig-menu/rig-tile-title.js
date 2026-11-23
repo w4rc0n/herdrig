@@ -1,11 +1,15 @@
 const clean = value => String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
 
 /** Presentation only: never use a title to establish terminal ownership. */
-export function tileTitle(seat, { label = "", runtime = null, readOnly = false } = {}) {
+export function workerPaneTitle(seat, label = "") {
   const id = clean(seat?.logicalId) || clean(label);
   const slice = Array.from(clean(seat?.activeSlice ?? seat?.slice));
   const part = slice.length > 24 ? slice.slice(0, 23).join("") + "…" : slice.join("");
-  return [id, part, clean(runtime ?? seat?.runtime) || "unreported"].filter(Boolean).join(" · ") + (readOnly ? " · read-only" : "");
+  return [id, part].filter(Boolean).join(" · ");
+}
+
+export function tileTitle(seat, { label = "", runtime = null, readOnly = false } = {}) {
+  return [workerPaneTitle(seat, label), clean(runtime ?? seat?.runtime) || "unreported"].filter(Boolean).join(" · ") + (readOnly ? " · read-only" : "");
 }
 
 export function gridViewerPayload(argv) {

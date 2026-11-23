@@ -1,0 +1,10 @@
+{
+  "place": "none",
+  "title": "OpenRig links",
+  "link_handlers": [
+    { "kind": "url", "pattern": "^https?://[^/\\s?#]+/api/(?:missions|slices)/[^\\s?#]+[?&]project=" },
+    { "kind": "url", "pattern": "^https?://[^/\\s?#]+/api/(?:queue|attention|rigs|specs|health|terminal)(?:[/?#]|$)" },
+    { "kind": "file", "pattern": "^/api/(?:missions|slices)/[^\\s?#]+[?&]project=" },
+    { "kind": "file", "pattern": "^/api/(?:queue|attention|rigs|specs|health|terminal)(?:[/?#]|$)" }
+  ]
+}
