@@ -121,7 +121,8 @@ by `rig status --json` on the machine. A mismatch or outage refuses the action w
 can restore tiles as shells: review **Rebuild tiles…** before replacing them. Unrecognised programs stay untouched.
 If an Attach or Operator tab became a shell, save any work and close that tab before attaching again; the mod
 explains this rather than opening a duplicate. Concurrent grid and Attach refreshes wait for each machine's relay
-preparation; a recovered connection clears its temporary grid notice on the next poll.
+preparation. When OpenRig reports a terminal-server outage, an existing rig grid stays in place. Once the server
+answers again, its viewers reconnect when the grid is out of focus.
 One daemon machine is supported; this is not per-seat routing. A local second-core simulation covers the integration,
 while real SSH login, remote PATH/account permissions and network latency need checking on the actual machine.
 
@@ -160,7 +161,8 @@ the note says which files must exist beside the copy before it can launch.
 It **runs the `rig` CLI** with the connection’s address when configured. Otherwise the CLI discovers the daemon
 from the selected OpenRig home. Pin a custom address in Herdrig’s connection settings if you previously reached it
 using shell variables.
-**Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port. For Codex,
+**Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port. Save resolves
+the home again and checks that the daemon record still matches the reviewed connection. For Codex,
 **Change model / harness** reads `<accountHome>/models_cache.json` and watches the folder while the catalog is open.
 The account home comes from OpenRig's seat status. Before reading cache contents, the helper checks that
 the opened file is a regular file owned by the current user and no larger than 1 MiB. The folder-copy helper

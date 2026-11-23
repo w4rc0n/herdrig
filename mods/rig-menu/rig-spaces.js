@@ -114,13 +114,16 @@ export class RebuildConfirmations {
   }
 }
 
+const gridSeats = rig => (rig.pods ?? []).flatMap(pod => pod.seats ?? []);
+const gridSeatAvailable = seat => !["stopped", "departed", "failed", "starting", "terminal_gone"].includes(seat.status);
+
 export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome, remote = false, remoteViewer = null } = {}) {
   const local = (host) => !host || host === "local" || host === selfHostId;
   if (!selfHostId && (rig.host && rig.host !== "local" || (rig.pods ?? []).some((p) => p.seats?.some((s) => s.host && s.host !== "local")))) {
     throw new Error("Couldn't confirm this machine: OpenRig didn't report its own host ID. Refresh before opening a rig space.");
   }
   if (!local(rig.host)) throw new Error("This rig's seats run on another machine; rig spaces need their tmux here.");
-  const seats = (rig.pods ?? []).flatMap((p) => p.seats ?? []).filter((s) => !["stopped", "departed", "failed", "starting", "terminal_gone"].includes(s.status)); // terminal_gone: its tmux server isn't answering
+  const seats = gridSeats(rig).filter(gridSeatAvailable);
   const tiles = seats.map((s) => {
     if (!local(s.host)) throw new Error("This rig's seats run on another machine; rig spaces need their tmux here.");
     if (s.native) throw new Error("This grid needs tmux seats on this machine; use Attach for native Herdr seats.");
@@ -152,7 +155,7 @@ export async function localGridPreflight(host, plan) {
 }
 
 export class RigSpaces {
-  constructor(host) { this.host = host; this.done = new Map(); this.doneMeta = new Map(); this.needsVerify = new Set(); this.pending = new Map(); this.closed = new Set(); this.failures = new Map(); }
+  constructor(host) { this.host = host; this.done = new Map(); this.doneMeta = new Map(); this.outagedTabs = new Map(); this.needsVerify = new Set(); this.pending = new Map(); this.closed = new Set(); this.failures = new Map(); }
   clearPending(rig, config) {
     const key = `${origin(config)}|${config?.daemonMachine || ""}|${rig.name}`;
     const entry = this.pending.get(key);
@@ -287,6 +290,7 @@ export class RigSpaces {
     this.closed.add(key);
     this.done.delete(key);
     this.doneMeta.delete(key);
+    this.outagedTabs.delete(key);
     for (const pane of this.ownedPanes(rig, config)) {
       if (config?.daemonMachine) {
         const ready = await this.host.prepareRemote?.(config);
@@ -357,7 +361,18 @@ export class RigSpaces {
       if (other) return { ok: false, unconfirmedSpace: true, reason: unconfirmedSpaceReason(rig.name, machine, other.origin, config.daemonUrl) };
     }
     // A closed space is never recreated by polling, even when membership changes.
+    if (!space) this.outagedTabs.delete(key);
     if (!space && !explicit) { this.done.delete(key); this.doneMeta.delete(key); return { ok: true, closed: true }; }
+    const seats = gridSeats(rig);
+    if (seats.some(seat => seat.status === "terminal_gone") && (!explicit || !seats.some(gridSeatAvailable))) {
+      const pane = space && this.ownedPanes(rig, config).find(p => space.tabs?.some(tab => tab.id === p.tab));
+      if (pane) this.outagedTabs.set(key, { space: space.id, tab: pane.tab });
+      return explicit
+        ? { ok: false, retryable: true, closeAvailable: Boolean(pane), reason: "This rig's terminal server isn't answering." }
+        : { ok: true, skipped: true };
+    }
+    const outaged = this.outagedTabs.get(key);
+    const recovering = outaged?.space === space?.id && Boolean(outaged);
     // A machine's grid needs no daemon address: each tile runs the verified relay on that machine with only its tmux session, and the machine's
     // identity comes from prepareRemote. So a connection over Herdr's own connection (its herdr:// address naming its own machine and agreeing with its
     // record, which herdrIdentityOf checks) opens like a tunnel.
@@ -443,7 +458,7 @@ export class RigSpaces {
       return { hc: hcTuple, list };
     };
     let plan = null, remote = null, expectedMachine = { hc: null, list: null }, fromFastPath = false;
-    if (!rebuild && space && !this.needsVerify.has(key) && this.done.has(key) && this.doneMeta.has(key)) {
+    if (!rebuild && !recovering && space && !this.needsVerify.has(key) && this.done.has(key) && this.doneMeta.has(key)) {
       currentStep = "checking existing grid";
       const cur = index();
       const meta = this.doneMeta.get(key);
@@ -547,6 +562,10 @@ export class RigSpaces {
     currentStep = "checking restored tiles";
     const spaceTabsSet = new Set((space?.tabs ?? []).map((t) => t.id));
     let tab = gridTerms().map((t) => qualified(index().labelsByAddr.get(addr(t))?.["herdr.tab"])).find((id) => spaceTabsSet.has(id));
+    if (recovering && tab !== outaged.tab) {
+      this.outagedTabs.delete(key);
+      if (!explicit) return { ok: true, closed: true };
+    }
     const tabPanes = () => index().panesByTab.get(tab) ?? [];
     const snapshot = () => { const cur = index(); return (cur.panesByTab.get(tab) ?? []).map((p) => tileSnapshot(cur.byAddr.get(p.terminal), p, cur.labelsByAddr.get(p.terminal))); };
     let stale = gridTerms().filter((t) => { const a = addr(t); return qualified(index().labelsByAddr.get(a)?.["herdr.tab"]) === tab && !ownAt(a); });
@@ -647,11 +666,11 @@ export class RigSpaces {
         gateToken,
         expectedMachine,
       });
-      if (!rebuild && tab && !this.done.has(key) && !stale.length && this.isPlannedGrid(plan, tabPanes(), index())) {
+      if (!rebuild && !recovering && tab && !this.done.has(key) && !stale.length && this.isPlannedGrid(plan, tabPanes(), index())) {
         this.done.set(key, stamp());
         recordBuilt();
       }
-      if (!rebuild && tab && this.done.get(key) === stamp()) {
+      if (!rebuild && !recovering && tab && this.done.get(key) === stamp()) {
         // A reuse found by the slow path (after a settings change, or a machine check) records what it just checked, so the next sync can take the fast
         // path again. The fast path checked nothing new and keeps the record it read.
         if (!fromFastPath) recordBuilt();
@@ -782,7 +801,8 @@ export class RigSpaces {
         const argv = t.argv?.[0] === "env" && t.argv?.[1]?.startsWith("HERDR_OPENRIG_GRID_TILE=") ? t.argv.slice(2) : t.argv;
         return JSON.stringify(argv) === JSON.stringify(first.argv);
       };
-      let anchor = tabPanes().find((p) => {
+      // A parked relay still looks like the previous viewer in Herdr's process list.
+      let anchor = recovering ? null : tabPanes().find((p) => {
         const cur = index(), t = cur.byAddr.get(p.terminal), l = cur.labelsByAddr.get(p.terminal);
         return Boolean(t && cur.ownSet.has(p.terminal) && l?.["herdr-openrig.seat"] === first.session && sameViewer(t));
       });
@@ -911,6 +931,7 @@ export class RigSpaces {
       await ready();
       await waitFor(() => [...builtOwned.keys()].every((id) => index().ownSet.has(id)), "viewer labels");
       this.done.set(key, stamp());
+      this.outagedTabs.delete(key);
       this.doneMeta.set(key, {
         selfHostId: remote?.selfHostId ?? host.selfHostId?.(),
         node: remote?.node ?? null,

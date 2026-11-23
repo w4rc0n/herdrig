@@ -19,7 +19,12 @@ export class AddLocalPanel {
     this.homeInput.on('submit',(_e,cx)=>this.check(cx));
     this.homeInput.on('focus',()=>{this.homeFocused=true;});this.homeInput.on('blur',()=>{this.homeFocused=false;});
   }
-  expire(){if(this.expired)return;this.expired=this.closed=true;this.generation++;this.gate.expire();this.pendingFocus=null;this.focusTask?.cancel?.();this.homeInput.release?.();this.checkHandle?.release?.();releaseFocusTargets(this);}
+  expire(){
+    if(this.expired)return;
+    this.expired=this.closed=true;
+    this.finishOperationRedraw?.();this.finishOperationRedraw=null;
+    this.generation++;this.gate.expire();this.pendingFocus=null;this.focusTask?.cancel?.();this.homeInput.release?.();this.checkHandle?.release?.();releaseFocusTargets(this);
+  }
   homeText(){return String(this.homeInput.value()??'').trim();}
   async open(cx){
     const value=await this.gate.prefill();
@@ -32,12 +37,16 @@ export class AddLocalPanel {
     // to the dialog, so start that task while the event still owns the view.
     let finish;
     const completion=new Promise(resolve=>{finish=resolve;});
+    this.finishOperationRedraw=finish;
     cx.spawn(async task=>{
       await completion;
       if(!this.expired)task.notify();
     });
     return cx.spawn(async task=>{
-      try{await run(task);}finally{finish();}
+      try{await run(task);}finally{
+        if(this.finishOperationRedraw===finish)this.finishOperationRedraw=null;
+        finish();
+      }
     },{owner:null});
   }
   check(cx){

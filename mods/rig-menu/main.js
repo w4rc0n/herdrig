@@ -368,12 +368,12 @@ export default class RigMenu extends View {
           mono:settings()?.font_family??"monospace",copyIcon:icon("rig-copy"),stop:step.action==="stop-machine",
           initialConfirmation:step.action==="confirm-machine"?(step.confirmation??null):null,
           waitingForRig:step.waitingForRig??null,
-          continuationText:step.token?(step.continuationText??'What you started continues when you close this.'):null,
+          continuationText:this.machineConfirmationToken?()=>this.machineContinuationText(step):null,
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,retryHandle:this.dialogRetryHandle,
           copyHandles:this.dialogCopyHandles,
-          cancel:()=>this.dismiss(),done:(_cx,result)=>{
-            this.completeMachineConfirmation();
-            this.dismiss();
+          cancel:()=>this.dismiss(),done:(doneCx)=>{
+            if(this.completeMachineConfirmation())this.dismiss();
+            else doneCx.notify();
           }});
         if(step.action!=="stop-machine")await this.setupPanel.check(cx,Boolean(step.action==="confirm-machine"&&step.confirmation));
         this.pendingDialogFocus=()=>(step.action==='stop-machine'?this.dialogCancelHandle:this.dialogConfirmHandle)?.focus?.();
@@ -983,13 +983,26 @@ export default class RigMenu extends View {
     const id = target?.conn;
     return typeof id === "string" && connections.some((c) => c?.id === id) ? { section: "topology", conn: id } : { section: "topology" };
   }
-  /** herdr's teardown (a click beside the dialog closes it): what was typed stays for next time. */
-  completeMachineConfirmation() {
-    if(this.gone||this.machineConfirmationEmitted||!this.machineConfirmationToken)return;
+  machineContinuationText(step) {
+    if(shared("rig.machineSetupToken")!==this.machineConfirmationToken)return "The original action is no longer waiting. Repeat the original action from the Rig sidebar.";
+    if(!layoutShowsMod(layout(),MOD_IDS.sidebar))return "Show the Rig sidebar, then choose Done to continue.";
+    return step.continuationText??"What you started continues when you close this.";
+  }
+
+  completeMachineConfirmation({closing=false}={}) {
+    const token=this.machineConfirmationToken;
+    if(this.gone||this.machineConfirmationEmitted||!token)return true;
+    const ownsAction=shared("rig.machineSetupToken")===token;
+    const visible=layoutShowsMod(layout(),MOD_IDS.sidebar);
+    if(!ownsAction||!visible){
+      if(closing||!ownsAction)notify({title:`${this.setupPanel?.machine??this.setupPanel?.config?.daemonMachine??'Machine'} is set up`,
+        body:visible?"Repeat the original action from the Rig sidebar.":"The Rig sidebar is hidden. Show it and repeat the original action.",level:"info"});
+      return !ownsAction;
+    }
     this.machineConfirmationEmitted=true;
-    if(!layoutShowsMod(layout(),MOD_IDS.sidebar)){notify({title:`${this.setupPanel?.machine??this.setupPanel?.config?.daemonMachine??'Machine'} is set up`,body:"The next step needs the Rig sidebar, which is hidden. Show it, then try again.",level:"info"});return;}
-    setShared("rig.machineConfirmation",this.machineConfirmationToken);
+    setShared("rig.machineConfirmation",token);
     run("rig.confirm-machine");
+    return true;
   }
 
   async close() {
@@ -997,7 +1010,7 @@ export default class RigMenu extends View {
     // Herdr's reserved Escape closes the overlay before a panel key handler runs.
     this.releaseCompactionReview();
     // Treat only a settled successful approval as Done; a busy close is cancellation.
-    if(this.setupPanel?.phase==='done'&&!this.setupPanel.busy&&!this.setupPanel.followUpBusy)this.completeMachineConfirmation();
+    if(this.setupPanel?.phase==='done'&&!this.setupPanel.busy&&!this.setupPanel.followUpBusy)this.completeMachineConfirmation({closing:true});
     this.sayInFlight(); try { this.herdr?.release?.(); } catch (_) {} this.gone = true; releaseFocusTargets(this);
     for(const release of this.machinePreparationReleases??[])release();
     this.machinePreparationReleases?.clear();
@@ -1221,7 +1234,9 @@ export default class RigMenu extends View {
 
   resumeReadView(t,cx,target,kind) {
     const button=(id,label,read)=>this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).bg(t.raised).cursor_pointer(),null,(_e,next)=>this.requestResumeRead(next,read),false,label);
-    const fresh=(id,logicalId)=>this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).bg(t.raised).cursor_pointer(),null,()=>dialog({...target,logicalId},{action:'fresh',confirm:true},RESULT_HEIGHT),false,'Start fresh…');
+    const {rig,rigId,conn,rowsConfig}=target;
+    const fresh=(id,logicalId)=>this.dialogButton(t,div().id(id).px(8).h(24).rounded(5).bg(t.raised).cursor_pointer(),null,()=>dialog(
+      {kind:"seat",rig,rigId,conn,logicalId,...(rowsConfig?{rowsConfig}:{})},{action:'fresh',confirm:true},RESULT_HEIGHT),false,'Start fresh…');
     return kind==='plan'?restorePlanView(t,this.resumePlan,target.rig,button,fresh):rollCallView(t,this.resumeRollCall,button,fresh);
   }
 

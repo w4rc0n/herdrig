@@ -173,7 +173,8 @@ export class SeatCompaction {
       e.node.runtime==='pi'
         ? e.requestedAttemptId&&data?.state?.attemptId===e.requestedAttemptId
         : data?.preparation?.mode==='manual'&&preparationId
-          &&(e.requestedAttemptId?preparationId===e.requestedAttemptId:preparationId!==start.baseline)
+          &&(e.requestedAttemptId?preparationId===e.requestedAttemptId
+            :start.allowBaseline&&preparationId!==start.baseline)
     )){
       this.host.reportStart(start.token,'started');
       e.start=null;
@@ -221,7 +222,9 @@ export class SeatCompaction {
         }else if(decision==='allow'||decision.status==='allow'){
           if(!review.cancel&&typeof decision==='object'){
             const start=review.start=e.start={token:review.token,deadline:decision.deadline,
-              baseline:e.data?.preparation?.attemptId,copy:compactionStartCopy(e.node.canonicalSessionName)};
+              // Claude's trigger can wait for the map and idle seat before returning a receipt.
+              allowBaseline:true,baseline:e.data?.preparation?.attemptId,
+              copy:compactionStartCopy(e.node.canonicalSessionName)};
             if(!Number.isFinite(start.deadline)||Date.now()>=start.deadline||!this.host.reportStart?.(start.token,'checking')){
               this.expireStart(e,start,cx);return;
             }
@@ -257,7 +260,7 @@ export class SeatCompaction {
   }
   async act(e,review,cx){
     const start=review.start;
-    let dispatched=false;
+    let dispatched=false,received=false,accepted=false;
     try{
       const op=review.operation??this.host.operation(e.config);
       const tenure=await this.host.get(e.config,`/api/telemetry/v1/nodes/${encodeURIComponent(e.node.nodeId)}/tenures?limit=1`,op);
@@ -279,9 +282,12 @@ export class SeatCompaction {
       // A state read started before this command cannot describe its result.
       const dispatchRead=e.stateRead=(e.stateRead??0)+1;
       dispatched=true;const result=await this.host.exec(command,op,240000);
+      received=true;
       let data;try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
-      if(!review.cancel&&result.code===0&&data.ok===true&&typeof data.attemptId==='string'&&data.attemptId.trim())e.requestedAttemptId=data.attemptId;
+      accepted=result.code===0&&data.ok===true;
+      if(!review.cancel&&accepted&&typeof data.attemptId==='string'&&data.attemptId.trim())e.requestedAttemptId=data.attemptId;
       if(start?.expired)return;
+      if(start)start.allowBaseline=accepted&&data.session===e.node.canonicalSessionName&&data.stage==='compact-sent';
       const refused=result.code!==0||data.ok===false;
       if(refused&&data.preparation&&e.stateRead===dispatchRead)e.data=data;
       // Always read authoritative state; a trigger receipt alone never completes a request.
@@ -294,7 +300,16 @@ export class SeatCompaction {
           &&cancelled(receipt.reason)&&latest.status==='stopped'&&cancelled(latest.reason);
         if(!confirmedCancel)e.error=data.error??data.reason??'OpenRig refused compaction.';
       }
-    }catch(error){if(!start?.expired){const unsent=!dispatched||isKnownUnsentError(error);e.error=unsent?`${String(error.message??error)} Nothing was sent.`:`${String(error.message??error)} The request may have reached OpenRig. Check the pane or OpenRig's CLI before trying again.`;e.uncertain=!unsent;}}
+    }catch(error){
+      if(!start?.expired){
+        // A gate refusal during readback describes the GET, never the preceding command.
+        const unsent=!dispatched||(!received&&isKnownUnsentError(error));
+        e.error=accepted?"The request reached OpenRig, but Herdrig couldn't refresh its state. Check the pane or OpenRig's CLI before trying again."
+          :unsent?`${String(error.message??error)} Nothing was sent.`
+          :`${String(error.message??error)} The request may have reached OpenRig. Check the pane or OpenRig's CLI before trying again.`;
+        e.uncertain=!unsent;
+      }
+    }
     finally{
       if(!start?.expired){
         if(start&&e.start===start&&e.error){this.host.reportStart(start.token,'error',e.error);e.start=null;}

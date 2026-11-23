@@ -135,7 +135,8 @@ export class MachineSetupPanel {
     if(this.error)body=body.child(div().id("machine-setup-error").text_color(t.blocked).child(errorBlock(this,t,"machine-setup-error-detail",this.error,{where:this.machine??"this computer",prefix:"✗ "})));
     if(done)body=body.child(div().id("machine-setup-done").child(this.stop?`✓ Stopped using ${this.machine}. Open box tiles and the helper were left in place.`
       :`✓ Using ${this.machine}. Attach helper ${this.result.installed?"installed and verified":"already installed, verified"}.`));
-    if(done&&this.continuationText)body=body.child(div().id('machine-setup-continuation').text_color(t.muted).child(this.continuationText));
+    if(done&&this.continuationText)body=body.child(div().id('machine-setup-continuation').text_color(t.muted)
+      .child(typeof this.continuationText==="function"?this.continuationText():this.continuationText));
     if(done&&this.warning)body=body.child(h_flex().gap(6).items_center().flex_wrap()
       .child(div().id("machine-setup-warning").text_color(t.working).when(!!this.warningDetail,el=>el.tooltip(plainError(this.warningDetail,{where:"this computer"}).text)).child(this.warning))
       .when(!!this.warningDetail,el=>el.child(errorBlock(this,t,"machine-setup-warning-detail",this.warningDetail,{where:"this computer"})))

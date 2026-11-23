@@ -9,7 +9,10 @@ export function connectionIdentity(config){
  return origin?{origin,machine:config.daemonMachine??null,home:config.openrigHome??null,host:config.expectedHostId??null}:null;
 }
 const same=(a,b)=>!!a&&!!b&&a.origin===b.origin&&a.machine===b.machine&&a.home===b.home&&a.host===b.host;
-const configurations=config=>config&&!config.configInvalid?connectionsOf(config).connections.map(conn=>connectionConfig(config,conn)):[];
+const configurations=config=>config&&!config.configInvalid?connectionsOf(config).connections.map(conn=>
+ conn.id===LEGACY_CONNECTION_ID&&!config.connectionsList&&config.daemonUrlSource==='cli'
+  ?connectionConfig(config,{...conn,daemonUrl:config.daemonUrl})
+  :connectionConfig(config,conn)):[];
 const label=config=>config.daemonMachine||config.daemonUrl||config.connectionId;
 export function resolveConnectionIdentity(identity,oldId,configs){
  if(!identity){const exact=configs.find(config=>config.connectionId===oldId);return exact?{kind:'matched',config:exact}:{kind:'missing-evidence',oldId};}
@@ -28,8 +31,12 @@ export function migrateConnectionState({shared,setShared,migrateWorkers=true},ne
  const prior=previous??shared('rig.data')?.config;
  const before={...saved};
  const priorConfigs=configurations(prior);
- for(const config of priorConfigs)before[config.connectionId]=connectionIdentity(config);
+ for(const config of priorConfigs){
+  const identity=connectionIdentity(config);
+  if(identity||config.connectionId!==LEGACY_CONNECTION_ID)before[config.connectionId]=identity;
+ }
  const configs=configurations(next);
+ const legacyAddressPending=!next.connectionsList&&configs.some(config=>config.connectionId===LEGACY_CONNECTION_ID&&!config.daemonUrl);
  const resolve=(identity,id)=>{
   const result=resolveConnectionIdentity(identity,id,configs);
   if(result.kind==='matched'&&result.config.connectionId!==id&&priorConfigs.filter(config=>same(identity,connectionIdentity(config))).length>1)
@@ -94,6 +101,7 @@ export function migrateConnectionState({shared,setShared,migrateWorkers=true},ne
  };
  for(const [key,entry] of Object.entries(migrateWorkers?stored:{})){
   if(!entry?.config||!entry.view)continue;
+  if(legacyAddressPending&&(entry.config.connectionId??LEGACY_CONNECTION_ID)===LEGACY_CONNECTION_ID)continue;
   const identity=workerEvidence(entry.config);
   if(entry.connectionIssue?.kind==='ambiguous'&&!configs.some(config=>config.connectionId===entry.config.connectionId&&same(connectionIdentity(config),identity)))continue;
   const result=resolve(identity,entry.config.connectionId??LEGACY_CONNECTION_ID);
@@ -129,7 +137,11 @@ export function migrateConnectionState({shared,setShared,migrateWorkers=true},ne
   setShared('rig.workerViews',workers);
   setShared('rig.spaceState',{...(shared('rig.spaceState')??{}),workerViews:workers});
  }
- const identities={...before};for(const config of configs)identities[config.connectionId]=connectionIdentity(config);
+ const identities={...before};
+ for(const config of configs){
+  if(legacyAddressPending&&config.connectionId===LEGACY_CONNECTION_ID)continue;
+  identities[config.connectionId]=connectionIdentity(config);
+ }
  if(changed(saved,identities))setShared('rig.connectionIdentities',identities);
  return{workersChanged,entry:mapEntry};
 }
