@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.8
+
+The Rig sidebar is quieter when idle, Herdr 0.1.17 is supported, and spec drafts stay with the connection they were written for.
+
+- In a large idle setup, the Rig sidebar sent about one thirteenth as many requests and used substantially less CPU. With OpenRig’s full event stream, the sidebar updates from live events and checks once a minute during quiet periods. It checks more often when the full stream is unavailable or a recovery check is pending.
+- Tested with the official Herdr 0.1.17 build.
+- Spec drafts stay with the OpenRig connection they were written for, even when a replacement uses the same address. Earlier drafts with an unknown connection can be checked before saving. You can close that preview and reopen it later.
+- When a quiet sidebar replaces its idle event stream (about every two minutes), it no longer repeats the capability check and the full read.
+- On Herdr 0.1.17, a quiet sidebar keeps its connection to OpenRig instead of reconnecting and re-reading everything every 30 seconds.
+- In herdrig's Spaces list, a repository kept as `<project>/.bare` is named after the project, as in Herdr 0.1.17.
+- A late OpenRig refusal that confirms no input was sent clears the compaction recovery warning.
+- When OpenRig accepts compaction after the seat card has shown an unconfirmed warning, the card updates to say the request reached OpenRig.
+- Old-view cleanup receipts apply to the OpenRig connections that answered. The sidebar retries failed settings reads on the next check, and framed errors give retry advice only when it fits the failure.
+
 ## v0.5.7
 
 Recover unconfirmed compaction requests, keep unrelated Rig tabs intact during cleanup, and see clearer setup and status feedback.

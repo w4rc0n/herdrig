@@ -16,7 +16,7 @@ import { errorBlock, errorNotice } from "./rig-error-view.js";
 const notify = value => errorNotice(rawNotify, value);
 import { followedConnection, spaceMachine } from "./rig-follow.js";
 import { herdrIdentityOf } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, hasOldProviderStrip, oldViewsGone, oldStripCleanupBusy, oldStripBusyTip } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, hasOldProviderStrip, visibleOldViewsGone, oldStripCleanupBusy, oldStripBusyTip } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperationOrRefusal, gateSameConfig, CONFIG_CHANGED, numberedConfigReads } from "./rig-gate.js";
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
@@ -579,7 +579,7 @@ export default class RigPalette extends View {
     // The TUI's refresh re-reads its own view; here the sidebar re-reads (the page follows it).
     if (verb === "refresh" && !arg) { run("rig.refresh"); this.dismiss(); return true; }
     if ((verb === "leave-old-strip"||verb === "close-old-worker-views") && !arg) {
-      const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).filter(view=>view.current);
+      const views = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],visibleOldViewsGone(shared,this.config,terminals())).filter(view=>view.current);
       if (oldStripCleanupBusy(shared)) { this.error=oldStripBusyTip;cx.notify();return true; }
       if (!hasOldProviderStrip(layout())) {
         this.error = "There is no OpenRig strip in this window.";

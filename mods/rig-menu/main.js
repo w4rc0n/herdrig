@@ -23,7 +23,7 @@ import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { workerCapabilityText, rowTitle, rowTip, rowText, rowIdIn, sweepFinding, checkLabel, TERMINAL_GONE_REASON, TERMINAL_GONE_SEND_NOTE, TERMINAL_GONE_RIG_REASON, rigTerminalsGone } from "./rig-lib.js";
-import {knownOldProviderViews,readOldProviderViews,hasOldProviderStrip,oldStripLayouts,oldViewsGone,oldStripCleanupBusy,oldStripBusyTip} from './rig-old-views.js';
+import {knownOldProviderViews,readOldProviderViews,hasOldProviderStrip,oldStripLayouts,visibleOldViewsGone,oldStripCleanupBusy,oldStripBusyTip} from './rig-old-views.js';
 import {layouts} from 'herdr';
 import { rigOrigin, syncRetainedOrigins } from "./rig-space-context.js";
 import { MachineSetupPanel } from "./rig-machine-setup-view.js";
@@ -1289,7 +1289,7 @@ export default class RigMenu extends View {
     const sidebarItem = (iconName, label, command, act, dynamicLabel = false) => { const reason = sidebarRefusal(layout(), command); out.push({ icon: iconName, label, act, disabled: !!reason, reason, dynamicLabel }); };
     const oldStripItem=()=>{
       if(!hasOldProviderStrip(layout()))return;
-      const views=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).filter(view=>view.current);
+      const views=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],visibleOldViewsGone(shared,this.config,terminals())).filter(view=>view.current);
       const disabled=oldStripCleanupBusy(shared);
       out.push({icon:"x",label:"Leave OpenRig's old strip…",disabled,reason:disabled?oldStripBusyTip:null,
         act:()=>dialog({kind:"old-views"},{action:"close-old-views",views,confirm:true},480)});
@@ -2053,7 +2053,8 @@ export default class RigMenu extends View {
     if(step.action==='resume'&&(this.resumePlan?.ready!==true||this.result))return;
     if(step.action==='resume')this.resetResumeRollCall();
     if(step.action==="close-old-views"){
-      step={...step,views:(step.views??[]).filter(view=>!oldViewsGone(shared,this.config).includes(view.id))};
+      const gone=visibleOldViewsGone(shared,this.config,terminals());
+      step={...step,views:(step.views??[]).filter(view=>!gone.includes(view.id))};
       if(this.cleanupQueued)return;
       if(oldStripCleanupBusy(shared)){
         this.result={ok:false,notSent:true,text:'A cleanup is already running in this window. Wait for its result.'};
@@ -2749,7 +2750,10 @@ export default class RigMenu extends View {
   }
 
   dialogView(t, cx, target, step) {
-    if(step.action==='close-old-views')step={...step,views:(step.views??[]).filter(view=>!oldViewsGone(shared,this.config).includes(view.id))};
+    if(step.action==='close-old-views'){
+      const gone=visibleOldViewsGone(shared,this.config,terminals());
+      step={...step,views:(step.views??[]).filter(view=>!gone.includes(view.id))};
+    }
     this.dialogRenderCx=cx;this.dialogButtonIndex=0;
     this.dialogFirstControl=step.action==='design-view'?this.handle:null;
     this.dialogLastControl=null;
