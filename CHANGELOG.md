@@ -4,6 +4,7 @@
 
 Recover unconfirmed compaction requests, keep unrelated Rig tabs intact during cleanup, and see clearer setup and status feedback.
 
+- If OpenRig accepts compaction and the state refresh fails, the recovery controls and warning stay on the seat card when you leave and reopen it.
 - The Rig sidebar no longer shows a stale-context error while waiting for Herdr to open panes. If Herdr reports an internal context error, Herdrig explains it in plain language and keeps the original error in Details.
 - Leaving OpenRig’s old strip keeps unrelated Rig tabs and their history intact. Cleanup keeps an old view available to retry while a local OpenRig is still being checked.
 - Request Details keeps the row IDs referenced in the message. Sweep checks no longer count as human requests in Pulse, and the palette keeps your draft when it cannot verify which requests take replies.

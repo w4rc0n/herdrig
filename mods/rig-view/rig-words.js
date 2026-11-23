@@ -48,9 +48,6 @@ export function plainError(error, { where = "OpenRig's machine", what = null, wh
   if (outcomeUnknown || /\bunconfirmed\b|\boutcome\s+is\s+unknown\b|\bnot\s+confirmed\b|\b(?:may|might)\s+(?:still\s+)?(?:not\s+)?have\b|\bdid(?:n't| not)\s+finish\s+in\s+time\b|\bpartly done\b|\bearlier part was recorded\b|\bwrite reached\b|\banswer couldn't be read\b/i.test(detail)) {
     return { text: withoutPaths(detail), detail };
   }
-  if (/\bcx is no longer valid\b/i.test(detail)) {
-    return { text: `Herdrig could not finish this step. Try again. ${toast ? "The exact error is in the log." : "Details has the exact error."}`, detail };
-  }
   // These producers already explain what failed and what still works. Replace only their diagnostic.
   if (toast && /^(?:Needs notifications|Live updates) stopped working\b/.test(detail)) {
     const diagnosticAt = detail.indexOf(": "), recoveryAt = detail.lastIndexOf(". The sidebar ");
@@ -71,8 +68,13 @@ export function plainError(error, { where = "OpenRig's machine", what = null, wh
     }
   }
   const code = String(error?.code ?? "") + " " + detail;
+  const receipts = detail.match(/(?:Nothing (?:more )?was (?:sent|started|changed|stopped)|It (?:may|might) (?:still )?have (?:arrived|been (?:delivered|recorded)|finished)|The write[^.()]*may still have arrived|(?:Check|Refresh) before [^.]*|Your earlier part was recorded; the rest was not sent)\.?/gi) ?? [];
   let text;
-  if (/\b(?:ENFILE|EMFILE)\b/.test(code)) text = `${where} has run out of open files. Try again in a moment.`;
+  if (/\bcx is no longer valid\b/i.test(detail)) {
+    const retry = receipts.some(receipt => /^(?:Check|Refresh) before|^Nothing more was/i.test(receipt)) ? "" : " Try again.";
+    text = `Herdrig could not finish this step.${retry} ${toast ? "The exact error is in the log." : "Details has the exact error."}`;
+  }
+  else if (/\b(?:ENFILE|EMFILE)\b/.test(code)) text = `${where} has run out of open files. Try again in a moment.`;
   else if (/\bENOSPC\b/.test(code)) text = `${where} is out of disk space.`;
   else if (/\b(?:EACCES|EPERM)\b/.test(code)) text = `${where} didn't allow access to a file OpenRig needs.`;
   else if (/\bENOENT\b/.test(code)) text = `A file OpenRig needs is missing on ${where}.`;
@@ -92,7 +94,6 @@ export function plainError(error, { where = "OpenRig's machine", what = null, wh
   // A nicer diagnostic must not erase an existing delivery/partial-work warning or a proven-unsent receipt.
   if (text !== detail) {
     if (/may (?:still )?have|partly done|earlier part was recorded/i.test(detail)) text = text.replace(" Try again in a moment.", "");
-    const receipts = detail.match(/(?:Nothing (?:more )?was (?:sent|started|changed|stopped)|It (?:may|might) (?:still )?have (?:arrived|been (?:delivered|recorded)|finished)|The write[^.()]*may still have arrived|(?:Check|Refresh) before [^.]*|Your earlier part was recorded; the rest was not sent)\.?/gi) ?? [];
     for (const receipt of receipts) {
       const sentence = withoutPaths(receipt).trim().replace(/\.?$/, ".");
       if (!text.toLowerCase().includes(sentence.toLowerCase())) text += ` ${sentence}`;
