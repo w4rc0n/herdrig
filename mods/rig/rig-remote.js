@@ -1,8 +1,8 @@
 import { errorDiagnostic } from "./rig-words.js";
 // The person's configured Herdr machine is the only remote authority. Daemon data never selects it.
-import { isLoopbackDaemonUrl, parseDaemonStatusJson, differentDaemons } from "./rig-lib.js";
+import { isLoopbackDaemonUrl, parseDaemonStatusJson, differentDaemons, parseDaemonHostJson, sameDaemon, cliEnv } from "./rig-lib.js";
 import { gateConfigGeneration } from "./rig-gate.js";
-import { localDaemonOrigin, addressKey, addMachineConnection, connectionsOf, openrigHomeProblem, isCodeError, CONFIG_NOT_JSON, parseExecTimeout, describeExecTimeout, logExecError, plainExecError } from "./rig-connections.js";
+import { localDaemonOrigin, addressKey, addMachineConnection, addLocalConnection, connectionsOf, LOCAL_ALREADY_CONNECTED, localTaken, CONFIG_LIST_INVALID, openrigHomeProblem, isCodeError, CONFIG_NOT_JSON, parseExecTimeout, describeExecTimeout, logExecError, plainExecError } from "./rig-connections.js";
 // v0.4.7: the relay's content changed (the poll-storm fix: an in-flight guard, a fetch timeout, backoff and jitter);
 // the person re-approves the new hook/hash once on update, as every relay change requires.
 export const RELAY_SHA256 = "285a54561125c00964e607ce379bbbd5e7988dcdd768b61bd2daa9f9522f15ad";
@@ -167,6 +167,8 @@ export class RemoteMachine {
     const waitBefore = before
       ? (this.host.waitQueue ? this.host.waitQueue(() => before.settled) : before.settled)
       : Promise.resolve();
+    // A queue release can drain under the previous caller's closing view.
+    // Dialog hosts settle waitQueue inside their own view's callback instead.
     const job = waitBefore.then(() => this.prepareExclusive(config, options));
     let prevRef = before, rawRelease;
     const released = new Promise((r) => { rawRelease = r; });
@@ -178,7 +180,11 @@ export class RemoteMachine {
     const holdTimer = this.host.deadline ?? this.host.wait;
     const entry = { settled: holdTimer ? Promise.race([baseSettled, holdTimer(PREPARE_HOLD_MS)]) : baseSettled, release };
     preparations.set(machine, entry);
-    return job.finally(() => { if (preparations.get(machine) === entry) preparations.delete(machine); });
+    const clear = () => { if (preparations.get(machine) === entry) preparations.delete(machine); };
+    // Owner release or the independent hold bound also retires a stranded job's
+    // map entry; it must not retain a closed dialog until another caller arrives.
+    entry.settled.then(clear,clear);
+    return job.finally(clear);
   }
   /** Read-only identity check shared by detection and home TUI opens. No relay installation or consent writes. */
   async readIdentity(config, { defaultHome = false } = {}) {
@@ -574,6 +580,154 @@ export function machineSetupGate(host, machineName, picked = null) {
       const saved = await addMachineConnection(host, before, {
         machine: machineName, daemonUrl: tunnel.address, expectedHostId: tunnel.selfHostId, openrigHome, legacyDaemonUrl: liveConfig.daemonUrl,
       });
+      expired = true;
+      return saved;
+    },
+  };
+}
+
+/** The two rig reads the "Add this computer" check runs, for ONE home: the CLI environment a non-legacy connection gets (every inherited session,
+ *  bearer, database, URL and home variable unset) with that home, then the rig program and the read. No OPENRIG_URL: the CLI asks only the daemon
+ *  that home names, so the home's own token goes nowhere else. */
+const LOCAL_PROBE_READS = { status: ["status", "--json"], daemonHost: ["config", "get", "daemon.host", "--json"] };
+export const localProbeArgs = (home, rigArgv, read) => [...cliEnv({ connectionId: "conn-local-probe", openrigHome: home }), ...rigArgv, ...LOCAL_PROBE_READS[read]];
+/** The only commands the "Add this computer" screen runs: a fixed-shape LOCAL probe, the local sibling of `machineProbeExec`.
+ *  A home has no connection yet, so no gate scope can name it; this sink admits exactly, on this computer and nowhere else (no `on`):
+ *  `printenv OPENRIG_HOME` (the prefill), `test -d <path>` and `realpath -- <path>` for the pinned home and the listed homes, and, with a home
+ *  pinned, the two reads of `localProbeArgs` for that home. Anything else is refused before it reaches the host. */
+export function localProbeExec(rawExec, { home = null, rigArgv = ["rig"], listedHomes = [] } = {}) {
+  if (home !== null && openrigHomeProblem(home)) throw new Error("localProbeExec needs an absolute OpenRig home.");
+  if (!Array.isArray(rigArgv) || !rigArgv.length || rigArgv.some((a) => typeof a !== "string" || !PROBE_VALUE.test(a))) throw new Error("localProbeExec needs the rig program.");
+  if (rigArgv[0].includes("=")) throw new Error("This check needs the rig program first, without an environment assignment. Nothing was saved.");
+  if(['sh','bash','dash','ash','zsh','ksh','fish','cmd','cmd.exe','powershell','pwsh','env'].includes(rigArgv[0].split(/[\\/]/).at(-1).toLowerCase()))throw new Error('This check needs the rig program directly, not a shell wrapper. Nothing was saved.');
+  const paths = new Set([...(home === null ? [] : [home]), ...listedHomes.filter((h) => typeof h === "string" && !openrigHomeProblem(h))]);
+  const reads = home === null ? [] : Object.keys(LOCAL_PROBE_READS).map((read) => localProbeArgs(home, rigArgv, read));
+  return async (command, args, options) => {
+    const a = Array.isArray(args) ? args : [];
+    if (options?.on) throw new Error("Runs read-only checks on this computer only.");
+    const allowed = (command === "printenv" && sameList(a, ["OPENRIG_HOME"]))
+      || (command === "test" && a.length === 2 && a[0] === "-d" && paths.has(a[1])) // `test -d <path>`: GNU test reads a `--` here as a binary expression
+      || (command === "realpath" && a.length === 2 && a[0] === "--" && paths.has(a[1]))
+      || (command === "env" && reads.some((r) => sameList(a, r)));
+    if (!allowed) throw new Error("Runs read-only checks on this computer only.");
+    return rawExec(command, [...a], { timeout: 15000 });
+  };
+}
+
+/** The "Add this computer" check and save. `host` gives `localProbe(options)` (a `localProbeExec`), `readDaemonState(home)` (the text of that home's daemon.json),
+ *  `setupFetch` (the loopback-only /healthz read), `readConfig` and `writeConfig`. Check: the typed home must exist and is resolved to its canonical
+ *  path BEFORE any rig read (the CLI may create a missing home); that home's own OpenRig is read through the probe pinned to the canonical path; its
+ *  address must be loopback; its identity is read; and an OpenRig, address, host id or home another connection already uses is refused. Save: re-reads
+ *  the identity (the same id, and pid when both have one) and appends exactly what Check saw, compare-and-swap against the file Check read. */
+export function localSetupGate(host, { rigArgv = ["rig"] } = {}) {
+  const generation = gateConfigGeneration();
+  let expired = false, checked = null, epoch = 0;
+  const recheck = (attempt=epoch) => {
+    if(attempt!==epoch)throw new Error("The OpenRig home changed. Check again. Nothing was saved.");
+    if (expired) throw new Error("This check has expired. Reopen the screen.");
+    if (gateConfigGeneration() !== generation) throw new Error("OpenRig's settings changed while this was open. Reopen it and check again.");
+  };
+  const readHealthz = async (origin,request=host.setupFetch) => {
+    let text;
+    try {
+      const response = await request(`${origin}/healthz`, { method: "GET" });
+      if (!response?.ok) throw new Error("no answer");
+      text = await response.text();
+    } catch (error) { throw new Error(`OpenRig doesn't answer at ${origin.replace(/^https?:\/\//, "")}. Check rig status, then check again.`); }
+    if (utf8Length(text) > JSON_READ_CAP) throw new Error(`${origin.replace(/^https?:\/\//, "")} answered with more than OpenRig's health ever holds.`);
+    try { return JSON.parse(text); } catch (_) { throw new Error(`${origin.replace(/^https?:\/\//, "")} answered, but not like an OpenRig.`); }
+  };
+  return {
+    /** The prefill: this computer's own OPENRIG_HOME when it is set, else "" (never a guessed folder). */
+    async prefill() {
+      try { const r = await host.localProbe({ rigArgv })("printenv", ["OPENRIG_HOME"]); const v = r?.code === 0 ? String(r.stdout ?? "").trim() : ""; return openrigHomeProblem(v) ? "" : v; }
+      catch (_) { return ""; }
+    },
+    async check(typedHome,request=host.setupFetch) {
+      const attempt=++epoch;
+      recheck(attempt);
+      checked = null;
+      const typed = String(typedHome ?? "").trim(), shape = openrigHomeProblem(typed);
+      if (shape) throw new Error(shape);
+      const before = await host.readConfig() ?? null;
+      recheck(attempt);
+      let raw;
+      try { raw = JSON.parse(before ?? ""); } catch (_) { throw new Error("openrig/config.json is not valid JSON."); }
+      if (!Array.isArray(raw?.connections)) throw new Error("This setup has no connections list, so this computer is already its only connection. Nothing was saved.");
+      const { connections, invalid } = connectionsOf(raw);
+      if (invalid) throw new Error(CONFIG_LIST_INVALID);
+      if (connections.some((c) => !c.machine)) throw new Error(LOCAL_ALREADY_CONNECTED);
+      const listed = connections.filter((c) => typeof c.openrigHome === "string" && !openrigHomeProblem(c.openrigHome));
+      // The home exists and is canonical first (the CLI may create a missing one), and is not another connection's (compared as resolved).
+      const paths = host.localProbe({ home: typed, rigArgv, listedHomes: listed.map((c) => c.openrigHome) });
+      if ((await paths("test", ["-d", typed]))?.code !== 0) throw new Error("That folder doesn't exist on this computer. Nothing was saved.");
+      recheck(attempt);
+      const resolved = await paths("realpath", ["--", typed]), home = String(resolved?.stdout ?? "").replace(/\n$/, "");
+      recheck(attempt);
+      if (resolved?.code !== 0 || openrigHomeProblem(home)) throw new Error("Herdr couldn't resolve that folder on this computer. Nothing was saved.");
+      const canonicalHomes = [];
+      for (const c of listed) {
+        const r = await paths("realpath", ["--", c.openrigHome]), real = r?.code === 0 ? String(r.stdout ?? "").replace(/\n$/, "") : c.openrigHome;
+        recheck(attempt);
+        canonicalHomes.push(real);
+        if (real === home || c.openrigHome === home) throw new Error(localTaken(c));
+      }
+      // The home's own daemon, as OpenRig records it (daemon.json: its pid and port), the same proof as the built-in folder copy. A home with no
+      // record names no daemon of its own, so nothing is read for it: the CLI would fall back to a default port and find some other OpenRig there.
+      let recorded = null;
+      try { recorded = JSON.parse(await host.readDaemonState(home) ?? "null"); } catch (_) { recorded = null; }
+      if (!recorded || !Number.isInteger(recorded.pid) || recorded.pid<1 || !Number.isInteger(recorded.port) || recorded.port<1 || recorded.port>65535) throw new Error("OpenRig isn't running for that home. Start it with rig daemon start, then check again.");
+      recheck(attempt);
+      // That home's own OpenRig, through the probe pinned to the canonical path.
+      const probe = host.localProbe({ home, rigArgv });
+      const statusRun = await probe("env", localProbeArgs(home, rigArgv, "status"));
+      recheck(attempt);
+      if(statusRun?.code!==0)throw new Error("OpenRig couldn't be read for that home. Nothing was saved.");
+      if(utf8Length(String(statusRun.stdout??''))>JSON_READ_CAP)throw new Error("OpenRig's status answer was too large. Nothing was saved.");
+      let status = parseDaemonStatusJson(statusRun?.stdout);
+      if (status.reachable && status.port) {
+        const hostRun = await probe("env", localProbeArgs(home, rigArgv, "daemonHost"));
+        recheck(attempt);
+        if(hostRun?.code!==0)throw new Error("OpenRig could not report its address for that home. Nothing was saved.");
+        status = parseDaemonStatusJson(statusRun.stdout,parseDaemonHostJson(hostRun.stdout));
+      }
+      if (!status.reachable || !status.daemonUrl) throw new Error("OpenRig isn't running for that home. Start it with rig daemon start, then check again.");
+      const origin = localDaemonOrigin(status.daemonUrl);
+      if (!origin) throw new Error("That home's OpenRig doesn't answer on a loopback address of this computer, so it can't be added as this computer. Nothing was saved.");
+      const health = await readHealthz(origin,request), id = typeof health?.selfHostId === "string" ? health.selfHostId : "";
+      recheck(attempt);
+      if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) throw new Error(`${origin.replace(/^https?:\/\//, "")} answered, but not like an OpenRig.`);
+      const port = Number(/:(\d+)$/.exec(origin)?.[1] ?? (origin.startsWith("https:") ? 443 : 80));
+      if (health?.pid !== recorded.pid || port !== recorded.port)
+        throw new Error(`The OpenRig at ${origin.replace(/^https?:\/\//, "")} isn't the one that home records. Start that home's OpenRig with rig daemon start, then check again. Nothing was saved.`);
+      for (const c of connections) if ((c.daemonUrl && addressKey(c.daemonUrl) === addressKey(origin)) || c.expectedHostId === id) throw new Error(localTaken(c));
+      // A listed connection on a loopback address is read live too: the same daemon, or the same id, is the same OpenRig.
+      for (const c of connections) {
+        recheck(attempt);
+        const o = localDaemonOrigin(c.daemonUrl ?? "");
+        if (!o) continue;
+        let other = null;
+        try { other = await readHealthz(o,request); } catch (_) { continue; }
+        if (other?.selfHostId === id || sameDaemon(other, health)) throw new Error(localTaken(c));
+      }
+      recheck(attempt);
+      checked = { daemonUrl: origin, selfHostId: id, pid: Number.isInteger(health?.pid) ? health.pid : null, home, canonicalHomes, before };
+      return { daemonUrl: origin, selfHostId: id, home };
+    },
+    invalidate() { checked=null;epoch++; },
+    expired() { return expired; },
+    checked() { return checked ? { daemonUrl: checked.daemonUrl, selfHostId: checked.selfHostId, home: checked.home } : null; },
+    expire() { expired=true;checked=null;epoch++; },
+    /** Saves exactly what Check saw, compare-and-swap against the file Check read; the daemon is read again first. */
+    async save(request=host.setupFetch) {
+      if (!checked) throw new Error("Check this computer's OpenRig before adding it.");
+      const snapshot=checked,attempt=epoch;
+      recheck(attempt);
+      const again = await readHealthz(snapshot.daemonUrl,request);
+      if (again?.selfHostId !== snapshot.selfHostId || again?.pid !== snapshot.pid)
+        throw new Error("OpenRig changed since the check. Check again. Nothing was saved.");
+      recheck(attempt);
+      const saved = await addLocalConnection({writeConfig:(text,before)=>host.writeConfig(text,before,()=>recheck(attempt))}, snapshot.before, { daemonUrl: snapshot.daemonUrl, expectedHostId: snapshot.selfHostId, openrigHome: snapshot.home, canonicalHomes: snapshot.canonicalHomes });
       expired = true;
       return saved;
     },

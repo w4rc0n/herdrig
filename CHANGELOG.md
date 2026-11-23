@@ -1,5 +1,100 @@
 # Changelog
 
+## v0.5.6
+
+Rig graphs show who is still working on a handoff, and connection setup and recovery give clearer results.
+
+- A working task line pulses green continuously, including through a 15-second idle grace period. The idle line is dashed and dim. Lines for seats that need you or are blocked are steady amber. The needs-you chip is red where there is room to show it. Stopped lines are grey. The legend explains the states on screen. Reduced motion keeps all lines steady.
+- An open task shows idle minutes on redraw after the graph observes its seat go idle from working. A seat first seen idle without a reported timestamp shows plain idle.
+- Needs breadcrumbs use the current request title. Recent activity keeps more of the work description, up to 240 characters. Request cards count hidden lines across paragraphs.
+- Change model / harness keeps supported Codex effort choices when the local model cache advertises additional efforts.
+- Typing guard controls show readable names for OpenRig settings and explain what happens when you replace one with Quiet while I type. **Hold all messages and notices** also holds direct messages. You can still type.
+- On a seat page that opens before the OpenRig version is loaded, Compact now avoids a duplicate capability check.
+- Herdrig clears inherited OpenRig address selectors before running the CLI. If you used variables such as `OPENRIG_HOST` or `OPENRIG_PORT` to reach your daemon, pin its address in Herdrig’s connection settings. Add this computer checks the rig program directly and refuses a leading environment assignment.
+- Herdrig shares one copy of each connection’s rig and request rows across its views. In a large fixture, the shared snapshot was about half its previous size. Rig pages still refresh when their own connection’s rows change.
+- Checks on stalled work open the original queue row even when it is outside Needs. Needs cards keep instructions that follow a repeated heading.
+- A message, queued request, or reply confirmed as held by OpenRig stays available to copy from its receipt. Reopening the composer starts with an empty field.
+- Resume asks you to review the plan again if a fresh check finds that it changed before starting the rig.
+- The typing guard asks you to review again if its setting changes before you confirm. The held-messages panel stays open on seat pages opened by name.
+- Seat compaction status recovers after a temporary read failure and keeps newer results when an older read finishes late. If a refresh fails, the seat page offers Check again and keeps technical details in the log.
+- When the selected model lists its effort levels, switching models offers those levels.
+- Add this computer preserves spaces in the resolved OpenRig home and shows the result when Check or Save finishes. An unresolved page keeps its connection chooser if its old connection ID returns for a different destination.
+
+## v0.5.5
+
+Rig spaces name their seat tiles, and seat pages show reported Pi token totals and offer supported compaction.
+
+- The old-strip dialog uses singular wording when only one view remains.
+
+- Topology marks the lead OpenRig reports for each rig. Model change requests go to that lead, or to the advisor when changing the lead's own seat.
+- Change model / harness shows available models and efforts from the local runtime, with a marked current selection and manual model entry when the list is unavailable. Codex uses its local model list.
+- Attach focuses a seat's existing viewer whether you opened it from the seat page, menu or palette.
+- With OpenRig 0.7.20 or later, a seat whose tmux server stops answering is marked unreachable. The sidebar warns once per outage, affected actions explain why they are unavailable, and Worker view can still open reachable seats.
+- The Rig palette opens the card you selected. The machine approval result names the machine, and the message dialog keeps room for the draft.
+
+- Multi-line text on the Rig page, such as a question asked of you, a request's body or a Health finding, now shows each line on its own row instead of running the lines together. A request card shows its first three lines, then how many more are in Details.
+- Fix the seat page rendering error for Codex and terminal seats when compaction is unavailable.
+
+- Old-strip cleanup counts views in the current layout, checks the destination again before switching, and reports views it could not verify. Only one cleanup can run in a window at a time, and the Rig page shows one result.
+- Pi seat pages show OpenRig's reported input and output token totals when the context window is unavailable. They say when the first usage report is pending or the last report may be out of date.
+- OpenRig context menus fit their actions without an empty footer. Longer menus scroll, and disabled actions show their reason beside the action.
+- Ask OpenRig to compact one Claude or Pi seat from its context card, with confirmation and progress. **Check again** retries a failed support check. Claude's submitted command stays unconfirmed until there is evidence it compacted.
+- Rig-space tiles show the seat name, slice when reported, and runtime. Open rig space refreshes older unnamed viewer tiles once; your seat sessions stay running. With tmux set-titles enabled, tmux's own title can still replace the header.
+- **OpenRig's checks on stuck rows read as checks, not new requests.** A check names the row it's about ("Check on: …"), opens that row, isn't counted with your requests and doesn't toast. The row itself is what to act on, and the check then closes by itself.
+- Resume rig shows what each seat will do before it starts, then checks which conversations came back. Bare shells and missing sessions are called out, with Check again and a separate Start fresh choice where available.
+- **Quiet while I type** on an agent seat keeps OpenRig's reminders out of its pane. The seat page shows its typing guard and a read-only held-messages drawer; turning the guard off does not replay held messages. Reopening the menu retries an unsuccessful support check.
+
+- When OpenRig holds a message without delivering it, its dialog now shows the held text with Copy and keeps sending disabled.
+
+- Reply checks OpenRig before sending. If the check fails, your draft stays and you can try again; a failed send after a successful check still asks you to verify whether it arrived.
+
+- A refused Send, Queue or Reply keeps its reason visible beside your draft. When OpenRig says "No text was sent", you can correct the draft and try again; uncertain or retained sends stay protected from a second send.
+- Request labels replace raw queue row IDs with “a row” or omit an ID-only bracket, including in sidebar rows, Needs titles opened from toasts and links, and Topology Recent. Request Details and **Copy request id** still give access to the original text and ID. Headlines preserve abbreviations such as “vs.”, “etc.” and “Inc.”
+- Saving a rig spec keeps its graph preview on the Rig page when you switch tabs. The saved result appears while the preview loads, an older preview cannot replace a newer one, and the spec library refreshes after save.
+
+- Idle refreshes no longer rewrite unchanged saved state or reload settings just because that state file changed. Unreadable settings show a warning, and later reads can recover without an unhandled failure. Refresh repeats a failed settings warning when you ask; a saved sidebar view that could not be loaded is reported separately.
+
+- The Rig page keeps picking up settings-file changes after you switch tabs. A failed read shows a warning and the next file change can retry it.
+
+- A settings save that needs checking starts that check from its own page, so switching or closing another tab cannot strand the check. Closing its Settings page cancels a check that has not started.
+
+- Configuration keeps keys typed for the next setting while the previous save finishes, including Backspace. Cancelling the edit or a failed save clears those queued keys. If too much typing arrives, it asks you to edit or cancel before saving a partial value.
+- Large Configuration pages open one category at a time, with up to 40 settings plus any rows you are editing or reviewing. Search narrows the list; counts explain what is hidden. Smaller pages stay expanded.
+
+- Operator actions chosen from the palette continue after their lookup finishes.
+
+- After a machine approval finishes, closing its Done dialog also continues the waiting action once. Closing it while approval is still running does not continue the action.
+- Asking to focus the Rig sidebar or its machine offer now hands keyboard focus over from the sidebar's next draw, so another tab closing cannot drop the handoff. A closed sidebar does not take focus.
+- Folder-watch retries and the waits for Attach, grid and TUI tabs no longer depend on whichever Herdr tab was active when their wait began.
+- Closing the Rig sidebar while a local Attach viewer is starting no longer stalls its wait; the started viewer finishes opening and receives focus.
+- Machine and connected-assistant read deadlines no longer depend on whichever Herdr tab was active when they began. Completed reads cancel their pending deadline.
+- After you approve a machine, its waiting action resumes in the Rig sidebar's context and reports a warning if it fails. Closing the Rig sidebar during the approval check prevents the waiting action from starting.
+- Closing a machine approval while it is busy no longer leaves later approvals stuck on Saving. A later check can start without restarting Herdr; closing still does not resume the cancelled action.
+- Show in worker view now focuses the seat's tile in the rig grid it opens, instead of saying the tile isn't there yet.
+- Rig pages avoid redrawing cached Graph and Health results when only unused observation clocks changed. Real state changes, errors and explicit refreshes still update the page.
+- Pages and menus no longer send commands to a hidden Rig sidebar. Actions use their existing fallback or explain that the sidebar must be opened; dismissing or restoring an update leaves nothing queued while it is hidden.
+
+- Hiding the Rig sidebar takes Attach directly through the page or menu, even while the hidden sidebar keeps running in the background.
+
+- Attach works from the Rig page when the sidebar is closed, without first showing Herdr's raw “unknown command” error.
+
+- Attach causes fewer redraws while idle. If the sidebar crashes, Attach may wait up to 75 seconds before checking the connection itself.
+- System no longer shows a cached "ok" while its OpenRig is unavailable.
+- After removing this computer from a connections list, add it back from Add a machine or System → Connections. Check its OpenRig home, then confirm the local connection; your other connections and tiles stay in place.
+- When a connection id disappears after a rename or a move from a single address into a connections list, its worker views and Rig page histories move only when the recorded destination matches uniquely. Existing page ids keep following that id, including address edits; worker tiles stay with their destination. Unmatched pages explain why they cannot read or act. A rig whose state is not reported offers neither Pause nor Resume.
+- With several OpenRigs, a page shows its own rig's seats, Health findings, machine and connection errors. A request id shared by several OpenRigs no longer picks the first one.
+
+- Configuration category headers explain their expand/collapse action on hover; pinned categories explain why they stay open.
+- The machine card's "Find where OpenRig runs", "Use <machine>" and "Not now" buttons now show a focus ring when you Tab to them. When herdrig can't read its approvals file, the sidebar names the file's real path.
+- Tab no longer stops on the machine card itself, where Enter did nothing; it goes straight to the card's buttons.
+- Tab and Enter reach the sidebar's copy-the-command and Start daemon buttons, and the startup banner's button.
+- System › Connections calls the approval to open seats on a machine "Open seats" and says what will happen: Allowed, Asks the first time, Asks again next time, or Couldn't check. It no longer shows "Helper: Needs approval" when nothing is waiting.
+- Tab and Enter reach the sidebar's Retry when OpenRig can't be reached or a refresh failed, including the Retry for a second machine that isn't answering.
+- Tab and Enter reach machine offers, connection hints, error Details and Archived controls, including Details above a dialog's action buttons. Clicking these links keeps focus on the link, so the sidebar does not take keyboard focus back.
+- Rig pages avoid repeatedly copying their navigation history while drawing, while actions continue to use the current connection.
+
+- **See who is working on a handoff.** A Rig graph gives two gentle breaths when work starts or a working seat claims a new task, then keeps the line steady. A line to an idle seat is dashed, and one that needs you is red; hover a line to read its tasks. Opening or refreshing the graph does not replay a pulse. Reduced motion keeps every line steady.
+
 ## v0.5.4
 
 Leave OpenRig's old strip and return to the Herdr layout you choose. The Rig page stays open and your seats keep running.

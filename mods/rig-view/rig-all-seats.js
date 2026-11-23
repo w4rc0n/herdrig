@@ -2,7 +2,7 @@
 import {computePulseCounts,matchesPulseFilter,needTarget,isUpdateNeed,orderSiblings} from './rig-lib.js';
 import {assistantsForRig,assistantWord,terminalAttention} from './rig-connected-assistants.js';
 export const allSeatsLayout=(width,rigWidth=120)=>({runtime:width>=Math.max(680,490+rigWidth),compact:width<Math.max(460,318+rigWidth),attach:width>=Math.max(760,580+rigWidth),minText:120});
-const ranks={needs_input:0,attention_required:1,blocked:1,failed:1,active:2,done:3,completed:3,idle:4,terminal:4,stopped:5,exited:5,detached:5,unknown:6,assistant:7};
+const ranks={needs_input:0,attention_required:1,blocked:1,failed:1,terminal_gone:1.5,active:2,done:3,completed:3,idle:4,terminal:4,stopped:5,exited:5,detached:5,unknown:6,assistant:7};
 // The attention a draw counts with and its requests as targets, kept per attention list and roster: the list holds every update, and the same
 // filtered list (not a new one each draw) is what lets the pulse counts work out its requests once.
 const attentionMade=new WeakMap();
@@ -35,7 +35,7 @@ export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,fil
    const raw=model.nodesState?.data?.find(n=>n.canonicalSessionName===seat.session)??{};
    return {rig,seat,status,needIds:ids,rigIndex,key:`all-seat:${rig.id}:${seat.session??seat.logicalId}`,
     since:raw.activityState?.since??raw.agentActivity?.eventAt??raw.lastActivityAt??null,
-    attachable:!!seat.session&&raw.attachable!==false&&raw.sessionAlive!==false&&!['stopped','exited','detached'].includes(seat.status)&&!['stopped','recoverable'].includes(raw.lifecycleState)};
+    attachable:!!seat.session&&raw.attachable!==false&&raw.sessionAlive!==false&&!['stopped','exited','detached','terminal_gone'].includes(seat.status)&&!['stopped','recoverable'].includes(raw.lifecycleState)};
   });
   const assistants=(!pulse||pulse==='all'?assistantsForRig(hostedMembers,rig.name,rig.conn):[])
    .filter(m=>!filter||[m.name,m.rig,'connected assistant',assistantWord(m.status)].some(v=>String(v).toLowerCase().includes(filter.toLowerCase())))

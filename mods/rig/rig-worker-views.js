@@ -1,9 +1,12 @@
 // Host-side worker views consume public composition data, never daemon programs.
 import {isValidSessionName,tmuxServerArgsFrom,base64EncodeUtf8,hostOf} from "./rig-lib.js";
 import {goodHome} from "./rig-remote.js";
+import {tileTitle} from "./rig-tile-title.js";
 
 const text=(value,max=160)=>String(value??"").replace(/[\u0000-\u001f\u007f-\u009f]/g," ").trim().slice(0,max);
 const invalid=()=>{throw new Error("This OpenRig doesn't offer a supported view preview.");};
+/** Why a planned seat got no viewer: OpenRig reports its tmux server unreachable (a seat marked terminalServerGone). The page counts these on their own. */
+export const TERMINAL_GONE_PLAN_REASON="terminal server isn't answering";
 export function workerMissingReason(reason){
   if(/^tmux session .+ is not alive$/.test(reason??""))return "no live tmux session";
   if(["seat-not-running","stopped"].includes(reason))return "stopped";
@@ -46,10 +49,11 @@ export function hostWorkerPlan(preview,nodes,remote,view=null){
         ||typeof pane.readOnly!=="boolean")invalid();
       const session=pane.seat,label=text(pane.label)||text(session),node=inventory.get(session);
       const runtime=text(pane.runtime??node?.runtime??"unreported",40);
-      const title=`${label} · ${runtime}${pane.readOnly?" · read-only":""}`;
+      const title=tileTitle(node,{label,runtime,readOnly:pane.readOnly});
       const serverArgs=node?.tmuxAttachCommand?tmuxServerArgsFrom(node.tmuxAttachCommand,session):null;
       let reason=null;
       if(!isValidSessionName(session)||!node)reason="no valid session";
+      else if(node.terminalServerGone===true)reason=TERMINAL_GONE_PLAN_REASON; // first: it says why, and its tmux is never checked
       else if(node.sessionStatus!=="running"||node.intentionallyStopped)reason="seat is not running";
       else if(hostOf(node)&&hostOf(node)!=="local"&&hostOf(node)!==remote.selfHostId)reason="seat runs on another machine";
       else if(node.placement==="herdr"||node.attachmentType==="external_cli"||serverArgs===null)reason="no verified tmux session";

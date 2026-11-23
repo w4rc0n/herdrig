@@ -4,16 +4,20 @@ import {LEGACY_CONNECTION_ID,perConnection,withConnection} from "./rig-connectio
 export const GRAPH_HOLD_MS=1600,GRAPH_FADE_MS=500,GRAPH_MAX_PATHS=8;
 export function normalizeRunningGraph(data,fallback=[]){
   const nodes=Array.isArray(data?.nodes)?data.nodes:[],pods=[],byId=new Map(),refs=new Map();
+  const live=new Map(fallback.map(n=>[n.logicalId,n]));
   const group=(id,label)=>{if(!byId.has(id)){const p={id,label:label||id,seats:[]};byId.set(id,p);pods.push(p);}return byId.get(id);};
   for(const n of nodes.filter(n=>n.type==="podGroup")){const d=n.data??n,id=String(d.logicalId??n.id);group(id,d.podLabel);refs.set(n.id,"pod:"+id);}
   const seats=nodes.filter(n=>n.type==="rigNode");
+  // OpenRig's graph doesn't know a seat's tmux server stopped answering: the rig's model does (terminal_gone), and it wins on the card too.
+  const gone=new Set((Array.isArray(fallback)?fallback:[]).filter(s=>s?.status==="terminal_gone").flatMap(s=>[s.session,s.logicalId]).filter(Boolean));
   for(const node of seats.length?seats:fallback){
-    const d=node.data??node,lid=d.logicalId;if(typeof lid!=="string")continue;
+    const raw=node.data??node,d={...raw,...live.get(raw.logicalId)},lid=d.logicalId;if(typeof lid!=="string")continue;
     // Cached fallback seats have no graph IDs. Only a real pod-group parent overrides their own pod.
     const parentRef=node.parentId??d.parentId,parentGroup=parentRef==null?null:refs.get(parentRef);
     const parent=(parentGroup?.startsWith("pod:")?parentGroup.slice(4):null)??d.podNamespace??d.pod??lid.split(".")[0];
     // The public graph's status is the raw session status, not its working/needs activity.
-    const status=["running","ready","stopped","detached","exited","completed"].includes(d.status)
+    const status=gone.has(d.canonicalSessionName??d.session)||gone.has(lid)?"terminal_gone"
+      :d.sessionStatus?seatStatus(d):["running","ready","stopped","detached","exited","completed"].includes(d.status)
       ?seatStatus({...d,sessionStatus:d.status}):d.status??seatStatus(d);
     group(parent,d.podLabel).seats.push({lid,runtime:d.runtime,model:d.model,profile:d.profile,session:d.canonicalSessionName??d.session,status,node:d});if(typeof node.id==="string")refs.set(node.id,lid);refs.set(lid,lid);
   }
@@ -30,9 +34,10 @@ export function graphQueueEvent(event,now=Date.now()){
  *  must not reset the first. An older flat value reads as the legacy connection's. */
 export function publishGraphActivity(shared,setShared,origin,event,conn=LEGACY_CONNECTION_ID){
   let data;try{data=typeof event.data==="string"?JSON.parse(event.data):event.data;}catch{return false;}
-  const item=graphQueueEvent({...data,type:data?.type??event.event});if(!item)return false;
+  const type=data?.type??event.event;if(typeof type!=='string'||!type.startsWith('queue.'))return false;
+  const item=graphQueueEvent({...data,type});
   const stored=shared("rig.graphActivity"),old=perConnection(stored,conn),same=old?.origin===origin,serial=(same?old.serial??0:0)+1;
-  setShared("rig.graphActivity",withConnection(stored,conn,{origin,serial,events:[...(same?old.events??[]:[]),{...item,serial}].slice(-64)}));return true;
+  setShared("rig.graphActivity",withConnection(stored,conn,{origin,serial,events:[...(same?old.events??[]:[]),...(item?[{...item,serial}]:[])].slice(-64)}));return true;
 }
 export const graphActivityOf=(shared,conn=LEGACY_CONNECTION_ID)=>perConnection(shared("rig.graphActivity"),conn);
 export class GraphMotion{
