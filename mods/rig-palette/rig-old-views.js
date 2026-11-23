@@ -81,7 +81,9 @@ async function keepRigPage(host,ensure=false){
   const tabs=()=>new Set((host.spaces?.()??[]).flatMap(space=>space.tabs??[]).map(tab=>tab.id));
   const before=tabs(),nav=host.shared?.('rig.nav');
   const run=async(name,args)=>{const result=await host.run(name,args);if(result?.error)throw Error(String(result.error));};
-  const pages=host.shared?.('rig.tabPages')??{},entry=pageProps.entry??nav?.stack?.at(-1);
+  // The layout's props are its opening route. Legacy navigation updates rig.nav.
+  const stack=nav?.stack?.length?nav.stack:pageProps.entry?[pageProps.entry]:[];
+  const pages=host.shared?.('rig.tabPages')??{},entry=stack.at(-1);
   const rigPanes=(host.panes?.()??[]).filter(pane=>pane.mod===MOD_IDS.view&&before.has(pane.tab));
   const native=rigPanes.filter(pane=>rigPanes.filter(other=>other.tab===pane.tab).length===1);
   const active=(host.spaces?.()??[]).find(space=>space.active)??host.spaces?.()[0];
@@ -101,11 +103,10 @@ async function keepRigPage(host,ensure=false){
     if(!(host.spaces?.()??[]).length)throw Error('Herdr did not confirm a space for the Rig page.');
   }
   const destination=(host.spaces?.()??[]).find(space=>space.active)??host.spaces?.()[0];
-  await run('tab.new',{name:'Rig',space:destination.id,mod:MOD_IDS.view,props:pageProps});
+  await run('tab.new',{name:'Rig',space:destination.id,mod:MOD_IDS.view,props:entry?{...pageProps,entry}:pageProps});
   for(let i=0;i<20;i++){
     const pane=(host.panes?.()??[]).find(p=>p.mod===MOD_IDS.view&&!before.has(p.tab));
     if(pane){
-      const stack=navKey(nav?.stack?.at(-1))===navKey(entry)?nav?.stack??[]:[entry];
       host.setShared?.('rig.tabPages',{...(host.shared?.('rig.tabPages')??{}),[pane.tab]:{stack,at:Date.now()}});
       return pane.tab;
     }

@@ -11,6 +11,7 @@ function observedTime(at,timezone){
 }
 const changedSeat = session => `${session} changed since this page read it, so nothing was sent. Try again from its current card.`;
 const UNCONFIRMED_REASON = "The last request wasn't confirmed. Use Send again anyway, or Clear this.";
+const ACCEPTED_READ_FAILED = "The request reached OpenRig, but Herdrig couldn't refresh its state. Check the pane or OpenRig's CLI before trying again.";
 const DISPATCH_CLOCK_SKEW_MS=3000;
 const stageWords={preparing:'preparation started','compact-sent':'compaction sent','restore-sent':'restore requested','audit-sent':'restore check requested',cancelled:'cancelled','skipped-or-failed':'stopped'};
 const contextPercent=node=>Number.isFinite(node.contextUsage?.usedPercentage)?Math.round(node.contextUsage.usedPercentage):null;
@@ -102,12 +103,18 @@ export class SeatCompaction {
     e.error=null;
     e.requestedAttemptId=null;
   }
-  recordRecovery(e,dispatch){
-    if(e.dispatch!==dispatch||this.recovery(e)||e.recordedDispatch===dispatch.token)return;
+  recordRecovery(e,dispatch,accepted=false){
+    if(e.dispatch!==dispatch)return;
+    const current=this.recovery(e);
+    if(current){
+      if(accepted&&current.token===dispatch.token)this.saveRecovery(e,{...current,accepted:true});
+      return;
+    }
+    if(e.recordedDispatch===dispatch.token)return;
     // A later receipt failure must not restore a warning the user cleared.
     e.recordedDispatch=dispatch.token;
     e.recoveryToken=dispatch.token;
-    this.saveRecovery(e,{...dispatch,attemptId:e.requestedAttemptId??null});
+    this.saveRecovery(e,{...dispatch,attemptId:e.requestedAttemptId??null,accepted});
   }
   keepPendingRecovery(e){
     if(e?.start?.dispatched&&e.dispatch?.token===e.start.token)this.recordRecovery(e,e.dispatch);
@@ -189,7 +196,10 @@ export class SeatCompaction {
     return e.support===false?"This OpenRig can't compact a seat on request.":"Couldn't check compaction support. Check again to retry.";
   }
   reason(e,resend=false){
-    if(!resend&&this.recovery(e))return UNCONFIRMED_REASON;
+    const recovery=this.recovery(e);
+    if(!resend&&recovery)return recovery.accepted
+      ?"OpenRig accepted the last request, but its state couldn't be refreshed. Use Send again anyway, or Clear this."
+      :UNCONFIRMED_REASON;
     if(e.reading||e.checking)return 'Checking compaction support…';
     if(e.config.daemonUrl?.startsWith('herdr://'))return "Not available over Herdr's connection yet.";
     const unsupported=e.cliReason??this.supportReason(e);
@@ -204,7 +214,8 @@ export class SeatCompaction {
     if(recovery){
       const {at,contextBefore,contextNow}=recovery;
       const evidence=contextNow!=null&&contextBefore!=null&&contextNow<contextBefore?`Context is now ${contextNow}% (was ${contextBefore}% when you asked).`:null;
-      return {...v,text:`Your compaction request at ${this.recoveryClock(at)} wasn't confirmed. OpenRig may or may not have compacted ${e.node.canonicalSessionName}.`,live:false,cancel:false,recovery:true,evidence};
+      const text=recovery.accepted?ACCEPTED_READ_FAILED:`Your compaction request at ${this.recoveryClock(at)} wasn't confirmed. OpenRig may or may not have compacted ${e.node.canonicalSessionName}.`;
+      return {...v,text,live:false,cancel:false,recovery:true,evidence};
     }
     if(e.recoveryEvidence)v.evidence=e.recoveryEvidence;
     if(e.config.daemonUrl?.startsWith('herdr://')||e.pollError)v.cancel=false;
@@ -280,7 +291,8 @@ export class SeatCompaction {
     e.review={token,cancel,recoveryToken:recovery?.token,expires:Date.now()+300000,snapshot:e.snapshot,operation:this.host.operation(e.config)};
     const seat=e.node.canonicalSessionName;
     const duplicateEffect=e.node.runtime==='pi'?`${seat}'s Pi runner may be asked to compact twice.`:`${seat} may be asked to write its restore map twice.`;
-    const copy=recovery?{title:'Send another compaction request?',body:`The request at ${this.recoveryClock(recovery.at)} wasn't confirmed and may already have run or still run. If both go through, ${duplicateEffect} Check its pane first if you can.`,confirm:'Send again',dismiss:'Cancel',focusCancel:true}:compactionConfirmation(e.node,cancel);
+    const outcome=recovery?.accepted?"reached OpenRig, but Herdrig couldn't refresh its state. It":"wasn't confirmed and";
+    const copy=recovery?{title:'Send another compaction request?',body:`The request at ${this.recoveryClock(recovery.at)} ${outcome} may already have run or still run. If both go through, ${duplicateEffect} Check its pane first if you can.`,confirm:'Send again',dismiss:'Cancel',focusCancel:true}:compactionConfirmation(e.node,cancel);
     this.host.confirm(e,token,copy,cancel?null:compactionStartCopy(e.node.canonicalSessionName));
   }
   expireStart(e,start,cx){
@@ -422,11 +434,11 @@ export class SeatCompaction {
         if(current?.token===dispatch.token||!current&&e.recordedDispatch!==dispatch.token)this.saveRecovery(e,priorWarning);
       }
       if(!start?.expired){
-        e.error=accepted?"The request reached OpenRig, but Herdrig couldn't refresh its state. Check the pane or OpenRig's CLI before trying again."
+        e.error=accepted?ACCEPTED_READ_FAILED
           :unsent?`${String(error.message??error)} Nothing was sent.`
           :`${String(error.message??error)} The request may have reached OpenRig. Check the pane or OpenRig's CLI before trying again.`;
         e.uncertain=!unsent;
-        if(!unsent&&dispatch&&typeof data?.ok!=='boolean')this.recordRecovery(e,dispatch);
+        if(!unsent&&dispatch&&(accepted||typeof data?.ok!=='boolean'))this.recordRecovery(e,dispatch,accepted);
       }
     }
     finally{
