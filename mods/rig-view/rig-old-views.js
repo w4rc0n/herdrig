@@ -207,6 +207,7 @@ export function oldViewCandidates(config,capsFor){
 const authorityId=config=>config.connectionId??LEGACY_CONNECTION_ID;
 const pinnedAddress=config=>config.daemonUrlSource==='cli'||config.daemonUrlSource==='default'?null:config.daemonUrl??null;
 const authorityIdentity=(config,address,hostId)=>({id:authorityId(config),address,home:config.openrigHome??null,hostId:typeof hostId==='string'&&hostId?hostId:null});
+const completeAuthority=identity=>Boolean(identity?.address&&identity?.hostId);
 const receiptKey=identities=>JSON.stringify(identities.slice().sort((a,b)=>a.id.localeCompare(b.id)));
 const readGone=shared=>shared?.('rig.oldProviderGone')?.receipts??{};
 const sameAuthorities=(receipt,identities)=>receipt.scope===receiptKey(identities);
@@ -225,7 +226,7 @@ function publishedAuthorities(shared,config,capsFor,published=shared?.('rig.data
     const hostId=matches&&address===discovered?own?.healthz?.selfHostId:null;
     return authorityIdentity(candidate,address,hostId);
   });
-  return identities.every(identity=>identity.address)?identities:null;
+  return identities.every(completeAuthority)?identities:null;
 }
 export function oldViewsGone(shared,config,capsFor=()=>({herdrAppProvider:true})){
   const receipts=readGone(shared);
@@ -323,11 +324,11 @@ export async function closeOldViews(host,config,views,appHome,capsFor){
         try{return await resolveAuthority(host,await readAuthorized(candidate));}
         catch{return null;} // The original authorization check still runs before a write.
       }));
-      scope=!pending&&identities.length&&identities.every(Boolean)?receiptKey(identities):null;
+      scope=!pending&&identities.length&&identities.every(completeAuthority)?receiptKey(identities):null;
     }
     const previous=readGone(host.shared)[view.id];
     if(previous&&scope===previous.scope)continue;
-    if(previous&&host.setShared){
+    if(previous&&scope&&host.setShared){
       const receipts={...readGone(host.shared)};delete receipts[view.id];host.setShared('rig.oldProviderGone',{receipts});
     }
     for(const [index,candidate] of candidates.entries()){

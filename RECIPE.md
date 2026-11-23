@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.8
+Version: v0.5.9
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -493,7 +493,8 @@ and update dismissals after their 10-second Undo window;
 `POST /api/rigs/import/validate` when validating a user spec edit; and `POST /api/specs/library/sync` on **Save** and
 after **Copy to library**; `POST /api/specs/library/:id/rename` names a whole-folder copy, including a resumed
 unfinished copy; `POST /api/up` with `plan: true` previews a restore; `POST`/`DELETE /api/config/:key` save/reset a setting). Typing-guard changes use the CLI with inherited seat identity removed and no synthesized actor; held messages are read-only, not retired or replayed. It **runs** the programs above. Before running `rig`, Herdrig clears inherited `OPENRIG_URL`, `OPENRIG_HOST`,
-`OPENRIG_PORT` and the corresponding legacy `RIGGED_*` address variables. It also clears inherited seat identity and
+`OPENRIG_PORT` and the corresponding legacy `RIGGED_*` address variables. It also clears inherited seat identity,
+including `TMUX_PANE` so the CLI cannot infer a sender from the pane that launched Herdr, and clears inherited
 database selection, uses the configured home when supplied, and clears inherited home and bearer credentials for
 an isolated connection before applying its configured values. With a click, **Start OpenRig** runs
 `rig daemon start`. It **reads** `<appHome>/openrig/config.json` (optional: the person's OpenRig name),

@@ -375,6 +375,19 @@ const isLocalSpecTransferCleanup = (command, args, on, appHome) => {
   return !flatten([command, args]).some((t) => /^OPENRIG_[A-Z_]+=/.test(String(t)));
 };
 
+// A stale Save reply can only prove that this exact spec was written. Never pass
+// the reply back through the gate or authorize any follow-on operation with it.
+function confirmsSpecSave(command, args, on, appHome, result) {
+  if (basename(command) !== "node" || on || !appHome || !Array.isArray(args) || args.length !== 12 ||
+      args[0] !== `${appHome}/mods/rig-view/rig-spec-transport.cjs` || args[1] !== "run" ||
+      args[2] !== appHome || args[6] !== "save" || !/^[a-f0-9]{64}$/.test(args[11]) ||
+      result?.code !== 0 || typeof result.stdout !== "string" || result.stdout.length > 65536) return false;
+  try {
+    const receipt = JSON.parse(result.stdout);
+    return receipt?.ok === true && !receipt.error && receipt.path === args[7] && receipt.sha256 === args[11];
+  } catch { return false; }
+}
+
 /** A process run for the mod (the OpenRig CLI is `env ... rig ...`). Local utilities pass; everything else names an OpenRig and is checked against the scope. */
 export async function gatedExec(rawExec, command, args, options, since, scope, appHome) {
   const on = options && typeof options === "object" ? options.on : undefined;
@@ -395,7 +408,13 @@ export async function gatedExec(rawExec, command, args, options, since, scope, a
   // A rig CLI aimed at an OpenRig over Herdr's connection never runs here: the transport carries it to the helper's rig verb on the machine.
   try { result = !local && herdrCli([command, args]) ? await herdrCliRun(command, args, s.id) : await rawExec(command, args, options); }
   catch (error) { if (!local) (isKnownUnsentError(error) ? stillCurrent : stillCurrentAfterSend)(s, started); throw error; }
-  if (!local) stillCurrentAfterSend(s, started);
+  if (!local) {
+    try { stillCurrentAfterSend(s, started); }
+    catch (error) {
+      if (error instanceof GateRefusal && confirmsSpecSave(command, args, on, appHome, result)) error.confirmedSpecSave = true;
+      throw error;
+    }
+  }
   return result;
 }
 

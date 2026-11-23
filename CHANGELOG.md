@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.9
+
+Old-view cleanup remembers confirmed closes across restarts, and spec saves and compaction recovery keep the right state when a connection changes or a reply arrives late.
+
+- Closed old views stay closed in Herdrig’s cleanup list when the same OpenRig comes back after a restart.
+- A confirmed spec save keeps later edits based on the version it wrote, even when the connection changes during the save. Discarding an earlier draft shows the saved file, and identical drafts open as a preview.
+- Compaction recovery keeps a late receipt when Check again is in progress and restores the original warning if a resend is refused before any input is sent.
+- The Rig sidebar retries incomplete seat lists sooner, shows newly read updates promptly, and catches up followed views after its event stream reconnects.
+- Starting Herdr from an OpenRig seat terminal no longer attributes Herdrig CLI actions to that seat. Actions with an explicit person keep using that person.
+- A critical health finding in the sidebar's Needs list no longer shows raw request IDs.
+- When the Rig grid repeatedly fails to check existing spaces, it waits longer between retries, up to one minute.
+
 ## v0.5.8
 
 The Rig sidebar is quieter when idle, Herdr 0.1.17 is supported, and spec drafts stay with the connection they were written for.

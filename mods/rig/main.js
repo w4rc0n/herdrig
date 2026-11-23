@@ -771,6 +771,8 @@ export default class RigSidebar extends View {
     this.migrateConnections(next);
     this.config = next;
     if (changed) {
+      this.spaceSyncError = null;
+      this.spacePreflightRetry = null;
       this.data = null; this.live = false; this.lists = {}; this.primary.needsApproval = false; this.primary.approvalsUnreadable = false; // another OpenRig: the old one's approval mark goes too
       this.healthz = null; this.cliVersion = null; // the old daemon's health and version are not the new one's; a failed read of the new one leaves them unknown (routeHost's selfHostId too)
       if (this.primaryStateId() === prevPrimary) {
@@ -1886,6 +1888,7 @@ export default class RigSidebar extends View {
   }
 
   syncRigSpaces(cx) {
+    if (this.spacePreflightRetry?.nextAt > Date.now()) return;
     if (this.spaceSyncing && Date.now() - (this.spaceSyncingAt ?? 0) < SYNC_STALE_MS) { this.spaceAgain = true; return; }
     const sweep = {}; // only the latest sweep ends the turn: an older one that outlived SYNC_STALE_MS finishes without clearing it
     this.spaceSyncing = true; this.spaceSyncingAt = Date.now(); this.spaceSweep = sweep;
@@ -1894,8 +1897,14 @@ export default class RigSidebar extends View {
       const beforeDisplay=displayKey();
       try {
         let preflight;
-        try{preflight=this.spaceSyncPreflight();this.spaceSyncError=null;}
-        catch(error){this.spaceSyncError=`Couldn't check existing rig spaces. ${errorDiagnostic(error)}`;this.completedSpaceSweep=null;return;}
+        try{preflight=this.spaceSyncPreflight();this.spaceSyncError=null;this.spacePreflightRetry=null;}
+        catch(error){
+          this.spaceSyncError=`Couldn't check existing rig spaces. ${errorDiagnostic(error)}`;
+          this.completedSpaceSweep=null;
+          const delay=this.spacePreflightRetry?Math.min(this.spacePreflightRetry.delay*2,60000):5000;
+          this.spacePreflightRetry={delay,nextAt:Date.now()+delay};
+          return;
+        }
         // Approval may be written by Attach or another view, without changing any structural input.
         // This only invalidates a read-only observation; the controller still re-reads authority before acting.
         const cards=shared("rig.spaceStatus")??{},waiting=[];
@@ -2696,34 +2705,37 @@ export default class RigSidebar extends View {
 
   /** One refresh's attention read (see ASKS_PATH): the requests now, with the other items of the connection's last whole list. An OpenRig that
    *  ignores `kind` answers with its whole list; that answer is used as one, and read again only when due. A failed read is null, as before. */
-  async readAttention(feed, get) {
+  async readAttention(feed, get, consumeFull = false) {
     const key = fullAttentionKey(feed.config);
     let full = feed.fullAttention;
     if (full?.key !== key) full = feed.fullAttention = { key, data: null, ms: 0, nextAt: 0, pending: false, unsupported: false };
-    if (full.unsupported && Date.now() < full.nextAt) return attentionAnswer(full, null);
+    const answer = (asks) => { full.unpublished = false; return attentionAnswer(full, asks); };
+    if (full.unsupported && Date.now() < full.nextAt) return answer(null);
     const started = Date.now();
     const asks = await get(ASKS_PATH).catch(rethrowGate(null));
     if (!asks) {
       // The narrow read failed: the whole list is read as it always was (not beside a background read of it), and its own failure is the answer.
-      if (full.pending) return attentionAnswer(full, null);
+      if (full.pending || (consumeFull && full.unpublished)) return answer(null);
       const wholeStarted = Date.now();
       const whole = await get(FULL_ATTENTION_PATH).catch(rethrowGate(null));
       if (!Array.isArray(whole?.items)) return null;
       this.fullAttentionDone(full, Date.now() - wholeStarted, whole);
-      return attentionAnswer(full, null);
+      return answer(null);
     }
     if (!kindFiltered(asks)) {
       full.unsupported = true;
       this.fullAttentionDone(full, Date.now() - started, asks);
-      return attentionAnswer(full, null);
+      return answer(null);
     }
     full.unsupported = false;
-    this.startFullAttention(feed);
-    return attentionAnswer(full, asks);
+    // A poll admitted to publish a completed read must not start a fresh
+    // whole-list read of its own. Regular and event refreshes keep their cadence.
+    if (!consumeFull || !full.unpublished) this.startFullAttention(feed);
+    return answer(asks);
   }
 
   /** Starts the connection's background whole-list read when one is due and none is running. Its answer is kept only for the connection it was
-   *  read from, and is used by the next refresh (every five seconds), so nothing is published from here. */
+   *  read from. A changed answer makes the next poll due, including on a quiet full stream. */
   startFullAttention(feed) {
     const full = feed.fullAttention;
     if (!full || full.unsupported || full.pending || Date.now() < full.nextAt || feed.closed || !feed.config?.daemonUrl) return;
@@ -2733,7 +2745,9 @@ export default class RigSidebar extends View {
     this.get(FULL_ATTENTION_PATH, feed).then((data) => ({ data }), (error) => ({ error })).then(({ data, error }) => {
       full.pending = false;
       if (feed.fullAttention !== full || feed.closed || fullAttentionKey(feed.config) !== full.key) return;
+      const previous = full.data;
       this.fullAttentionDone(full, Date.now() - started, data, error);
+      if (!sameValue(previous, full.data)) full.unpublished = true;
     });
   }
 
@@ -2793,7 +2807,7 @@ export default class RigSidebar extends View {
     this.oldViewsSignature=signature;this.oldViewsDirty=(this.oldViewsRevision??0)!==revision;
     if(!sameValue(shared("rig.oldProviderViews"),views)){setShared("rig.oldProviderViews",views);cx.notify();}return views;
   }
-  async refresh(cx, feed = this.primary) {
+  async refresh(cx, feed = this.primary, consumeFull = false) {
     if(feed===this.primary)await this.refreshOldViews(cx);
     let notifyArgs = null; // the needs notifications to run once the read is done (runNotifyNeeds)
     let observeRaw = false; // this feed's live updates were read: its dismissals are observed against them once the read is done (observeDismissals)
@@ -2866,7 +2880,7 @@ export default class RigSidebar extends View {
       }
       if (!unreachableState) {
         feed.hostedReader??=new HostedMembersReader(); // one reader per connection: its 404 cache and identity are its own
-        const summaryRead=get('/api/rigs/summary'),attentionRead=this.readAttention(feed,get);
+        const summaryRead=get('/api/rigs/summary'),attentionRead=this.readAttention(feed,get,consumeFull);
         const nodesByRig = Object.create(null), representatives = Object.create(null); // keyed by the daemon's rig ids
         const unavailableRigs = new Set();
         const nodesRead=summaryRead.then(summary=>Promise.all(summary.filter((r) => !r.archivedAt).map(async (r) => {
@@ -3203,18 +3217,21 @@ export default class RigSidebar extends View {
     if (feed.error && feed.refreshRetry?.key === key && now < feed.refreshRetry.nextAt) return false;
     const fullEvents = feed.eventPath === "/api/events?replay=0" || feed.eventPath === "herdr";
     if (event || !fullEvents || !feed.live || feed.error || !feed.data || feed.terminalOutage || feed.inflightRouteOps) return true;
+    if (feed.data.topology?.some(rig => rig.nodesUnavailable) || feed.fullAttention?.unpublished) return true;
     // Only the primary refresh runs the grid sweep, which already has its own retry backoff.
-    if (feed === this.primary && (this.spaceSyncError || this.spaceAgain || this.spaceSweepRetry?.nextAt <= now)) return true;
+    if (feed === this.primary && (this.spacePreflightRetry?.nextAt <= now || this.spaceAgain || this.spaceSweepRetry?.nextAt <= now)) return true;
     return feed.quietRefresh?.key !== key || now < feed.quietRefresh.at || now - feed.quietRefresh.at >= QUIET_RECONCILE_MS;
   }
 
   /** One refresh of one feed: the primary's full read, or a secondary connection's own read of its rows. */
   async refreshFeed(cx, feed, {automatic=false,event=false}={}) {
     if (automatic && !this.automaticRefreshDue(feed, Date.now(), event)) return;
+    if(!automatic && feed===this.primary)this.spacePreflightRetry=null;
     if(feed.refreshing){feed.again=true;return;}
     const key=JSON.stringify([gateIdentity(feed.config),gateGeneration(feed.config?.connectionId)]),previous=feed.refreshRetry;
     if(!automatic){this.completedSpaceSweep=null;this.spaceSweepRetry=null;}
-    await (feed===this.primary?this.refresh(cx,feed):this.refreshSecondary(cx,feed));
+    const consumeFull = automatic && !event && feed.fullAttention?.unpublished === true;
+    await (feed===this.primary?this.refresh(cx,feed,consumeFull):this.refreshSecondary(cx,feed,consumeFull));
     if(!feed.error)feed.quietRefresh={key,at:Date.now()};
     if(feed.error){const delay=previous?.key===key?Math.min(previous.delay*2,60000):10000;feed.refreshRetry={key,delay,nextAt:Date.now()+delay};}
     else feed.refreshRetry=null;
@@ -3265,7 +3282,7 @@ export default class RigSidebar extends View {
 
   /** A secondary connection's read: its rigs, seats and requests, stamped with its own connection. A failure is this connection's alone:
    *  its data is dropped (never shown as live) and the others are untouched. */
-  async refreshSecondary(cx, feed) {
+  async refreshSecondary(cx, feed, consumeFull = false) {
     if (feed.closed) return;
     if (feed.refreshing) { feed.again = true; return; }
     feed.refreshing = true;
@@ -3283,7 +3300,7 @@ export default class RigSidebar extends View {
       })));
       const initialPerson=feed.config.person?String(feed.config.person).replace(/@external$/i,''):null;
       const [tz,summary,attention,attentionAgg,native,hostedMembers,hz,initialQuiet]=await Promise.all([
-        get('/api/config/ui.timezone').catch(rethrowGate(null)),summaryRead,this.readAttention(feed,get),
+        get('/api/config/ui.timezone').catch(rethrowGate(null)),summaryRead,this.readAttention(feed,get,consumeFull),
         get('/api/queue/attention-aggregate').catch(rethrowGate(null)),get('/api/native-seats').catch(rethrowGate(null)),
         feed.hostedReader.read(op.fetch,feed.config,(ms,done)=>cx.timer.after(ms,done,{owner:null})),op.fetch(`${feed.config.daemonUrl}/healthz`).catch(rethrowGate(null)),
         initialPerson?Promise.all([get(`/api/gateway/human/${encodeURIComponent(initialPerson)}/quiet`).catch(rethrowGate(null)),get(`/api/gateway/human/${encodeURIComponent(initialPerson)}/mode`).catch(rethrowGate(null))]):null,
@@ -3523,10 +3540,9 @@ export default class RigSidebar extends View {
           feed.live = true; feed.delay = 1000;
           const readAll = !planned || feed.hadDisconnect;
           if (feed.hadDisconnect) { feed.hadDisconnect = false; feed.forceCapabilityProbe = true; }
-          if (readAll) {
-            await this.refreshFeed(cx, feed);
-            await this.workerController(cx).event(feed.config); // every connection's events drive its own worker views
-          }
+          if (readAll) await this.refreshFeed(cx, feed);
+          if (!this.closed && !feed.closed && feed.config?.daemonUrl === origin)
+            await this.workerController(cx).event(feed.config); // A replacement does not replay membership changes from the gap.
           if(opened.initial.length){let text;[text,carry]=utf8(opened.initial,carry);parseEvents(text);}
           // An idle read timeout (Herdr's 30 s) is not a disconnect: one health request, then the same socket is read again.
           const end = await pumpEvents(feed.sock, {
@@ -5173,8 +5189,9 @@ export default class RigSidebar extends View {
       for (const n of orderedNeeds) {
         if (n.criticalHealth) {
           const entry = { section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) };
-          out.push(this.treeLeafRow(t, { id: `need-${n.id}`, rowKey: `need:${n.id}`, label: `Critical: ${n.summary} · System → Health`,
-            entry, indent: treeIndent(1), parentKey: parentBranchKey }));
+          // OpenRig's finding summary can name queue rows: show it as the Needs page does (no raw ids; the full text is in the tooltip).
+          out.push(this.treeLeafRow(t, { id: `need-${n.id}`, rowKey: `need:${n.id}`, label: `Critical: ${rowTitle(n.summary)} · System → Health`,
+            tooltip: rowTip(n.summary), entry, indent: treeIndent(1), parentKey: parentBranchKey }));
           continue;
         }
         if (n.update) continue;

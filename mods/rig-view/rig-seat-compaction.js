@@ -98,8 +98,8 @@ export class SeatCompaction {
     this.resetRecovery(e);
     this.changed(e,cx);
   }
-  resetRecovery(e){
-    this.saveRecovery(e,null);
+  resetRecovery(e,warning=null){
+    this.saveRecovery(e,warning);
     e.recoveryToken=null;
     e.uncertain=false;
     e.error=null;
@@ -122,8 +122,9 @@ export class SeatCompaction {
     if(e?.start?.dispatched&&e.dispatch?.token===e.start.token)this.recordRecovery(e,e.dispatch);
   }
   recoveryClock(at){return formatAbsoluteTime(at,{timezone:this.host.timezone?.()});}
-  checkRecovery(e,data,record){
-    if(this.recovery(e)?.token!==record.token)return;
+  checkRecovery(e,data,token){
+    const record=this.recovery(e);
+    if(record?.token!==token)return;
     const p=data?.preparation,s=data?.state,pi=e.node.runtime==='pi';
     const updated=timestamp(pi?s?.requestedAt:s?.updatedAt);
     const recent=Number.isFinite(updated)&&updated>=record.at;
@@ -351,12 +352,12 @@ export class SeatCompaction {
       const status=await this.host.get(e.config,`/api/seat/status/${encodeURIComponent(e.node.canonicalSessionName)}`,op);
       const health=await this.host.get(e.config,'/healthz',op);
       e.snapshot=compactionSnapshot(e.node,status,tenure,health.selfHostId);
-      const recovery=this.recovery(e);
+      const recoveryToken=this.recovery(e)?.token;
       const observed=await this.readState(e,op);
       if(observed?.applied){
-        if(recovery){
+        if(recoveryToken){
           op.check();
-          if(!this.closed&&this.entry===e)this.checkRecovery(e,observed.data,recovery);
+          if(!this.closed&&this.entry===e)this.checkRecovery(e,observed.data,recoveryToken);
         }
         else if(!e.uncertain)e.error=null;
       }
@@ -422,7 +423,7 @@ export class SeatCompaction {
         const record=this.recovery(e);
         if(record&&record.token===dispatch?.token&&!record.accepted&&result.code!==0&&data.ok===false&&!data.preparation&&UNSENT_TRIGGER_REFUSALS.has(data.reason)){
           const current=this.entry?.recoveryKey===e.recoveryKey?this.entry:e;
-          this.resetRecovery(current);
+          this.resetRecovery(current,priorWarning);
           current.error='OpenRig refused the compaction request. Nothing was sent to the seat.';
           this.changed(current,cx);
         }
