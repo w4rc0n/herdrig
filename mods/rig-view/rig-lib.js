@@ -1199,7 +1199,8 @@ export function cliEnv(config) {
   const isolated = Boolean(config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID);
   // RIGGED_* are the legacy names the CLI still reads for the same things. A seat's node id goes too: with it, `rig tui`
   // asks the daemon about that seat's permissions and exits when herdr-app inherited it from a seat.
-  return ["-u", "OPENRIG_SESSION_NAME", "-u", "RIGGED_SESSION_NAME", "-u", "OPENRIG_NODE_ID", "-u", "RIGGED_NODE_ID",
+  // OpenRig can recover a sender from a bound tmux pane when no session env remains.
+  return ["-u", "TMUX_PANE", "-u", "OPENRIG_SESSION_NAME", "-u", "RIGGED_SESSION_NAME", "-u", "OPENRIG_NODE_ID", "-u", "RIGGED_NODE_ID",
     "-u", "OPENRIG_ACTIVITY_HOOK_TOKEN", "-u", "RIGGED_ACTIVITY_HOOK_TOKEN", "-u", "OPENRIG_OCCUPANT_GENERATION",
     "-u", "OPENRIG_DB", "-u", "RIGGED_DB", "-u", "OPENRIG_URL",
     "-u", "OPENRIG_HOST", "-u", "OPENRIG_PORT", "-u", "RIGGED_URL", "-u", "RIGGED_HOST", "-u", "RIGGED_PORT",
@@ -1338,7 +1339,7 @@ export function writeCommand(config, args, { env = [] } = {}) {
 
 /**
  * Build a headerless CLI write command for `System -> People` (`rig gateway human quiet|mode ...`):
- * requires `config.person` (`<id>@external`), unsets both `OPENRIG_SESSION_NAME` and `RIGGED_SESSION_NAME`, and passes `--actor <person>@external`.
+ * requires `config.person` (`<id>@external`), removes inherited seat identity, and passes `--actor <person>@external`.
  */
 export function peopleCliCommand(config, subargs = [], { env = [] } = {}) {
   if (!config?.person || !/^[^@\s]+@external$/.test(String(config.person).trim())) return null;
