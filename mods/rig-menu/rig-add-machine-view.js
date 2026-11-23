@@ -225,9 +225,10 @@ export class AddMachineChooser {
     this.phase="loading";this.rows=[];this.error=null;this.panel=null;
   }
   expire(){this.expired=true;releaseFocusTargets(this);this.focusTask?.cancel?.();this.panel?.expire?.();for(const handle of this.rowHandles??[])handle?.release?.();this.rowHandles=[];}
+  hasChoices(){return this.phase==="choose" ? Boolean(this.rows.length||this.local) : this.phase==="error"&&this.local;}
   cycleFocus(forward,cx){
     cx.stop_propagation();
-    const handles=[...(this.phase==="choose"?this.rowHandles??[]:[]),this.cancelHandle].map(liveFocus).filter(Boolean);
+    const handles=[...(this.hasChoices()?this.rowHandles??[]:[]),this.cancelHandle].map(liveFocus).filter(Boolean);
     if(this.expired||this.panel||!handles.length)return;
     const index=handles.findIndex(handle=>handle.is_focused?.());
     const next=handles[index<0?(forward?0:handles.length-1):(index+(forward?1:-1)+handles.length)%handles.length];
@@ -240,11 +241,10 @@ export class AddMachineChooser {
       const live=this.liveConfig?.()??{},taken=[live.daemonMachine,...(live.connections??[]).map(c=>c?.machine)];
       this.local=localConnectionMissing(live)&&typeof this.makeLocalPanel==='function';
       this.rows=await listAddableMachines(this.host,taken);this.phase="choose";
-      // Each row's focus handle is made by the next draw (rowHandlesFor), never in this continuation: a handle made after an await belongs to
-      // whichever view drained the promise jobs. Without one Tab can't reach the row and its keys never arrive.
-      for(const handle of this.rowHandles??[])handle?.release?.();
-      this.rowHandles=[];
-    }catch(error){this.phase="error";this.error=plainExecError(error,{machine:this.machine,kind:"remote"});}
+    }catch(error){this.rows=[];this.phase="error";this.error=plainExecError(error,{machine:this.machine,kind:"remote"});}
+    // The next draw creates focus handles, so they belong to this view.
+    for(const handle of this.rowHandles??[])handle?.release?.();
+    this.rowHandles=[];
     cx.notify();
   }
   async chooseLocal(cx){
@@ -273,7 +273,8 @@ export class AddMachineChooser {
   renderFocused(t,cx){
     if(this.panel)return this.panel.render(t,cx);
     this.theme=t;
-    if(this.phase==="choose")this.rowHandlesFor(cx);
+    const hasChoices=this.hasChoices();
+    if(hasChoices)this.rowHandlesFor(cx);
     const root=v_flex().id("add-machine-choose").size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
       .key_context("RigDialog").on_action("rig-dialog-next",(_e,cx)=>this.cycleFocus(true,cx)).on_action("rig-dialog-prev",(_e,cx)=>this.cycleFocus(false,cx))
       .on_key_down((event,cx)=>{if(event.key==="tab"&&!event.modifiers?.control&&!event.modifiers?.platform&&!event.modifiers?.alt)this.cycleFocus(!event.modifiers?.shift,cx);else if(event.key==="escape"){cx.stop_propagation();this.expire();this.cancel?.(cx);}})
@@ -281,8 +282,8 @@ export class AddMachineChooser {
     let body=v_flex().flex_1().min_h(0).overflow_y_scrollbar().gap(6);
     if(this.phase==="loading")body=body.child(div().id("add-machine-loading").text_color(t.muted).child("◌ Reading Herdr's machines…"));
     else if(this.phase==="error")body=body.child(div().id("add-machine-choose-error").text_color(t.blocked).child(errorBlock(this,t,"add-machine-choose-error-detail",this.error,{where:"this computer"})));
-    else if(!this.rows.length&&!this.local)body=body.child(div().id("add-machine-none").child("Every connected Herdr machine already has a connection."));
-    else{
+    else if(!hasChoices)body=body.child(div().id("add-machine-none").child("Every connected Herdr machine already has a connection."));
+    if(hasChoices){
       body=body.child(div().text_color(t.muted).child("Machine"));
       if(this.local){const activation=activationPair(this,'pick-local');body=body.child(v_flex().id('add-machine-pick-local').role('button').tab_stop(true).px(8).py(5).rounded(5).bg(t.raised).cursor_pointer()
         .when(!!this.rowHandles?.[0],el=>el.track_focus(this.rowHandles[0])).focus(el=>el.border_1().border_color(t.accent))
@@ -296,7 +297,7 @@ export class AddMachineChooser {
         .on_click(activationPair(this,`pick-${row.name}`).click((_e,cx)=>cx.spawn(cx=>this.choose(row,cx))))
         .on_key_down(activationPair(this,`pick-${row.name}`).key((e,cx)=>{if(!e.is_held&&["enter"," ","space"].includes(String(e.key??"").toLowerCase())){cx.stop_propagation();cx.spawn(cx=>this.choose(row,cx));}})).child(row.name));
     }
-    const closeLabel=this.phase==="choose"&&(this.rows.length||this.local)?"Cancel":"Close";
+    const closeLabel=hasChoices?"Cancel":"Close";
     const close=div().id("add-machine-choose-close-focus").p(2).border(2).border_color("#00000000").rounded(7).role("button").tab_stop(true)
       .when(!!this.cancelHandle,el=>el.track_focus(this.cancelHandle)).focus(el=>el.border_color(t.accent))
       .on_mouse_down('left',activationPair(this,'choose-close').pointer())

@@ -657,20 +657,23 @@ export function localSetupGate(host, { rigArgv = ["rig"] } = {}) {
       const { connections, invalid } = connectionsOf(raw);
       if (invalid) throw new Error(CONFIG_LIST_INVALID);
       if (connections.some((c) => !c.machine)) throw new Error(LOCAL_ALREADY_CONNECTED);
-      const listed = connections.filter((c) => typeof c.openrigHome === "string" && !openrigHomeProblem(c.openrigHome));
+      const listed = connections.flatMap(connection => {
+        const home = connection.openrigHome?.replace(/\/+$/, "");
+        return openrigHomeProblem(home) ? [] : [{ connection, home }];
+      });
       // The home exists and is canonical first (the CLI may create a missing one), and is not another connection's (compared as resolved).
-      const paths = host.localProbe({ home: typed, rigArgv, listedHomes: listed.map((c) => c.openrigHome) });
+      const paths = host.localProbe({ home: typed, rigArgv, listedHomes: listed.map(c => c.home) });
       if ((await paths("test", ["-d", typed]))?.code !== 0) throw new Error("That folder doesn't exist on this computer. Nothing was saved.");
       recheck(attempt);
       const resolved = await paths("realpath", ["--", typed]), home = String(resolved?.stdout ?? "").replace(/\n$/, "");
       recheck(attempt);
       if (resolved?.code !== 0 || openrigHomeProblem(home)) throw new Error("Herdr couldn't resolve that folder on this computer. Nothing was saved.");
       const canonicalHomes = [];
-      for (const c of listed) {
-        const r = await paths("realpath", ["--", c.openrigHome]), real = r?.code === 0 ? String(r.stdout ?? "").replace(/\n$/, "") : c.openrigHome;
+      for (const { connection, home: listedHome } of listed) {
+        const r = await paths("realpath", ["--", listedHome]), real = r?.code === 0 ? String(r.stdout ?? "").replace(/\n$/, "") : listedHome;
         recheck(attempt);
         canonicalHomes.push(real);
-        if (real === home || c.openrigHome === home) throw new Error(localTaken(c));
+        if (real === home || listedHome === home) throw new Error(localTaken(connection));
       }
       // The home's own daemon, as OpenRig records it (daemon.json: its pid and port), the same proof as the built-in folder copy. A home with no
       // record names no daemon of its own, so nothing is read for it: the CLI would fall back to a default port and find some other OpenRig there.
@@ -711,14 +714,14 @@ export function localSetupGate(host, { rigArgv = ["rig"] } = {}) {
         if (other?.selfHostId === id || sameDaemon(other, health)) throw new Error(localTaken(c));
       }
       recheck(attempt);
-      checked = { daemonUrl: origin, selfHostId: id, pid: Number.isInteger(health?.pid) ? health.pid : null, home, canonicalHomes, before };
+      checked = { daemonUrl: origin, selfHostId: id, pid: recorded.pid, port, typed, home, canonicalHomes, before };
       return { daemonUrl: origin, selfHostId: id, home };
     },
     invalidate() { checked=null;epoch++; },
     expired() { return expired; },
     checked() { return checked ? { daemonUrl: checked.daemonUrl, selfHostId: checked.selfHostId, home: checked.home } : null; },
     expire() { expired=true;checked=null;epoch++; },
-    /** Saves exactly what Check saw, compare-and-swap against the file Check read; the daemon is read again first. */
+    /** Recheck the endpoint and home binding before the compare-and-swap against the file Check read. */
     async save(request=host.setupFetch) {
       if (!checked) throw new Error("Check this computer's OpenRig before adding it.");
       const snapshot=checked,attempt=epoch;
@@ -727,6 +730,16 @@ export function localSetupGate(host, { rigArgv = ["rig"] } = {}) {
       if (again?.selfHostId !== snapshot.selfHostId || again?.pid !== snapshot.pid)
         throw new Error("OpenRig changed since the check. Check again. Nothing was saved.");
       recheck(attempt);
+      const paths = host.localProbe({ home: snapshot.typed, rigArgv });
+      const resolved = await paths("realpath", ["--", snapshot.typed]);
+      recheck(attempt);
+      if (resolved?.code !== 0 || String(resolved.stdout ?? "").replace(/\n$/, "") !== snapshot.home)
+        throw new Error("The OpenRig home changed since the check. Check again. Nothing was saved.");
+      let recorded = null;
+      try { recorded = JSON.parse(await host.readDaemonState(snapshot.home) ?? "null"); } catch (_) { recorded = null; }
+      recheck(attempt);
+      if (recorded?.pid !== snapshot.pid || recorded?.port !== snapshot.port)
+        throw new Error("The OpenRig home now records a different daemon. Check again. Nothing was saved.");
       const saved = await addLocalConnection({writeConfig:(text,before)=>host.writeConfig(text,before,()=>recheck(attempt))}, snapshot.before, { daemonUrl: snapshot.daemonUrl, expectedHostId: snapshot.selfHostId, openrigHome: snapshot.home, canonicalHomes: snapshot.canonicalHomes });
       expired = true;
       return saved;

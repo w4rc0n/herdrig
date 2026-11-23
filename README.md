@@ -154,7 +154,8 @@ Check the `Version:` line in the README you copied, or open System and read **He
   OpenRig's spec library `<OpenRig home>/specs`, and `workspace.specs_root` from the local `rig`. The home is
   `openrigHome` if you set it, else `OPENRIG_HOME` in Herdr's environment, else `~/.openrig`, so a default install
   edits with no setup. A link out of those folders, or a path only the daemon names, is refused.
-  **Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port.
+  **Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port. Save resolves
+  the home again and checks that its daemon record still matches the reviewed connection.
   **Change model / harness** reads `<accountHome>/models_cache.json` for Codex and watches its containing folder
   while the catalog is open. The account home comes from OpenRig's seat status. The helper checks that the
   opened cache is a regular file owned by the current user and no larger than 1 MiB before reading its contents.

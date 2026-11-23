@@ -742,6 +742,7 @@ export default class RigSidebar extends View {
     // Retire asynchronous controller jobs before a persisted key can change.
     if(this.workerViews){this.workerViews.dispose();this.workerViews=null;setShared('rig.workerMigrationGeneration',(shared('rig.workerMigrationGeneration')??0)+1);}
     const result=migrateConnectionState({shared,setShared},next,this.config);
+    this.legacyWorkerMigrationPending=!next?.configInvalid&&!next?.connectionsList&&!next?.daemonUrl;
     if(result.workersChanged)this.saveSpaceState({workerViews:shared('rig.workerViews')}).catch(error=>{this.workerMigrationError=errorDiagnostic(error);notify({title:"Couldn't save the moved worker view",body:this.workerMigrationError,level:'warning'});});
     return result;
   }
@@ -1917,9 +1918,7 @@ export default class RigSidebar extends View {
           const current = () => this.stillCurrent(feed, config);
           if (!current() || feed.error) continue;
           if (rig.nodesUnavailable) continue;
-          // A seat on a tmux server OpenRig reports unreachable: the space stays as it is (its panes parked in place) until the server answers. A sync
-          // would only check the dead server and blame this machine on a card and a toast.
-          if ((rig.pods ?? []).some((pod) => (pod.seats ?? []).some((seat) => seat.status === "terminal_gone"))) continue;
+          // The controller records an unreachable grid without touching its panes, so it can refresh parked viewers after recovery.
           if (activeInPlaceOpen({ spaces:preflight.spaces, panes:preflight.panes, shared }, config, rig.id)) continue;
           const statusKey = this.statusKey(rig);
           const prevStatus = (shared("rig.spaceStatus") ?? {})[statusKey];
@@ -2473,6 +2472,8 @@ export default class RigSidebar extends View {
 
   async close() {
     this.closed = true;
+    const setupToken=shared("rig.machineSetupToken");
+    if(this.machineConfirmations?.has(setupToken))setShared("rig.machineSetupToken",null);
     this.cancelSidebarFocus();
     try { this.herdr?.release?.(); } catch (_) {} // this view's herdr:// transport registration ends with it
     releaseFocusTargets(this); // the follow hint's buttons
@@ -2900,6 +2901,7 @@ export default class RigSidebar extends View {
         if (hasExplicitConfigUrl) {
           if (hzRes?.ok) {
             const hzBody = await hzRes.json().catch(rethrowGate(() => null)); // a body that doesn't parse keeps the last reading itself (no fresh copy of it)
+            op.check(); // The connection can move after the response guard and before this continuation.
             if (hzBody) feed.healthz = steadyHealthz(hzBody);
           }
         }
@@ -2938,6 +2940,8 @@ export default class RigSidebar extends View {
         ]);
         capabilities.hostWorkerViews = hostWorkerViews;
         op.check(); // everything read above belongs to the settings this refresh began under: if they changed, nothing of it is published (the next refresh reads the new daemon)
+        if(feed===this.primary&&this.legacyWorkerMigrationPending&&feed.config.daemonUrlSource==="cli"&&!feed.config.connectionsList)
+          this.migrateConnections(feed.config);
         if(!sameValue(shared("rig.capabilities"),capabilities))setShared("rig.capabilities", capabilities);
         this.markTerminalOutage(feed, nodesByRig);
         const topology = buildTopology(summary, nodesByRig, native?.seats, feed.config?.connectionId, representatives);
@@ -3282,6 +3286,7 @@ export default class RigSidebar extends View {
       const attentionItems = raw ? enrichAttentionItems(raw, attentionAgg, queueRows, attentionHealth?.records ?? []) : null;
       // Its health first: it says which of its tmux servers stopped answering, and so which seats read "unreachable".
       const hzBody = hz?.ok ? await hz.json().catch(rethrowGate(() => null)) : null; // a body that doesn't parse keeps the last reading itself
+      op.check(); // The connection can move after the response guard and before this continuation.
       if (hzBody) feed.healthz = steadyHealthz(hzBody);
       this.markTerminalOutage(feed, nodesByRig);
       const topology = buildTopology(summary, nodesByRig, native?.seats, feed.config.connectionId, representatives);

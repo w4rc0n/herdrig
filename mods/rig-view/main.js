@@ -182,6 +182,7 @@ import {StatusMotion} from "./rig-status-motion.js";
  *  a daemon stopped mid-request) would otherwise hold that path on skeletons for the life of the tab. Asking again does not give up on the older
  *  read: whichever answer comes back first is shown (a slow but live daemon still settles), and only an answer older than the one shown is dropped. */
 const READ_LOST_MS = 30_000;
+const seatStatusRead = path => /^\/api\/seat\/status\/[^/?]+$/.test(path);
 /** The connection id of a page that names no OpenRig while several are set up: it matches none, so nothing is read or sent for it. */
 const NO_PAGE_CONNECTION = "no-page-connection";
 
@@ -275,7 +276,7 @@ export default class RigView extends View {
       this.observeSidebarRefresh();
       const seen = this.refreshSeen;
       if (layoutHasMod(layout(), MOD_IDS.sidebar) && seen?.conn === this.activeConnId() && Date.now() - seen.at <= SIDEBAR_FRESH_MS) { this.refreshUnmirrored(cx); return; }
-      this.invalidateLiveReads();
+      this.invalidateLiveReads({ seatStatus: true });
       cx.notify();
     });
     // The header's status line and a reply's confirmation come and go by time: redraw while one shows or a new one arrives.
@@ -512,28 +513,28 @@ export default class RigView extends View {
     if (this.closed) return;
     // Loads run concurrently (the watcher, the timers). The mod-wide numberedConfigReads
     // returns the newest installed config; a newer read that throws cannot drop an older successful one.
-    // `loadSeq` still numbers by START and guards only the spec-folder publish below (a separate concern: the newest started load publishes its folders).
-    const seq = this.loadSeq = (this.loadSeq ?? 0) + 1;
     let mine = null;
     const installed = await configReads(async () => (mine = preserveCliDiscoveredConfig(parseConfig(await readTextFile(CONFIG())), this.config)));
     // A newer read (this page's or another page's) installed while this one was reading: the page takes THAT config (what the file says now), never its own older one.
     if (this.closed) return;
     this.sayConfigReadFailure(null);
     const next = this.latestRead = installed === mine ? mine : preserveCliDiscoveredConfig(installed, this.config);
-    const needsFolders=!sameConfig(next,this.config)||this.specFoldersReady===false;
-    if(needsFolders){
+    if(!sameConfig(next,this.config)){
       const migration=migrateConnectionState({shared,setShared,migrateWorkers:false},next,this.config);
       this.initialEntry=migration.entry(this.initialEntry);
       this.initialConn=this.initialEntry?.conn??this.initialConn;
-      const connIdentity = (cfg) => JSON.stringify((cfg?.connections?.length ? cfg.connections : [{ id: cfg?.connectionId, daemonUrl: cfg?.daemonUrl, machine: cfg?.daemonMachine, openrigHome: cfg?.openrigHome }])
-        .map((c) => [c?.id ?? null, c?.daemonUrl ?? null, c?.machine ?? c?.daemonMachine ?? null, c?.openrigHome ?? null]));
-      const primaryMoved = Boolean(this.config && (next.daemonUrl !== this.config.daemonUrl || next.daemonMachine !== this.config.daemonMachine || next.connectionId !== this.config.connectionId));
-      if (primaryMoved || (this.config && connIdentity(next) !== connIdentity(this.config))) {
+      const previous = this.config;
+      const ids = new Set([...(previous?.connections ?? []), ...(next?.connections ?? [])].map(connection => connection.id));
+      if (previous?.connectionId) ids.add(previous.connectionId);
+      if (next?.connectionId) ids.add(next.connectionId);
+      const identity = (cfg, id) => {
+        const connection = configOfConnection(cfg, id);
+        return connection && [connection.daemonUrl, connection.daemonMachine, connection.openrigHome, connection.expectedHostId];
+      };
+      const changed = new Set([...ids].filter(id => JSON.stringify(identity(previous, id)) !== JSON.stringify(identity(next, id))));
+      if (previous && changed.size) {
         this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx);this.graphWork?.close();this.graphWork=null;
-        if (primaryMoved) {
-          for(const box of Object.values(this.specBoxes??{}))box.state?.release?.();
-          this.specBoxes={};
-        }
+        this.invalidateSpecEditors(changed);
       }
       // Publish before the consent await: otherwise each one-second missing-config retry
       // can overtake a valid initial load and leave the page on Reading forever.
@@ -543,6 +544,7 @@ export default class RigView extends View {
       this.specConsentMachine=null;
       cx.notify();
     }
+    const warmConfig = this.config;
     let consentMachine = null;
     try{
       const consentConfig=this.activeConfig(),text=await readTextFile(`${appHome()}/openrig/spec-consent.json`);
@@ -555,29 +557,53 @@ export default class RigView extends View {
     // never "Needs approval".
     const approvals = (name) => readTextFile(`${appHome()}/openrig/${name}`).catch(() => CONSENT_UNREADABLE);
     const connectionConsent = await approvals("machine-consent.json"), helperConsent = await approvals("openrig-consent.json");
-    if (this.closed || this.latestRead !== next) return; // a newer read installed while the consent file was read: it sets its own config
-    this.specConsentMachine=consentMachine;
-    if (this.connConsent !== connectionConsent || this.helperConsent !== helperConsent) { this.connConsent = connectionConsent; this.helperConsent = helperConsent; cx.notify(); }
-    // Only the newest load publishes consent/folders; an identical retry still
-    // finishes folders when the prior load was overtaken during those checks.
-    if (!needsFolders) return;
-    // The spec editor's folders, from local facts only (never the daemon's list). The AUTHORITY is
-    // per-connection and per-use (specRootsFor), so a page opened after a load that resolved for another machine's page still gets its own
-    // folders. This warm for the page shown now is a head start only, and it publishes under the same "overtaken" rule as the rest of the
-    // load (the newest load wins).
-    const pageCfg = this.activeConfig();
-    if(pageCfg && !pageCfg.daemonMachine) {
-      // Resolved here for the page shown NOW and published under the load's own overtaken rule; specRootsFor is the same call for a page
-      // that needs folders later, so a tab whose first load ran on another machine's page is not left without them.
-      const warmed = await localSpecRoots(pageCfg, execFor(pageCfg), home());
-      if (this.closed || seq !== this.loadSeq) return; // overtaken while resolving the folders: the newer load publishes its own
-      this.specRoots = warmed; this.specRootsConn = pageCfg.connectionId ?? LEGACY_CONNECTION_ID; this.specRootsPublished = warmed;
+    if (this.closed || this.config !== warmConfig) return;
+    if (this.latestRead === next) {
+      this.specConsentMachine=consentMachine;
+      if (this.connConsent !== connectionConsent || this.helperConsent !== helperConsent) { this.connConsent = connectionConsent; this.helperConsent = helperConsent; cx.notify(); }
     }
-    const realpathAvailable = await specRealpathAvailable(exec);
-    if (this.closed || seq !== this.loadSeq) return; // overtaken while checking realpath
-    this.specRealpathAvailable = realpathAvailable;
-    this.specFoldersReady = true;
-    cx.notify();
+    // A successful warmup belongs to the installed config. An identical poll shares its work.
+    if (this.specFoldersReady || this.specFolderWarmup === warmConfig) return;
+    this.specFolderWarmup = warmConfig;
+    try {
+      const pageCfg = this.activeConfig();
+      if (pageCfg && !pageCfg.daemonMachine) {
+        const warmed = await localSpecRoots(pageCfg, execFor(pageCfg), home());
+        if (this.closed || this.config !== warmConfig) return;
+        if (sameConfig(this.activeConfig(), pageCfg)) {
+          this.specRoots = warmed; this.specRootsConn = pageCfg.connectionId ?? LEGACY_CONNECTION_ID; this.specRootsPublished = warmed;
+        }
+      }
+      const realpathAvailable = await specRealpathAvailable(exec);
+      if (this.closed || this.config !== warmConfig) return;
+      this.specRealpathAvailable = realpathAvailable;
+      this.specFoldersReady = true;
+      cx.notify();
+    } finally {
+      if (this.specFolderWarmup === warmConfig) this.specFolderWarmup = null;
+    }
+  }
+
+  invalidateSpecEditors(changed) {
+    const graphKeys = [...(this.graphs?.keys() ?? [])].filter(key => key.startsWith("spec:")).map(key => key.slice(5));
+    const keys = new Set([...Object.keys(this.specBoxes ?? {}), ...Object.keys(this.specCopyNotes ?? {}), ...(this.specAutoEdit ?? []), ...graphKeys]);
+    for (const key of keys) {
+      const conn = /^\["(conn-[^"]+)",/.exec(key)?.[1] ?? LEGACY_CONNECTION_ID;
+      if (!changed.has(conn)) continue;
+      const box = this.specBoxes?.[key];
+      if (box) {
+        box.invalidated = true;
+        box.secondaryEnterTask?.cancel?.();
+        box.pendingEditor = null;
+        box.state?.release?.();
+        box.state = null;
+        delete this.specBoxes[key];
+      }
+      this.specAutoEdit?.delete(key);
+      delete this.specCopyNotes?.[key];
+      this.graphs?.get(`spec:${key}`)?.reset();
+      this.graphs?.delete(`spec:${key}`);
+    }
   }
 
   // A worker view is its own connection's: matched by that connection's machine, origin and id (the legacy entry carries no id).
@@ -1200,16 +1226,20 @@ export default class RigView extends View {
     if (served) cache[path] = served;
     const hit = cache[path];
     const lost = Boolean(hit?.loading) && Number.isFinite(hit.startedAt) && Date.now() - hit.startedAt > READ_LOST_MS;
-    if (!served && (!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost)) {
+    // A spec write needs an observation made after its sync. Fence off earlier reads as soon as that GET starts.
+    const afterSpecSync = inTask && force && path === "/api/specs/library";
+    if (!served && (!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost || afterSpecSync)) {
       const published = sharedRigData(cfg, this.sharedOnce);
       const sharedAt = (this.config?.connections?.length ?? 0) > 1 ? published?.byConnection?.[cfg?.connectionId]?.at : published?.at;
       // The read belongs to the daemon and connection it started against: a late answer, after the configuration moved, is dropped.
       const epoch = this.cacheEpoch ?? 0;
       // Each read of a path is numbered. Any outstanding read's answer settles a loading entry; once an answer is shown, an older one is dropped.
       const seq = (hit?.seq ?? 0) + 1;
-      const older = () => Number.isFinite(cache[path]?.shownSeq) && seq < cache[path].shownSeq;
+      const libraryGeneration = afterSpecSync ? Symbol() : hit?.libraryGeneration;
+      const older = () => libraryGeneration !== cache[path]?.libraryGeneration || seq < (cache[path]?.shownSeq ?? 0);
       let answerChanged = false;
-      cache[path] = { ...(hit ?? {}), stale: false, loading: true, startedAt: Date.now(), seq };
+      const generation = libraryGeneration ? { libraryGeneration } : {};
+      cache[path] = { ...(hit ?? {}), ...generation, stale: false, loading: true, startedAt: Date.now(), seq };
       const finish = (outcome) => {
         const pending = cache[path];
         if (older()) return;
@@ -1219,6 +1249,7 @@ export default class RigView extends View {
           || (hit?.status !== undefined && hit.status !== outcome.status) || !canSkipReadAnswer(path, hit.data, outcome.data));
         cache[path] = {
           ...settleRead(pending, outcome),
+          ...generation,
           sharedAt: outcome.ok ? sharedAt : pending?.sharedAt,
           // Consume invalidation when starting, not when finishing: another update may arrive mid-read.
           ...(pending?.stale ? { stale: true } : {}),
@@ -2111,12 +2142,12 @@ export default class RigView extends View {
     ]);
   }
 
-  invalidateLiveReads() {
+  invalidateLiveReads({ seatStatus = false } = {}) {
     this.nowDue = true;
     // /healthz is the page's own read only while no running sidebar is its source (a sidebar refresh carries its reading): with one, a
     // refresh re-reads nothing extra, as before; without one, at most once per live refresh.
     const ownHealth = !this.attentionFromSidebar || this.attentionFromSidebar !== this.activeConnId();
-    markStale(this.cache, (path) => path==='/api/config/ui.timezone' || (ownHealth && path === '/healthz') || path.startsWith('/api/views/execution?') || path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
+    markStale(this.cache, (path) => (seatStatus && seatStatusRead(path)) || path==='/api/config/ui.timezone' || (ownHealth && path === '/healthz') || path.startsWith('/api/views/execution?') || path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
   }
 
   /** The sidebar doesn't mirror handoff history, workflow execution or request detail. Keep those shown-page reads live without polling full attention. */
@@ -2129,7 +2160,7 @@ export default class RigView extends View {
     if(last===undefined){this.unmirroredAt[conn]=now;return;}
     if(now>=last&&now-last<60000)return;
     this.unmirroredAt[conn]=now;
-    const matches=path=>/^\/api\/seat\/status\/[^/?]+$/.test(path)||path==='/api/health'||path==='/api/health?status=cleared'||/^\/api\/rigs\/[^/]+\/graph$/.test(path)||path.startsWith('/api/views/execution?')||path.startsWith('/api/queue/recent-transitions?')||path.startsWith('/api/queue/hosted-members:')||(/^\/api\/queue\/[^/?]+$/.test(path)&&path!=='/api/queue/attention-aggregate');
+    const matches=path=>seatStatusRead(path)||path==='/api/health'||path==='/api/health?status=cleared'||/^\/api\/rigs\/[^/]+\/graph$/.test(path)||path.startsWith('/api/views/execution?')||path.startsWith('/api/queue/recent-transitions?')||path.startsWith('/api/queue/hosted-members:')||(/^\/api\/queue\/[^/?]+$/.test(path)&&path!=='/api/queue/attention-aggregate');
     if(!Object.keys(this.cache).some(matches))return;
     markStale(this.cache,matches);cx.notify();
   }
@@ -2673,6 +2704,13 @@ export default class RigView extends View {
       div().id(`${id}-line-${index}`).w_full().min_w(0).whitespace_normal().line_height('20px').text_size(12.5).text_color(t.foreground)
         .child(line.replace(/^ +/,spaces=>'\u00a0'.repeat(spaces.length)).replace(/ {2,}/g,spaces=>' '+'\u00a0'.repeat(spaces.length-1))||'\u00a0')));
   }
+  heldMessagesRouteKey(entry) {
+    if (entry?.section !== "topology" || entry.kind !== "seat" || entry.connectionIssue) return null;
+    const known = this.cache["/api/rigs/summary"]?.data;
+    const rigId = entry.rigId ?? (Array.isArray(known) ? known.find(rig => rig.name === entry.rig || rig.id === entry.rig)?.id : undefined);
+    return navKey({ ...entry, rigId, conn: entry.conn ?? this.activeConnId() });
+  }
+
   heldMessagesCard(t,cx,entry,guard) {
     if(!guard?.heldCount&&!this.heldMessagesOpen)return null;
     const cfg=this.activeConfig(),seat=entry.session??`${entry.name}@${entry.rig}`,key=JSON.stringify([cfg?.connectionId,cfg?.daemonUrl,cfg?.openrigHome,seat]);
@@ -2688,7 +2726,7 @@ export default class RigView extends View {
     if(!this.heldMessagesView&&cfg){
       const view=new SeatTypingGuard({fetch:(url)=>gatedOperationOrRefusal(cfg.connectionId).fetch(url),closed:()=>this.closed||this.heldMessagesKey!==key,
         currentConfig:()=>this.activeConfig()},cfg,seat);
-      this.heldMessagesView=view;this.heldMessagesRoute=navKey(this.shownEntry());start(cx,after=>view.more(after));
+      this.heldMessagesView=view;this.heldMessagesRoute=this.heldMessagesRouteKey(entry);start(cx,after=>view.more(after));
     }
     const view=this.heldMessagesView;
     const selected=view?.selected;
@@ -3519,6 +3557,7 @@ export default class RigView extends View {
       try {
         if (!spec) throw new Error("This page's OpenRig is no longer set up, so its spec can't be read. Reopen the page.");
         const text = await this.specText(s, null, spec);
+        if (this.closed || box.invalidated) return;
         const key = spec.draftKey(s.id), raw = (shared("rig.drafts") ?? {})[key];
         const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
         let initial = text;
@@ -5118,7 +5157,10 @@ export default class RigView extends View {
   }
 
   openCheckedQueueRow(check, rows, conn) {
-    if (!validHealthQitemId(check.about)) return;
+    if (!validHealthQitemId(check.about)) {
+      notify({ title: "Can't open the checked row", body: "This check points to an invalid queue item ID.", level: "warning" });
+      return;
+    }
     const scope = conn ? { conn } : {};
     if (this.checkedRequest(check, rows, conn)) {
       this.push({ section: "needs", id: `queue:${check.about}`, name: checkLabel(check, rows).replace(/^Check on: /, ""), ...scope });
@@ -6809,7 +6851,7 @@ export default class RigView extends View {
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
     let entry = this.shownEntry(); // this tab's own connection's page (the global top only when it is this tab's)
-    if(this.heldMessagesView&&this.heldMessagesRoute!==navKey(entry)){
+    if(this.heldMessagesView&&this.heldMessagesRoute!==this.heldMessagesRouteKey(entry)){
       this.heldMessagesView.close();this.heldMessagesView=null;this.heldMessagesKey=null;this.heldMessagesOpen=false;
     }
     if (!this.perTab()) this.legacyShown = entry ?? undefined; // what this pane drew from the shared history, kept if it latches later

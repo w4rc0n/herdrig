@@ -19,6 +19,17 @@ Rig graphs show who is still working on a handoff, and connection setup and reco
 - Seat compaction status recovers after a temporary read failure and keeps newer results when an older read finishes late. If a refresh fails, the seat page offers Check again and keeps technical details in the log.
 - When the selected model lists its effort levels, switching models offers those levels.
 - Add this computer preserves spaces in the resolved OpenRig home and shows the result when Check or Save finishes. An unresolved page keeps its connection chooser if its old connection ID returns for a different destination.
+- Open rig grids stay in place during a terminal-server outage and reconnect their viewers after the server comes back and the grid is out of focus. Spec editors reload when their connection changes, folder checks can finish across settings polls, and seat status refreshes without the Rig sidebar.
+- Machine approval keeps Done available while the Rig sidebar is hidden. Show the sidebar to continue, or repeat the original action if the sidebar that held it has closed.
+- Start fresh from a Resume plan or roll call targets the seat you selected.
+- Add this computer checks for another connection using the same resolved OpenRig home. Save rechecks that the folder and its recorded daemon still match what you reviewed.
+- Saved Worker views keep their connection while Herdrig discovers the address for a default OpenRig setup. Once it answers, Herdrig checks that the connection matches the saved destination.
+- When OpenRig accepts a compaction command but the state refresh fails, the seat page reports that the command reached OpenRig and asks you to check before trying again.
+- Add a machine keeps **This computer** available when Herdr’s machine list cannot be read and the local OpenRig is eligible to add.
+- If OpenRig supplies a Claude compaction attempt ID before the dialog closes, Herdrig verifies the start against that attempt. While the receipt is pending, or when it cannot name the attempt, a new manual preparation can still belong to another request on the same seat.
+- When an OpenRig connection changes, the sidebar discards health responses from its old daemon before they can mark seats unreachable.
+- Saving a spec refreshes its library entry even when a previous read is still running. Held messages stay open when you switch between links to the same seat. Checks with an invalid queue item ID now explain why they cannot open it.
+- A model-change request that leaves effort alone describes it as unchanged.
 
 ## v0.5.5
 

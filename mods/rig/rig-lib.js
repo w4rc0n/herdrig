@@ -1970,12 +1970,13 @@ export function changeModelPlan(target = {}, pick = {}, extra = null) {
   const cliPreview = procedureLines[0] ?? setCmd;
   const continuity = tier === 1 ? "lossless" : isFreshCross ? "fresh" : "handover";
   const tone = tier === 1 ? "working" : tier === 2 ? "warn" : "blocked";
+  const targetEffort = nextEffort ?? (isAgy ? "agy-settings" : sameHarness && nextModel && !sameModel ? "unchanged" : "default");
   const body = [
     `Seat hot-swap request from the Rig mod (D7):`,
     `- seat: ${JSON.stringify(logicalId)} (${JSON.stringify(session)})`,
     `- rig: ${JSON.stringify(rig)}`,
     `- from: runtime=${curRuntime}, model=${curModel ?? "default"}, effort=${curEffort ?? "default"}`,
-    `- target: runtime=${nextRuntime}, model=${nextModel ?? (isAgy ? "agy-settings" : "default")}, effort=${nextEffort ?? (isAgy ? "agy-settings" : "default")}`,
+    `- target: runtime=${nextRuntime}, model=${nextModel ?? (isAgy ? "agy-settings" : "default")}, effort=${targetEffort}`,
     `- continuity: Tier ${tier} — ${badge}`,
     `- carries over: ${carriesOver}`,
     `- update spec file: ${updateSpec ? "yes" : "no"}`,
