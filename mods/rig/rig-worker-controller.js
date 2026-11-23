@@ -2,6 +2,7 @@ import { errorDiagnostic } from "./rig-words.js";
 // The sidebar owns reconciliation. Daemon previews are read-only; Herdr owns PTYs.
 import {isValidSessionName,rigSeatServers} from "./rig-lib.js";
 import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
+import {workerPaneTitle} from "./rig-tile-title.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
 import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue,prepareRigSpaceAdoption} from "./rig-space-context.js";
 import {rigSpaceRelocation,localGridPreflight} from "./rig-spaces.js";
@@ -59,7 +60,7 @@ const inactive=node=>!node||node.sessionStatus!=="running"||["idle","idle-at-pro
 /** The worker view's screen scan (is a seat tile's viewer ended?): one budget for all its reads, and how many run at once. */
 const SCAN_BUDGET_MS=15000,SCAN_READERS=4;
 export class HostWorkerViews{
-  constructor(host){this.host=host;this.generation=host.generation?.();this.pending=new Map();this.entries=new Map(Object.entries(host.loadViews?.()??{}));this.wakeVersion=0;}
+  constructor(host){this.host=host;this.generation=host.generation?.();this.pending=new Map();this.paneWork=new Map();this.paneWorkSessions=new Map();this.entries=new Map(Object.entries(host.loadViews?.()??{}));this.wakeVersion=0;}
   sync(config,view,options={}){
     if(typeof view!=="string"||!view.trim()||view.length>256||/[\u0000-\u001f\u007f-\u009f]/.test(view))
       return Promise.resolve({ok:false,reason:"Choose a valid worker view."});
@@ -198,7 +199,7 @@ export class HostWorkerViews{
           throw new Error(`The read-only mode changed for ${wanted.label}. Close its worker tab, then reopen this view. Existing tiles were kept.`);
       }
       if(!options.explicit&&previous&&!existing.length){
-        this.entries.delete(key);await this.save();return {ok:true,closed:true};
+        this.entries.delete(key);this.paneWorkSessions.delete(key);await this.save();return {ok:true,closed:true};
       }
       // Another connection's entry keeps its own id and home, so its identity (and its events) stay its own; the legacy entry keeps its old shape.
       const entry={...previous,view,config:storedWorkerConfig(config),target:options.target??previous?.target??null,
@@ -358,6 +359,8 @@ export class HostWorkerViews{
           this.current(config);this.run(config,"pane.close",{pane:tile.pane.pane});entry.pruned[tile.session]=true;
         }
       }
+      if (list(host,"commands").some(command => command.name === "pane.rename"))
+        await this.nameWorkerPanes(config,view,key,remote,plan,options.explicit);
       entry.pages=pages.map((tab,index)=>({tab,name:plan.pages[index]?.name??`${plan.name} · ${index+1}`}));entry.space=spaceId;
       this.entries.set(key,entry);await this.save();this.schedule();
       if(options.explicit&&entry.pages.length){this.run(config,"space.select",{id:spaceId});this.run(config,"tab.select",{id:entry.pages[0].tab});}
@@ -371,18 +374,73 @@ export class HostWorkerViews{
       return {ok:false,paused:!!previous,reason:errorDiagnostic(error),kept:true};
     }
   }
+  async nameWorkerPanes(config, view, key, remote, plan, explicit) {
+    const seats = new Map(plan.pages.flatMap(page => page.tiles).filter(tile => tile.paneSeat)
+      .map(tile => [tile.session, tile.paneSeat]));
+    const workers = () => this.owned(config, view, remote).filter(tile => seats.has(tile.session) && tile.programArgv[0] !== "sleep");
+    const sessions = [...new Set(workers().map(tile => tile.session))];
+    const id = identity(config);
+    if (!this.paneWork.has(id)) this.paneWork.set(id, new Map());
+    const cache = this.paneWork.get(id);
+    if (this.host.currentWorkerSlice) {
+      let index = 0;
+      const read = async () => {
+        while (index < sessions.length) {
+          const session = sessions[index++];
+          this.current(config);
+          if (!cache.has(session)) cache.set(session,{dirty:true,delay:0,nextAt:0});
+          const work = cache.get(session);
+          if (explicit) { work.dirty = true; work.nextAt = 0; }
+          if (!work.pending && work.dirty && work.nextAt <= (this.host.now?.()??Date.now())) {
+            work.dirty = false;
+            work.pending = this.timed(this.host.currentWorkerSlice(config, session), 10000, "Worker slice unavailable.")
+              .then(slice => { work.slice = slice; work.delay = 0; work.nextAt = 0; })
+              .catch(() => {
+                // An unavailable read is not a confirmed empty slice.
+                work.dirty = true;
+                work.delay = work.delay ? Math.min(60000,work.delay*2) : 5000;
+                work.nextAt = (this.host.now?.()??Date.now()) + work.delay;
+              }).finally(() => { work.pending = null; });
+          }
+          await work.pending;
+        }
+      };
+      await Promise.all(Array.from({length:Math.min(SCAN_READERS,sessions.length)},read));
+    }
+    const titles = new Map(sessions.map(session => [session,
+      workerPaneTitle({logicalId:seats.get(session),activeSlice:cache.get(session)?.slice})]));
+    this.current(config);
+    // Re-read ownership after the queue requests. A pane can disappear or change owners while they are in flight.
+    const currentWorkers = workers();
+    this.paneWorkSessions.set(key,new Set(currentWorkers.map(tile=>tile.session)));
+    for (const tile of currentWorkers) {
+      const pane = tile.pane, name = titles.get(tile.session);
+      // After restoring a view, only a successful read can clear its existing slice.
+      if (cache.get(tile.session)?.slice === undefined && pane.name?.startsWith(`${seats.get(tile.session)} · `)) continue;
+      if (name && pane.pane && pane.name !== name) this.run(config,"pane.rename",{pane:pane.pane,name});
+    }
+  }
   async save(){if(this.closed||this.host.generation&&this.host.generation()!==this.generation)return;await this.host.saveViews?.(Object.fromEntries(this.entries));if(!this.closed&&(!this.host.generation||this.host.generation()===this.generation))this.host.changed?.(Object.fromEntries(this.entries));}
   schedule(){
     const version=++this.wakeVersion,now=this.host.now?.()??Date.now(),due=[],configs=new Map();
-    for(const entry of this.entries.values())if(entry.following&&!entry.paused&&entry.pruneMs)
-      for(const [session,since] of Object.entries(entry.inactiveSince))if(!entry.pruned[session]&&since+entry.pruneMs>now){due.push(since+entry.pruneMs);configs.set(identity(entry.config),entry.config);}
+    for(const [key,entry] of this.entries) {
+      if (!entry.following || entry.paused) continue;
+      const id = identity(entry.config), cache = this.paneWork.get(id);
+      for (const session of this.paneWorkSessions.get(key) ?? []) {
+        const nextAt = cache?.get(session)?.nextAt;
+        if (nextAt > 0) { due.push(nextAt); configs.set(id,entry.config); }
+      }
+      if(entry.pruneMs)for(const [session,since] of Object.entries(entry.inactiveSince))
+        if(!entry.pruned[session]&&since+entry.pruneMs>now){due.push(since+entry.pruneMs);configs.set(id,entry.config);}
+    }
     // The wake refreshes each due entry's OWN connection, with that connection's live settings (a removed one has none and is left alone).
     if(due.length)this.host.after?.(Math.max(0,Math.min(...due)-now),async()=>{
       if(version!==this.wakeVersion)return;
       for(const saved of configs.values()){const live=this.host.currentConfig?this.host.currentConfig(saved):saved;if(live)await this.event(live);}
     });
   }
-  async event(config){
+  async event(config,{workChanged=false}={}){
+    if (workChanged) for (const work of this.paneWork.get(identity(config))?.values() ?? []) work.dirty = true;
     for(const entry of [...this.entries.values()])if(entry.following&&!entry.paused&&identity(entry.config)===identity(config))await this.sync(config,entry.view);
   }
   focusChanged(config,focus){

@@ -1,7 +1,7 @@
 // Host-side worker views consume public composition data, never daemon programs.
 import {isValidSessionName,tmuxServerArgsFrom,base64EncodeUtf8,hostOf} from "./rig-lib.js";
 import {goodHome} from "./rig-remote.js";
-import {tileTitle} from "./rig-tile-title.js";
+import {tileTitle,workerPaneTitle} from "./rig-tile-title.js";
 
 const text=(value,max=160)=>String(value??"").replace(/[\u0000-\u001f\u007f-\u009f]/g," ").trim().slice(0,max);
 const invalid=()=>{throw new Error("This OpenRig doesn't offer a supported view preview.");};
@@ -60,7 +60,7 @@ export function hostWorkerPlan(preview,nodes,remote,view=null){
       const argv=reason?["sleep","2147483647"]:[remote.node,remote.relayPath,base64EncodeUtf8(JSON.stringify({
         mode:"grid",session,serverArgs,readOnly:pane.readOnly,title,
       }))];
-      return {session,label,runtime,readOnly:pane.readOnly,title,argv,...(!reason?{serverArgs}:{}),...(reason?{placeholder:true,reason}:{})};
+      return {session,label,runtime,readOnly:pane.readOnly,title,argv,...(!reason?{serverArgs,paneSeat:workerPaneTitle({logicalId:node.logicalId},label)}:{}),...(reason?{placeholder:true,reason}:{})};
     });
     for(let i=0;i<blanks;i++)tiles.push(workerPad(remote));
     return {name:pages.length>1?`${name} · ${index+1}/${pages.length}`:name,columns,rows,tiles};

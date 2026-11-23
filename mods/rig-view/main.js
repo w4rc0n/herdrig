@@ -175,7 +175,6 @@ const setDraft = (key, draft) => {
   const all = { ...(shared("rig.drafts") ?? {}) };
   if (draft == null) delete all[key]; else all[key] = key.startsWith("spec-draft:") ? {...draft,at:Date.now()} : draft;
   setShared("rig.drafts", all);
-  return all[key];
 };
 const specDraft = raw => typeof raw === "string" ? { text: raw } : typeof raw?.text === "string" ? raw : null;
 const inRigLayout = () => !!(function find(n) {
@@ -1821,7 +1820,8 @@ export default class RigView extends View {
         .child(this.dim(t, "Recorded queue changes · oldest to newest"))
         .children(rows.map((row) => {
           const key = String(row.transitionId);
-          const summary = (workText(row.summary) || workText(row.bodyPreview) || "No work served").slice(0, 240);
+          // A text that is only a row id is a real row with no words (rowTitle's "Untitled row"); only an empty one served no work.
+          const summary = (workText(row.summary) || workText(row.bodyPreview) || (rowIdOnly(row.summary) || rowIdOnly(row.bodyPreview) ? "Untitled row" : "No work served")).slice(0, 240);
           const selected = this.recentSelected?.transitionId === row.transitionId;
           return v_flex().gap(4)
             .child(h_flex().id(`topology-recent-event-${key}`).tooltip("Show or hide this event's details").gap(8).px(6).py(4).rounded(6).items_center().cursor_pointer().hover((el) => el.bg(t.hover))
@@ -3006,6 +3006,7 @@ export default class RigView extends View {
             .when(!!it.priority, (el) => el.child(div().text_size(11.5).text_color(t.dim).child(String(it.priority)))))
         : [this.dim(t, queueEmpty("No active claimed work."))]))))
       // 5. QUEUE section (warnings, depth, basis, UP NEXT, NEEDS YOU, RECENTLY FINISHED)
+      .when(tab === "queue" && Boolean(entry.queueItem), el => el.child(this.queueItemCard(t, cx, entry.queueItem, n.canonicalSessionName)))
       .when(tab === "queue", el => el.child(v_flex().id("seat-section-queue").child(this.card(t, "QUEUE", [
         ...queueWarnings.map((w, i) => div().id(`seat-queue-warn-${i}`).text_size(12).text_color(t.blocked).child(String(w))),
         this.kv(t, [
@@ -3644,7 +3645,11 @@ export default class RigView extends View {
   setSpecEditorDraft(box, key, draft) {
     // Shared state is copied across editors. A stamp distinguishes another editor writing the same text.
     const record = draft && { ...draft, editStamp: Math.random().toString(36).slice(2) };
-    box.draftRecord = JSON.stringify(setDraft(key, record));
+    setDraft(key, record);
+    const stored = (shared("rig.drafts") ?? {})[key];
+    // The host normalizes fields. Read its representation only if this editor's write survived.
+    const own = record ? stored?.editStamp === record.editStamp : stored === undefined;
+    box.draftRecord = own ? JSON.stringify(stored) : undefined;
   }
 
   reconcileSavedSpecDraft(box, key, id, config, saved) {
@@ -4935,7 +4940,11 @@ export default class RigView extends View {
 
   needs(t, cx, entry) {
     const viewParam = entry.view ?? shared("rig.needsView") ?? null;
-    const attPath = viewParam ? `/api/attention?view=${encodeURIComponent(viewParam)}` : "/api/attention";
+    const itemPath = entry.id ? `/api/attention?item=${encodeURIComponent(entry.id)}${viewParam ? `&view=${encodeURIComponent(viewParam)}` : ""}` : null;
+    // Terminal links set an explicit Everyone view. Use their exact read before
+    // drawing the card because the sidebar's published list may predate the link.
+    const linkedRequest = entry.view === "" && String(entry.id).startsWith("queue:");
+    const attPath = linkedRequest ? itemPath : viewParam ? `/api/attention?view=${encodeURIComponent(viewParam)}` : "/api/attention";
     let att = this.read(cx, attPath);
     if (viewParam && att.status === 404) {
       att = this.read(cx, "/api/attention");
@@ -4947,13 +4956,12 @@ export default class RigView extends View {
     this.currentTopology(cx);
     if (!entry.id) this.warmPersonAwayData(cx);
     if (entry.id) {
-      const itemPath = `/api/attention?item=${encodeURIComponent(entry.id)}${viewParam ? `&view=${encodeURIComponent(viewParam)}` : ""}`;
-      this.read(cx, itemPath);
+      if (!linkedRequest) this.read(cx, itemPath);
       if (String(entry.id).startsWith("queue:")) {
         this.read(cx, `/api/queue/${encodeURIComponent(String(entry.id).slice(6))}`);
       }
     }
-    const wait = this.status(t, cx, attPath, att);
+    const wait = this.status(t, cx, attPath, linkedRequest && att.error ? { ...att, data: undefined } : att);
     if (wait) return wait;
     // Every item as a target, made again only when the items, their aggregate or a cached queue row they merge from is read again (the
     // queue rows cached are the requests opened, a few): not every update on every render.
@@ -5002,7 +5010,7 @@ export default class RigView extends View {
         if (answered?.text) return v_flex().gap(10).child(this.title(t, rowTitle(answered.summary)))
           .child(h_flex().id(`need-result-${entry.id}`).gap(6).items_start().min_w(0)
             .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(this.dim(t, answered.text).flex_1().min_w(0)));
-        return this.dim(t, "This request was already answered.");
+        return this.dim(t, linkedRequest ? "OpenRig did not report that request in Needs." : "This request was already answered.");
       }
       if (n.criticalHealth) return this.healthNeedsLine(t, n);
       const check = sweepFinding(n);
@@ -5010,7 +5018,7 @@ export default class RigView extends View {
       this.pageCrumbEntry = { ...entry, name };
       return v_flex().gap(12)
         .when(!!whoseRow, (el) => el.child(whoseRow))
-        .child(this.decisionCard(t, cx, n, { standalone: true, perspective: att.data?.perspective }))
+        .child(this.decisionCard(t, cx, n, { standalone: true, perspective: att.data?.perspective, ...(linkedRequest ? { viewParam } : {}) }))
         ;
     }
     // Replies sent from here whose item has left the list: said for a moment, then gone.
@@ -5534,8 +5542,7 @@ export default class RigView extends View {
               .child(this.copyValue(t, `Inspect: rig queue show ${n.qitemId ?? id} --full`, `need-inspect-${id}`, "inspect command")))))));
   }
 
-  decisionCard(t, cx, n, { standalone = false, perspective = null } = {}) {
-    const viewParam = shared("rig.needsView") ?? null;
+  decisionCard(t, cx, n, { standalone = false, perspective = null, viewParam = shared("rig.needsView") ?? null } = {}) {
     const itemPath = `/api/attention?item=${encodeURIComponent(n.id)}${viewParam ? `&view=${encodeURIComponent(viewParam)}` : ""}`;
     let got = this.read(cx, itemPath);
     if (viewParam && got.status === 404) {
@@ -6433,22 +6440,42 @@ export default class RigView extends View {
       el => el.underline().bg(t.hover), tip).child(label);
   }
 
+  queueItemCard(t, cx, qid, destination = null, backControl = null) {
+    if (!validHealthQitemId(qid)) return this.card(t, "Queue item", [this.dim(t, "Invalid queue item id. Choose a valid item.")]);
+    const path = `/api/queue/${encodeURIComponent(qid)}`, queue = this.read(cx, path);
+    const row = queue.data?.item ?? queue.data?.qitem ?? queue.data;
+    const matches = (row?.qitemId ?? row?.id) === qid && (!destination || row.destinationSession === destination);
+    const failure = this.status(t, cx, path, queue) ?? (matches ? null : this.dim(t, "Couldn't read queue item: OpenRig returned no matching row."));
+    return this.card(t, "Queue item", [
+      ...(backControl ? [backControl] : []),
+      ...(failure ? [failure] : [this.copyValue(t, qid, "health-queue-id", "queue item id"),
+        this.plain(t, row?.summary ?? "No summary reported.", "health-queue-summary"),
+        this.kv(t, [["State", statusWord(row?.state ?? "not reported", "queue")], ["From", row?.sourceSession ?? "not reported"], ["To", row?.destinationSession ?? "not reported"]]),
+        requestMarkdownView(row?.body ?? "No body reported.", { TextView, div, v_flex, id: "health-queue-body" }),
+      ]),
+    ]);
+  }
+
   healthFindingsCard(t, cx, got, entry = {}) {
     // A health subject may belong to another seat or be closed; it needn't exist in human /api/attention.
     if (entry.healthQitem) {
-      if (!validHealthQitemId(entry.healthQitem)) return this.card(t, "Queue item", [this.dim(t, "Invalid queue item id. Open Health and choose a valid item.")]);
-      const qid = String(entry.healthQitem), path = `/api/queue/${encodeURIComponent(qid)}`, queue = this.read(cx, path);
-      const wait = this.status(t, cx, path, queue), row = queue.data?.item ?? queue.data?.qitem ?? queue.data;
-      const failure = wait ?? (String(row?.qitemId ?? row?.id ?? "") !== qid ? this.dim(t, "Couldn't read queue item: OpenRig returned no matching row.") : null);
       const back = { ...entry }; delete back.healthQitem;
-      return this.card(t, "Queue item", [
-        h_flex().child(this.button(t, "health-queue-back", "‹ Health", () => this.push(back), { small: true, tip: "Back to System › Health" })),
-        ...(failure ? [failure] : [this.copyValue(t, qid, "health-queue-id", "queue item id"),
-          this.plain(t, row?.summary ?? "No summary reported.", "health-queue-summary"),
-          this.kv(t, [["State", statusWord(row?.state ?? "not reported", "queue")], ["From", row?.sourceSession ?? "not reported"], ["To", row?.destinationSession ?? "not reported"]]),
-          requestMarkdownView(row?.body ?? "No body reported.", { TextView, div, v_flex, id: "health-queue-body" }),
-        ]),
+      return this.queueItemCard(t, cx, entry.healthQitem, null,
+        h_flex().child(this.button(t, "health-queue-back", "‹ Health", () => this.push(back), { small: true, tip: "Back to System › Health" })));
+    }
+    const findingId = entry.healthFinding;
+    const showAll = () => this.button(t, "health-finding-back", "Show all findings", () => {
+      const next = { ...entry }; delete next.healthFinding; this.push(next);
+    }, { small: true });
+    if (findingId) {
+      const path = `/api/health/${encodeURIComponent(findingId)}`;
+      const exact = this.read(cx, path);
+      if (exact.status === 404) return this.card(t, "Health", [this.dim(t, "OpenRig did not report that finding."), showAll()]);
+      const wait = this.status(t, cx, path, exact);
+      if (wait || exact.data?.id !== findingId) return this.card(t, "Health", [
+        wait ?? this.dim(t, "Couldn't read that finding: OpenRig returned a different result."), showAll(),
       ]);
+      got = { data: { records: [exact.data] } };
     }
     if (got.error || (got.data !== undefined && !Array.isArray(got.data?.records))) return this.card(t, "Health", [
       this.dim(t, `Couldn't read health: ${got.error ?? "OpenRig returned no records list."}`),
@@ -6458,13 +6485,13 @@ export default class RigView extends View {
     const data = got.data, open = shared("rig.open.page") ?? {};
     // 0.7.11 omits cleared records from its default list. This optional read uses
     // the existing health cache/refresh, only on System → Health, never a timer.
-    const history = entry.subview === "health" ? this.read(cx, "/api/health?status=cleared") : null;
+    const history = entry.subview === "health" && !findingId ? this.read(cx, "/api/health?status=cleared") : null;
     const allRecords = mergeHealthHistory(data.records, history?.error ? null : history?.data);
     const rigs = this.read(cx, "/api/rigs/summary").data ?? this.pageRigData()?.topology ?? [];
     const nodes = { ...(this.pageRigData()?.nodesByRig ?? {}) };
     for (const id of new Set(allRecords.map(r => r.scope?.rigId).filter(Boolean))) nodes[id] = this.nodesOf(cx, id).data ?? nodes[id] ?? [];
     const rig = entry.healthRigId ? rigs.find(r => r.id === entry.healthRigId) ?? { id: entry.healthRigId, name: entry.healthRigName ?? entry.healthRigId } : null;
-    const records = rig ? healthForRig(allRecords, rig, nodes[rig.id] ?? [], true, true) : allRecords;
+    const records = rig && !findingId ? healthForRig(allRecords, rig, nodes[rig.id] ?? [], true, true) : allRecords;
     const counts = healthCounts(records), groups = groupHealthRecords(records);
     const partial = (Array.isArray(data.coverage) ? data.coverage : data.coverage ? [data.coverage] : []).filter(c => c.partial);
     const coverage = partial.map(c => Number.isFinite(c.evaluated) && Number.isFinite(c.total) ? `partial check (${c.evaluated} of ${c.total})` : "partial check").join(" · ");
@@ -6477,6 +6504,7 @@ export default class RigView extends View {
       : `No problems found.${counts.notes ? ` ${plural(counts.notes, "note")} available for reference.` : ""}`;
     const serverRows = rig ? [] : this.terminalServerRows(t, cx, rigs, nodes); // OpenRig 0.7.20: tmux servers it can't reach
     return this.card(t, `Health · ${plural(counts.problems, "problem")} · ${plural(counts.notes, "note")}`, [
+      ...(findingId ? [showAll()] : []),
       ...serverRows,
       ...(rig ? [h_flex().id("health-rig-filter").gap(6).items_center().cursor_pointer().tooltip(`Show findings for every rig, not only ${rig.name}`)
         .on_click(() => this.push({ section: "system", subview: "health" }))
@@ -6486,7 +6514,7 @@ export default class RigView extends View {
       ...(history && (history.error || history.data !== undefined && !Array.isArray(history.data?.records))
         ? [this.dim(t,"Cleared history is unavailable on this OpenRig.")] : []),
       ...groups.map((g, index) => {
-        const key = `sys:health:${g.key}`, shown = open[key] ?? (!g.cleared && index === 0);
+        const key = `sys:health:${g.key}`, shown = open[key] ?? (Boolean(findingId) || (!g.cleared && index === 0));
         const detailKey = `sys:health-details:${g.key}`, details = Boolean(open[detailKey]);
         const allKey = `sys:health-all:${g.key}`, allShown = Boolean(open[allKey]), hiddenRecords = allShown ? 0 : Math.max(0, g.records.length - HEALTH_ROW_CAP);
         const tone = g.worst === 2 ? t.blocked : g.worst === 1 ? t.working : t.muted;
@@ -6537,7 +6565,7 @@ export default class RigView extends View {
   }
 
   system(t, cx, entry = {}) {
-    const health = this.read(cx, "/api/health");
+    const health = entry.healthFinding ? null : this.read(cx, "/api/health");
     const healthz = this.read(cx, "/healthz");
     // The daemon's settings, as `rig config` resolves them (the TUI's :config). `config <category>` and
     // `setting <key>` narrow this card only, with their own ×; the other cards stay whole.

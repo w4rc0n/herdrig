@@ -2233,10 +2233,10 @@ export default class RigSidebar extends View {
     if(!this.workerViews){
       const generation=shared('rig.workerMigrationGeneration')??0;
       // Each sync is its own connection's: its live settings, its send scope, its daemon (the first connection's settings never judge another's work).
-      this.workerViews=new HostWorkerViews({spaces,panes,terminals,hcFor,runFor,execFor,generation:()=>shared('rig.workerMigrationGeneration')??0,currentConfig:config=>config?configOfConnection(this.config,config.connectionId):this.config,
+      this.workerViews=new HostWorkerViews({spaces,panes,terminals,commands,hcFor,runFor,execFor,generation:()=>shared('rig.workerMigrationGeneration')??0,currentConfig:config=>config?configOfConnection(this.config,config.connectionId):this.config,
         routeState:()=>shared("rig.spaceState"),loadViews:()=>shared("rig.spaceState")?.workerViews??{},
         saveViews:views=>this.saveSpaceState({workerViews:views},()=>generation===(shared('rig.workerMigrationGeneration')??0)),changed:views=>{setShared("rig.workerViews",views);cx.notify();},
-        preview:(config,view)=>this.workerPreview(config,view), probeHealth: this.healthProbe(cx),
+        preview:(config,view)=>this.workerPreview(config,view),currentWorkerSlice:(config,session)=>this.workerSlice(config,session), probeHealth: this.healthProbe(cx),
         // The seats on a tmux server the connection's OpenRig reports unreachable are marked, so the plan leaves them out and says why.
         nodes:async (config,rigId=null)=>{const outage=()=>this.ownFeed(config?.connectionId)?.terminalOutage??null;
           if(rigId)return withTerminalOutage(await this.workerRead(config,`/api/rigs/${encodeURIComponent(rigId)}/nodes`),outage()); // the view's own rig only
@@ -2276,6 +2276,11 @@ export default class RigSidebar extends View {
     const views=await this.workerRead(config,"/api/terminal/views"),members=views.saved?.find(v=>v.id===view.slice(6))?.members??[];
     const names=new Map(members.map(m=>[m.seat,m.label]));
     return {...preview,composed:{...preview.composed,absent:preview.composed?.absent?.map(item=>({...item,label:names.get(item.seat)??item.label??item.seat}))}};
+  }
+  async workerSlice(config, session) {
+    const answer = await this.workerRead(config, `/api/queue/whoami?session=${encodeURIComponent(session)}&recentLimit=1`);
+    const slice = answer?.currentWork?.slice;
+    return typeof slice === "string" ? slice : null;
   }
   async workerRead(config,path){
     const response=await fetchFor(config)(config.daemonUrl+path); // this connection's own scope
@@ -2715,19 +2720,24 @@ export default class RigSidebar extends View {
     const asks = await get(ASKS_PATH).catch(rethrowGate(null));
     if (!asks) {
       // The narrow read failed: the whole list is read as it always was (not beside a background read of it), and its own failure is the answer.
-      if (full.pending || (consumeFull && full.unpublished)) return answer(null);
+      // Cached whole lists can predate a successful action-only read. Keep
+      // that read's actions, including an empty list, until a fresh read wins.
+      if (full.pending || (consumeFull && full.unpublished)) return answer(full.lastAsks ?? null);
       const wholeStarted = Date.now();
       const whole = await get(FULL_ATTENTION_PATH).catch(rethrowGate(null));
       if (!Array.isArray(whole?.items)) return null;
       this.fullAttentionDone(full, Date.now() - wholeStarted, whole);
+      full.lastAsks = null;
       return answer(null);
     }
     if (!kindFiltered(asks)) {
       full.unsupported = true;
       this.fullAttentionDone(full, Date.now() - started, asks);
+      full.lastAsks = null;
       return answer(null);
     }
     full.unsupported = false;
+    full.lastAsks = asks;
     // A poll admitted to publish a completed read must not start a fresh
     // whole-list read of its own. Regular and event refreshes keep their cadence.
     if (!consumeFull || !full.unpublished) this.startFullAttention(feed);
@@ -3515,34 +3525,44 @@ export default class RigSidebar extends View {
           const opened=await openRigEventStream(netFor(feed.config),url,socket=>{feed.sock=socket;},()=>this.herdr.eventSocket(origin,feed.config?.connectionId)); // herdr://: the helper's long-poll
           if(this.closed||feed.closed||feed.config?.daemonUrl!==origin){opened.socket.close();continue;}
           feed.hostedReader?.reconnect(feed.config);
-          let carry = new Uint8Array(0), pending = false;
+          let carry = new Uint8Array(0), pending = false, workerWorkChanged = false;
           const parseEvents = sseParser((ev) => {
             if(feed.closed||feed.config?.daemonUrl!==origin)return;
             publishGraphActivity(shared,setShared,origin,ev,feed.config?.connectionId);
             this.toast(ev, feed); // every connection's events toast, naming the machine when there are several
+            if (!workerWorkChanged) {
+              let data;
+              try { data = JSON.parse(ev.data); } catch { /* Ignore malformed event payloads. */ }
+              const kind = ev.event === "message" ? data?.type : ev.event;
+              workerWorkChanged = ["queue.claimed","queue.unclaimed","queue.handed_off"].includes(kind) ||
+                (kind === "queue.updated" && data?.fromState !== data?.toState &&
+                  (data?.fromState === "in-progress" || data?.toState === "in-progress"));
+            }
             if (pending) return;
             pending = true;
             // The stream resumes outside a view call. These bounded tasks declare their
             // lifetime explicitly and recheck the feed instead of adopting an ambient tab.
             pendingTimer=cx.timer.after(500, (timerCx) => {
               pendingTimer=null;pending=false;
+              const workChanged = workerWorkChanged; workerWorkChanged = false;
               if(this.closed||feed.closed||feed.config?.daemonUrl!==origin)return;
               // Publication needs the original stream task's sidebar-owned cx.
               // The bounded timer and dispatch task have no view owner themselves.
               timerCx.spawn(async () => {
                 if(this.closed||feed.closed||feed.config?.daemonUrl!==origin)return;
                 await this.refreshFeed(cx, feed,{automatic:true,event:true});
-                if(!this.closed&&!feed.closed&&feed.config?.daemonUrl===origin)await this.workerController(cx).event(feed.config);
+                if(!this.closed&&!feed.closed&&feed.config?.daemonUrl===origin)await this.workerController(cx).event(feed.config,{workChanged});
               },{owner:null});
             },{owner:null});
           });
           feed.eventPath = opened.path;
           feed.live = true; feed.delay = 1000;
-          const readAll = !planned || feed.hadDisconnect;
+          const reconnect = feed.hadDisconnect;
+          const readAll = !planned || reconnect;
           if (feed.hadDisconnect) { feed.hadDisconnect = false; feed.forceCapabilityProbe = true; }
           if (readAll) await this.refreshFeed(cx, feed);
           if (!this.closed && !feed.closed && feed.config?.daemonUrl === origin)
-            await this.workerController(cx).event(feed.config); // A replacement does not replay membership changes from the gap.
+            await this.workerController(cx).event(feed.config,{workChanged:reconnect||planned}); // A replacement does not replay membership changes from the gap.
           if(opened.initial.length){let text;[text,carry]=utf8(opened.initial,carry);parseEvents(text);}
           // An idle read timeout (Herdr's 30 s) is not a disconnect: one health request, then the same socket is read again.
           const end = await pumpEvents(feed.sock, {
