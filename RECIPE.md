@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.6
+Version: v0.5.7
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -472,6 +472,9 @@ your shell sets, so set `openrigHome` in `<appHome>/openrig/config.json` for a h
 `realpath`, which resolves each spec folder and file so a symlink can't lead the editor elsewhere. Add a machine
 uses `test -d` to check a typed OpenRig home. Seat compaction uses `rig compact --help` to check support,
 `rig compact --json -- <session>` to request it and `rig compact --cancel --json -- <session>` to request cancellation.
+Herdr's shared state keeps unconfirmed requests scoped to their connection and seat. **Check again** reads
+OpenRig's state, **Clear this** clears the warning without sending a request, and **Send again anyway…** asks
+for confirmation before sending another request.
 **Change model / harness** runs `node rig-model-catalog.cjs`. It reads the Codex model cache or queries the
 local runtime with `claude --help`, `pi --list-models`, or `omp models --json --no-extensions`.
 
@@ -500,7 +503,8 @@ It also **reads** `<appHome>/layouts/<name>.json` to discover old provider views
 `<appHome>/mods/spaces/main.js` to check Spaces-list compatibility,
 `<openrigHome>/daemon.json` to check the PID and port when you add this computer, and
 `<accountHome>/models_cache.json` to list Codex models in Change model / harness. It watches the containing folder
-while that model catalog is open. Connection and consent actions **read and write**
+while that model catalog is open and refreshes on a change to the cache or a folder-wide change signal.
+Connection and consent actions **read and write**
 `<appHome>/openrig/config.json`, `machine-consent.json` and `spec-consent.json`; System → Layout reads and writes
 `<appHome>/openrig/spaces-list.json`. The consent filenames are also under `<appHome>/openrig/`.
 It keeps dismissal and navigation state under that same folder, drafts in Herdr's

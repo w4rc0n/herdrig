@@ -48,11 +48,17 @@ function closeFailureText(result){
   const count=result.closed?`Closed ${result.closed} of ${total} old views.`:"Couldn't close the old views.";
   return [`${count} Not confirmed: ${failedViewNames(result.failedViews)}. ${reason} They may still be open.`,uncheckedText].filter(Boolean).join(' ');
 }
+function canTraverseLayout(node){
+  if(!node||typeof node!=='object'||Array.isArray(node))return false;
+  const container=['row','column','stack'].includes(node.type);
+  if(!container&&node.children===undefined)return true;
+  return Array.isArray(node.children)&&node.children.every(canTraverseLayout);
+}
 async function readStripLayout(host,appHome,name){
   if(!safeLayoutName(name)||!(host.layouts?.()??[]).includes(name))return {state:'missing'};
   try{
     const tree=JSON.parse(await host.readTextFile(`${appHome}/layouts/${name}.json`));
-    if(!tree||!['block','row','column','stack'].includes(tree.type))return {state:'unreadable'};
+    if(!canTraverseLayout(tree)||!['block','row','column','stack'].includes(tree.type))return {state:'unreadable'};
     if(!(host.layouts?.()??[]).includes(name))return {state:'missing'};
     return {state:hasOldProviderStrip(tree)?'strip':'ready',tree};
   }catch{return {state:'unreadable'};}
@@ -79,8 +85,8 @@ async function keepRigPage(host,ensure=false){
   const rigPanes=(host.panes?.()??[]).filter(pane=>pane.mod===MOD_IDS.view&&before.has(pane.tab));
   const native=rigPanes.filter(pane=>rigPanes.filter(other=>other.tab===pane.tab).length===1);
   const active=(host.spaces?.()??[]).find(space=>space.active)??host.spaces?.()[0];
-  const existing=native.find(pane=>entry&&navKey(pages[pane.tab]?.stack?.at(-1))===navKey(entry))
-    ??native.find(pane=>active?.tabs?.some(tab=>tab.id===pane.tab));
+  const existing=native.find(pane=>(entry||page&&pages[pane.tab])&&navKey(pages[pane.tab]?.stack?.at(-1))===navKey(entry))
+    ??(!page&&native.find(pane=>active?.tabs?.some(tab=>tab.id===pane.tab)));
   if(existing){
     const held=pages[existing.tab]?.stack??[];
     if(entry&&navKey(held.at(-1))!==navKey(entry))host.setShared?.('rig.tabPages',{...pages,[existing.tab]:{stack:[...held,entry].slice(-30),at:Date.now()}});
@@ -99,7 +105,8 @@ async function keepRigPage(host,ensure=false){
   for(let i=0;i<20;i++){
     const pane=(host.panes?.()??[]).find(p=>p.mod===MOD_IDS.view&&!before.has(p.tab));
     if(pane){
-      if(nav?.stack)host.setShared?.('rig.tabPages',{...(host.shared?.('rig.tabPages')??{}),[pane.tab]:{stack:nav.stack,at:Date.now()}});
+      const stack=navKey(nav?.stack?.at(-1))===navKey(entry)?nav?.stack??[]:[entry];
+      host.setShared?.('rig.tabPages',{...(host.shared?.('rig.tabPages')??{}),[pane.tab]:{stack,at:Date.now()}});
       return pane.tab;
     }
     await host.wait(50);
@@ -124,7 +131,8 @@ export async function leaveOldStrip(host,config,views,appHome,capsFor,returnLayo
   let result={ok:true,closed:0,failures:[]},switched=false;
   if((await readStripLayout(host,appHome,returnLayout)).state!=='ready')return{ok:false,closed:0,switched:false,title:"Still in OpenRig's old strip",text:`Couldn't switch to ${label}: that layout changed or is no longer available. Open the palette (Ctrl+Shift+P) and choose a Layout.\nYour seats keep running.`};
   if(views.length){
-    if(!oldViewCandidates(config,capsFor).length){
+    const {candidates,pending}=oldViewAvailability(config,capsFor);
+    if(!candidates.length&&!pending){
       result={ok:false,closed:0,failures:[]};lines.push("The old views weren't closed: this OpenRig can't close them from here.");
     }else{
       result=await closeOldViews(host,config,views,appHome,capsFor);
@@ -176,10 +184,23 @@ export function oldProviderViews(tree){
     walk(node.header);walk(content?.pane?.header);for(const child of Array.isArray(node.children)?node.children:[])walk(child);
   };walk(tree);return [...found.values()];
 }
-export function oldViewCandidates(config,capsFor){
+function localOldViewAuthorities(config){
   if(!config||config.configInvalid)return [];
   const list=config.connections?.length?config.connections.map(c=>configOfConnection(config,c.id)).filter(Boolean):[config];
-  return list.filter(c=>!c.daemonMachine&&capsFor(c.connectionId??LEGACY_CONNECTION_ID)?.herdrAppProvider===true);
+  return list.filter(c=>!c.daemonMachine);
+}
+function oldViewAvailability(config,capsFor){
+  const candidates=[];
+  let pending=false;
+  for(const authority of localOldViewAuthorities(config)){
+    const caps=capsFor(authority.connectionId??LEGACY_CONNECTION_ID);
+    if(caps?.probed===false||typeof caps?.herdrAppProvider!=='boolean')pending=true;
+    else if(caps.herdrAppProvider)candidates.push(authority);
+  }
+  return{candidates,pending};
+}
+export function oldViewCandidates(config,capsFor){
+  return oldViewAvailability(config,capsFor).candidates;
 }
 const goneKey=config=>JSON.stringify((config?.connections?.length?config.connections.map(c=>configOfConnection(config,c.id)).filter(Boolean):[config])
   .filter(c=>c&&!c.daemonMachine).map(c=>[c.connectionId??LEGACY_CONNECTION_ID,c.daemonUrl??null,c.openrigHome??null]).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))));
@@ -204,7 +225,7 @@ async function scanOldProviderViews(host,appHome){
     if(typeof name!=='string'||!name||name==='.'||name==='..'||/[\/\\\u0000-\u001f]/.test(name))continue;
     try{
       const tree=JSON.parse(await host.readTextFile(`${appHome}/layouts/${name}.json`));
-      if(!tree||!['block','row','column','stack'].includes(tree.type)&&!hasOldProviderStrip(tree)){unreadable.add(name);continue;}
+      if(!canTraverseLayout(tree)||!['block','row','column','stack'].includes(tree.type)&&!hasOldProviderStrip(tree)){unreadable.add(name);continue;}
       for(const view of oldProviderViews(tree)){
         const prior=found.get(view.id)??{...view,current:false,layouts:[]};
         if(!prior.layouts.includes(name))prior.layouts.push(name);
@@ -229,14 +250,14 @@ export async function closeOldViewsOnly(host,config,views,appHome,capsFor){
     text:`${text}\nThe strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout).\nYour seats keep running.`};
 }
 export async function closeOldViews(host,config,views,appHome,capsFor){
-  const candidates=oldViewCandidates(config,capsFor),failures=[],failedViews=[],uncheckedViews=[];let closed=0;
+  const {candidates,pending}=oldViewAvailability(config,capsFor),failures=[],failedViews=[],uncheckedViews=[];let closed=0;
   const fail=(view,reason)=>{failures.push(`${view.name}: ${reason}`);failedViews.push({id:view.id,name:view.name,reason:closeReason(reason)});};
   for(const reviewed of views){
     const view={...reviewed,name:cleanDisplay(reviewed.name).slice(0,160)||reviewed.id};
     if(oldViewsGone(host.shared,config).includes(view.id))continue;
     const inventory=await scanOldProviderViews(host,appHome);
     if(!inventory.views.some(v=>v.id===view.id)){
-      if(view.layouts?.some(name=>inventory.unreadable.has(name))||view.current===false&&!view.layouts?.length&&inventory.unreadable.size)uncheckedViews.push(view);
+      if(view.layouts?.some(name=>inventory.unreadable.has(name))||!view.layouts?.length&&inventory.unreadable.size)uncheckedViews.push(view);
       continue;
     }
     let known=false;
@@ -258,7 +279,8 @@ export async function closeOldViews(host,config,views,appHome,capsFor){
       }catch(error){fail(view,String(error?.message??error));known=true;break;}
     }
     if(!known){
-      if(candidates.length)rememberGone(host,config,view.id); // Every eligible local authority replied definitely view_not_found.
+      if(pending)fail(view,'herdrig is still checking whether every local OpenRig can close old views. Try again after it finishes.');
+      else if(candidates.length)rememberGone(host,config,view.id); // Every supported local authority replied definitely view_not_found.
       else fail(view,'No OpenRig on this computer knows it.');
     }
   }

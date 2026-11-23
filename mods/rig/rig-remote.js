@@ -628,12 +628,16 @@ export function localSetupGate(host, { rigArgv = ["rig"] } = {}) {
     if (gateConfigGeneration() !== generation) throw new Error("OpenRig's settings changed while this was open. Reopen it and check again.");
   };
   const readHealthz = async (origin,request=host.setupFetch) => {
+    const offline = () => new Error(`OpenRig doesn't answer at ${origin.replace(/^https?:\/\//, "")}. Check rig status, then check again.`);
     let text;
     try {
       const response = await request(`${origin}/healthz`, { method: "GET" });
-      if (!response?.ok) throw new Error("no answer");
+      if (!response?.ok) throw offline();
       text = await response.text();
-    } catch (error) { throw new Error(`OpenRig doesn't answer at ${origin.replace(/^https?:\/\//, "")}. Check rig status, then check again.`); }
+    } catch (error) {
+      if (error?.code === "NO_ANSWER") throw offline();
+      throw error;
+    }
     if (utf8Length(text) > JSON_READ_CAP) throw new Error(`${origin.replace(/^https?:\/\//, "")} answered with more than OpenRig's health ever holds.`);
     try { return JSON.parse(text); } catch (_) { throw new Error(`${origin.replace(/^https?:\/\//, "")} answered, but not like an OpenRig.`); }
   };

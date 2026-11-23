@@ -80,8 +80,8 @@ export default class RigPalette extends View {
     flatOwner = this;
     // OpenRigs over Herdr's connection (herdr:// addresses): what the palette runs (a send, a queue row, a launch) goes through the pinned helper on
     // that machine, like the sidebar's and the page's.
-    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, wait: waitWith(cx), appHome, readTextFile, writeTextFile, config: () => this.config,
-      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.palette).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") });
+    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, appHome, readTextFile, writeTextFile, config: () => this.config,
+      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.palette).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") }, cx);
     const routingConfig = (conn) => conn && this.config ? (configOfConnection(this.config, conn) ?? { configInvalid: UNKNOWN_CONNECTION }) : this.config;
     registerRigRouting(cx, (context, conn) => { const cfg = routingConfig(conn); return { shared, setShared, run: runFor(cfg), spaces, panes, terminals, hc: hcFor(cfg), layout, notify, openOverlay:spec=>this.open(spec),closeOverlay,config: cfg, currentConfig: () => routingConfig(conn), wait: waitWith(context) }; });
     this.input = InputState.new({ placeholder: "agent dev.design · :scopes · tab graph · /codex" });
@@ -100,8 +100,8 @@ export default class RigPalette extends View {
       // Reads are numbered across every palette of this mod copy (rig-gate.js numberedConfigReads): an older palette's read that lands after a newer one gets the INSTALLED config, never its own stale one.
       try { this.config = await configReads(async () => parseConfig(await readTextFile(`${appHome()}/openrig/config.json`))); }
       catch (error) {
-        this.error = errorDiagnostic(error);
-        notify({ title: "Couldn't read OpenRig settings", body: this.error, level: "warning" });
+        this.configReadError = errorDiagnostic(error);
+        notify({ title: "Couldn't read OpenRig settings", body: this.configReadError, level: "warning" });
         cx.notify(); return;
       }
       setShared("rig.oldProviderViews",await readOldProviderViews({layout,layouts,readTextFile,currentLayout:()=>shared("layout")},appHome()));
@@ -611,7 +611,7 @@ export default class RigPalette extends View {
       this.busy = true; this.running = "tui"; cx.notify();
       cx.spawn(async (cx) => {
         try {
-          const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+          const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout, wait: waitWith(cx) }, config);
           if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
         }
         finally { this.running = null; this.dismiss(); }
@@ -1036,6 +1036,9 @@ export default class RigPalette extends View {
         const asks = await this.get("/api/attention?kind=action", acting.config).catch(rethrowGate(null)) ?? await this.get("/api/attention", acting.config);
         // OpenRig's checks on other rows take no reply: the aggregate's rows carry the tags that tell them apart (an unread aggregate tells none apart).
         const agg = await this.get("/api/queue/attention-aggregate", acting.config).catch(rethrowGate(null));
+        if (!Array.isArray(agg?.items) && !Array.isArray(agg?.attentionRows) && !Array.isArray(agg)) {
+          return fail("Couldn't verify which requests take a reply. Try again when OpenRig can read its queue.");
+        }
         const items = enrichAttentionItems(asks?.items ?? [], agg).map(needTarget).filter((n) => !n.update && n.reply !== "none" && !sweepFinding(n));
         let target = null;
         if (top.section === "needs" && top.id) {
@@ -1103,8 +1106,8 @@ export default class RigPalette extends View {
           .child(div().text_size(12).font_semibold().text_color(t.muted).child("Rig"))
           .child(div().flex_1().child(Input.new(this.input)))
           .child(div().text_size(11).text_color(t.dim).child(this.busy ? "…" : "esc")))
-        .when(!!this.error, (el) => el.child(errorBlock(this,t,"palette-error",this.error)))
-        .when(!this.error && !!this.note, (el) => el.child(errorBlock(this,t,"palette-note",this.note,{tone:t.muted})))
+        .when(!!(this.configReadError ?? this.error), (el) => el.child(errorBlock(this,t,"palette-error",this.configReadError ?? this.error)))
+        .when(!this.configReadError && !this.error && !!this.note, (el) => el.child(errorBlock(this,t,"palette-note",this.note,{tone:t.muted})))
         .child(v_flex().id("rig-palette-rows").flex_1().overflow_y_scrollbar().children(rows.map((r, i) => h_flex().id(`row-${i}`).px(6).h(24).gap(10).items_center()
           .rounded(5).when(i === selectedIndex, (el) => el.bg(t.selected).text_color(t.foreground)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => { this.selected = i; this.choose(cx); })
           .child(div().w(r.wide ? 360 : r.label ? 280 : 200).truncate().text_size(12.5).tooltip(r.label ?? r.line).child(r.label ?? r.line))

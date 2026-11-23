@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.6
+Version: v0.5.7
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -66,7 +66,8 @@ The Rig palette: jump to any rig, seat or page from the keyboard.
 - **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs show pod and seat
   routes, hover/keyboard selection and briefly lit handoff paths. A working task line pulses green through short idle
   pauses, then turns dashed after a 15-second grace period. A seat that needs you or is blocked has a steady amber line
-  with a red needs-you chip where there is room to show it.
+  with a red needs-you chip where there is room to show it. Open tasks for unreachable seats have a muted line
+  and an unreachable label.
   The legend explains the lines on screen. Hover a task line for summaries and ages. Idle minutes update on redraw
   after the graph sees the seat stop working. Dense edges group by pod, and the text Edges list stays available.
   Saved previews come from your connected OpenRig server, including a host-to-box tunnel.
@@ -157,8 +158,13 @@ Check the `Version:` line in the README you copied, or open System and read **He
   **Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port. Save resolves
   the home again and checks that its daemon record still matches the reviewed connection.
   **Change model / harness** reads `<accountHome>/models_cache.json` for Codex and watches its containing folder
-  while the catalog is open. The account home comes from OpenRig's seat status. The helper checks that the
+  while the catalog is open. A cache change or a folder-wide change signal refreshes the list. The account home
+  comes from OpenRig's seat status. The helper checks that the
   opened cache is a regular file owned by the current user and no larger than 1 MiB before reading its contents.
+
+  An unconfirmed compaction request stays with its seat in Herdr's shared state. **Check again** reads OpenRig's
+  current state. **Clear this** dismisses the warning without sending a request. **Send again anyway…** opens a
+  confirmation before another request is sent.
 
   Remote saves instead use the configured machine's own resolved user spec folders. Separate permission names
   those folders, the account and the spec helper's checksum; a changed folder or helper asks again. The helper

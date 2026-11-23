@@ -10,7 +10,7 @@ import {switchConnection,switchBack,HERDR_CONNECTION_OFFERED,SWITCH_NOT_OFFERED,
 // Tab wraps; Esc cancels. The switch asks this machine's own approval for the helper (its words say what it allows), installs it, and checks that
 // the helper and the tunnel reach the SAME OpenRig (one host id) before it writes anything. The tunnel address is kept for switching back.
 export class SwitchConnectionPanel {
-  /** `host`: readConfig/writeConfig (compare-and-swap), health(url). `makeRemote()`: this connection's RemoteOpenRig. `direction`: "herdr" | "back" |
+  /** `host`: readConfig/writeConfig (compare-and-swap), health(url). `makeRemote(task)`: this connection's RemoteOpenRig. `direction`: "herdr" | "back" |
    *  "approve" (a herdr:// connection whose helper approval is missing or stale: the same review, then that connection's approval; no config write). */
   constructor(host,connection,{direction="herdr",offered=HERDR_CONNECTION_OFFERED,makeRemote,done,cancel,cancelHandle,primaryHandle,rig=null,checkOnFirstDraw=false}={}){
     Object.assign(this,{host,connection,direction,offered,makeRemote,done,cancel,cancelHandle,primaryHandle,rig,checkOnFirstDraw});
@@ -35,7 +35,7 @@ export class SwitchConnectionPanel {
         if(!this.offered)throw new Error(this.direction==="approve"?HERDR_APPROVE_NOT_OFFERED:SWITCH_NOT_OFFERED);
         if(this.direction==="approve"&&!String(this.connection?.daemonUrl??"").startsWith("herdr://"))
           throw new Error(`${this.name} doesn't use Herdr's connection, so it has no helper to approve. Nothing was approved.`);
-        const remote=this.makeRemote(),consent=this.confirmation?{key:this.confirmation.key}:null;
+        const remote=this.makeRemote(cx),consent=this.confirmation?{key:this.confirmation.key}:null;
         // Before approving: the settings must still name the connection this dialog opened on (edited or removed meanwhile: nothing is approved).
         if(this.direction==="approve"&&consent){
           if(typeof this.host.stillChosen!=="function")throw new Error("Herdr can't check this connection's settings from here, so nothing was approved.");

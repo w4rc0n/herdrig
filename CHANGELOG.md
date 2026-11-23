@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.7
+
+Recover unconfirmed compaction requests, keep unrelated Rig tabs intact during cleanup, and see clearer setup and status feedback.
+
+- The Rig sidebar no longer shows a stale-context error while waiting for Herdr to open panes. If Herdr reports an internal context error, Herdrig explains it in plain language and keeps the original error in Details.
+- Leaving OpenRig’s old strip keeps unrelated Rig tabs and their history intact. Cleanup keeps an old view available to retry while a local OpenRig is still being checked.
+- Request Details keeps the row IDs referenced in the message. Sweep checks no longer count as human requests in Pulse, and the palette keeps your draft when it cannot verify which requests take replies.
+- Setup dialogs and the Rig palette explain when settings could not be read. Add this computer shows health-check refusals, accepts IPv6 loopback aliases, and moves focus to Close if the save could not be confirmed.
+- Claude compaction shows preparation and offers Cancel while the command waits for its reply, even with a small clock difference between Herdr and OpenRig. Grid title updates keep the original viewer if its replacement pane disappears.
+- Pages with an unresolved connection hide header Actions until a connection is chosen. A saved rig spec reports graph refresh failure while keeping the successful save receipt.
+- The Rig graph marks open tasks whose seats are unreachable. Old-strip cleanup reports saved layouts it cannot check, including layouts with malformed children. The Codex model picker refreshes when Herdr signals that the whole cache folder may have changed.
+- An unconfirmed compaction request stays on its seat card when you navigate away. Check again reads the current state. You can clear the warning without sending anything or explicitly confirm another request.
+
 ## v0.5.6
 
 Rig graphs show who is still working on a handoff, and connection setup and recovery give clearer results.

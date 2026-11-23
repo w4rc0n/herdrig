@@ -10,6 +10,11 @@ function observedTime(at,timezone){
   return day(date)===day(today)?asOf(date,timezone):`as of ${formatAbsoluteTime(date,{timezone,date:true})}`;
 }
 const changedSeat = session => `${session} changed since this page read it, so nothing was sent. Try again from its current card.`;
+const UNCONFIRMED_REASON = "The last request wasn't confirmed. Use Send again anyway, or Clear this.";
+const DISPATCH_CLOCK_SKEW_MS=3000;
+const stageWords={preparing:'preparation started','compact-sent':'compaction sent','restore-sent':'restore requested','audit-sent':'restore check requested',cancelled:'cancelled','skipped-or-failed':'stopped'};
+const contextPercent=node=>Number.isFinite(node.contextUsage?.usedPercentage)?Math.round(node.contextUsage.usedPercentage):null;
+const timestamp=value=>typeof value==='number'?value:Date.parse(value??'');
 export const compactionRuntime = n => ['claude-code','pi'].includes(n?.runtime);
 export const compactionVersion = health => health?.semver??health?.openrigVersion?.semver??null;
 export function compactionCommand(config, session, cancel=false) {
@@ -76,18 +81,77 @@ export function compactionView(data,{runtime,session,pending=false,localError=nu
 
 // No timers or handles here. The page calls tick from its existing owned timer.
 export class SeatCompaction {
-  constructor(host){this.host=host;this.support=new Map();this.closed=false;}
+  constructor(host){this.host=host;this.support=new Map();this.unconfirmed=new Map();this.closed=false;}
+  recovery(e){
+    return this.host.readUnconfirmed?this.host.readUnconfirmed(e.recoveryKey):this.unconfirmed.get(e.recoveryKey);
+  }
+  saveRecovery(e,value){
+    if(this.host.writeUnconfirmed)this.host.writeUnconfirmed(e.recoveryKey,value);
+    else if(value)this.unconfirmed.set(e.recoveryKey,value);
+    else this.unconfirmed.delete(e.recoveryKey);
+  }
+  clearRecovery(e,cx){
+    if(this.closed||this.entry!==e||!this.recovery(e)||e.review||e.start||e.busy||e.cancelling||e.checking)return;
+    this.resetRecovery(e);
+    this.changed(e,cx);
+  }
+  resetRecovery(e){
+    this.saveRecovery(e,null);
+    e.recoveryToken=null;
+    e.uncertain=false;
+    e.error=null;
+    e.requestedAttemptId=null;
+  }
+  recordRecovery(e,dispatch){
+    if(e.dispatch!==dispatch||this.recovery(e)||e.recordedDispatch===dispatch.token)return;
+    // A later receipt failure must not restore a warning the user cleared.
+    e.recordedDispatch=dispatch.token;
+    e.recoveryToken=dispatch.token;
+    this.saveRecovery(e,{...dispatch,attemptId:e.requestedAttemptId??null});
+  }
+  keepPendingRecovery(e){
+    if(e?.start?.dispatched&&e.dispatch?.token===e.start.token)this.recordRecovery(e,e.dispatch);
+  }
+  recoveryClock(at){return formatAbsoluteTime(at,{timezone:this.host.timezone?.()});}
+  checkRecovery(e,data,record){
+    if(this.recovery(e)?.token!==record.token)return;
+    const p=data?.preparation,s=data?.state,pi=e.node.runtime==='pi';
+    const updated=timestamp(pi?s?.requestedAt:s?.updatedAt);
+    const recent=Number.isFinite(updated)&&updated>=record.at;
+    const sameAttempt=record.attemptId&&(pi?s?.attemptId:p?.attemptId)===record.attemptId;
+    const preparation=!Number.isFinite(updated)&&p?.mode==='manual'&&p.attemptId&&p.attemptId!==record.baseline;
+    const stage=pi?(s?.status==='completed'?'completed':null):Object.hasOwn(stageWords,s?.stage)?stageWords[s.stage]:null;
+    const isBaseline=p?.attemptId&&p.attemptId===record.baseline;
+    const matched=record.attemptId?sameAttempt:!isBaseline&&(recent||preparation);
+    const settled=pi?s?.status==='completed'&&matched
+      :p?.mode!=='automatic'&&p?.compact!=='uncertain'&&matched&&(stage||preparation);
+    if(settled){
+      const at=this.recoveryClock(recent?updated:Date.now()),seat=e.node.canonicalSessionName,words=stage??stageWords.preparing;
+      this.resetRecovery(e);
+      e.recoveryEvidence=recent?`OpenRig recorded a manual compaction for ${seat} at ${at} (${words}), after your request.`
+        :`At ${at}, Herdrig saw OpenRig's manual compaction record for ${seat} (${words}), after your request.`;
+      return;
+    }
+    this.saveRecovery(e,{...record,contextNow:contextPercent(e.node)});
+  }
   show(cx,config,node,version=null){
     const key=JSON.stringify([this.host.identity(config),node.nodeId,node.canonicalSessionName,node.runtime]);
     let e=this.entry;
     if(e?.key===key){
       e.node={...node};
+      if(e.recoveryToken&&!this.recovery(e)){
+        e.recoveryToken=null;
+        e.uncertain=false;
+        e.error=null;
+      }
       // An upgrade refreshes support without dropping an open review or a receipt's uncertainty.
       if(!version||version===e.version||e.reading||e.polling||e.busy||e.cancelling||e.review||e.start)return e;
       e.version=version;
       e.reading=true;
     }else{
-      e=this.entry={key,config,version,node:{...node},busy:false,reading:true,data:null,snapshot:null,nextAt:0};
+      this.keepPendingRecovery(e);
+      const recoveryKey=JSON.stringify([config.connectionId,config.daemonUrl,config.openrigHome,node.canonicalSessionName]);
+      e=this.entry={key,recoveryKey,config,version,node:{...node},busy:false,reading:true,data:null,snapshot:null,nextAt:0};
     }
     cx?.spawn?.(async task=>{
       try{
@@ -124,16 +188,25 @@ export class SeatCompaction {
     if(e.support===true)return null;
     return e.support===false?"This OpenRig can't compact a seat on request.":"Couldn't check compaction support. Check again to retry.";
   }
-  reason(e){
+  reason(e,resend=false){
+    if(!resend&&this.recovery(e))return UNCONFIRMED_REASON;
     if(e.reading||e.checking)return 'Checking compaction support…';
     if(e.config.daemonUrl?.startsWith('herdr://'))return "Not available over Herdr's connection yet.";
     const unsupported=e.cliReason??this.supportReason(e);
     if(unsupported)return unsupported;
-    return e.node.sessionStatus!=='running'?"This seat isn't running.":!e.snapshot?'The current seat generation could not be checked. Look again.':e.uncertain||e.data?.preparation?.compact==='uncertain'||e.node.runtime==='pi'&&e.data?.state?.status==='uncertain'?'Check the seat before another compaction request.':e.busy||e.review||e.start?'A compaction request is already open.':e.automatic&&compactionView(e.data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,automatic:true}).live?'An automatic compaction is already under way.':null;
+    const uncertain=e.uncertain||e.data?.preparation?.compact==='uncertain'||e.node.runtime==='pi'&&e.data?.state?.status==='uncertain';
+    return e.node.sessionStatus!=='running'?"This seat isn't running.":!e.snapshot?'The current seat generation could not be checked. Look again.':!resend&&uncertain?'Check the seat before another compaction request.':e.busy||e.review||e.start?'A compaction request is already open.':e.automatic&&compactionView(e.data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,automatic:true}).live?'An automatic compaction is already under way.':null;
   }
   view(e,forPolling=false){
     const v=compactionView(e.data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,pending:e.busy,localError:forPolling?null:e.error,automatic:e.automatic,expectedAttemptId:e.requestedAttemptId});
     if(e.start)return {...v,text:e.start.copy.starting,live:true,cancel:false};
+    const recovery=this.recovery(e);
+    if(recovery){
+      const {at,contextBefore,contextNow}=recovery;
+      const evidence=contextNow!=null&&contextBefore!=null&&contextNow<contextBefore?`Context is now ${contextNow}% (was ${contextBefore}% when you asked).`:null;
+      return {...v,text:`Your compaction request at ${this.recoveryClock(at)} wasn't confirmed. OpenRig may or may not have compacted ${e.node.canonicalSessionName}.`,live:false,cancel:false,recovery:true,evidence};
+    }
+    if(e.recoveryEvidence)v.evidence=e.recoveryEvidence;
     if(e.config.daemonUrl?.startsWith('herdr://')||e.pollError)v.cancel=false;
     else if(!v.text&&!e.reading&&!e.checking&&!e.cliReason&&e.support==null)v.text=this.supportReason(e);
     if(v.live&&e.pollStartedAt!=null&&Date.now()-e.pollStartedAt>=300000){v.live=false;if(e.node.runtime==='claude-code'&&v.text)v.text+=` (${observedTime(e.observedAt??e.pollStartedAt,this.host.timezone?.())})`;}
@@ -169,12 +242,19 @@ export class SeatCompaction {
     const preparationId=data?.preparation?.attemptId;
     const attempt=preparationId??data?.state?.attemptId??data?.state?.requestedAt??'unidentified';
     const start=e.start;
+    // Released Claude triggers return after preparation, without an attempt ID.
+    // Before the receipt, require a new preparation consistent with this anonymous CLI request.
+    const actor=data?.preparation?.policyActor;
+    const preparationAt=timestamp(data?.preparation?.requestedAt??data?.state?.requestedAt??data?.state?.updatedAt);
+    const pendingPreparation=['sending','waiting'].includes(data?.preparation?.status)
+      &&(!actor||actor.source==='caller'&&actor.session==null)
+      &&(!Number.isFinite(preparationAt)||preparationAt>=start?.dispatchedAt-DISPATCH_CLOCK_SKEW_MS);
     if(start?.dispatched&&Date.now()<start.deadline&&(
       e.node.runtime==='pi'
         ? e.requestedAttemptId&&data?.state?.attemptId===e.requestedAttemptId
         : data?.preparation?.mode==='manual'&&preparationId
           &&(e.requestedAttemptId?preparationId===e.requestedAttemptId
-            :start.allowBaseline&&preparationId!==start.baseline)
+            :preparationId!==start.baseline&&(start.allowBaseline||!start.receiptRead&&pendingPreparation))
     )){
       this.host.reportStart(start.token,'started');
       e.start=null;
@@ -189,15 +269,19 @@ export class SeatCompaction {
     const id=e.requestedAttemptId,p=data?.preparation,s=data?.state;
     const terminal=Boolean(id)&&(e.node.runtime==='pi'?s?.attemptId===id&&['completed','failed','aborted','unsupported'].includes(s.status)
       :p?.attemptId===id&&p.mode==='manual'&&['audit-sent','cancelled','skipped-or-failed'].includes(s?.stage)&&p.compact!=='uncertain'&&p.delivery!=='uncertain');
-    if(e.uncertain&&id&&terminal){e.uncertain=false;e.error=null;}
+    if(e.uncertain&&id&&terminal&&!this.recovery(e)){e.uncertain=false;e.error=null;}
   }
   changed(e,cx){if(!this.closed&&this.entry===e)this.host.notify(cx);}
-  review(e,cancel=false){
-    if(this.closed||this.entry!==e||e.config.daemonUrl?.startsWith('herdr://')||(!cancel&&e.busy)||e.cancelling||e.review||(!cancel&&this.reason(e))||(cancel&&!this.view(e).cancel))return;
+  review(e,cancel=false,resend=false){
+    const recovery=resend&&this.recovery(e);
+    if(this.closed||this.entry!==e||resend&&!recovery||e.config.daemonUrl?.startsWith('herdr://')||(!cancel&&e.busy)||e.cancelling||e.review||(!cancel&&this.reason(e,resend))||(cancel&&!this.view(e).cancel))return;
     if(this.host.currentConfig&&this.host.identity(this.host.currentConfig(e.config))!==this.host.identity(e.config)){e.error=changedSeat(e.node.canonicalSessionName);return;}
     const token=`compact-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    e.review={token,cancel,expires:Date.now()+300000,snapshot:e.snapshot,operation:this.host.operation(e.config)};
-    this.host.confirm(e,token,compactionConfirmation(e.node,cancel),cancel?null:compactionStartCopy(e.node.canonicalSessionName));
+    e.review={token,cancel,recoveryToken:recovery?.token,expires:Date.now()+300000,snapshot:e.snapshot,operation:this.host.operation(e.config)};
+    const seat=e.node.canonicalSessionName;
+    const duplicateEffect=e.node.runtime==='pi'?`${seat}'s Pi runner may be asked to compact twice.`:`${seat} may be asked to write its restore map twice.`;
+    const copy=recovery?{title:'Send another compaction request?',body:`The request at ${this.recoveryClock(recovery.at)} wasn't confirmed and may already have run or still run. If both go through, ${duplicateEffect} Check its pane first if you can.`,confirm:'Send again',dismiss:'Cancel',focusCancel:true}:compactionConfirmation(e.node,cancel);
+    this.host.confirm(e,token,copy,cancel?null:compactionStartCopy(e.node.canonicalSessionName));
   }
   expireStart(e,start,cx){
     start.expired=true;
@@ -205,6 +289,7 @@ export class SeatCompaction {
     e.busy=false;
     e.uncertain=!!start.dispatched;
     e.error=start.dispatched?start.copy.uncertain:start.copy.unsent;
+    if(start.dispatched&&e.dispatch?.token===start.token)this.recordRecovery(e,e.dispatch);
     this.host.reportStart?.(start.token,'error',e.error);
     this.changed(e,cx);
   }
@@ -222,8 +307,7 @@ export class SeatCompaction {
         }else if(decision==='allow'||decision.status==='allow'){
           if(!review.cancel&&typeof decision==='object'){
             const start=review.start=e.start={token:review.token,deadline:decision.deadline,
-              // Claude's trigger can wait for the map and idle seat before returning a receipt.
-              allowBaseline:true,baseline:e.data?.preparation?.attemptId,
+              allowBaseline:false,
               copy:compactionStartCopy(e.node.canonicalSessionName)};
             if(!Number.isFinite(start.deadline)||Date.now()>=start.deadline||!this.host.reportStart?.(start.token,'checking')){
               this.expireStart(e,start,cx);return;
@@ -253,14 +337,25 @@ export class SeatCompaction {
       const status=await this.host.get(e.config,`/api/seat/status/${encodeURIComponent(e.node.canonicalSessionName)}`,op);
       const health=await this.host.get(e.config,'/healthz',op);
       e.snapshot=compactionSnapshot(e.node,status,tenure,health.selfHostId);
-      if((await this.readState(e,op))?.applied&&!e.uncertain)e.error=null;
+      const recovery=this.recovery(e);
+      const observed=await this.readState(e,op);
+      if(observed?.applied){
+        if(recovery){
+          op.check();
+          if(!this.closed&&this.entry===e)this.checkRecovery(e,observed.data,recovery);
+        }
+        else if(!e.uncertain)e.error=null;
+      }
       e.nextAt=Date.now()+5000;
     }
-    catch(error){e.error=String(error.message??error);}finally{e.polling=false;e.checking=false;this.changed(e,cx);}
+    catch(error){
+      if(this.recovery(e))e.pollError=String(error.message??error);
+      else e.error=String(error.message??error);
+    }finally{e.polling=false;e.checking=false;this.changed(e,cx);}
   }
   async act(e,review,cx){
     const start=review.start;
-    let dispatched=false,received=false,accepted=false;
+    let dispatched=false,received=false,accepted=false,dispatch=null,data=null,priorWarning=null;
     try{
       const op=review.operation??this.host.operation(e.config);
       const tenure=await this.host.get(e.config,`/api/telemetry/v1/nodes/${encodeURIComponent(e.node.nodeId)}/tenures?limit=1`,op);
@@ -273,6 +368,11 @@ export class SeatCompaction {
         return;
       }
       op.check();const command=compactionCommand(e.config,e.node.canonicalSessionName,review.cancel);if(!command)throw Error('This connection cannot run compaction.');
+      if(!review.cancel)priorWarning=this.recovery(e);
+      if(!review.cancel&&priorWarning?.token!==review.recoveryToken){
+        e.error='The compaction warning changed. Check the current seat card before trying again.';
+        return;
+      }
       if(start){
         if(Date.now()>=start.deadline||!this.host.reportStart(start.token,'dispatched')){
           this.expireStart(e,start,cx);return;
@@ -281,11 +381,25 @@ export class SeatCompaction {
       }
       // A state read started before this command cannot describe its result.
       const dispatchRead=e.stateRead=(e.stateRead??0)+1;
+      if(!review.cancel){
+        if(priorWarning)this.resetRecovery(e);
+        dispatch=e.dispatch={token:review.token,at:Date.now(),baseline:e.data?.preparation?.attemptId??null,contextBefore:contextPercent(e.node)};
+        if(start){
+          start.dispatchedAt=dispatch.at;
+          start.baseline=dispatch.baseline;
+        }
+        e.recoveryEvidence=null;
+      }
       dispatched=true;const result=await this.host.exec(command,op,240000);
       received=true;
-      let data;try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
+      if(start)start.receiptRead=true;
+      try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
       accepted=result.code===0&&data.ok===true;
-      if(!review.cancel&&accepted&&typeof data.attemptId==='string'&&data.attemptId.trim())e.requestedAttemptId=data.attemptId;
+      if(!review.cancel&&accepted&&typeof data.attemptId==='string'&&data.attemptId.trim()){
+        const record=this.recovery(e);
+        if(record?.token===dispatch.token)this.saveRecovery(e,{...record,attemptId:data.attemptId});
+        if(!start?.expired)e.requestedAttemptId=data.attemptId;
+      }
       if(start?.expired)return;
       if(start)start.allowBaseline=accepted&&data.session===e.node.canonicalSessionName&&data.stage==='compact-sent';
       const refused=result.code!==0||data.ok===false;
@@ -301,13 +415,18 @@ export class SeatCompaction {
         if(!confirmedCancel)e.error=data.error??data.reason??'OpenRig refused compaction.';
       }
     }catch(error){
+      // A gate refusal during readback describes the GET, never the preceding command.
+      const unsent=!dispatched||(!received&&isKnownUnsentError(error));
+      if(unsent&&priorWarning&&dispatch&&e.dispatch===dispatch){
+        const current=this.recovery(e);
+        if(current?.token===dispatch.token||!current&&e.recordedDispatch!==dispatch.token)this.saveRecovery(e,priorWarning);
+      }
       if(!start?.expired){
-        // A gate refusal during readback describes the GET, never the preceding command.
-        const unsent=!dispatched||(!received&&isKnownUnsentError(error));
         e.error=accepted?"The request reached OpenRig, but Herdrig couldn't refresh its state. Check the pane or OpenRig's CLI before trying again."
           :unsent?`${String(error.message??error)} Nothing was sent.`
           :`${String(error.message??error)} The request may have reached OpenRig. Check the pane or OpenRig's CLI before trying again.`;
         e.uncertain=!unsent;
+        if(!unsent&&dispatch&&typeof data?.ok!=='boolean')this.recordRecovery(e,dispatch);
       }
     }
     finally{
@@ -318,5 +437,5 @@ export class SeatCompaction {
       }
     }
   }
-  close(){this.closed=true;this.entry=null;}
+  close(){this.keepPendingRecovery(this.entry);this.closed=true;this.entry=null;}
 }

@@ -83,7 +83,7 @@ import {
   parseSidebarState, serializeSidebarState, treeKeyNav, rigViewsBranch, attachToSeat, isLoopbackDaemonUrl, formatSeatContextPct, isSeatContextWarning,
   tierOf, sortNeedsByTier, enrichAttentionItems, quietModeHeaderChip, whoseQueueSummary, statusMark, statusMarkElement, pageRevealOpen,
   attachRelayPath, isValidSessionName, sessionNameRefusal,
-  findAttachedSeat, seatTerminalIndex, seatOrigin, seatNameShared, newRigOverlay, rigSpaceMarks, waitWith } from "./rig-lib.js";
+  findAttachedSeat, seatTerminalIndex, seatOrigin, seatNameShared, newRigOverlay, rigSpaceMarks } from "./rig-lib.js";
 import { installHerdrTransport } from "./rig-openrig-wire.js";
 
 /** This folder, for its own icons: derived from `MOD_IDS.sidebar` so a 1-line rename in `MOD_IDS` updates both cross-mod opens and icons. */
@@ -312,8 +312,8 @@ export default class RigSidebar extends View {
     this.cleanupSession=`cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.listScroll = ScrollHandle.new();
     // OpenRigs over Herdr's connection (herdr:// addresses): reads and the event stream go through the pinned helper on that machine.
-    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, wait: waitWith(cx), appHome, readTextFile, writeTextFile, config: () => this.config,
-      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.sidebar).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") });
+    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, appHome, readTextFile, writeTextFile, config: () => this.config,
+      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.sidebar).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") }, cx);
     registerRigRouting(cx, (context, conn) => {
       if (!this.primary.config) return { config: null, notify };
       if (this.primary.config.configInvalid) return { config: this.primary.config, notify };
@@ -1533,8 +1533,7 @@ export default class RigSidebar extends View {
         return result.code === 0 ? JSON.parse(result.stdout) : null;
       }),
       padPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-pad.cjs`,
-      viewerPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-viewer.cjs`, selfHostId: () => feed.healthz?.selfHostId,
-      wait: (ms) => this.trackRouteOp(feed, this.currentSpaceAttempt?.get(key) ?? null, ms < 10000, () => new Promise((resolve) => cx.timer.after(ms, resolve, {owner:null}))) }));
+      viewerPath: `${appHome()}/mods/${MOD_IDS.sidebar}/rig-grid-viewer.cjs`, selfHostId: () => feed.healthz?.selfHostId }));
     (this.currentSpaceAttempt ??= new Map()).set(key, attempt);
     const controller = all.get(key);
     const attached = this.attachHost(cx, consent, feed, attempt);
@@ -1547,6 +1546,7 @@ export default class RigSidebar extends View {
     controller.host.onRebuildStart = attached.onRebuildStart;
     controller.host.currentStep = attached.currentStep;
     controller.host.deadline = attached.deadline;
+    controller.host.wait = attached.wait;
     controller.host.probeHealth = attached.probeHealth; // this attempt's cx, like deadline and health
     controller.host.waitQueue = attached.waitQueue;
     controller.host.registerBarrier = attached.registerBarrier;
@@ -3155,7 +3155,7 @@ export default class RigSidebar extends View {
         ...(req.body ? { headers: req.headers, body: JSON.stringify(req.body) } : {}) });
       const data = await res.json().catch(rethrowGate(null));
       return { ok: res.ok, status: res.status, data };
-    }, (ms, done) => cx.timer.after(ms, done));
+    }, (ms, done) => cx.timer.after(ms, done, { owner: null }));
   }
   /** One dismissal, committed through the update's OWN connection; an unknown or missing connection stays a local hide and sends nothing. */
   async commitDismissalFor(cx, item, expectedScope = null) {
@@ -4702,14 +4702,14 @@ export default class RigSidebar extends View {
     const key = "needs:updates", expanded = branchFoldOpen(this.viewState("rig.open.sidebar") ?? {}, key, true);
     const selected = this.viewState("rig.sel")?.key;
     const hovered = (id) => this.hoveredUpdate === id || selected === id;
-    const hover = (id) => (over, ctx) => { this.hoveredUpdate = over ? id : null; (ctx ?? cx).notify(); };
+    const hover = (id) => (over, ctx) => { this.hoveredUpdate = over ? id : null; ctx?.notify?.(); };
     const action = (verb, value) => (_e, ctx) => {
-      (ctx ?? cx).stop_propagation(); this.sidebarUpdateAction(verb, value, scope); (ctx ?? cx).notify();
+      ctx?.stop_propagation?.(); this.sidebarUpdateAction(verb, value, scope); ctx?.notify?.();
     };
     this.visibleTreeRows.push({ key, foldKey: key, expandable: true, isOpen: expanded, parentKey: branchKey("needs") });
     const head = h_flex().id("needs-updates-branch").pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
       .on_hover(hover(key)).hover(s => s.bg(t.hover))
-      .on_click((_e, ctx) => { this.setViewState("rig.sel", { key }, stateConn); this.fold(key, !expanded,[],stateConn); (ctx ?? cx)?.notify?.(); })
+      .on_click((_e, ctx) => { this.setViewState("rig.sel", { key }, stateConn); this.fold(key, !expanded,[],stateConn); ctx?.notify?.(); })
       .on_mouse_down("right", () => this.menu({ kind: "updates-group", ...(stateConn ? { conn: stateConn } : {}), name: "Updates", items: updates }))
       .child(svg(icon(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim))
       .child(div().flex_1().text_size(11.5).text_color(t.muted).child("Updates"));
@@ -4725,7 +4725,7 @@ export default class RigSidebar extends View {
       this.visibleTreeRows.push({ key: rowKey, expandable: false, parentKey: key, entry, update: record ? null : { ...n, dismissalPosition: position } });
       const el = h_flex().id(record ? `sidebar-hidden-${n.id}` : `need-${n.id}`).pl(treeIndent(1)).pr(8).h(24).gap(6).items_center()
         .on_hover(hover(rowKey)).hover(s => s.bg(t.hover))
-        .on_click((_e, ctx) => { this.selectRow(entry, rowKey); (ctx ?? cx)?.notify?.(); })
+        .on_click((_e, ctx) => { this.selectRow(entry, rowKey); ctx?.notify?.(); })
         .on_mouse_down("right", () => this.menu({ ...(n.conn || !stateConn ? n : { ...n, conn: stateConn }), dismissed: !!record }))
         .child(leafCell()).child(div().flex_1().min_w(0).truncate().text_size(12).text_color(hovered(rowKey) ? t.foreground : t.dim).tooltip(rowTip(n.summary)).child(rowTitle(n.summary)));
       if (hovered(rowKey) && dismissible(n)) {
@@ -5653,7 +5653,7 @@ export default class RigSidebar extends View {
     else if (want.why === "pinned" || want.id === follow.shownId) { apply(want.id, want.hint); } // the person's own pick is immediate; the same box just refreshes the hint
     else if (follow.pending?.id !== want.id) {
       const pending = follow.pending = { id: want.id };
-      cx.timer.after(150, (next) => { if (follow.pending !== pending) return; apply(want.id, want.hint); (next ?? cx).notify(); });
+      cx.timer.after(150, (next) => { if (follow.pending !== pending) return; apply(want.id, want.hint); next?.notify?.(); });
     }
     return feeds.find((f) => f.id === follow.shownId) ?? this.primary;
   }

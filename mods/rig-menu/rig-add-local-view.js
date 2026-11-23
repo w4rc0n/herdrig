@@ -73,7 +73,7 @@ export class AddLocalPanel {
         if(!this.expired){this.phase='done';try{await this.host.saved?.(saved);}catch(_){this.warning="The connection was saved, but Herdr couldn't refresh the sidebar. Refresh it to check.";}}
       }catch(error){
         outcome={ok:false,uncertain:error?.uncertain===true,error:errorDiagnostic(error)};
-        if(!this.expired){this.phase=outcome.uncertain?'uncertain':'edit';this.verified=null;this.error=outcome.error;this.pendingFocus='home';}
+        if(!this.expired){this.phase=outcome.uncertain?'uncertain':'edit';this.verified=null;this.error=outcome.error;this.pendingFocus=outcome.uncertain?'close':'home';}
       }finally{
         if(this.expired){if(outcome?.ok||outcome?.uncertain)this.host.closedOutcome?.(outcome);}
         else this.busy=false;
@@ -103,7 +103,16 @@ export class AddLocalPanel {
     if(this.expired)return div().id('add-local-closed');
     this.theme=t;
     if(!this.expired&&!this.checkHandle&&!this.checkHandlePending){this.checkHandlePending=true;cx.timer.after(0,next=>{this.checkHandlePending=false;if(this.expired)return;this.checkHandle=next.focus_handle();next.notify();});}
-    if(this.pendingFocus){this.pendingFocus=null;const generation=this.generation;this.focusTask?.cancel?.();this.focusTask=cx.timer.after(0,next=>{if(this.expired||generation!==this.generation||['saving','done','uncertain'].includes(this.phase))return;this.homeInput.focus();next.notify();});}
+    if(this.pendingFocus){
+      const target=this.pendingFocus,generation=this.generation;
+      this.pendingFocus=null;this.focusTask?.cancel?.();
+      this.focusTask=cx.timer.after(0,next=>{
+        if(this.expired||generation!==this.generation)return;
+        if(target==='close'&&this.phase==='uncertain')this.cancelHandle?.focus();
+        if(target==='home'&&!['saving','done','uncertain'].includes(this.phase))this.homeInput.focus();
+        next.notify();
+      });
+    }
     const done=this.phase==='done',uncertain=this.phase==='uncertain',v=this.verified;
     const root=v_flex().id('add-local').size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
       .key_context('RigDialog').on_action('rig-dialog-next',(_e,next)=>this.cycle(true,next)).on_action('rig-dialog-prev',(_e,next)=>this.cycle(false,next))

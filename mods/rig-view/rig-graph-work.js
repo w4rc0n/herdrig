@@ -27,9 +27,10 @@ export function graphWorkLines(graph,rows,now){
   const status=line.seat.status??'unknown';line.status=status;line.pulse=false;line.dashed=status==='idle';
   if(status==='idle')line.chip='idle';else if(status==='active'){line.chip=line.rows.length>1?String(line.rows.length):null;}
   else if(['blocked','needs_input','attention_required'].includes(status))line.chip='needs you';
+  else if(status==='terminal_gone')line.chip='seat unreachable';
   else if(['detached','failed','stopped','exited','completed'].includes(status))line.chip='seat stopped';
   // The sidebar's marks: working green (ansi2), waiting on someone amber (ansi3), stopped muted. Herdr's own `working` is ANSI yellow.
-  line.color=line.chip==='needs you'?'ansi3':line.chip==='seat stopped'?'muted':'ansi2';
+  line.color=line.chip==='needs you'?'ansi3':line.chip==='seat stopped'||status==='terminal_gone'?'muted':'ansi2';
   line.chipColor=line.chip==='needs you'?'blocked':null; // the "needs you" chip keeps its own needs colour
   line.opacity=status==='active' ? .8 : line.color==='ansi3' ? .9 : status==='idle' ? .6 : .35;
   const times=new Map(line.rows.map(row=>[row,rowAt(row)]));

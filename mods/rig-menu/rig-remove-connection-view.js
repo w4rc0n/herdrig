@@ -1,4 +1,4 @@
-import { errorDiagnostic } from "./rig-words.js";
+import { errorDiagnostic,plainError } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
 import {div} from "gpui-kit";
 import {errorBlock} from "./rig-error-view.js";
@@ -41,12 +41,16 @@ export class RemoveConnectionPanel {
   render(...args){return withFocusContext(this,args[1],()=>this.renderFocused(...args));}
   renderFocused(t,cx){
     this.theme=t;
+    const error=this.error?plainError(this.error,{where:"this computer"}):null;
     const cycle=(forward,cx)=>{
       cx.stop_propagation();if(this.busy)return;
-      const first=this.cancelHandle,last=this.primaryHandle;
-      const boundary=forward&&last?.is_focused?.()?first:!forward&&first?.is_focused?.()?last:null;
-      if(boundary){this.focusTask?.cancel?.();this.focusTask=cx.timer.after(16,nextCx=>{boundary.focus();nextCx.notify();});}
-      else if(forward)globalThis.window.focus_next();else globalThis.window.focus_prev();
+      const detail=error&&error.detail!==error.text&&this.focusTargets?.get('remove-connection-error-detail-details');
+      const handles=[detail,this.cancelHandle,this.primaryHandle].filter(Boolean);
+      if(!handles.length)return;
+      const at=handles.findIndex(handle=>handle.is_focused?.());
+      const target=handles[at<0?(forward?0:handles.length-1):(at+(forward?1:-1)+handles.length)%handles.length];
+      this.focusTask?.cancel?.();
+      this.focusTask=cx.timer.after(16,nextCx=>{if(this.expired)return;target.focus();nextCx.notify();});
     };
     const root=v_flex().id("remove-connection").size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12)
       .key_context("RigDialog").on_action("rig-dialog-next",(_e,cx)=>cycle(true,cx)).on_action("rig-dialog-prev",(_e,cx)=>cycle(false,cx))
