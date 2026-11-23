@@ -137,6 +137,7 @@ export class RigGraph{
       const route=this.workRoutes.get(line.key);if(!route)continue;
       const label=line.dashed?'open task, seat idle'
         :line.color==='ansi3'?'open task, seat needs you or blocked'
+        :line.status==='terminal_gone'?'open task, seat unreachable'
         :line.color==='muted'?'open task, seat stopped'
         :(line.pulseUntil!==null||line.status==='active')?'open task, seat working':'open task';
       workLegend.set(label,{color:t[line.color],width:2.5,dashed:line.dashed});

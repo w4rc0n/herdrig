@@ -518,9 +518,14 @@ export async function switchConnection(host, before, id, herdrUrl, verifiedTunne
 
 export function localDaemonOrigin(value) {
   if (typeof value !== "string") return "";
-  const m = /^(https?):\/\/(localhost|\[::1\]|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?\/?$/i.exec(value.trim());
+  const m = /^(https?):\/\/(localhost|\[[0-9a-f:]+\]|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?\/?$/i.exec(value.trim());
   if (!m) return "";
-  const scheme = m[1].toLowerCase(), host = m[2].toLowerCase(), port = m[3] == null ? null : Number(m[3]);
+  const scheme = m[1].toLowerCase(), port = m[3] == null ? null : Number(m[3]);
+  let host = m[2].toLowerCase();
+  if (host.startsWith("[")) {
+    if (canonicalIPv6(host.slice(1, -1)) !== "::1") return "";
+    host = "[::1]";
+  }
   if (host.startsWith("127.") && host.split(".").some((part) => Number(part) > 255 || String(Number(part)) !== part)) return "";
   if (port !== null && (port < 1 || port > 65535)) return "";
   return `${scheme}://${host}${port !== null && port !== (scheme === "https" ? 443 : 80) ? `:${port}` : ""}`;

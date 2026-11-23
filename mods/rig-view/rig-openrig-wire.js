@@ -8,7 +8,17 @@ import { configOfConnection, consentOf, consentText, LEGACY_CONNECTION_ID } from
 
 /** `env`: `{ execFor(scope), hcFor(scope), machines, wait, appHome(), readTextFile, writeTextFile, bridgePath(), config() }`: the mod's own gated
  *  exec and hc for a connection's scope, and its current config (it lists the connections). Returns the registered transport; its `release()` ends the registration (a view calls it when it closes). */
-export function installHerdrTransport(env) {
+export function retainedTaskWait(cx) {
+  const taskContext = new Promise(resolve => cx.spawn(resolve, { owner: null }));
+  return async ms => {
+    const task = await taskContext;
+    await new Promise(resolve => task.timer.after(ms, resolve, { owner: null }));
+  };
+}
+
+export function installHerdrTransport(env, cx = null) {
+  // Preparation can poll machine readiness after the registration call.
+  const wait = cx ? retainedTaskWait(cx) : env.wait;
   const transport = new HerdrTransport({
     generation: (scope) => gateGeneration(scope), // a write stops if its connection's settings change while it is staged
     connection: (scope, parsed) => {
@@ -18,7 +28,7 @@ export function installHerdrTransport(env) {
       const id = conn.connectionId ?? LEGACY_CONNECTION_ID, file = `${env.appHome()}/openrig/openrig-consent.json`;
       const host = {
         exec: env.execFor(scope), hc: env.hcFor(scope),
-        machines: env.machines, wait: env.wait, appHome: env.appHome(), openrigBridgePath: env.bridgePath(), writeText: env.writeTextFile,
+        machines: env.machines, wait, appHome: env.appHome(), openrigBridgePath: env.bridgePath(), writeText: env.writeTextFile,
         // A file that exists but can't be read (Herdr answers null only for a missing one): OpenRig was never asked, so it isn't an outage.
         readOpenRigConsent: async () => {
           let text;

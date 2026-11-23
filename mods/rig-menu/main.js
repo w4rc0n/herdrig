@@ -63,7 +63,7 @@ const requestVisibleDismissal = (scope, action, value) => {
   requestDismissal({ shared, setShared, run, scope }, action, value);
 };
 // A send for a CONNECTION names its gate scope (several OpenRigs: a bare sink refuses). `config` is that connection's own config.
-import { installHerdrTransport } from "./rig-openrig-wire.js";
+import { installHerdrTransport, retainedTaskWait } from "./rig-openrig-wire.js";
 const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId, appHome());
 const fetchFor = (config) => (url, init) => gatedFetch(url, init, undefined, config?.connectionId);
 const hcFor = (config) => (args, bytes) => gatedHc(rawHc, args, bytes, undefined, config?.connectionId);
@@ -304,8 +304,8 @@ export default class RigMenu extends View {
   init(_p, cx) {
     // OpenRigs over Herdr's connection (herdr:// addresses): the menu's own reads and writes (a pause's review, archive, delete, a new rig) go through
     // the pinned helper on that machine, like the sidebar's and the page's; without this they could never reach a switched OpenRig.
-    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, wait: waitWith(cx), appHome, readTextFile, writeTextFile, config: () => this.config,
-      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.menu).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") });
+    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, appHome, readTextFile, writeTextFile, config: () => this.config,
+      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.menu).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") }, cx);
     const routingConfig = (conn) => conn && this.config ? (configOfConnection(this.config, conn) ?? { configInvalid: UNKNOWN_CONNECTION }) : this.config;
     registerRigRouting(cx, (context, conn) => { const cfg = routingConfig(conn); return { shared, setShared, run: runFor(cfg), spaces, panes, terminals, hc: hcFor(cfg), layout, notify, openOverlay,closeOverlay,config: cfg, currentConfig: () => routingConfig(conn), wait: waitWith(context) }; });
     this.config = null;
@@ -389,7 +389,7 @@ export default class RigMenu extends View {
         const makeLocalPanel=ownerCx=>new AddLocalPanel({
           ...this.machineSetupHost(ownerCx,this.config),...this.localSetupHost(),
           localProbe:options=>localProbeExec(rawExec,options),
-          requestFor:task=>this.machineSetupHost(task,this.config).setupFetch,
+          requestFor:task=>this.machineSetupFetch(task),
           saved:async()=>{refreshSidebar();},
         },{rigArgv:Array.isArray(this.config?.rig)&&this.config.rig.length?this.config.rig:['rig'],mono:settings()?.font_family??'monospace',
           cancelHandle:this.dialogCancelHandle,primaryHandle:this.dialogConfirmHandle,cancel:()=>this.dismiss(),
@@ -419,7 +419,7 @@ export default class RigMenu extends View {
         if(step.action==="approve-helper"&&!approveOffered){notify({title:"Connections",body:HERDR_APPROVE_NOT_OFFERED,level:"warning"});this.dismiss();return;}
         const consentFile=`${appHome()}/openrig/openrig-consent.json`;
         // The helper's runs are gated under THIS connection's scope, and its approval lives in its own file (never a spec-save or Attach grant).
-        const makeRemote=()=>new RemoteOpenRig({exec:execFor(conn),hc:hcFor(conn),machines,wait:waitWith(cx),appHome:appHome(),writeText:writeTextFile,
+        const makeRemote=task=>new RemoteOpenRig({exec:execFor(conn),hc:hcFor(conn),machines,wait:waitWith(task),appHome:appHome(),writeText:writeTextFile,
           openrigBridgePath:attachRelayPath(appHome(),MOD_IDS.menu).replace(/rig-attach-relay\.cjs$/,"rig-openrig-transport.cjs"),
           readOpenRigConsent:async()=>openrigConsentOf(await readTextFile(consentFile).catch(()=>null),connection.id),
           writeOpenRigConsent:async value=>{const previous=await readTextFile(consentFile).catch(()=>null);return writeTextFile(consentFile,openrigConsentText(previous,connection.id,value).trimEnd(),previous??null);}});
@@ -501,7 +501,7 @@ export default class RigMenu extends View {
     if (step?.load === "pause") this.loadPause(cx);
     if(step&&!step.input&&!['new-rig','launch-spec','design-view','change-model','confirm-machine','setup-machine','stop-machine'].includes(step.action)){
       cx.timer.after(0,nextCx=>{
-        const cancel=step.run||['pause','fresh','delete-rig','archive-rig','rebuild-space'].includes(step.action)||!['resume','move-grid','confirm-spec-write','spaces-list'].includes(step.action);
+        const cancel=step.copy?.focusCancel||step.run||['pause','fresh','delete-rig','archive-rig','rebuild-space'].includes(step.action)||!['resume','move-grid','confirm-spec-write','spaces-list'].includes(step.action);
         (cancel?this.dialogCancelHandle:this.dialogConfirmHandle)?.focus?.();nextCx.notify();
       });
     }
@@ -886,7 +886,7 @@ export default class RigMenu extends View {
           let files;
           try { files = await watchFolder(watchHome); } catch { return; }
           if (this.gone || this.swapWatchedHome !== watchHome) return;
-          if (this.swapRuntime === "codex" && files.some(file => file === "models_cache.json" || file === `${watchHome}/models_cache.json`)) {
+          if (this.swapRuntime === "codex" && files.some(file => file === watchHome || file === "models_cache.json" || file === `${watchHome}/models_cache.json`)) {
             this.queueSwapCatalog(target);
             task.notify();
             await this.readSwapCatalogs(task);
@@ -2056,8 +2056,7 @@ export default class RigMenu extends View {
       step={...step,views:(step.views??[]).filter(view=>!oldViewsGone(shared,this.config).includes(view.id))};
       if(this.cleanupQueued)return;
       if(oldStripCleanupBusy(shared)){
-        this.cleanupQueued=true;
-        this.result={ok:false,text:'A cleanup is already running in this window. Wait for its result.'};
+        this.result={ok:false,notSent:true,text:'A cleanup is already running in this window. Wait for its result.'};
         cx.notify();return;
       }
       if(!layoutShowsMod(layout(),MOD_IDS.sidebar)){this.result={ok:false,notSent:true,text:"Open the Rig sidebar, then try again. Nothing was closed."};cx.notify();return;}
@@ -3009,7 +3008,7 @@ export default class RigMenu extends View {
       .when(fixedResumePlan,el=>el.child(v_flex().id('rig-resume-review').flex_1().min_h(0).child(body)))
       // Long results and the model/harness form scroll; the action footer never shrinks into the body.
       .when(!messageComposer && !heldDraft && !fixedResumePlan && (step.action !== "design-view" || !!this.result || !!this.busy), (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
-        .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","resume","close-old-views"].includes(step.action) && !!body&&(step.action!=='close-old-views'||!this.result), (content) => content.child(body))
+        .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","resume","close-old-views"].includes(step.action) && !!body&&(step.action!=='close-old-views'||!this.result||this.result.notSent), (content) => content.child(body))
         .child(this.resultView(t, cx, target, step) ?? div())))
       .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
         .child(this.dialogButton(t,div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),this.dialogCancelHandle,
@@ -3148,6 +3147,10 @@ export default class RigMenu extends View {
         :{title:'Connection save not confirmed',body:'The dialog closed before Herdr heard back. Check Connections before adding it again.',level:'warning'}),
     };
   }
+  machineSetupFetch(cx){
+    return loopbackHealthFetch(globalThis.fetch.bind(globalThis),(ms,fn)=>cx.timer.after(ms,fn,{owner:null}));
+  }
+
   machineSetupHost(cx,config=this.config){
     const configPath=`${appHome()}/openrig/config.json`,consentPath=`${appHome()}/openrig/machine-consent.json`;
     let completedConfig=this.openedOn;
@@ -3176,7 +3179,7 @@ export default class RigMenu extends View {
         Promise.resolve().then(read).then(value=>{ticket.value=value;ticket.ready=true;},error=>{ticket.error=error;ticket.failed=true;ticket.ready=true;});
         cx.notify();
       }),
-      setupFetch:loopbackHealthFetch(globalThis.fetch.bind(globalThis),(ms,fn)=>cx.timer.after(ms,fn,{owner:null})),relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:waitWith(cx),
+      setupFetch:this.machineSetupFetch(cx),relayPath:attachRelayPath(appHome(),MOD_IDS.menu),wait:retainedTaskWait(cx),
       stillChosen:currentChoice, // Approve helper: the settings still name the connection this dialog opened on
       localFolderExists:localDirectoryProbe(execFor(config)),localHome:()=>home(),
       machineFolders:name=>[...(spaces()??[]).filter(s=>s?.machine===name).map(s=>s.folder),...(panes()??[]).filter(p=>typeof p?.pane==="string"&&p.pane.startsWith(`${name}/`)).map(p=>p.cwd)],
@@ -3245,11 +3248,14 @@ export default class RigMenu extends View {
     if(this.setupPanel)return this.setupPanel.render(t,cx);
     if(p.step&&["confirm-machine","setup-machine","stop-machine","add-machine","remove-connection","switch-connection","switch-back","approve-helper"].includes(p.step.action)){
       this.dialogFirstControl=this.dialogLastControl=this.dialogCancelHandle;
-      return div().id('machine-config-loading').p(14).key_context('RigDialog')
+      const panel=div().id('machine-config-loading').p(14).key_context('RigDialog')
         .on_action('rig-dialog-next',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{}},cx))
         .on_action('rig-dialog-prev',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{shift:true}},cx))
-        .on_key_down((e,cx)=>this.dialogTab(e,cx))
-        .when(!!this.dialogCancelHandle,el=>el.track_focus(this.dialogCancelHandle).tab_stop(true)).child("Checking OpenRig configuration…");
+        .on_key_down((e,cx)=>this.dialogTab(e,cx));
+      if(this.result?.ok===false)return panel
+        .child(errorBlock(this,t,"machine-config-error",this.result.text))
+        .child(this.dialogButton(t,div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised),this.dialogCancelHandle,()=>this.dismiss(),false,"Close"));
+      return panel.when(!!this.dialogCancelHandle,el=>el.track_focus(this.dialogCancelHandle).tab_stop(true)).child("Checking OpenRig configuration…");
     }
     if (!p.target) return div();
     const target = complete(p.target, this.config);

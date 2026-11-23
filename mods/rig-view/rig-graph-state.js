@@ -11,14 +11,14 @@ export function normalizeRunningGraph(data,fallback=[]){
   // OpenRig's graph doesn't know a seat's tmux server stopped answering: the rig's model does (terminal_gone), and it wins on the card too.
   const gone=new Set((Array.isArray(fallback)?fallback:[]).filter(s=>s?.status==="terminal_gone").flatMap(s=>[s.session,s.logicalId]).filter(Boolean));
   for(const node of seats.length?seats:fallback){
-    const raw=node.data??node,d={...raw,...live.get(raw.logicalId)},lid=d.logicalId;if(typeof lid!=="string")continue;
+    const raw=node.data??node,d={...live.get(raw.logicalId),...raw},lid=d.logicalId;if(typeof lid!=="string")continue;
     // Cached fallback seats have no graph IDs. Only a real pod-group parent overrides their own pod.
     const parentRef=node.parentId??d.parentId,parentGroup=parentRef==null?null:refs.get(parentRef);
     const parent=(parentGroup?.startsWith("pod:")?parentGroup.slice(4):null)??d.podNamespace??d.pod??lid.split(".")[0];
     // The public graph's status is the raw session status, not its working/needs activity.
+    const sessionStatus=raw.sessionStatus??(["running","ready","stopped","detached","exited","completed"].includes(raw.status)?raw.status:null);
     const status=gone.has(d.canonicalSessionName??d.session)||gone.has(lid)?"terminal_gone"
-      :d.sessionStatus?seatStatus(d):["running","ready","stopped","detached","exited","completed"].includes(d.status)
-      ?seatStatus({...d,sessionStatus:d.status}):d.status??seatStatus(d);
+      :sessionStatus?seatStatus({...d,sessionStatus}):raw.status??(d.sessionStatus?seatStatus(d):d.status??seatStatus(d));
     group(parent,d.podLabel).seats.push({lid,runtime:d.runtime,model:d.model,profile:d.profile,session:d.canonicalSessionName??d.session,status,node:d});if(typeof node.id==="string")refs.set(node.id,lid);refs.set(lid,lid);
   }
   const edges=(Array.isArray(data?.edges)?data.edges:[]).map(e=>({from:refs.get(e.source??e.from)??e.source??e.from,to:refs.get(e.target??e.to)??e.target??e.to,kind:e.label??e.data?.kind??e.kind??"edge"}));

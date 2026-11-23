@@ -84,9 +84,10 @@ export class SeatTypingGuard {
       const page=heldMessagePage(this.total,this.scanned??0);if(!page.limit)return;
       const list=await this.json(`/api/seat/held-messages/${encodeURIComponent(this.seat)}?limit=${page.limit}&offset=${page.offset}`,after);
       if(!this.live()||generation!==this.generation)return;
-      this.scanned=(this.scanned??0)+page.limit;
+      if(!Array.isArray(list.items)||list.items.some(item=>typeof item?.outboxId!=='string'))throw new Error('Invalid held-message page');
       const seen=new Set(this.items.map(item=>item.id));
-      this.items.push(...(Array.isArray(list.items)?list.items:[]).slice(0,20).reverse().filter(item=>typeof item.outboxId==='string'&&!seen.has(item.outboxId)).map(item=>({id:item.outboxId,time:heldMessageText(item.tsDispatched,128).text,sender:heldMessageText(item.senderSession??'OpenRig',256).text,summary:heldMessageText(String(item.body??'').split(/\r\n?|\n/)[0],512).text})));
+      this.items.push(...list.items.slice(0,20).reverse().filter(item=>!seen.has(item.outboxId)).map(item=>({id:item.outboxId,time:heldMessageText(item.tsDispatched,128).text,sender:heldMessageText(item.senderSession??'OpenRig',256).text,summary:heldMessageText(String(item.body??'').split(/\r\n?|\n/)[0],512).text})));
+      this.scanned=(this.scanned??0)+page.limit;
     }catch{if(this.live()&&generation===this.generation)this.error='Held messages could not be read. No message was sent or retired.';}
     finally{if(generation===this.generation)this.loading=false;}
   }

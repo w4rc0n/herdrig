@@ -214,8 +214,8 @@ export default class RigView extends View {
   time(value,options={}) { return formatAbsoluteTime(value,{timezone:this.uiTimezone,...options}); }
   init(p, cx) {
     // OpenRigs over Herdr's connection (herdr:// addresses): the page's reads go through the pinned helper on that machine.
-    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, wait: waitWith(cx), appHome, readTextFile, writeTextFile, config: () => this.config,
-      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.view).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") });
+    this.herdr = installHerdrTransport({ execFor: (scope) => execFor({ connectionId: scope }), hcFor: (scope) => hcFor({ connectionId: scope }), machines, appHome, readTextFile, writeTextFile, config: () => this.config,
+      bridgePath: () => attachRelayPath(appHome(), MOD_IDS.view).replace(/rig-attach-relay\.cjs$/, "rig-openrig-transport.cjs") }, cx);
     const routingConfig = (conn) => conn && this.config ? (configOfConnection(this.config, conn) ?? { configInvalid: UNKNOWN_CONNECTION }) : this.config;
     registerRigRouting(cx, (context, conn) => { const cfg = routingConfig(conn); return { shared, setShared, run: runFor(cfg), spaces, panes, terminals, hc: hcFor(cfg), layout, notify, openOverlay:spec=>this.open(spec),config: cfg, currentConfig: () => routingConfig(conn), wait: waitWith(context) }; });
     this.statusMotion = new StatusMotion();
@@ -655,7 +655,7 @@ export default class RigView extends View {
     const config = this.activeConfig(), rigLayout = inRigLayout(); // the connection the page shows; none when it is no longer set up
     if (!config) { notify({ title: "Open TUI", body: UNKNOWN_CONNECTION, level: "warning" }); return; } // never another connection's TUI
     cx.spawn(async (cx) => {
-      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout: rigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r())) }, config);
+      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout: rigLayout, wait: waitWith(cx) }, config);
       if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
     });
   }
@@ -2623,6 +2623,12 @@ export default class RigView extends View {
     if(this.compaction)return this.compaction;
     this.compaction=new SeatCompaction({
       timezone:()=>this.uiTimezone,
+      readUnconfirmed:key=>shared('rig.unconfirmedCompactions')?.[key],
+      writeUnconfirmed:(key,record)=>{
+        const records={...shared('rig.unconfirmedCompactions')};
+        if(record)records[key]=record;else delete records[key];
+        setShared('rig.unconfirmedCompactions',records);
+      },
       identity:config=>JSON.stringify([config?.connectionId,config?.daemonUrl,config?.daemonMachine,config?.openrigHome,config?.rig]),
       currentConfig:config=>configOfConnection(this.config,config?.connectionId),
       cliReason:config=>cliRefusal({...config,person:null}),
@@ -2658,10 +2664,17 @@ export default class RigView extends View {
     return v_flex().id('seat-compaction').gap(5)
       .child(focusTarget(this,cx,'seat-compact-now',this.button(t,'seat-compact-now','Compact now…',()=>controller.review(e),{small:true,primary:Number(n.contextUsage?.usedPercentage)>=85,disabled:!!reason,tooltip:reason??"Ask OpenRig to compact this seat",tip:"Ask OpenRig to compact this seat"}),()=>controller.review(e),el=>el.border_1().border_color(t.accent)))
       .when(!!view.text,el=>el.child(div().id('seat-compaction-status').text_size(12).text_color(e.error?t.blocked:t.muted).child(view.text)))
+      .when(!!view.evidence,el=>el.child(div().id('seat-compaction-evidence').text_size(12).text_color(t.muted).child(view.evidence)))
       .when(!!e.pollError,el=>el.child(div().id('seat-compaction-read-error').text_size(12).text_color(t.blocked).child("Couldn't refresh compaction status. Check again to retry.")))
       .children(view.guidance.map((line,i)=>div().id(`seat-compaction-guidance-${i}`).text_size(12).text_color(t.blocked).child(line)))
       .when(view.cancel,el=>el.child(focusTarget(this,cx,'seat-compact-cancel',this.button(t,'seat-compact-cancel','Cancel…',()=>controller.review(e,true),{small:true,disabled:e.cancelling,tip:'Stop preparation and restore steps still to come'}),()=>controller.review(e,true),el=>el.border_1().border_color(t.accent))))
-      .when(!!(view.text||e.pollError)&&!e.busy&&!e.start&&!e.checking,el=>el.child(focusTarget(this,cx,'seat-compact-check',this.button(t,'seat-compact-check','Check again',null,{small:true,tip:"Check compaction support and read OpenRig's state. Nothing is sent to the seat."}),click=>click.spawn(task=>controller.check(e,task)),el=>el.border_1().border_color(t.accent))));
+      .when(!!(view.text||e.pollError)&&!e.busy&&!e.start&&!e.checking,el=>el.child(focusTarget(this,cx,'seat-compact-check',this.button(t,'seat-compact-check','Check again',null,{small:true,tip:"Check compaction support and read OpenRig's state. Nothing is sent to the seat."}),click=>click.spawn(task=>controller.check(e,task)),el=>el.border_1().border_color(t.accent))))
+      .when(!!view.recovery,el=>{
+        const resendReason=controller.reason(e,true);
+        return el
+          .child(focusTarget(this,cx,'seat-compact-resend',this.button(t,'seat-compact-resend','Send again anyway…',null,{small:true,disabled:!!resendReason,tooltip:resendReason??'Review before sending another request'}),()=>controller.review(e,false,true),node=>node.border_1().border_color(t.accent)))
+          .child(focusTarget(this,cx,'seat-compact-clear',this.button(t,'seat-compact-clear','Clear this',null,{small:true,disabled:e.checking||!!e.review||e.busy,tip:"You've checked the seat yourself. This hides the warning and sends nothing."}),click=>controller.clearRecovery(e,click),node=>node.border_1().border_color(t.accent)));
+      });
   }
   moreButton(t, id, onClick, { tip = "More actions" } = {}) {
     return h_flex().id(id).size(20).rounded(5).items_center().justify_center().flex_none().cursor_pointer().text_color(t.dim)
@@ -3676,13 +3689,17 @@ export default class RigView extends View {
         delete this.specCopyNotes?.[spec.boxKey(s.id)];
         if(synced?.ok&&s.kind==="rig"){
           const preview=this.reloadSpecGraph(cx,s,box,spec),request=box.graphRequest;
-          preview.catch(error=>{
+          const reportPreviewError=message=>{
             if(this.closed||this.specBoxes?.[spec.boxKey(s.id)]!==box||box.graphRequest!==request)return;
-            const message=box.graphError??singleLineText(error?.message??error).slice(0,240);
+            if(!message)return;
             // The task context may have been refused; report without asking it to redraw again.
             try{notify({title:"Couldn't refresh the spec graph",body:message,level:"warning"});}
             catch{console.error(message);}
-          });
+          };
+          preview.then(
+            ()=>reportPreviewError(box.graphError),
+            error=>reportPreviewError(box.graphError??singleLineText(error?.message??error).slice(0,240))
+          );
         }
         // Keys typed while it saved stay: their draft is kept, now against what was written.
         if(box.state){
@@ -3895,10 +3912,9 @@ export default class RigView extends View {
     cx.timer.after(250,next=>{
       if(this.decisionPollPending!==ticket)return;
       this.decisionPollPending=null;
-      if(this.closed)return;
-      const live=next??cx;
-      this.pollSpacesDecision(live);this.pollSpecDecision(live);
-      this.armDecisionPoll(live);
+      if(this.closed||!next)return;
+      this.pollSpacesDecision(next);this.pollSpecDecision(next);
+      this.armDecisionPoll(next);
     });
   }
 
@@ -3922,7 +3938,7 @@ export default class RigView extends View {
     if (!decision && Date.now() < pending.expires) return;
     this.spacesPending = null;
     const rest = { ...decisions }; delete rest[pending.token]; setShared("rig.spacesListDecisions", rest);
-    if (decision === "allow") this.runSpacesChange(cx, pending);
+    if (decision === "allow") cx.spawn(task => this.runSpacesChange(task, pending));
     else { (this.spacesList ??= {}).note = "Nothing was changed."; cx.notify(); }
   }
 
@@ -6597,6 +6613,7 @@ export default class RigView extends View {
   // ---- the header ------------------------------------------------------------------------------------------------
   /** The menu target for what is shown (the header's Actions), or null when it has none. */
   targetFor(cx, entry) {
+    if (entry.connectionIssue) return null;
     if (this.activeConnId() === NO_PAGE_CONNECTION) return null; // a page that names no OpenRig acts for none: no Actions, no reads
     if(entry.section==='topology'&&entry.kind==='assistant'){
       const member=this.hostedMembers(cx)?.members?.find(m=>!m.invalid&&m.seat===entry.session&&m.conn===entry.conn);

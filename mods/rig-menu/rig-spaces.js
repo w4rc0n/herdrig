@@ -719,7 +719,8 @@ export class RigSpaces {
           await ready(); guard(); dropIndex();
           const after = index(), oldTerm = after.byAddr.get(old.terminal);
           const oldPane = (after.panesByTab.get(tab) ?? []).find(p => p.pane === old.pane && p.terminal === old.terminal);
-          if (!oldTerm || !oldPane || !after.ownSet.has(old.terminal) || !after.ownSet.has(next.terminal)
+          const replacementPresent = (after.panesByTab.get(tab) ?? []).some(p => p.pane === next.pane && p.terminal === next.terminal);
+          if (!oldTerm || !oldPane || !replacementPresent || !after.ownSet.has(old.terminal) || !after.ownSet.has(next.terminal)
             || JSON.stringify(after.byAddr.get(next.terminal)?.argv) !== JSON.stringify(argv)
             || after.byAddr.get(next.terminal)?.pid !== (record.pid ?? record.terminal?.pid)
             || after.byAddr.get(next.terminal)?.created_ms !== (record.created_ms ?? record.terminal?.created_ms)

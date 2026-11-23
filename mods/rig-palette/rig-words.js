@@ -48,6 +48,9 @@ export function plainError(error, { where = "OpenRig's machine", what = null, wh
   if (outcomeUnknown || /\bunconfirmed\b|\boutcome\s+is\s+unknown\b|\bnot\s+confirmed\b|\b(?:may|might)\s+(?:still\s+)?(?:not\s+)?have\b|\bdid(?:n't| not)\s+finish\s+in\s+time\b|\bpartly done\b|\bearlier part was recorded\b|\bwrite reached\b|\banswer couldn't be read\b/i.test(detail)) {
     return { text: withoutPaths(detail), detail };
   }
+  if (/\bcx is no longer valid\b/i.test(detail)) {
+    return { text: `Herdrig could not finish this step. Try again. ${toast ? "The exact error is in the log." : "Details has the exact error."}`, detail };
+  }
   // These producers already explain what failed and what still works. Replace only their diagnostic.
   if (toast && /^(?:Needs notifications|Live updates) stopped working\b/.test(detail)) {
     const diagnosticAt = detail.indexOf(": "), recoveryAt = detail.lastIndexOf(". The sidebar ");

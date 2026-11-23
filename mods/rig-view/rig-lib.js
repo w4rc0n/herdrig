@@ -183,14 +183,22 @@ function parseRequestCard(item, body, rowChars) {
     const wrapped = ["**", "__", "_", "`"].map(mark => `${mark}${first}${mark}`).find(prefix => opening.startsWith(prefix));
     const duplicate = sameProse(rowText(firstLine)) === sameProse(headline) ? firstLine
       : wrapped ?? (opening.startsWith(first) ? first : "");
-    if (duplicate) opening = opening.slice(duplicate.length).replace(/^[^\S\n]*(?:\n|$)|^[^\S\n]+/, "");
+    if (duplicate) {
+      const summaryIds = new Set(summary.match(ROW_ID) ?? []);
+      if ((duplicate.match(ROW_ID) ?? []).some(id => !summaryIds.has(id))) {
+        rest = [duplicate, rest].filter(Boolean).join("\n\n");
+      }
+      opening = opening.slice(duplicate.length).replace(/^[^\S\n]*(?:\n|$)|^[^\S\n]+/, "");
+    }
   }
   // The opening is cut to what its box shows (three rows at the card's width), so nothing is hidden: the rest of a cut line
   // and every later line start Details, and the card says how many lines moved, or "More in Details".
-  const cut = cutToRows(opening, REQUEST_OPENING_LINES, rowChars);
+  const strippedOpening = withoutRowIds(opening);
+  const cut = cutToRows(strippedOpening, REQUEST_OPENING_LINES, rowChars);
   const laterLines = rest.split("\n").filter(line => line.trim()).length;
-  if (cut.rest) rest = [cut.rest, rest].filter(Boolean).join("\n\n");
-  opening = withoutRowIds(cut.shown);
+  const openingDetails = strippedOpening !== opening ? opening : cut.rest;
+  if (openingDetails) rest = [openingDetails, rest].filter(Boolean).join("\n\n");
+  opening = cut.shown;
   const openingMoreLines = cut.moreLines + laterLines, openingCut = cut.cut;
   const details = [summary.length > 140 || summaryHadIds ? `Full summary:\n${String(item.summary ?? item.title)}` : "", rest].filter(Boolean).join("\n\n");
   const headings = [...details.matchAll(/^(?:#{1,6}\s+(.+)|\*\*(.+?)\*\*)\s*$/gm)].map(m => requestPlain(m[1] ?? m[2])).slice(0, 3);
@@ -5576,7 +5584,7 @@ function actionableNeedsOf(attentionItems) {
   if (!Array.isArray(attentionItems)) return [];
   let hit = actionableNeedsCache.get(attentionItems);
   if (!hit || hit.length !== attentionItems.length) {
-    hit = { length: attentionItems.length, needs: attentionItems.filter((i) => i && !isUpdateNeed(i) && !["done", "closed", "denied", "canceled", "handed-off"].includes(i.state)) };
+    hit = { length: attentionItems.length, needs: attentionItems.filter((i) => i && !isUpdateNeed(i) && !sweepFinding(i) && !["done", "closed", "denied", "canceled", "handed-off"].includes(i.state)) };
     actionableNeedsCache.set(attentionItems, hit);
   }
   return hit.needs;
@@ -7192,12 +7200,13 @@ export function isLoopbackDaemonUrl(daemonUrl) {
 }
 
 /**
- * The `wait` attachToSeat polls with until herdr has adopted the new tab, built on a context that outlives one host
- * call: the `cx` that `cx.spawn` (or `init`) hands over. A click's own `cx` is valid only for that call and goes stale at
- * its first `await`, so a wait built on it throws and the tab is never named, selected or focused.
+ * Pure polling waits use a task context and must settle even if an unrelated
+ * view drains the preceding promise and then closes.
  */
 export function waitWith(cx) {
-  return (ms) => (typeof cx?.sleep === "function" ? cx.sleep(ms) : new Promise((r) => (cx?.timer ? cx.timer.after(ms, () => r()) : r())));
+  return (ms) => typeof cx?.timer?.after === "function"
+    ? new Promise(resolve => cx.timer.after(ms, resolve, { owner: null }))
+    : cx?.sleep?.(ms) ?? Promise.resolve();
 }
 
 /**

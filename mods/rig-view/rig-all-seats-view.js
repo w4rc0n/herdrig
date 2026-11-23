@@ -7,7 +7,7 @@ import {assistantEntry} from './rig-connected-assistants-view.js';
 import {pageBodyLayout} from './rig-page-layout.js';
 
 /** Uses the page's existing row keys, marks, Attach and seat menu. No data reads. */
-export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,openSpecs,orderMap={},hostedMembers=null}){
+export function allSeatsView(page,t,_cx,models,attention,{navigate,menu,attach,openSpecs,orderMap={},hostedMembers=null}){
  const padding=pageBodyLayout(page.pageWidth).padding;
  const width=(page.pageWidth??960)-padding*2;
  const model=allSeatsModel(models,attention,{order:page.allSeatsOrder,pulse:page.pulseFilter,filter:page.filter??'',orderMap,hostedMembers});
@@ -15,7 +15,7 @@ export function allSeatsView(page,t,cx,models,attention,{navigate,menu,attach,op
  const cell=(id,text,size=120,color=t.foreground)=>div().when(!!id,el=>el.id(id)).min_w(120).when(!!size,el=>el.w(size).flex_none()).when(!size,el=>el.flex_1())
   .truncate().text_size(12).text_color(color).tooltip(String(text??'')).child(text??'');
  const link=(id,rig)=>cell(id,rig.name,model.rigWidth,t.muted).tooltip(id.startsWith(`all-seat-rig-`)?`Open rig ${rig.name}`:rig.name).cursor_pointer().hover(el=>el.underline()).on_click((_e,cx)=>{cx?.stop_propagation?.();navigate({section:'topology',kind:'rig',rigId:rig.id,conn:rig.conn,name:rig.name});});
- const hover=key=>(on,next)=>{if(on)page.hoveredAllSeat=key;else if(page.hoveredAllSeat===key)page.hoveredAllSeat=null;(next??cx)?.notify?.();};
+ const hover=key=>(on,next)=>{if(on)page.hoveredAllSeat=key;else if(page.hoveredAllSeat===key)page.hoveredAllSeat=null;next?.notify?.();};
  const row=r=>{
   if(r.assistant){
    const m=r.assistant,target=assistantTarget(m,r.rig),entry=assistantEntry(m,r.rig),selected=page.pageSel===r.key,active=selected||page.hoveredAllSeat===r.key,id=`${m.conn}-${m.seat}`,open=()=>navigate(entry);
