@@ -3,14 +3,15 @@
 // Modified for herdrig: OpenRig seats and asks instead of herdr agents; see Third-party code in README.md.
 // This file is licensed under the Apache License, Version 2.0 (LICENSES/herdr-app-Apache-2.0.txt).
 import { qualifyKey } from "./rig-connections.js";
-import { needsToastFor, diffNeedsNotifications, findAttachedSeat, seatOrigin, statusMarkElement, isUpdateNeed, requestHeadline, statusNeedHalo, resolveAskerSeat } from "./rig-lib.js";
+import { needsToastFor, diffNeedsNotifications, findAttachedSeat, seatOrigin, statusMarkElement, isUpdateNeed, requestHeadline, statusNeedHalo, resolveAskerSeat, sweepFinding, checkLabel } from "./rig-lib.js";
 
 export const PRIORITY_GROUPS = [
-  { rank: 4, label: "Needs you", tone: "blocked" }, { rank: 3, label: "Done", tone: "ansi4" },
+  // A seat whose tmux server stopped answering: right after Needs you, in the needs colour, but its own group (it isn't a request).
+  { rank: 4, label: "Needs you", tone: "blocked" }, { rank: 3.5, label: "Unreachable", tone: "blocked" }, { rank: 3, label: "Done", tone: "ansi4" },
   { rank: 2, label: "Working", tone: "ansi2" }, { rank: 1, label: "Idle", tone: "muted" },
   { rank: 0, label: "Not reported", tone: "dim" },
 ];
-const RANK = { needs: 4, done: 3, working: 2, idle: 1, unreported: 0 };
+const RANK = { needs: 4, gone: 3.5, done: 3, working: 2, idle: 1, unreported: 0 };
 const excluded = (seat) => seat.terminal || ["stopped", "detached", "exited"].includes(seat.sessionStatus) || ["terminal", "stopped", "detached", "exited", "unknown"].includes(seat.status);
 const needs = (seat) => !excluded(seat) && ["needs_input", "attention_required", "failed"].includes(seat.status);
 const helperStatus = (child) => ["blocked", "error", "needs_input"].includes(child.status) ? "needs" : child.status === "working" ? "working" : "idle";
@@ -73,8 +74,9 @@ export class NeedsTracker {
       if (!ask?.id || isUpdateNeed(ask) || ["done", "closed", "denied", "canceled", "handed-off"].includes(ask.state)) continue;
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
       const owner = seatOf(ask, session) ?? seatOf(ask, resolveAskerSeat(session, topology.filter((r) => sameConn(ask, r))).seat?.session);
-      if (owner && !excluded(owner.seat)) owner.asks.push(ask);
-      else rows.push({ key: qualifyKey(ask.conn, `ask:${ask.id}`), kind: "ask", ask, seat: owner?.seat, rig: owner?.rig, name: requestHeadline(ask), helpers: [], asks: [ask] });
+      const check = sweepFinding(ask);
+      if (!check && owner && !excluded(owner.seat)) owner.asks.push(ask);
+      else rows.push({ key: qualifyKey(ask.conn, `ask:${ask.id}`), kind: "ask", ask, check, seat: owner?.seat, rig: owner?.rig, name: check ? checkLabel(check, attention) : requestHeadline(ask), helpers: [], asks: [ask] });
     }
     for (const row of rows) {
       if (row.kind === "ask") {
@@ -82,7 +84,9 @@ export class NeedsTracker {
         continue;
       }
       const s = row.seat;
-      const raw = s.status==="unknown" ? "unreported" : excluded(s) ? "idle" : needs(s) || row.asks.length ? "needs" : ["active", "blocked"].includes(s.status) ? "working" : "idle";
+      // A request still needs the person whatever its seat's terminal says; otherwise a seat whose tmux server is gone has its own group.
+      const raw = s.status==="unknown" ? "unreported" : row.asks.length ? "needs" : s.status === "terminal_gone" ? "gone"
+        : excluded(s) ? "idle" : needs(s) ? "needs" : ["active", "blocked"].includes(s.status) ? "working" : "idle";
       const prev = Object.hasOwn(this.changed, row.key) ? this.changed[row.key] : null;
       // Attaching viewers can briefly trip window sampling. Require a working stretch or stronger evidence.
       const worked = prev?.s === "working" && (prev.strong === true || (Number.isFinite(prev.at) && now - prev.at >= 10000));
@@ -102,7 +106,9 @@ export class NeedsTracker {
       row.since = record.at;
       if (row.asks.length) row.since = Math.max(row.since, ...row.asks.map((a) => Date.parse(a.at ?? a.tsCreated ?? "") || 0));
       if (!excluded(s)) row.rank = Math.max(row.rank, ...row.helpers.map((c) => RANK[helperStatus(c)]));
-      row.mark = row.rank === 4 ? "needs_input" : row.rank === 3 ? "completed" : row.rank === 2 ? (s.status==='blocked'?'blocked':"active")
+      // No age on a terminal-gone row: OpenRig's `since` is when it recorded the outage, which a daemon restart resets.
+      row.noAge = row.rank === RANK.gone;
+      row.mark = row.rank === 4 ? "needs_input" : row.rank === RANK.gone ? "terminal_gone" : row.rank === 3 ? "completed" : row.rank === 2 ? (s.status==='blocked'?'blocked':"active")
         : ["stopped", "detached", "exited"].includes(s.sessionStatus) ? s.sessionStatus : s.terminal ? "terminal" : s.status;
       row.focused = looking;
       Object.defineProperty(this.changed, row.key, { value: record, writable: true, enumerable: true, configurable: true });
@@ -142,7 +148,7 @@ export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
   return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
 }
 
-export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, askOwner, machineOf = null, now = Date.now() }) {
+export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, askOwner, machineOf = null, now = Date.now(), staleTip = null }) {
   const { div, svg, h_flex } = ui;
   const out = [];
   const many = rows.filter((r) => r.kind === "seat").length > 12;
@@ -153,8 +159,9 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
     register({ key, foldKey: key, expandable: true, isOpen: expanded, parentKey: "branch:topology" });
     out.push(h_flex().id(key).px(16).h(30).pt(8).gap(6).items_center().text_size(11).font_medium().cursor_pointer()
       .on_click((_e, cx) => fold(key, !expanded, cx))
-      .child(div().text_color(t[group.tone] ?? t.dim).child(group.label))
-      .child(div().id(`priority-count-${group.rank}`).text_color(t.dim).child(String(group.rank === 4 && requestCount !== null ? requestCount : members.length)))
+      // After a failed read the group words and counts are the last known ones: dimmed, with when OpenRig said them.
+      .child(div().id(`priority-label-${group.rank}`).text_color(staleTip ? t.dim : t[group.tone] ?? t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(group.label))
+      .child(div().id(`priority-count-${group.rank}`).text_color(t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(String(group.rank === 4 && requestCount !== null ? requestCount : members.length)))
       .child(div().flex_1()).child(svg(iconOf(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim)));
     if (!expanded) continue;
     for (const row of members) {
@@ -169,17 +176,18 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
         .hover((el) => el.bg(t.hover))
         .on_hover((on, cx) => hover(on ? row.key : null, cx))
         .on_click((event,cx) => open(row,event,cx)).on_mouse_down("right", () => menu(row))
-        .child(svg(iconOf(row.kind === "ask" ? "rig-bell" : row.seat.terminal ? "rig-terminal-prompt" : "rig-seat")).size(13).flex_none().text_color(t.muted))
+        .when(!row.check, el => el.child(svg(iconOf(row.kind === "ask" ? "rig-bell" : row.seat.terminal ? "rig-terminal-prompt" : "rig-seat")).size(13).flex_none().text_color(t.muted)))
         .child(h_flex().flex_1().min_w(0).gap(4).text_size(12.5)
           .child(div().min_w(0).max_w(130).truncate().text_color(row.rank === 0 ? t.dim : row.rank === 1 ? t.muted : t.foreground).tooltip(String(row.name??"")).child(row.name))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).tooltip(context).child(`· ${context}`)))
+          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).tooltip(row.check ? "OpenRig check" : context).child(row.check ? "· check" : `· ${context}`)))
         .when(row.helpers.length > 0, (el) => el.child(div().id(`priority-fold-${row.key}`).px(3).h(18).text_color(t.dim)
           .on_click((_e, cx) => { cx.stop_propagation(); fold(helperKey, !helpersOpen, cx); })
           .child(svg(iconOf(helpersOpen ? "chevron-down" : "chevron-right")).size(11))
           .when(!helpersOpen, (el) => el.child(div().text_size(11).child(String(row.helpers.length))))))
-        .when(row.mark==='blocked',el=>el.child(div().id(`priority-status-${row.key}`).flex_none().text_size(11).text_color(t.blocked).child('blocked')))
-        .when(hovered !== row.key, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(priorityDuration(now - row.since))))
-        .child(mark?mark(row):needsMark(ui, t, row.mark, true, iconOf)));
+        .when(Boolean(row.seat?.isRepresentative), el => el.child(div().flex_none().text_size(10.5).text_color(t.dim).tooltip("This rig's lead, as OpenRig reports it.").child("Lead")))
+        .when(row.mark==='blocked',el=>el.child(div().id(`priority-status-${row.key}`).flex_none().text_size(11).text_color(staleTip ? t.dim : t.blocked).when(Boolean(staleTip), (x) => x.tooltip(staleTip)).child('blocked')))
+        .when(hovered !== row.key && !row.noAge, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(priorityDuration(now - row.since))))
+        .when(!row.check, el => el.child(mark ? mark(row) : needsMark(ui, t, row.mark, true, iconOf))));
       if (helpersOpen) for (const [i, child] of row.helpers.entries()) {
         const childKey = `priority-helper:${child.address}`;
         register({ key: childKey, expandable: false, parentKey: row.key, helper: child });

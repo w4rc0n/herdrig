@@ -86,9 +86,11 @@ function migrateDismissalRecord(r, ownerConn, now) {
  */
 export function boundedDismissalRequest(request, after, timeoutMs = 15000) {
   return (req) => new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (fn, result) => { if (!settled) { settled = true; fn(result); } };
-    after(timeoutMs, () => finish(reject, new Error("OpenRig dismissal request timed out; the close was not confirmed.")));
+    let settled = false, timer = null;
+    const cancel = () => { try { timer?.cancel?.(); } catch (_) {} };
+    const finish = (fn, result) => { if (!settled) { settled = true; cancel(); fn(result); } };
+    timer = after(timeoutMs, () => finish(reject, new Error("OpenRig dismissal request timed out; the close was not confirmed.")));
+    if (settled) cancel(); // a host/test adapter may fire a deadline synchronously
     Promise.resolve().then(() => request(req)).then((r) => finish(resolve, r), (e) => finish(reject, e));
   });
 }

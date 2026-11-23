@@ -5,15 +5,18 @@ import {hostWorkerPlan,workerPad} from "./rig-worker-views.js";
 import {machineId,machineLocalId} from "./rig-remote.js";
 import {rigOrigin,resolveRigSpace,unconfirmedRigSpace,unconfirmedSpaceReason,openRigSpaceContext,sameDaemonOrigin,hostLabelValue,prepareRigSpaceAdoption} from "./rig-space-context.js";
 import {rigSpaceRelocation,localGridPreflight} from "./rig-spaces.js";
-import {LEGACY_CONNECTION_ID} from "./rig-connections.js";
+import {workerConnectionId as own,workerIdentity as identity,workerViewKey as keyFor} from './rig-worker-identity.js';
 
 const list=(host,key)=>(typeof host[key]==="function"?host[key]():host[key])??[];
 // Another connection's worker views are its own even when it shares an address spelling; the legacy connection's keys are the old ones
 // (stored views stay found).
-const own=config=>config?.connectionId&&config.connectionId!==LEGACY_CONNECTION_ID?[config.connectionId]:[];
-const identity=config=>JSON.stringify([rigOrigin(config?.daemonUrl),config?.daemonMachine,config?.rig??null,...own(config)]);
-const keyFor=(config,view)=>JSON.stringify([rigOrigin(config?.daemonUrl),config?.daemonMachine,view,...own(config)]);
-export {identity as workerIdentity,keyFor as workerViewKey};
+// QuickJS needs local exports here, rather than re-exported imported bindings.
+export function workerIdentity(config){return identity(config);}
+export function workerViewKey(config,view){return keyFor(config,view);}
+export function storedWorkerConfig(config){
+  return{daemonUrl:config.daemonUrl,daemonMachine:config.daemonMachine,...(config.expectedHostId?{expectedHostId:config.expectedHostId}:{}),...(config.rig?{rig:[...config.rig]}:{}),
+    ...(own(config).length?{connectionId:config.connectionId,...(config.openrigHome?{openrigHome:config.openrigHome}:{})}:{})};
+}
 const nonce=()=>`${Date.now().toString(36)}-${Math.random().toString(36).slice(2,9)}`;
 const addr=terminal=>terminal?.address??terminal?.terminal;
 // Herdr's display/seen labels change during ordinary adoption. Bind only ownership labels.
@@ -56,7 +59,7 @@ const inactive=node=>!node||node.sessionStatus!=="running"||["idle","idle-at-pro
 /** The worker view's screen scan (is a seat tile's viewer ended?): one budget for all its reads, and how many run at once. */
 const SCAN_BUDGET_MS=15000,SCAN_READERS=4;
 export class HostWorkerViews{
-  constructor(host){this.host=host;this.pending=new Map();this.entries=new Map(Object.entries(host.loadViews?.()??{}));this.wakeVersion=0;}
+  constructor(host){this.host=host;this.generation=host.generation?.();this.pending=new Map();this.entries=new Map(Object.entries(host.loadViews?.()??{}));this.wakeVersion=0;}
   sync(config,view,options={}){
     if(typeof view!=="string"||!view.trim()||view.length>256||/[\u0000-\u001f\u007f-\u009f]/.test(view))
       return Promise.resolve({ok:false,reason:"Choose a valid worker view."});
@@ -80,7 +83,7 @@ export class HostWorkerViews{
   }
   // The live settings of THIS config's own connection (with several OpenRigs, another connection's change leaves this one's work alone).
   current(config){
-    if(this.closed||!rigOrigin(config.daemonUrl)||this.host.currentConfig&&identity(this.host.currentConfig(config))!==identity(config))
+    if(this.closed||this.host.generation&&this.host.generation()!==this.generation||!rigOrigin(config.daemonUrl)||this.host.currentConfig&&identity(this.host.currentConfig(config))!==identity(config))
       throw new Error("OpenRig's connection changed. The worker view was left in place.");
   }
   // Every Herdr call goes through the synced connection's own send scope when the host offers one (an unscoped send is refused with several OpenRigs).
@@ -198,8 +201,7 @@ export class HostWorkerViews{
         this.entries.delete(key);await this.save();return {ok:true,closed:true};
       }
       // Another connection's entry keeps its own id and home, so its identity (and its events) stay its own; the legacy entry keeps its old shape.
-      const entry={...previous,view,config:{daemonUrl:config.daemonUrl,daemonMachine:config.daemonMachine,...(config.rig?{rig:[...config.rig]}:{}),
-        ...(own(config).length?{connectionId:config.connectionId,...(config.openrigHome?{openrigHome:config.openrigHome}:{})}:{})},target:options.target??previous?.target??null,
+      const entry={...previous,view,config:storedWorkerConfig(config),target:options.target??previous?.target??null,
         following:options.following??previous?.following??plan.kind==="following",
         pruneMs:options.pruneMs??previous?.pruneMs??0,planId:plan.planId,name:plan.name,missing:plan.missing,
         members:plan.pages.flatMap(p=>p.tiles).filter(t=>!t.blank).map(({session,label,runtime,readOnly})=>({session,label,runtime,readOnly})),
@@ -369,7 +371,7 @@ export class HostWorkerViews{
       return {ok:false,paused:!!previous,reason:errorDiagnostic(error),kept:true};
     }
   }
-  async save(){await this.host.saveViews?.(Object.fromEntries(this.entries));this.host.changed?.(Object.fromEntries(this.entries));}
+  async save(){if(this.closed||this.host.generation&&this.host.generation()!==this.generation)return;await this.host.saveViews?.(Object.fromEntries(this.entries));if(!this.closed&&(!this.host.generation||this.host.generation()===this.generation))this.host.changed?.(Object.fromEntries(this.entries));}
   schedule(){
     const version=++this.wakeVersion,now=this.host.now?.()??Date.now(),due=[],configs=new Map();
     for(const entry of this.entries.values())if(entry.following&&!entry.paused&&entry.pruneMs)

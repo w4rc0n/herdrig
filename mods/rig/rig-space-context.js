@@ -1,4 +1,5 @@
 import { errorDiagnostic } from "./rig-words.js";
+import { connectionRows } from "./rig-connections.js";
 import { publishedUnder, gateGeneration, gateSameConfig, gateIdentity, gatedFetch } from "./rig-gate.js";
 import { decodeRelayToken } from "./rig-relay-payload.js";
 // Space identity and sidebar size state use public lists and labels, never display names.
@@ -327,7 +328,9 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
     // Relabelling the space cannot change a running relay's destination. Report the actual argv, never a saved argv label.
     const relayOrigin=rigOrigin(machine?identity.daemonUrl:config.daemonUrl);
     const viewerNames=new Map(),display=value=>typeof value==='string'?value.replace(/[\x00-\x1f\x7f]/g,' ').trim().slice(0,160):'';
-    const published=host.shared?.('rig.data'),ownPublished=publishedUnder(config,published)?(published?.byConnection?.[config.connectionId]??((config.connections?.length??0)<=1?published:null)):null;
+    const published=host.shared?.('rig.data'),singleConnection=(config.connections?.length??0)<=1;
+    const ownPublished=publishedUnder(config,published)&&(singleConnection||published?.byConnection)
+      ?(connectionRows(published,config.connectionId)??(singleConnection?published:null)):null;
     const ownTopology=(host.topology?.()??ownPublished?.topology??[]).filter(rig=>!rig.conn||rig.conn===config.connectionId);
     const nodes=[...Object.values(ownPublished?.nodesByRig??{}).flat(),...ownTopology.flatMap(rig=>Array.isArray(rig.seats)?rig.seats:(rig.pods??[]).flatMap(pod=>pod.seats??[]))]
       .filter(node=>!node.conn||node.conn===config.connectionId);
@@ -532,8 +535,9 @@ export function topologyRig(host,refs,config){
   // The sidebar's rows vouch only for the daemon they were read from: the same gate as every other reader of `rig.data` (a refused list or no config reads nothing; other settings' rows are not used).
   const published=host.topology?null:host.shared?.("rig.data");
   const conn=config?.connectionId??null,multi=(config?.connections?.length??0)>1;
-  const ownPublished=conn&&published?.byConnection?.[conn]?.topology?published.byConnection[conn].topology:published?.topology;
-  const raw=host.topology?.()??(config&&!config.configInvalid&&publishedUnder(config,published)?ownPublished:null)??[];
+  const scoped=conn?connectionRows(published,conn):published;
+  const ownTopology=scoped?.topology??(scoped?.answering===false?null:published?.topology);
+  const raw=host.topology?.()??(config&&!config.configInvalid&&publishedUnder(config,published)?ownTopology:null)??[];
   const topology=conn?raw.filter(rig=>rig?.conn?rig.conn===conn:!multi):raw;
   const wanted=(refs??[]).filter(Boolean);
   return topology.find(rig=>wanted.some(ref=>rig.id===ref||rig.name===ref))??null;

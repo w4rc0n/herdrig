@@ -1,5 +1,5 @@
 import { errorDiagnostic } from "./rig-words.js";
-import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, rigSeatServers, layoutHasMod, MOD_IDS, relayIdentity } from "./rig-lib.js";
+import { buildAttachRelayArgv, isValidSessionName, tmuxServerArgsFrom, rigSeatServers, layoutShowsMod, MOD_IDS, relayIdentity } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure } from "./rig-remote.js";
 import { commandFor, operatorCommandFor } from "./rig-connections.js";
 import { gatedOperationOrRefusal } from "./rig-gate.js";
@@ -15,7 +15,7 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
   if (!isValidSessionName(session)) return { ok: false, reason: "The seat has no valid session address." };
   if (["stopped", "departed", "failed"].includes(seat.status) && !seat.sessionAlive && !seat.attachable) return { ok: false, reason: "Stopped: seat has no running session to attach." };
   if (!host.prepareRemote) {
-    if (typeof host.layout === "function" && layoutHasMod(host.layout(), MOD_IDS.sidebar)) {
+    if (!host.routeOwner && typeof host.layout === "function" && layoutShowsMod(host.layout(), MOD_IDS.sidebar)) {
       host.run(options.operator || session === "operator-agent@kernel" ? operatorCommandFor(config) : commandFor("rig.attach", config, session));
       return { ok: true, routed: true };
     }

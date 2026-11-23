@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.4
+Version: v0.5.6
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -50,6 +50,8 @@ The Rig palette: jump to any rig, seat or page from the keyboard.
   with a quiet note in Configuration; exact timestamps include their numeric offset. Relative ages are unchanged.
 - **Seat now lines:** visible screen narration and tool status beside rig rows, with selectable cleaned lines on
   hover and on the seat page. Drafts, incoming messages and terminal seats are excluded; ambiguous input stays blank.
+- **Quiet while I type:** an agent seat's menu can keep OpenRig's reminders out of its pane. Its Activity page shows
+  the typing guard and held messages; held messages are read-only and never replayed when the guard is turned off.
 - **Calm status marks:** working dots stay visible without continuous animation; a seat starting work or a new
   request gets one brief pulse. Action spinners still show work in progress.
 
@@ -58,11 +60,16 @@ The Rig palette: jump to any rig, seat or page from the keyboard.
 - **Sidebar tree** with six branches: **Topology** (host, rig, pod, seat, helper), **Specs**, **Scopes**,
   **Terminals**, **Needs** and **System**, each seat with its status and context usage.
 - **Spaces list and layout:** open **System → Layout** in the sidebar or on the System page to choose Herdr's Spaces list, herdrig's list, or both.
+- **Configuration:** Pages with more than 30 settings open one category at a time. A category or search shows up to 40 settings. Rows you are editing, selecting or reviewing stay visible, and counts show how many more settings there are. Use the filter to find another setting, or navigate category headers with Enter, Space and the arrow keys. Small pages stay expanded.
 - **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
   OpenRig reports.
 - **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs show pod and seat
-  routes, hover/keyboard selection and briefly lit handoff paths. Dense edges group by pod; the text Edges list stays
-  available. Saved previews come from your connected OpenRig server, including a host-to-box tunnel.
+  routes, hover/keyboard selection and briefly lit handoff paths. A working task line pulses green through short idle
+  pauses, then turns dashed after a 15-second grace period. A seat that needs you or is blocked has a steady amber line
+  with a red needs-you chip where there is room to show it.
+  The legend explains the lines on screen. Hover a task line for summaries and ages. Idle minutes update on redraw
+  after the graph sees the seat stop working. Dense edges group by pod, and the text Edges list stays available.
+  Saved previews come from your connected OpenRig server, including a host-to-box tunnel.
   Set `"reducedMotion": true` in `<appHome>/openrig/config.json` to skip entrance, fades and status pulses.
 - **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
   questions, or reply in your own words), with quiet hours and modes in **System → People**.
@@ -120,17 +127,24 @@ Check the `Version:` line in the README you copied, or open System and read **He
   It reads live state; write requests follow your actions:
   - a Decision Card act, or dismissal of your queue updates after the 10-second Undo window;
   - a usage refresh;
+  - a restore-plan preview (`POST /api/up` with `plan: true`) when you open **Resume rig**;
   - spec validation and library sync, when you save a spec or copy one to the library; whole-folder Copy & edit
     also renames the new library copy, including when resuming an unfinished copy.
   - a per-setting save or reset in System → Configuration. Saved boot settings may still need a daemon restart;
     Herdrig never restarts OpenRig.
 
   With a configured Herdr machine, `hc` also carries approved helper commands and spec content to that machine.
+- **CLI address:** Herdrig clears inherited `OPENRIG_URL`, `OPENRIG_HOST`, `OPENRIG_PORT` and the corresponding
+  legacy `RIGGED_*` address variables. Pin a custom address in Herdrig’s connection settings. Otherwise the CLI
+  discovers the daemon from the selected OpenRig home.
 - **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**); for Attach, `hc` starts `node` on the
   mod's own `rig-attach-relay.cjs`, which runs `tmux attach-session -t =<session>` directly, with no shell, for a
   session name OpenRig makes; `hc` also opens the TUI tab. For the local spec editor, `printenv OPENRIG_HOME` and `realpath`; for Add a machine, `test -d` to check whether a typed OpenRig home folder exists here.
   On a configured machine, pinned helpers run through `hc exec`; spec content travels on stdin, without staging
   a remote transfer file. Helper installation and verification use that machine's ordinary file and identity tools.
+  Seat compaction probes and runs OpenRig's `rig compact` commands. **Change model / harness** uses
+  `node rig-model-catalog.cjs` to read Codex's local cache or query the runtime with `claude --help`,
+  `pi --list-models`, or `omp models --json --no-extensions`.
 - **Files:** it reads `<appHome>/openrig/config.json` (optional: your OpenRig name), `<appHome>/openrig/state.json`,
   the saved layout files used to discover old views, `<appHome>/mods/spaces/main.js` for compatibility, and the
   spec and slice files you open in its viewer. Connection and layout actions also read and write `config.json`,
@@ -139,8 +153,11 @@ Check the `Version:` line in the README you copied, or open System and read **He
   you edit and save in its spec editor. Local edits are limited to this machine's spec folders, with symlinks resolved:
   OpenRig's spec library `<OpenRig home>/specs`, and `workspace.specs_root` from the local `rig`. The home is
   `openrigHome` if you set it, else `OPENRIG_HOME` in Herdr's environment, else `~/.openrig`, so a default install
-  edits with no setup. A link out of those folders, or a path only the daemon names, is refused. It reads none of
-  OpenRig's own files.
+  edits with no setup. A link out of those folders, or a path only the daemon names, is refused.
+  **Add this computer** reads `<openrigHome>/daemon.json` to check the daemon's PID and port.
+  **Change model / harness** reads `<accountHome>/models_cache.json` for Codex and watches its containing folder
+  while the catalog is open. The account home comes from OpenRig's seat status. The helper checks that the
+  opened cache is a regular file owned by the current user and no larger than 1 MiB before reading its contents.
 
   Remote saves instead use the configured machine's own resolved user spec folders. Separate permission names
   those folders, the account and the spec helper's checksum; a changed folder or helper asks again. The helper
@@ -157,6 +174,26 @@ with no shell, and attaches only to session names OpenRig makes.
 
 Earlier versions' **Copy & edit** for a spec could read a file the OpenRig daemon named on your machine and send it
 to the daemon. This version copies only the spec text OpenRig served.
+
+## Quiet while I type
+
+Choose **Quiet while I type** in an agent seat's menu or its page's **⋯** menu. OpenRig's own reminders arrive as queue
+rows instead of typing into that seat. Messages people and agents deliberately send still type, but never over a draft.
+Reminders will not wake the seat while this is on. A pending change says that it waits for the current operation to finish.
+Terminal seats keep OpenRig's own default and do not offer this control.
+
+If another typing-guard mode was set outside Herdrig, replacing it asks first. Turning Quiet off later selects **off**;
+it does not restore the previous mode. A failed or unconfirmed change is reported, without an automatic retry.
+
+The seat's **Activity → CONTEXT** card shows its guard and held count. Held messages appear below it, newest first, with
+**Show more** for older messages and **Refresh** to read the newest list again. Select a row to read its body as literal
+plain text. Displayed bodies are limited to 64 KiB and 400 lines. **Copy message** copies the whole sanitized message
+(up to 1 MiB); its label warns when the copy includes hidden lines or text. Nothing is replayed, sent or copied automatically.
+Turning the guard off does not deliver them. Released OpenRig 0.7.20/0.7.21 requires a seat identity to retire a held
+message: use `rig seat retire-held-message` from a seat. Herdrig does not impersonate one and offers no Retire button.
+
+The control is disabled when OpenRig does not advertise the required level or its status cannot be read. The page refreshes a shown seat's status at most once per minute while
+the sidebar supplies fresh data; the sidebar does not poll every seat for this feature.
 
 ## Worker views
 
@@ -193,6 +230,13 @@ Remote Seats use the verified relay on the configured machine; only each tile's 
 
 Herdrig can show several OpenRigs: one on this computer and one on each Herdr machine where you run OpenRig.
 
+Rig pages follow their connection id; worker views follow their destination. If you edit connection A's address,
+an open Rig page reads whatever OpenRig A now points at. A rig id may no longer exist there, while a same-named
+seat may exist on the new OpenRig. No action is sent just because the address changed. Existing worker tiles
+stay with their original destination. If a connection id disappears, Herdrig moves its pages and worker views
+only when the recorded destination matches one configured connection uniquely; otherwise it explains how to
+choose a connection or reopen the view.
+
 **Adding a machine.** When you open a space on a Herdr machine that has no OpenRig connection yet, Herdrig looks
 there once. If OpenRig answers, the note under the sidebar header says "OpenRig also runs on `<machine>`. Show its
 rigs here too?" with **Add `<machine>`…** and **Not now**. This works with one OpenRig or several. If nothing
@@ -219,6 +263,11 @@ With two or more OpenRigs, **System › Connections** lists each one with its st
 helper is approved, and its OpenRig home, plus **Add a machine…** at the end. **Remove…** asks first, then takes that
 OpenRig's rigs and requests out of the sidebar. Its spaces and tiles stay as they are, and nothing on that machine
 changes.
+
+If this computer was removed from the list, choose **This computer** in **Add a machine…**, or **Add it…** beside
+"This computer isn't connected" in Connections. Give its OpenRig home, choose **Check**, then confirm the address,
+home and host before **Add this computer**. This runs only local checks and appends one connection; it installs no
+helper and leaves the other connections, spaces and tiles in place.
 
 Connections are saved in `<appHome>/openrig/config.json` as a `connections` list. Each entry has an `id`, the
 `machine` (empty for this computer), the `daemonUrl` this computer uses to reach it, and its `openrigHome`: a folder

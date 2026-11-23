@@ -1,4 +1,5 @@
 import { errorDiagnostic } from "./rig-words.js";
+import { tileTitle, gridViewerIdentity, gridViewerPayload } from "./rig-tile-title.js";
 // Rig-owned viewer grids. Only Herdr's public commands, terminal labels and live lists are used.
 import { isValidSessionName, isLoopbackDaemonUrl, tmuxServerArgsFrom, serverArgsRefusal, base64EncodeUtf8, rigSeatServers } from "./rig-lib.js";
 import { machineId, machineLocalId, remoteFailure, goodHome, herdrIdentityOf } from "./rig-remote.js";
@@ -12,6 +13,8 @@ const origin = (config) => String(config?.daemonUrl ?? "").replace(/\/$/, "");
 const belongsToOrigin = (l, rigName, expectedOrigin) => l["herdr-openrig.space"] === "1"
   && l["herdr-openrig.rig"] === rigName && expectedOrigin !== null && rigOrigin(l["herdr-openrig.origin"]) === expectedOrigin;
 const belongs = (t, rig, url) => belongsToOrigin(labels(t), rig.name, rigOrigin(url));
+/** A grid tile is live only while it runs the viewer its labels recorded; after a Herdr restart it comes back as a shell (labelled, not live). */
+export const liveGridTile = (t) => { const v = labels(t)["herdr-openrig.viewer-argv"]; return Boolean(v) && v === JSON.stringify(t?.argv); };
 const shell = (t, configured) => Array.isArray(t.argv) && (
   Array.isArray(configured) && configured.length > 0 && JSON.stringify(t.argv) === JSON.stringify(configured)
   || t.argv.length === 1 && /(?:^|\/)(?:sh|bash|dash|zsh|fish|ksh)$/.test(t.argv[0]));
@@ -57,7 +60,7 @@ function buildGridIndex(host, rig, expectedOrigin, machine) {
         let bucket = claimedBySpace.get(spId);
         if (!bucket) { bucket = []; claimedBySpace.set(spId, bucket); }
         bucket.push(t);
-        if (viewerArgv === JSON.stringify(t.argv)) ownSet.add(a);
+        if (liveGridTile(t)) ownSet.add(a);
       }
     }
   }
@@ -117,7 +120,7 @@ export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome,
     throw new Error("Couldn't confirm this machine: OpenRig didn't report its own host ID. Refresh before opening a rig space.");
   }
   if (!local(rig.host)) throw new Error("This rig's seats run on another machine; rig spaces need their tmux here.");
-  const seats = (rig.pods ?? []).flatMap((p) => p.seats ?? []).filter((s) => !["stopped", "departed", "failed", "starting"].includes(s.status));
+  const seats = (rig.pods ?? []).flatMap((p) => p.seats ?? []).filter((s) => !["stopped", "departed", "failed", "starting", "terminal_gone"].includes(s.status)); // terminal_gone: its tmux server isn't answering
   const tiles = seats.map((s) => {
     if (!local(s.host)) throw new Error("This rig's seats run on another machine; rig spaces need their tmux here.");
     if (s.native) throw new Error("This grid needs tmux seats on this machine; use Attach for native Herdr seats.");
@@ -125,15 +128,16 @@ export function rigGridPlan(rig, padPath, { selfHostId, viewerPath, openrigHome,
     const flags = tmuxServerArgsFrom(s.tmuxAttachCommand, s.session);
     if (!flags || !s.tmuxAttachCommand) throw new Error(serverArgsRefusal(s.tmuxAttachCommand, s.session));
     if (remote && (!goodHome(remoteViewer?.node) || !goodHome(remoteViewer?.path))) throw new Error("The remote grid relay has not been prepared and verified. No viewer was started.");
-    const argv = remote ? [remoteViewer.node, remoteViewer.path, base64EncodeUtf8(JSON.stringify({ mode: "grid", session: s.session, serverArgs: flags }))]
-      : viewerPath ? ["node", viewerPath, base64EncodeUtf8(JSON.stringify({ session: s.session, serverArgs: flags, openrigHome }))]
+    const title = tileTitle(s,{label:s.session});
+    const argv = remote ? [remoteViewer.node, remoteViewer.path, base64EncodeUtf8(JSON.stringify({ mode: "grid", session: s.session, serverArgs: flags, title }))]
+      : viewerPath ? ["node", viewerPath, base64EncodeUtf8(JSON.stringify({ session: s.session, serverArgs: flags, openrigHome, title }))]
       : ["env", "-u", "TMUX", "TERM=xterm-256color", "tmux", ...flags, "attach-session", "-t", `=${s.session}`];
     return { session: s.session, serverArgs: flags, argv };
   });
   const cols = tiles.length ? Math.ceil(Math.sqrt(tiles.length)) : 0, rows = cols ? Math.ceil(tiles.length / cols) : 0;
   if (tiles.length < cols * rows && !padPath && !remote) throw new Error("The installed grid padding program is missing.");
   while (tiles.length < cols * rows) tiles.push({ session: "", argv: remote ? ["sleep", "2147483647"] : ["node", padPath] });
-  return { tiles, cols, rows, signature: JSON.stringify(tiles) };
+  return { tiles, cols, rows, signature: JSON.stringify(tiles.map(t=>({...t,argv:gridViewerIdentity(t.argv)}))) };
 }
 
 /** A loopback URL may be a tunnel. Check the actual local server before creating viewers. */
@@ -273,9 +277,9 @@ export class RigSpaces {
     for (const p of tabPanes) {
       const t = cur.byAddr.get(p.terminal), l = cur.labelsByAddr.get(p.terminal);
       if (!t || !l || !cur.ownSet.has(p.terminal)) return false;
-      have.push(JSON.stringify([l["herdr-openrig.seat"] ?? "", viewerOf(t.argv)]));
+      have.push(JSON.stringify([l["herdr-openrig.seat"] ?? "", gridViewerIdentity(viewerOf(t.argv))]));
     }
-    const want = plan.tiles.map((tile) => JSON.stringify([tile.session ?? "", tile.argv]));
+    const want = plan.tiles.map((tile) => JSON.stringify([tile.session ?? "", gridViewerIdentity(tile.argv)]));
     return have.sort().join("\n") === want.sort().join("\n");
   }
   async closeAll(rig, config, key) {
@@ -582,9 +586,9 @@ export class RigSpaces {
         throw Object.assign(new Error("The Herdr machine changed while this grid was being built. The remaining tiles were not started."), { retryable: true });
       }
     };
-    const waitFor = async (test, what) => {
+    const waitFor = async (test, what, timeoutMessage = `Herdr did not confirm ${what}; the grid was not completed.`) => {
       for (let n = 0; n < 240; n++) { dropIndex(); const value = test(); if (value) return value; if (!host.wait) break; await host.wait(25); dropIndex(); }
-      throw new Error(`Herdr did not confirm ${what}; the grid was not completed.`);
+      throw new Error(timeoutMessage);
     };
     const hc = async (args) => {
       const res = await host.hc(args);
@@ -657,8 +661,114 @@ export class RigSpaces {
           dropIndex();
           if (!preflight.ok) return { ...preflight, closeAvailable: this.ownedPanes(rig, config).length > 0 };
         }
+        let refreshedTiles = 0;
+        // Upgrade only titleless viewers on a person's Open. Keep titled viewers,
+        // even when their presentation metadata has since changed.
+        if (explicit) for (const old of [...tabPanes()]) {
+          const cur = index(), terminal = cur.byAddr.get(old.terminal), l = cur.labelsByAddr.get(old.terminal);
+          if (!terminal || !cur.ownSet.has(old.terminal)) throw new Error("A tile changed while it was being renamed, so it was left as it was.");
+          const payload = gridViewerPayload(terminal.argv);
+          if (!payload || payload.title) continue;
+          const tile = plan.tiles.find(t => t.session && t.session === l["herdr-openrig.seat"]
+            && JSON.stringify(gridViewerIdentity(t.argv)) === JSON.stringify(gridViewerIdentity(terminal.argv)));
+          if (!tile || !gridViewerPayload(tile.argv)?.title) continue;
+          const snapshot = JSON.stringify(tileSnapshot(terminal, old, l));
+          await ready(); guard(); dropIndex();
+          const before = index(), live = before.byAddr.get(old.terminal);
+          const livePane = (before.panesByTab.get(tab) ?? []).find(p => p.pane === old.pane && p.terminal === old.terminal);
+          if (!live || !livePane || !before.ownSet.has(old.terminal)
+            || JSON.stringify(tileSnapshot(live, livePane, before.labelsByAddr.get(old.terminal))) !== snapshot)
+            throw new Error("A tile changed while it was being renamed, so it was left as it was.");
+          const previous = new Set(panes().map(p => p.pane));
+          const argv = ["env", `HERDR_OPENRIG_GRID_TILE=${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`, ...tile.argv];
+          const renameTimeout = "Herdr didn't confirm the renamed tile, so the old one was kept.";
+          let next = null, record = null, oldClosed = false;
+          try {
+          run("pane.split", { pane: old.pane, direction: "right", argv });
+          next = await waitFor(() => {
+            const current = index();
+            return (current.panesByTab.get(tab) ?? []).find(p => !previous.has(p.pane)
+              && JSON.stringify(current.byAddr.get(p.terminal)?.argv) === JSON.stringify(argv));
+          }, "refreshed viewer adoption");
+          record = JSON.parse(await hc(["get", "--json", "--", next.terminal]));
+          if (record.parent || record.terminal?.parent) throw new Error("Herdr didn't accept the renamed tile, so the old one was kept.");
+          if (JSON.stringify(record.argv ?? record.terminal?.argv) !== JSON.stringify(argv))
+            throw new Error("The renamed tile changed before it could be checked, so the old one was kept.");
+          await mark(next.terminal, tile, argv);
+          // hc acknowledges the label write before Herdr publishes its terminal list.
+          await waitFor(() => index().ownSet.has(next.terminal), "replacement tile labels", renameTimeout);
+          await ready(); guard(); dropIndex();
+          const after = index(), oldTerm = after.byAddr.get(old.terminal);
+          const oldPane = (after.panesByTab.get(tab) ?? []).find(p => p.pane === old.pane && p.terminal === old.terminal);
+          if (!oldTerm || !oldPane || !after.ownSet.has(old.terminal) || !after.ownSet.has(next.terminal)
+            || JSON.stringify(after.byAddr.get(next.terminal)?.argv) !== JSON.stringify(argv)
+            || after.byAddr.get(next.terminal)?.pid !== (record.pid ?? record.terminal?.pid)
+            || after.byAddr.get(next.terminal)?.created_ms !== (record.created_ms ?? record.terminal?.created_ms)
+            || JSON.stringify(tileSnapshot(oldTerm, oldPane, after.labelsByAddr.get(old.terminal))) !== snapshot)
+            throw new Error("A tile changed while it was being renamed.");
+          // No await between the final identity check and closing this viewer.
+          run("pane.close", { pane: old.pane });
+          oldClosed = true;
+          await waitFor(() => !panes().some(p => p.pane === old.pane), "old viewer close");
+          // A same-axis split halves the old slot. Herdr gives its removed
+          // share to the previous sibling, not necessarily this replacement.
+          // Restore the same equal weights used when the grid was created.
+          dropIndex();
+          for (const pane of tabPanes()) {
+            guard(); checkMachineLayout();
+            if (!index().ownSet.has(pane.terminal)) throw new Error("A personal pane was left unchanged.");
+            run("layout.resize", { id: pane.pane, weight: 1 });
+          }
+          refreshedTiles++;
+          } catch (error) {
+            if (oldClosed) {
+              // The close was dispatched, so never retire the replacement:
+              // the old pane may disappear later. Name a retained extra pane.
+              dropIndex();
+              if (tabPanes().some(p => p.pane === old.pane))
+                throw new Error(`${errorDiagnostic(error)} An extra tile was left; close the extra one with Herdr's pane close.`);
+              throw error;
+            }
+            let removed = false;
+            // Even a failed label can leave our own nonce-tagged process.
+            // Its original record must prove it parentless and unchanged;
+            // foreign or changed ownership labels prevent cleanup.
+            try {
+              if (next && record && !record.parent && !record.terminal?.parent
+                && JSON.stringify(record.argv ?? record.terminal?.argv) === JSON.stringify(argv)) {
+                await ready(); guard();
+                const fresh = JSON.parse(await hc(["get", "--json", "--", next.terminal]));
+                dropIndex();
+                const cur = index(), live = cur.byAddr.get(next.terminal), liveLabels = cur.labelsByAddr.get(next.terminal) ?? {};
+                const expected = { "herdr.space": localId(space.id), "herdr.tab": localId(tab),
+                  "herdr-openrig.space": "1", "herdr-openrig.rig": rig.name, "herdr-openrig.origin": url,
+                  "herdr-openrig.role": ROLE, "herdr-openrig.seat": tile.session,
+                  "herdr-openrig.viewer-argv": JSON.stringify(argv), ...(hostStamp ? { "herdr-openrig.host": hostStamp } : {}) };
+                const sameLabels = Object.entries(liveLabels).every(([k,v]) =>
+                  !(k.startsWith("herdr-openrig.") || k === "herdr.space" || k === "herdr.tab") || expected[k] === v);
+                const pid = record.pid ?? record.terminal?.pid, created = record.created_ms ?? record.terminal?.created_ms;
+                if (live && sameLabels && !fresh.parent && !fresh.terminal?.parent
+                  && JSON.stringify(fresh.argv ?? fresh.terminal?.argv) === JSON.stringify(argv)
+                  && JSON.stringify(live.argv) === JSON.stringify(argv)
+                  && (fresh.pid ?? fresh.terminal?.pid) === pid && live.pid === pid
+                  && (fresh.created_ms ?? fresh.terminal?.created_ms) === created && live.created_ms === created
+                  && (cur.panesByTab.get(tab) ?? []).some(p => p.pane === next.pane && p.terminal === next.terminal)) {
+                  // No await after this last nonce, incarnation and ownership check.
+                  run("pane.close", { pane: next.pane });
+                  await waitFor(() => !panes().some(p => p.pane === next.pane), "extra tile close");
+                  removed = true;
+                }
+              }
+            } catch { /* leave uncertain processes alone and report the extra tile */ }
+            if (!removed && error?.message === renameTimeout)
+              throw new Error(`${renameTimeout} An extra tile may have been left; close it with Herdr's pane close.`);
+            if (!removed) throw new Error(`${errorDiagnostic(error)} An extra tile ${next ? "was" : "may have been"} left; close the extra one with Herdr's pane close.`);
+            throw error;
+          }
+        }
+        if (refreshedTiles) this.done.set(key, stamp());
         if (explicit) { dropIndex(); host.run("space.select", { id: space.id }); host.run("tab.select", { id: tab }); }
-        return { ok: true, reused: true, space: space.id, tab };
+        return { ok: true, reused: true, space: space.id, tab, ...(refreshedTiles ? { refreshedTiles } : {}) };
       }
       if (rebuildingExisting && !explicit) host.onRebuildStart?.(); // a background sync that really rebuilds an existing grid says so from here
       guard();

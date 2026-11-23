@@ -46,7 +46,7 @@ const markPreSend = (e) => {
 };
 
 export class RemoteOpenRig {
-  constructor(host) { this.host = host; }
+  constructor(host) { this.host = host; this.helperChecks = new WeakMap(); }
   bridge(config, mode, args = [], timeout = 60000) {
     const node = config.rig?.[0]?.match(/(?:^|\/)node$/) ? config.rig[0] : 'node';
     return this.host.exec(node, [this.host.openrigBridgePath, mode, ...args], { timeout }).then((r) => answer(r, 'The OpenRig bridge'));
@@ -63,7 +63,9 @@ export class RemoteOpenRig {
     if (consent && consent.key !== key) throw Error('The machine or the helper changed since you approved it. Review it again.');
     const stored = await host.readOpenRigConsent();
     if (stored?.key !== key && consent?.key !== key) {
-      const confirmation = { key, machine, user: info.user, helperPath: openrigHelperPath(info.home), sha256: OPENRIG_HELPER_SHA256 };
+      // `updated`: an approval exists but for another helper (this release ships a new one), so the person is told why it asks again.
+      let storedSha = null; try { storedSha = stored?.key ? JSON.parse(stored.key)?.sha256 ?? null : null; } catch { storedSha = null; }
+      const confirmation = { key, machine, user: info.user, helperPath: openrigHelperPath(info.home), sha256: OPENRIG_HELPER_SHA256, ...(storedSha && storedSha !== OPENRIG_HELPER_SHA256 ? { updated: true } : {}) };
       return { ok: false, needsConsent: true, confirmation: { ...confirmation, words: openrigConsentWords(confirmation) } };
     }
     const fresh = await new RemoteMachine(host).ready(machine);
@@ -87,7 +89,17 @@ export class RemoteOpenRig {
   }
   /** Before a read or an event poll: the installed helper must be the file install checked (its stat, without following a link), still owned by the same
    *  user and writable by no one else. A changed or unsafe helper refuses, and the caller prepares again (a full re-inspect and reinstall). */
-  async checkHelper(p) {
+  forgetHelperCheck(p) { this.helperChecks.delete(p); }
+  checkHelper(p) {
+    const existing = this.helperChecks.get(p);
+    if (existing) return existing;
+    const flight = this.inspectHelper(p).finally(() => {
+      if (this.helperChecks.get(p) === flight) this.helperChecks.delete(p);
+    });
+    this.helperChecks.set(p, flight);
+    return flight;
+  }
+  async inspectHelper(p) {
     const was = p.helper?.stat;
     if (!was) throw Error(`The OpenRig helper on ${p.machine} hasn't been checked. Nothing was asked.`);
     // A check that fails on the machine (the helper deleted) is no answered refusal: the connection must prepare again and reinstall.

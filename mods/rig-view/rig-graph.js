@@ -1,8 +1,10 @@
-import {div,svg} from "gpui-kit";
+import * as kit from "gpui-kit";
+const {div,svg}=kit;
 import {h_flex,v_flex} from "gpui-base";
 import {settings} from "herdr";
-import {routeGraph,graphSeatPath,nearestGraphSeat,graphHeaderChips} from "./rig-graph-layout.js";
+import {routeGraph,graphSeatPath,graphWorkPath,graphWorkInk,graphWorkChip,nearestGraphSeat,graphHeaderChips} from "./rig-graph-layout.js";
 import {GraphMotion,GRAPH_FADE_MS} from "./rig-graph-state.js";
+import {GraphWorkProjection,WORK_PULSE} from "./rig-graph-work.js";
 import {statusMarkElement,seatStatus,statusLook,counted} from "./rig-lib.js";
 import {statusWord} from "./rig-words.js";
 
@@ -55,9 +57,9 @@ export function handoffAgo(seconds) {
 }
 
 export class RigGraph{
-  constructor(){this.width=700;this.motion=new GraphMotion();this.selected=null;this.hovered=null;this.eventCursor=0;}
-  reset(){this.motion.leave();this.active=false;}
-  render(t,cx,graph,{id,assets,running=false,reducedMotion=false,events=[],open,menu,now=Date.now()}={}){
+  constructor(){this.width=700;this.motion=new GraphMotion();this.selected=null;this.hovered=null;this.eventCursor=0;this.workProjection=new GraphWorkProjection();this.workRoutes=new Map();}
+  reset(){this.workPulseTimer?.cancel?.();this.workPulseTimer=null;this.workPulseUntil=null;this.workPulseEpoch=(this.workPulseEpoch??0)+1;this.motion.leave();this.active=false;this.workProjection.reset();this.workRoutes.clear();this.workChipLines=null;this.workChips=null;this.workChipLayout=null;}
+  render(t,cx,graph,{id,assets,running=false,reducedMotion=false,events=[],workRows=[],workReady=true,open,menu,now=Date.now()}={}){
     if(this.graphData!==graph||this.layoutWidth!==this.width){this.layout=routeGraph(graph,this.width);this.graphData=graph;this.layoutWidth=this.width;}
     const layout=this.layout;
     const mono=settings()?.font_family??"monospace";
@@ -89,9 +91,10 @@ export class RigGraph{
     const edges=placed(0,0,this.width,layout.height).id(id+"-edges"),countChips=[];
     if(running&&this.motion.entering)edges.opacity(this.motion.started?1:0).transition("opacity",{duration:300,delay:Math.min(index*50+100,2000),easing:"ease-out"});
     for(const[pi,pl]of layout.plans.entries()){
-      const own=emphasis&&pl.e.members.filter(e=>e.from===emphasis||e.to===emphasis),layer=placed(0,0,this.width,layout.height).id(id+"-edge-"+pi).opacity(emphasis ? .28 : 1)
-        .children(graphPathElements(pl.pts,pl.e.kind,t,assets));
-      edges.child(layer);
+      const own=emphasis&&pl.e.members.filter(e=>e.from===emphasis||e.to===emphasis),segments=graphPathElements(pl.pts,pl.e.kind,t,assets);
+      // Only selection needs a dimming group. Plain edges share the existing plane without a full-canvas box each.
+      if(emphasis)edges.child(placed(0,0,this.width,layout.height).id(id+"-edge-"+pi).opacity(.28).children(segments));
+      else edges.children(segments);
       if(own?.length)for(const e of own){const path=graphSeatPath(layout,e.from,e.to);if(path)edges.children(graphPathElements(path.points,e.kind,t,assets,{color:t.foreground,width:look(e.kind).width>1?2:1.5}));}
       if(pl.e.members.length>1){let best=0;for(let i=1;i<pl.pts.length-1;i++)if(distance(pl.pts[i],pl.pts[i+1])>distance(pl.pts[best],pl.pts[best+1]))best=i;
         const a=pl.pts[best],b=pl.pts[best+1],color=t[look(pl.e.kind).color];
@@ -101,6 +104,90 @@ export class RigGraph{
           .child(String(pl.e.members.length)));}
     }
     root.child(edges);
+    const {lines:work,taskCount}=running?this.workProjection.read(graph,workRows,now,{ready:workReady,reducedMotion}):{lines:[],taskCount:0};
+    // Native loops repaint a cached snapshot without rerunning this JS. A line stops breathing only at the end of its worker's idle debounce:
+    // one explicit invalidation then removes the loop even with no new event.
+    const pulseUntil=work.reduce((at,line)=>line.pulseUntil?Math.min(at,line.pulseUntil):at,Infinity);
+    const nextPulse=Number.isFinite(pulseUntil)?pulseUntil:null;
+    if(this.workPulseUntil!==nextPulse){
+      this.workPulseTimer?.cancel?.();this.workPulseTimer=null;this.workPulseUntil=nextPulse;
+      const epoch=this.workPulseEpoch=(this.workPulseEpoch??0)+1;
+      if(nextPulse!==null)this.workPulseTimer=schedule(Math.max(0,nextPulse-now),()=>{
+        if(this.workPulseEpoch!==epoch)return;
+        this.workPulseTimer=null;this.workPulseUntil=null;this.workProjection.expire();notify();
+      });
+    }
+    // Namespace lookup avoids linking a missing export on older supported Herdr versions.
+    const nativeInk=typeof kit.PathBuilder?.fill==='function'&&typeof globalThis.window?.paint_path==='function';
+    if(this.workLayout!==layout){this.workRoutes.clear();this.workLayout=layout;}
+    for(const line of work)if(!this.workRoutes.has(line.key))this.workRoutes.set(line.key,graphWorkPath(layout,line.source,line.target));
+    if(this.workChipLines!==work||this.workChipLayout!==layout){
+      const arrows=[...layout.plans.map(plan=>plan.pts),...work.map(line=>this.workRoutes.get(line.key)?.points).filter(Boolean)];
+      const placedChips=[];this.workChips=new Map();
+      for(const line of work)if(line.chip){
+        const chip=graphWorkChip(layout,this.workRoutes.get(line.key)?.points??[],line.chip,arrows,placedChips);
+        this.workChips.set(line.key,chip);if(chip)placedChips.push(chip);
+      }
+      this.workChipLines=work;this.workChipLayout=layout;
+    }
+    const workChipElements=[],steadyWork=new Map(),workLegend=new Map();
+    // Every working line breathes in one shared layer, so all of them share one phase (and one native loop).
+    let breathing=null;
+    for(const [i,line]of work.entries()){
+      const route=this.workRoutes.get(line.key);if(!route)continue;
+      const label=line.dashed?'open task, seat idle'
+        :line.color==='ansi3'?'open task, seat needs you or blocked'
+        :line.color==='muted'?'open task, seat stopped'
+        :(line.pulseUntil!==null||line.status==='active')?'open task, seat working':'open task';
+      workLegend.set(label,{color:t[line.color],width:2.5,dashed:line.dashed});
+      if(nativeInk&&(!route.ink||route.ink.dashed!==line.dashed)){
+        const segments=graphWorkInk(route.points,2.5,{dashed:line.dashed}),builder=kit.PathBuilder.fill();
+        for(const segment of segments)for(const polygon of segment.polygons)builder.add_polygon(polygon.map(([x,y])=>[x+segment.x,y+segment.y]),true);
+        // A render can be interrupted during construction. Publish only the complete
+        // geometry and Path together, so the next draw retries an unfinished build.
+        route.ink={segments,path:builder.build(),dashed:line.dashed};
+      }
+      // NativePath ignores element opacity on 0.1.16. Background alpha is
+      // honoured; older hosts and border/SVG paths keep an opacity wrapper.
+      const animated=line.pulse&&!reducedMotion;
+      if(animated&&!breathing){
+        breathing=placed(0,0,this.width,layout.height).id(id+'-work-breathing').opacity(line.opacity);
+        if(typeof breathing.loop==='function')breathing.loop('opacity',WORK_PULSE);
+      }
+      const layer=animated?breathing:null;
+      let alpha=null;
+      if(!layer&&nativeInk&&typeof kit.Background?.solid==='function'){
+        const color=t[line.color];
+        if(route.workPaint?.color!==color||route.workPaint?.opacity!==line.opacity){
+          const solid=kit.Background.solid(color);
+          if(typeof solid?.opacity==='function')route.workPaint={color,opacity:line.opacity,value:solid.opacity(line.opacity)};
+        }
+        alpha=route.workPaint?.color===color&&route.workPaint?.opacity===line.opacity?route.workPaint.value:null;
+      }
+      const key=alpha?'alpha':`wrapper-${i}`;
+      if(!layer&&!steadyWork.has(key)){
+        const plane=placed(0,0,this.width,layout.height).id(id+'-work-steady'+(alpha?'':`-${key}`));
+        if(!alpha)plane.opacity(line.opacity);
+        steadyWork.set(key,plane);
+      }
+      const target=layer??steadyWork.get(key);
+      if(nativeInk){
+        const paint=window.paint_path(route.ink.path,alpha??t[line.color]).absolute().inset_0();
+        paint.id(id+'-work-'+i);
+        target.child(paint);
+        // Native Path has no tooltip listeners. Plain divs keep hover bounds on the actual segments.
+        target.children(route.ink.segments.map(segment=>placed(segment.x,segment.y,segment.w,segment.h).tooltip(line.tip)));
+      }else target.children(graphPathElements(route.points,'delegates_to',t,assets,{color:t[line.color],width:2.5,dashed:line.dashed}).map((el,j)=>{
+        if(j===0)el.id(id+'-work-'+i);
+        return el.tooltip(line.tip);
+      }));
+      const chip=this.workChips.get(line.key);
+      if(chip){
+        workChipElements.push(placed(chip.x,chip.y,chip.w,chip.h).id(id+'-work-chip-'+i).rounded(8).bg(t.surface).border_1().border_color(t[line.chipColor??line.color])
+          .text_size(10).text_color(t[line.chipColor??line.color]).text_center().tooltip(line.tip).child(line.chip));}
+    }
+    // Steady routes must not cover breathing segments or their hover targets.
+    root.children([...steadyWork.values(),...(breathing?[breathing]:[])]);
     if(running)for(const path of this.motion.paths.values()){
       const route=path.cross?null:graphSeatPath(layout,path.source,path.target);
       if(!path.cross&&!route)continue;
@@ -151,14 +238,19 @@ export class RigGraph{
         }
       }
     }
+    root.children(workChipElements);
     const count=[counted(graph.seatCount??graph.pods.reduce((n,p)=>n+p.seats.length,0),"seat"),counted(graph.pods.length,"pod"),counted(graph.edges.length,"edge")].join(" · ");
-    const last=running&&this.motion.last,note=last?`Last handoff ${handoffAgo(Math.max(0,Math.floor((now-Number(new Date(last.at)))/1000)))} ago: ${last.source??last.from} → ${last.target??last.to}`:count;
+    const last=running&&this.motion.last,baseNote=last?`Last handoff ${handoffAgo(Math.max(0,Math.floor((now-Number(new Date(last.at)))/1000)))} ago: ${last.source??last.from} → ${last.target??last.to}`:count;
+    const note=taskCount?`${counted(taskCount,'task')} in progress · ${last?'last'+baseNote.slice(4):baseNote}`:baseNote;
     const seat=emphasis&&layout.ent[emphasis];
     const detail=this.detail??(seat?[seat.lid,seat.runtime,seat.model,seat.profile,running?statusLook(seat.status??seatStatus(seat.node??{})).word:null,
       ...["pendingWorkCount","inProgressWorkCount","blockedWorkCount"].filter(k=>running&&Number.isFinite(seat.node?.[k])).map(k=>`${seat.node[k]} ${k==="pendingWorkCount"?"pending":k==="inProgressWorkCount"?"in progress":"blocked"}`)].filter(Boolean).join(" · "):null);
     // The legend shrinks and wraps inside its own box at narrow widths (its items are fixed, so the row's shape depends on the width alone).
     const legend=h_flex().id(id+"-legend").flex_shrink(1).min_w(0).flex_wrap().gap(12).children([...new Set(graph.edges.map(e=>e.kind))].map(kind=>h_flex().gap(5).items_center()
       .child(div().relative().w(24).h(10).children(graphPathElements([[0,5],[22,5]],kind,t,assets))).child(div().text_size(11).text_color(t.muted).child(look(kind).word))));
+    for(const [label,style]of workLegend)legend.child(h_flex().gap(5).items_center()
+      .child(div().relative().w(24).h(10).children(graphPathElements([[0,5],[22,5]],'delegates_to',t,assets,style)))
+      .child(div().text_size(11).text_color(t.muted).child(label)));
     return v_flex().w_full().rounded(8).border_1().border_color(t.border)
       // The row never wraps: the status keeps at least 120 px, takes what the legend leaves and ends in an ellipsis, so its length (it changes every
       // second) never moves the legend.

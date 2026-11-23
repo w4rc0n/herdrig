@@ -211,6 +211,88 @@ export function graphSeatPath(layout,from,to){
   return{points:simplifyGraphPoints(points),plan};
 }
 
+/** Work may have no topology edge. Use card-row gaps and pod gutters without moving the saved layout. */
+export function graphWorkPath(layout,from,to){
+  const authored=graphSeatPath(layout,from,to);if(authored)return authored;
+  const s=layout.ent[from],t=layout.ent[to];if(!s||!t)return null;
+  const exit=en=>[[en.x+en.w,en.y+en.h/2],[en.x+en.w+6,en.y+en.h/2],[en.x+en.w+6,en.y+en.h+6],[en.pod.x+en.pod.w+6,en.y+en.h+6]];
+  const a=exit(s),b=exit(t),points=[...a];
+  if(s.pod!==t.pod){
+    const bottom=en=>Math.max(...layout.pods.filter(p=>p.row===en.pod.row).map(p=>p.y+p.h))+8;
+    const gutter=Math.min(layout.width-6,Math.max(...layout.pods.map(p=>p.x+p.w))+8),sy=bottom(s),ty=bottom(t);
+    points.push([a.at(-1)[0],sy],[gutter,sy],[gutter,ty],[b.at(-1)[0],ty]);
+  }
+  points.push(...b.reverse());return {points:simplifyGraphPoints(points)};
+}
+
+/** Prefer the longest usable run, sliding within it to clear cards and arrowheads. No clear run means no chip. */
+export function graphWorkChip(layout,points,text,arrowPaths=[],placedChips=[]){
+  const w=Math.max(18,text.length*6+10),h=16,pad=2;
+  const obstacles=[...Object.values(layout.ent).map(r=>r.isPod?{...r,h:POD_HEAD}:r),...placedChips].map(({x,y,w,h})=>({x,y,w,h}));
+  for(const p of Object.values(layout.ent).filter(r=>r.isPod))obstacles.push(
+    {x:p.x,y:p.y,w:0,h:p.h},{x:p.x+p.w,y:p.y,w:0,h:p.h},
+    {x:p.x,y:p.y,w:p.w,h:0},{x:p.x,y:p.y+p.h,w:p.w,h:0});
+  for(const path of arrowPaths){
+    const end=path.at(-1),prior=path.slice(0,-1).reverse().find(p=>p[0]!==end?.[0]||p[1]!==end?.[1]);
+    if(!end||!prior)continue;
+    const dx=Math.sign(end[0]-prior[0]),dy=Math.sign(end[1]-prior[1]);
+    obstacles.push({x:Math.min(end[0],end[0]-dx*6)-Math.abs(dy)*4,y:Math.min(end[1],end[1]-dy*6)-Math.abs(dx)*4,w:Math.abs(dx)*6+Math.abs(dy)*8,h:Math.abs(dy)*6+Math.abs(dx)*8});
+  }
+  const runs=points.slice(1).map((b,i)=>({a:points[i],b,length:Math.abs(b[0]-points[i][0])+Math.abs(b[1]-points[i][1])})).sort((a,b)=>b.length-a.length);
+  for(const {a,b}of runs){
+    const horizontal=a[1]===b[1],axis=horizontal?0:1,cross=horizontal?1:0,half=(horizontal?w:h)/2,across=(horizontal?h:w)/2;
+    const fixed=a[cross],crossLimit=horizontal?layout.height:layout.width;
+    if(fixed-across<0||fixed+across>crossLimit)continue;
+    let ranges=[[Math.max(Math.min(a[axis],b[axis])+half,half),Math.min(Math.max(a[axis],b[axis])-half,(horizontal?layout.width:layout.height)-half)]];
+    ranges=ranges.filter(([lo,hi])=>lo<=hi);
+    for(const r of obstacles){
+      const start=horizontal?r.y:r.x,size=horizontal?r.h:r.w;
+      if(fixed+across<=start-pad||fixed-across>=start+size+pad)continue;
+      const lo=(horizontal?r.x:r.y)-half-pad,hi=(horizontal?r.x+r.w:r.y+r.h)+half+pad;
+      ranges=ranges.flatMap(([l,u])=>hi<=l||lo>=u?[[l,u]]:[[l,Math.min(u,lo)],[Math.max(l,hi),u]].filter(([l,u])=>l<=u));
+    }
+    if(!ranges.length)continue;
+    const mid=(a[axis]+b[axis])/2,center=ranges.map(([l,u])=>Math.max(l,Math.min(u,mid))).sort((x,y)=>Math.abs(x-mid)-Math.abs(y-mid))[0];
+    return{x:(horizontal?center:fixed)-w/2,y:(horizontal?fixed:center)-h/2,w,h};
+  }
+  return null;
+}
+
+/** Filled segment geometry, including the last arrowhead. Bounds remain local hover targets. */
+export function graphWorkInk(points,width=2.5,{dashed=false}={}){
+  const pts=points.filter((p,i)=>!i||p[0]!==points[i-1][0]||p[1]!==points[i-1][1]).map(p=>[...p]);
+  if(pts.length<2)return[];
+  const end=[...pts.at(-1)],previous=pts.at(-2),hx=Math.sign(end[0]-previous[0]),hy=Math.sign(end[1]-previous[1]);
+  const trim=Math.min(6,Math.abs(end[0]-previous[0])+Math.abs(end[1]-previous[1]));
+  pts.at(-1)[0]-=hx*trim;pts.at(-1)[1]-=hy*trim;
+  const ink=[];
+  for(let i=0;i<pts.length-1;i++){
+    let [x1,y1]=pts[i],[x2,y2]=pts[i+1];const dx=Math.sign(x2-x1),dy=Math.sign(y2-y1),polygons=[];
+    if(i>0){x1-=dx*width/2;y1-=dy*width/2;}
+    if(i<pts.length-2){x2+=dx*width/2;y2+=dy*width/2;}
+    if(x1!==x2||y1!==y2){
+      const left=Math.min(x1,x2)-(y1===y2?0:width/2),top=Math.min(y1,y2)-(x1===x2?0:width/2);
+      const right=Math.max(x1,x2)+(y1===y2?0:width/2),bottom=Math.max(y1,y2)+(x1===x2?0:width/2);
+      if(!dashed)polygons.push([[left,top],[right,top],[right,bottom],[left,bottom]]);
+      else{
+        const horizontal=y1===y2,length=horizontal?right-left:bottom-top;
+        for(let offset=0;offset<length;offset+=10){
+          const end=Math.min(offset+6,length),a=horizontal?left+offset:top+offset,b=horizontal?left+end:top+end;
+          polygons.push(horizontal?[[a,top],[b,top],[b,bottom],[a,bottom]]:[[left,a],[right,a],[right,b],[left,b]]);
+        }
+      }
+    }
+    if(i===pts.length-2){
+      const [x,y]=end,px=-hy*4,py=hx*4;
+      polygons.push([[x-hx*6-px,y-hy*6-py],[x,y],[x-hx*6+px,y-hy*6+py]]);
+    }
+    if(!polygons.length)continue;
+    const all=polygons.flat(),x=Math.min(...all.map(p=>p[0])),y=Math.min(...all.map(p=>p[1]));
+    ink.push({x,y,w:Math.max(...all.map(p=>p[0]))-x,h:Math.max(...all.map(p=>p[1]))-y,polygons:polygons.map(poly=>poly.map(p=>[p[0]-x,p[1]-y]))});
+  }
+  return ink;
+}
+
 /** Arrow keys select the nearest card in that half-plane, with transverse distance as a tie breaker. */
 export function nearestGraphSeat(layout,current,direction){
   const seats=Object.entries(layout.ent).filter(([,s])=>!s.isPod);

@@ -30,7 +30,7 @@ export class ConnectionFeed {
   /** The connection now means another OpenRig (its address, home or machine changed): nothing read from the old one stays, so no row of it is drawn or acted on under the new identity,
    *  and the new one is read from scratch (capabilities probed again, backoff started over, its first needs read silent). The stream and the refresh in flight are the caller's. */
   moved() {
-    this.data = null; this.error = null; this.needsApproval = false; this.sidebarState = null; this.cliVersion = null; this.healthz = null; this.live = false; this.lists = {}; this.uiTimezone = undefined;
+    this.data = null; this.error = null; this.needsApproval = false; this.sidebarState = null; this.cliVersion = null; this.healthz = null; this.terminalOutage = null; this.lossReadHealthz = null; this.live = false; this.lists = {}; this.uiTimezone = undefined;
     this.workerPreviewSupport = null; this.providerProbe = null; this.hostedReader = null; this.prioritySeeded = false; this.fullAttention = null;
     this.delay = 1000; this.hadDisconnect = false; this.forceCapabilityProbe = true;
     this.forceHelpProbe = true;

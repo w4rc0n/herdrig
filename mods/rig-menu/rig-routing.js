@@ -1,6 +1,6 @@
 import { errorDiagnostic } from "./rig-words.js";
 // All explicit opens and background grid reconciliation pass through this coordinator.
-import { MOD_IDS, layoutHasMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn } from "./rig-lib.js";
+import { MOD_IDS, layoutShowsMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn } from "./rig-lib.js";
 /** The page a Rig tab shows: its own history's top, else the page the router last sent it, else (one OpenRig only) the last page opened anywhere. */
 function tabPageOf(host,config,tab){
   const own=host.shared?.("rig.tabPages")?.[tab]?.stack?.at(-1)??host.shared?.("rig.pageRoutes")?.[tab];
@@ -89,25 +89,26 @@ const ROUTE_ACK_POLL_MS = 100;
 /** A sidebar is registered but did not take the request in time: not "open the sidebar", which is already open. */
 export const SIDEBAR_NO_ANSWER = "The Rig sidebar didn't answer in time. Try again.";
 const sidebarNeeded = request => request.kind==="attach" ? "Open the Rig sidebar to attach." : "Open the Rig sidebar, then try again.";
-/** A sidebar entry in rig.routeReceivers is the time it last said it was alive (every 10 s); only a recent one earns the longer wait,
+/** A sidebar entry in rig.routeReceivers is the time it last said it was alive (every minute); only a recent one earns the longer wait,
  *  so a sidebar that crashed without removing its entry fails fast instead of making every Attach wait. */
-const ROUTE_RECEIVER_FRESH_MS = 30000;
+export const ROUTE_RECEIVER_HEARTBEAT_MS = 60000;
+const ROUTE_RECEIVER_FRESH_MS = 75000;
 /** Entries older than this, or not a time (older versions wrote true), are dropped when a sidebar writes its own. */
-export const ROUTE_RECEIVER_PRUNE_MS = 60000;
+export const ROUTE_RECEIVER_PRUNE_MS = 120000;
 /** The receivers map with `self` stamped now and leftovers pruned: what a sidebar writes when it says it is alive. */
 export function receiversWithBeat(current, self, now = Date.now()) {
-  const kept = Object.entries(current ?? {}).filter(([id, at]) => id !== self && typeof at === "number" && now - at <= ROUTE_RECEIVER_PRUNE_MS);
+  const kept = Object.entries(current ?? {}).filter(([id, at]) => id !== self && Number.isFinite(at) && at <= now && now - at <= ROUTE_RECEIVER_PRUNE_MS);
   return { ...Object.fromEntries(kept), [self]: now };
 }
-/** The replies map with `id` acknowledged now. A reply is the time it was written; one nobody read within ROUTE_RECEIVER_PRUNE_MS (its
+export const ROUTE_REPLY_PRUNE_MS = 60000;
+/** The replies map with `id` acknowledged now. A reply is the time it was written; one nobody read within ROUTE_REPLY_PRUNE_MS (its
  *  forwarder died or reloaded after the sidebar accepted), or one that isn't a time (older versions wrote true), is dropped. A forwarder
  *  waits ROUTE_RECEIVER_EXPIRY_MS at most, so a live one always finds its reply. */
 export function repliesWithReply(current, id, now = Date.now()) {
-  const kept = Object.entries(current ?? {}).filter(([key, at]) => key !== id && typeof at === "number" && now - at <= ROUTE_RECEIVER_PRUNE_MS);
+  const kept = Object.entries(current ?? {}).filter(([key, at]) => key !== id && typeof at === "number" && now - at <= ROUTE_REPLY_PRUNE_MS);
   return { ...Object.fromEntries(kept), [id]: now };
 }
-const receiverKnown = host => Object.values(host.shared("rig.routeReceivers")??{}).some(Boolean);
-const receiverLive = host => Object.values(host.shared("rig.routeReceivers")??{}).some(at => typeof at === "number" && Date.now() - at <= ROUTE_RECEIVER_FRESH_MS);
+const receiverLive = host => {const now=Date.now();return Object.values(host.shared?.("rig.routeReceivers")??{}).some(at => Number.isFinite(at) && at <= now && now - at <= ROUTE_RECEIVER_FRESH_MS);};
 
 async function adopted(host, predicate) {
   for (let n=0;n<100;n++) {
@@ -140,7 +141,7 @@ export async function forwardRigOpen(host, request) {
     // This lifecycle hint avoids Herdr's extra "unknown command" toast for a sidebar that never loaded.
     // A hint alone is never success: the consumed request's acknowledgement is still required.
     if(!sawLive && receiverLive(host)) sawLive=true;
-    if(!dispatched && receiverKnown(host)){
+    if(!dispatched && receiverLive(host)){
       if(budget<ROUTE_RECEIVER_EXPIRY_MS && receiverLive(host)){ // a live sidebar registered while this request waited: it gets the longer bound too
         budget=ROUTE_RECEIVER_EXPIRY_MS; expiresAt=started+budget;
         const pending=host.shared("rig.routeRequests")??{};
@@ -788,7 +789,12 @@ export async function routeOpen(host,config,request={}){
   // A page with no entry is Topology, stamped with this connection when several are set up (an unstamped page names no OpenRig there).
   if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology",...((config?.connections?.length??0)>1&&config?.connectionId?{conn:config.connectionId}:{})}));
   const tree=typeof host.layout==="function"?host.layout():host.layout;
-  if(!host.routeOwner && layoutHasMod(tree,MOD_IDS.sidebar) && !selected.background){
+  // Attach owns its normal open path unless a shown sidebar has a live lease; no envelope can cause a second open later.
+  // Other request kinds also use their existing own path when the sidebar is not shown.
+  const forward = selected.kind === "attach"
+    ? receiverLive(host) && layoutShowsMod(tree,MOD_IDS.sidebar)
+    : layoutShowsMod(tree,MOD_IDS.sidebar);
+  if(!host.routeOwner && !selected.background && forward){
     const targetConn=selected.conn??selected.entry?.conn??selected.seat?.conn??(selected.kind==="page"&&!requestRig(host,selected).key?config?.connectionId:undefined);
     return forwardRigOpen(host,targetConn?{...selected,conn:targetConn}:selected);
   }

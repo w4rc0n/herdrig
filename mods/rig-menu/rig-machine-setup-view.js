@@ -1,15 +1,17 @@
 import { errorDiagnostic, plainError } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
+import {withFocusContext,releaseFocusTargets} from './rig-lib.js';
 import {div,svg} from "gpui-kit";
 import {errorBlock} from "./rig-error-view.js";
 import {v_flex,h_flex} from "gpui-base";
 import {reviewMachineSetup,approveMachineSetup,stopUsingMachine} from "./rig-machine-setup.js";
 
 export class MachineSetupPanel {
-  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,initialConfirmation=null,waitingForRig=null,cancelHandle,primaryHandle,retryHandle,copyHandles={}}={}){
+  constructor(host,config,machine,{done,cancel,mono="monospace",copyIcon,stop=false,initialConfirmation=null,waitingForRig=null,continuationText=null,cancelHandle,primaryHandle,retryHandle,copyHandles={}}={}){
     this.host=host;this.config=config;this.machine=machine;this.done=done;this.cancel=cancel;
     this.mono=mono;this.copyIcon=copyIcon;this.stop=stop;this.phase=stop?"ready":"checking";
     this.initialConfirmation=initialConfirmation;this.waitingForRig=waitingForRig;
+    this.continuationText=continuationText;
     this.cancelHandle=cancelHandle;this.primaryHandle=primaryHandle;this.retryHandle=retryHandle;
     this.copyHandles=copyHandles;
   }
@@ -82,7 +84,9 @@ export class MachineSetupPanel {
         .on_key_down(activationPair(this,`copy-${label}`).key((event,cx)=>{if(!event.is_held&&["enter"," ","space"].includes(String(event.key??"").toLowerCase())){cx.stop_propagation();cx.write_to_clipboard(value);}}))
         .child(svg(this.copyIcon).size(12).text_color(this.theme.muted))));
   }
-  render(t,cx){
+  expire(){this.expired=true;releaseFocusTargets(this);}
+  render(...args){return withFocusContext(this,args[1],()=>this.renderFocused(...args));}
+  renderFocused(t,cx){
     this.theme=t;
     if(this.pendingFocus){const handle=this.pendingFocus;this.pendingFocus=null;this.focusTask?.cancel?.();this.focusTask=cx.timer.after(0,next=>{handle.focus();next.notify();});}
     const c=this.review?.confirmation,done=this.phase==="done",update=!!this.review?.alreadyConfigured&&c?.fileState==="older";
@@ -131,6 +135,7 @@ export class MachineSetupPanel {
     if(this.error)body=body.child(div().id("machine-setup-error").text_color(t.blocked).child(errorBlock(this,t,"machine-setup-error-detail",this.error,{where:this.machine??"this computer",prefix:"✗ "})));
     if(done)body=body.child(div().id("machine-setup-done").child(this.stop?`✓ Stopped using ${this.machine}. Open box tiles and the helper were left in place.`
       :`✓ Using ${this.machine}. Attach helper ${this.result.installed?"installed and verified":"already installed, verified"}.`));
+    if(done&&this.continuationText)body=body.child(div().id('machine-setup-continuation').text_color(t.muted).child(this.continuationText));
     if(done&&this.warning)body=body.child(h_flex().gap(6).items_center().flex_wrap()
       .child(div().id("machine-setup-warning").text_color(t.working).when(!!this.warningDetail,el=>el.tooltip(plainError(this.warningDetail,{where:"this computer"}).text)).child(this.warning))
       .when(!!this.warningDetail,el=>el.child(errorBlock(this,t,"machine-setup-warning-detail",this.warningDetail,{where:"this computer"})))
