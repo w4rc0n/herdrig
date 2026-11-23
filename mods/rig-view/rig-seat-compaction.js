@@ -12,6 +12,8 @@ function observedTime(at,timezone){
 const changedSeat = session => `${session} changed since this page read it, so nothing was sent. Try again from its current card.`;
 const UNCONFIRMED_REASON = "The last request wasn't confirmed. Use Send again anyway, or Clear this.";
 const ACCEPTED_READ_FAILED = "The request reached OpenRig, but Herdrig couldn't refresh its state. Check the pane or OpenRig's CLI before trying again.";
+// These trigger refusals precede any input. Other failure receipts can follow a partial send.
+const UNSENT_TRIGGER_REFUSALS=new Set(['compaction_unavailable','session_missing','runtime_filter']);
 const DISPATCH_CLOCK_SKEW_MS=3000;
 const stageWords={preparing:'preparation started','compact-sent':'compaction sent','restore-sent':'restore requested','audit-sent':'restore check requested',cancelled:'cancelled','skipped-or-failed':'stopped'};
 const contextPercent=node=>Number.isFinite(node.contextUsage?.usedPercentage)?Math.round(node.contextUsage.usedPercentage):null;
@@ -407,12 +409,25 @@ export class SeatCompaction {
       if(start)start.receiptRead=true;
       try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
       accepted=result.code===0&&data.ok===true;
-      if(!review.cancel&&accepted&&typeof data.attemptId==='string'&&data.attemptId.trim()){
+      if(!review.cancel&&accepted){
+        const attemptId=typeof data.attemptId==='string'&&data.attemptId.trim()?data.attemptId:null;
         const record=this.recovery(e);
-        if(record?.token===dispatch.token)this.saveRecovery(e,{...record,attemptId:data.attemptId});
-        if(!start?.expired)e.requestedAttemptId=data.attemptId;
+        if(record?.token===dispatch.token){
+          this.saveRecovery(e,{...record,accepted:true,attemptId:attemptId??record.attemptId});
+          if(start?.expired)this.changed(e,cx);
+        }
+        if(attemptId&&!start?.expired)e.requestedAttemptId=attemptId;
       }
-      if(start?.expired)return;
+      if(start?.expired){
+        const record=this.recovery(e);
+        if(record&&record.token===dispatch?.token&&!record.accepted&&result.code!==0&&data.ok===false&&!data.preparation&&UNSENT_TRIGGER_REFUSALS.has(data.reason)){
+          const current=this.entry?.recoveryKey===e.recoveryKey?this.entry:e;
+          this.resetRecovery(current);
+          current.error='OpenRig refused the compaction request. Nothing was sent to the seat.';
+          this.changed(current,cx);
+        }
+        return;
+      }
       if(start)start.allowBaseline=accepted&&data.session===e.node.canonicalSessionName&&data.stage==='compact-sent';
       const refused=result.code!==0||data.ok===false;
       if(refused&&data.preparation&&e.stateRead===dispatchRead)e.data=data;

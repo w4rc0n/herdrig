@@ -42,9 +42,10 @@ export async function openRigEventStream(connect,url,onSocket=()=>{},herdrSocket
   throw new Error("OpenRig has no supported event stream.");
 }
 
-/** Herdr's mod runtime fails a socket read after 30 s without bytes ("Resource temporarily unavailable", os error 11), and OpenRig's event
- *  stream sends nothing while quiet. That is an idle stream, not a closed one (a closed one reads as `null`). A TCP timeout is a dead peer. */
-export const isIdleTimeout = (error) => /Resource temporarily unavailable|os error 11\b/i.test(String(error?.message ?? error));
+/** Herdr's mod runtime fails a socket read after 30 s without bytes, and OpenRig's event stream sends nothing while quiet. That is an idle
+ *  stream, not a closed one (a closed one reads as `null`). herdr-app 0.1.16 and earlier say "Resource temporarily unavailable" (os error 11);
+ *  0.1.17 says exactly "socket read failed: timed out". A TCP timeout ("Connection timed out", os error 110) is a dead peer. */
+export const isIdleTimeout = (error) => { const text = String(error?.message ?? error); return /Resource temporarily unavailable|os error 11\b/i.test(text) || /(?:^|\s)socket read failed: timed out$/i.test(text); };
 
 /** After this many idle timeouts in a row (30 s each: about two minutes of silence) the stream is replaced even though the daemon still answers
  *  on a new connection. A tunnel or middlebox can drop an idle flow without a reset: the daemon is fine, this socket is not, and it would

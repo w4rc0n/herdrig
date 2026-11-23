@@ -1,5 +1,6 @@
 import {configOfConnection,LEGACY_CONNECTION_ID} from './rig-connections.js';
-import {writeCommand,writeOutcome,MOD_IDS,navKey} from './rig-lib.js';
+import {publishedConfigFor,publishedUnder} from './rig-gate.js';
+import {connectionCapabilities,discoverDaemonFromCli,isLoopbackDaemonUrl,writeCommand,writeOutcome,MOD_IDS,navKey} from './rig-lib.js';
 
 const safeLayoutName=name=>typeof name==='string'&&name&&name!=='.'&&name!=='..'&&!/[\/\\\u0000-\u001f]/.test(name);
 function layoutNodes(tree){
@@ -203,14 +204,61 @@ function oldViewAvailability(config,capsFor){
 export function oldViewCandidates(config,capsFor){
   return oldViewAvailability(config,capsFor).candidates;
 }
-const goneKey=config=>JSON.stringify((config?.connections?.length?config.connections.map(c=>configOfConnection(config,c.id)).filter(Boolean):[config])
-  .filter(c=>c&&!c.daemonMachine).map(c=>[c.connectionId??LEGACY_CONNECTION_ID,c.daemonUrl??null,c.openrigHome??null]).sort((a,b)=>JSON.stringify(a).localeCompare(JSON.stringify(b))));
-/** Session-only receipts, scoped to the configured local authorities; never inferred from a failed/uncertain close. */
-export const oldViewsGone=(shared,config)=>shared?.('rig.oldProviderGone')?.[goneKey(config)]??[];
-function rememberGone(host,config,id){
-  if(!host.shared||!host.setShared)return;
-  const all=host.shared('rig.oldProviderGone')??{},key=goneKey(config);
-  host.setShared('rig.oldProviderGone',{...all,[key]:[...new Set([...(all[key]??[]),id])]});
+const authorityId=config=>config.connectionId??LEGACY_CONNECTION_ID;
+const pinnedAddress=config=>config.daemonUrlSource==='cli'||config.daemonUrlSource==='default'?null:config.daemonUrl??null;
+const authorityIdentity=(config,address,hostId)=>({id:authorityId(config),address,home:config.openrigHome??null,hostId:typeof hostId==='string'&&hostId?hostId:null});
+const receiptKey=identities=>JSON.stringify(identities.slice().sort((a,b)=>a.id.localeCompare(b.id)));
+const readGone=shared=>shared?.('rig.oldProviderGone')?.receipts??{};
+const sameAuthorities=(receipt,identities)=>receipt.scope===receiptKey(identities);
+
+/** Display uses the sidebar's last resolution for each connection, scoped to its own raw settings. */
+function publishedAuthorities(shared,config,capsFor,published=shared?.('rig.data')){
+  const {candidates,pending}=oldViewAvailability(config,capsFor);
+  if(pending||!candidates.length)return null;
+  const identities=candidates.map(candidate=>{
+    const current=publishedConfigFor(candidate,published);
+    const own=published?.byConnection?.[authorityId(candidate)]??(current===published?.config?published:null);
+    const matches=publishedUnder(candidate,published)&&own?.answering!==false;
+    const pinned=pinnedAddress(candidate);
+    const discovered=matches?current?.daemonUrl:null;
+    const address=pinned??(discovered&&isLoopbackDaemonUrl(discovered)?discovered:null);
+    const hostId=matches&&address===discovered?own?.healthz?.selfHostId:null;
+    return authorityIdentity(candidate,address,hostId);
+  });
+  return identities.every(identity=>identity.address)?identities:null;
+}
+export function oldViewsGone(shared,config,capsFor=()=>({herdrAppProvider:true})){
+  const receipts=readGone(shared);
+  if(!Object.keys(receipts).length)return [];
+  const identities=publishedAuthorities(shared,config,capsFor);
+  return identities?Object.keys(receipts).filter(id=>sameAuthorities(receipts[id],identities)):[];
+}
+export function pruneOldViewsGone(shared,setShared,config,capsFor,published){
+  const receipts=readGone(shared);
+  if(!Object.keys(receipts).length)return;
+  const identities=publishedAuthorities(shared,config,capsFor,published);
+  if(!identities)return; // An incomplete publication cannot establish that an authority moved.
+  const kept=Object.fromEntries(Object.entries(receipts).filter(([,receipt])=>sameAuthorities(receipt,identities)));
+  if(Object.keys(kept).length!==Object.keys(receipts).length)setShared('rig.oldProviderGone',{receipts:kept});
+}
+export function visibleOldViewsGone(shared,config,terms){
+  return oldViewsGone(shared,config,id=>connectionCapabilities(shared,config,id,terms));
+}
+async function verifyAuthority(host,config,address){
+  if(host.fetchFor){
+    try{
+      const response=await host.fetchFor(config)(`${address}/healthz`);
+      if(!response.ok)return null;
+      return authorityIdentity(config,address,(await response.json())?.selfHostId);
+    }catch{return null;}
+  }
+  return authorityIdentity(config,address,null);
+}
+async function resolveAuthority(host,config){
+  const pinned=pinnedAddress(config);
+  if(pinned)return verifyAuthority(host,config,pinned);
+  const {daemonUrl,reachable}=await discoverDaemonFromCli(config,host.execFor(config));
+  return reachable&&daemonUrl&&isLoopbackDaemonUrl(daemonUrl)?verifyAuthority(host,config,daemonUrl):null;
 }
 export function knownOldProviderViews(tree,cached=[],gone=[]){
   const found=new Map(cached.map(view=>[view.id,{...view,current:false}]));
@@ -252,38 +300,74 @@ export async function closeOldViewsOnly(host,config,views,appHome,capsFor){
 }
 export async function closeOldViews(host,config,views,appHome,capsFor){
   const {candidates,pending}=oldViewAvailability(config,capsFor),failures=[],failedViews=[],uncheckedViews=[];let closed=0;
+  const completed=new Map(),answering=new Map();
+  let identities,scope=null;
   const fail=(view,reason)=>{failures.push(`${view.name}: ${reason}`);failedViews.push({id:view.id,name:view.name,reason:closeReason(reason)});};
+  const readAuthorized=async candidate=>{
+    const current=await host.currentConfig(),live=configOfConnection(current,authorityId(candidate));
+    if(current?.configInvalid||Array.isArray(current?.connections)&&!current.connections.some(c=>c.id===authorityId(candidate))
+      ||!live||live.daemonMachine||live.daemonUrl!==candidate.daemonUrl||live.openrigHome!==candidate.openrigHome)throw Error('OpenRig settings changed. Reopen this confirmation. Nothing was sent.');
+    return live;
+  };
   for(const reviewed of views){
     const view={...reviewed,name:cleanDisplay(reviewed.name).slice(0,160)||reviewed.id};
-    if(oldViewsGone(host.shared,config).includes(view.id))continue;
     const inventory=await scanOldProviderViews(host,appHome);
     if(!inventory.views.some(v=>v.id===view.id)){
       if(view.layouts?.some(name=>inventory.unreadable.has(name))||!view.layouts?.length&&inventory.unreadable.size)uncheckedViews.push(view);
       continue;
     }
     let known=false;
-    for(const candidate of candidates){
+    const answered=[];
+    if(!identities){
+      identities=await Promise.all(candidates.map(async candidate=>{
+        try{return await resolveAuthority(host,await readAuthorized(candidate));}
+        catch{return null;} // The original authorization check still runs before a write.
+      }));
+      scope=!pending&&identities.length&&identities.every(Boolean)?receiptKey(identities):null;
+    }
+    const previous=readGone(host.shared)[view.id];
+    if(previous&&scope===previous.scope)continue;
+    if(previous&&host.setShared){
+      const receipts={...readGone(host.shared)};delete receipts[view.id];host.setShared('rig.oldProviderGone',{receipts});
+    }
+    for(const [index,candidate] of candidates.entries()){
       try{
-        const current=await host.currentConfig(),live=configOfConnection(current,candidate.connectionId??LEGACY_CONNECTION_ID);
-        if(current?.configInvalid||Array.isArray(current?.connections)&&!current.connections.some(c=>c.id===(candidate.connectionId??LEGACY_CONNECTION_ID))
-          ||!live||live.daemonMachine||live.daemonUrl!==candidate.daemonUrl||live.openrigHome!==candidate.openrigHome)throw Error('OpenRig settings changed. Reopen this confirmation. Nothing was sent.');
-        const command=writeCommand(live,['terminal','close','--app-home',appHome,'--json','--',view.id]);
+        const live=await readAuthorized(candidate),identity=identities[index];
+        // The raw settings authorize the operation. When discovery can name
+        // the local daemon, use that same address for the close and its receipt.
+        const destination=identity&&!pinnedAddress(live)?{...live,daemonUrl:identity.address,daemonUrlSource:'configured'}:live;
+        const command=writeCommand(destination,['terminal','close','--app-home',appHome,'--json','--',view.id]);
         if(!command)throw Error('This OpenRig cannot run the close command. Nothing was sent.');
         const receipt=await host.execFor(live)(command.command,command.args,{timeout:30000}),result=writeOutcome(receipt);
         // writeOutcome normalizes CLI words, but does not carry transport/producer uncertainty flags.
         if([receipt,result.json,result.json?.error].some(value=>value?.outcomeUnknown===true||value?.uncertain===true)){
           fail(view,'The close was not confirmed. Check this view before trying again.');known=true;break;
         }
-        if(result.ok){closed++;rememberGone(host,config,view.id);known=true;break;}
-        if(result.json?.error?.code==='view_not_found'||result.json?.code==='view_not_found')continue;
+        const notFound=result.json?.error?.code==='view_not_found'||result.json?.code==='view_not_found';
+        if((result.ok||notFound)&&scope&&host.setShared){
+          answering.set(identity,live);
+          answered.push(identity);
+        }
+        if(result.ok){closed++;if(answered.length)completed.set(view.id,answered);known=true;break;}
+        if(notFound)continue;
         fail(view,result.text||'The close was not confirmed.');known=true;break;
       }catch(error){fail(view,String(error?.message??error));known=true;break;}
     }
     if(!known){
       if(pending)fail(view,'herdrig is still checking whether every local OpenRig can close old views. Try again after it finishes.');
-      else if(candidates.length)rememberGone(host,config,view.id); // Every supported local authority replied definitely view_not_found.
+      else if(candidates.length){if(answered.length)completed.set(view.id,answered);}
       else fail(view,'No OpenRig on this computer knows it.');
     }
+  }
+  if(completed.size){
+    const verified=new Set();
+    await Promise.all([...answering].map(async([identity,live])=>{
+      const current=await verifyAuthority(host,live,identity.address);
+      if(current?.hostId===identity.hostId)verified.add(identity);
+    }));
+    const receipts=Object.fromEntries([...completed].filter(([,ids])=>ids.every(id=>verified.has(id)))
+      .map(([id,answered])=>[id,{scope,answered}]));
+    if(Object.keys(receipts).length)host.setShared('rig.oldProviderGone',{receipts:{...readGone(host.shared),...receipts}});
   }
   return{ok:failures.length===0&&uncheckedViews.length===0,text:`Closed ${closed} old view${closed===1?'':'s'}; seats keep running.${failures.length?'\n'+failures.join('\n'):''}`,closed,failures,failedViews,uncheckedViews};
 }

@@ -11,6 +11,7 @@ export class ConnectionFeed {
     this.cliVersion = null;
     this.healthz = null;
     this.live = false; // its event stream is open
+    this.eventPath = null;
     this.lists = {}; // path -> { data, error, at } lazily loaded lists, per connection
     this.delay = 1000; // the stream's reconnect backoff
     this.sock = null;
@@ -33,6 +34,7 @@ export class ConnectionFeed {
     this.data = null; this.error = null; this.needsApproval = false; this.sidebarState = null; this.cliVersion = null; this.healthz = null; this.terminalOutage = null; this.lossReadHealthz = null; this.live = false; this.lists = {}; this.uiTimezone = undefined;
     this.workerPreviewSupport = null; this.providerProbe = null; this.hostedReader = null; this.prioritySeeded = false; this.fullAttention = null;
     this.delay = 1000; this.hadDisconnect = false; this.forceCapabilityProbe = true;
+    this.eventPath = null;
     this.forceHelpProbe = true;
   }
 }

@@ -159,8 +159,13 @@ const HEALTH_ROW_CAP = 20;
 /** Folds (rigs, pods, health, edges, needs) are one model in `shared("rig.open.page")`, shared with the sidebar tree. */
 const toggleOpen = (key, now, seats) => setShared("rig.open.page", seats ? foldChoice(shared("rig.open.page"), key, !now, seats) : { ...(shared("rig.open.page") ?? {}), [key]: !now });
 const setOpen = (key, open) => setShared("rig.open.page", { ...(shared("rig.open.page") ?? {}), [key]: open });
-/** Remote drafts belong to a connection and spec, never another daemon with the same path-derived id. */
-const specDraftKey = (id, config) => {
+const specDraftIdentity = config => config && [
+  config.connectionId ?? LEGACY_CONNECTION_ID,
+  ["cli", "default"].includes(config.daemonUrlSource) ? null : config.daemonUrl ?? null,
+  config.daemonMachine ?? null, config.openrigHome ?? null, config.expectedHostId ?? null,
+];
+const specDraftKey = (id, config) => `spec-draft:${JSON.stringify([specDraftIdentity(config), id])}`;
+const olderSpecDraftKey = (id, config) => {
   if (config === null) return `spec:no-connection:${id}`; // the page's connection is no longer set up: never another connection's key
   // The legacy connection's keys are the old ones (stored drafts stay found); another connection's carry its id.
   const own = config?.connectionId && config.connectionId !== LEGACY_CONNECTION_ID ? `${config.connectionId}:` : "";
@@ -168,9 +173,10 @@ const specDraftKey = (id, config) => {
 };
 const setDraft = (key, draft) => {
   const all = { ...(shared("rig.drafts") ?? {}) };
-  if (draft == null) delete all[key]; else all[key] = key.startsWith("remote-spec:") ? {...draft,at:Date.now()} : draft;
+  if (draft == null) delete all[key]; else all[key] = key.startsWith("spec-draft:") ? {...draft,at:Date.now()} : draft;
   setShared("rig.drafts", all);
 };
+const specDraft = raw => typeof raw === "string" ? { text: raw } : typeof raw?.text === "string" ? raw : null;
 const inRigLayout = () => !!(function find(n) {
   return n && typeof n === "object" && (n.id === STACK || n.id === "rig-sidebar" || n.content?.mod === MOD_IDS.sidebar || (n.children ?? []).some(find));
 })(layout());
@@ -339,7 +345,7 @@ export default class RigView extends View {
       };
       try{
         await fresh();
-        const result=await leaveOldStrip({layout,layouts,readTextFile,currentConfig:fresh,execFor,run,spaces,panes,shared,setShared,
+        const result=await leaveOldStrip({layout,layouts,readTextFile,currentConfig:fresh,execFor,fetchFor,run,spaces,panes,shared,setShared,
           currentLayout:()=>shared('layout'),wait:ms=>new Promise(done=>cx.timer.after(ms,done,{owner:null})),beforeSwitch:fresh,checkActive},
           job.config,job.views??[],appHome(),conn=>connectionCapabilities(shared,job.config,conn,terminals()),job.returnLayout);
         if(!this.closed&&!job.expired)this.publishStripRecovery(job,result,cx);
@@ -527,10 +533,7 @@ export default class RigView extends View {
       const ids = new Set([...(previous?.connections ?? []), ...(next?.connections ?? [])].map(connection => connection.id));
       if (previous?.connectionId) ids.add(previous.connectionId);
       if (next?.connectionId) ids.add(next.connectionId);
-      const identity = (cfg, id) => {
-        const connection = configOfConnection(cfg, id);
-        return connection && [connection.daemonUrl, connection.daemonMachine, connection.openrigHome, connection.expectedHostId];
-      };
+      const identity = (cfg, id) => specDraftIdentity(configOfConnection(cfg, id));
       const changed = new Set([...ids].filter(id => JSON.stringify(identity(previous, id)) !== JSON.stringify(identity(next, id))));
       if (previous && changed.size) {
         this.cache = {}; this.cacheEpoch = (this.cacheEpoch ?? 0) + 1; this.resetNowTails(cx);this.graphWork?.close();this.graphWork=null;
@@ -1106,20 +1109,23 @@ export default class RigView extends View {
    *  the folders the page holds): it is true only while this tab still shows the connection the operation began on. Null when the page's connection is no longer set up (nothing is sent). */
   specOperation(config = this.specConfig(), fromConn = this.shownEntry()?.conn ?? null) {
     if (!config) return null;
-    const conn = config.connectionId ?? LEGACY_CONNECTION_ID, base = config === this.config;
+    const base = config === this.config;
+    const identity = JSON.stringify(specDraftIdentity(config));
+    const sameIdentity = other => JSON.stringify(specDraftIdentity(other)) === identity;
     // The page's own config may learn its address after the operation began (a CLI discovery on a default install replaces it): the same connection's
     // newer copy is used then, never another connection's.
-    const current = () => (base && this.config && (this.config.connectionId ?? LEGACY_CONNECTION_ID) === conn ? this.config : config);
+    const current = () => (base && sameIdentity(this.config) ? this.config : config);
     return {
       config, fromConn,
       boxKey: (id) => this.specBoxKey(id, config),
       draftKey: (id) => specDraftKey(id, config),
+      stillConfigured: () => sameIdentity(configOfConnection(this.config, config.connectionId)),
       cache: () => this.cacheFor(config.connectionId),
       daemonUrl: () => this.resolveDaemonUrl(current()),
       rereadLibrary: (cx) => this.read(cx, "/api/specs/library", true, null, current(), true),
       refusal: () => this.specRefusal(config),
       // A page whose connection is no longer set up shows nothing: no operation is on it (the legacy id included).
-      onPage: () => { const shownNow = this.specConfig(); return !!shownNow && (shownNow.connectionId ?? LEGACY_CONNECTION_ID) === conn; },
+      onPage: () => sameIdentity(this.specConfig()),
     };
   }
   /** The connection a row or menu target on this page names: the page entry's own (passed as is: the menu dispatcher judges it, a stale one is
@@ -3340,10 +3346,20 @@ export default class RigView extends View {
         ? `Restored your unsaved edits from ${this.time(box.draftAt??Date.now())}.` : "Restored unsaved edits"))
         .child(this.button(t, `spec-discard-draft-${s.id}`, config.daemonMachine?"Discard edits":"Discard", (_e, cx) => this.discardDraft(cx, s), { tip: "Throw away the unsaved edits you had left here", small: true }))));
     const errors = box.errors ?? [];
+    const olderKey = olderSpecDraftKey(s.id, config);
+    const olderDraft = !isBuiltin && !box.loading && !box.error && !box.olderDraft
+      ? specDraft((shared("rig.drafts") ?? {})[olderKey]) : null;
+    const currentDraft = this.specDirty(box) || Boolean(specDraft((shared("rig.drafts") ?? {})[specDraftKey(s.id, config)]));
     if(single){this.pageActions=toolbar;this.pageHeading={title:s.name,status:`${s.kind??"spec"}${s.version?` · ${s.version}`:""}`};}
     return v_flex().gap(8)
       .child(this.kv(t, [["Kind", s.kind], ["Version", s.version], ["Summary", s.summary], ["File", `${s.sourcePath ?? "not a file on disk"}${config.daemonMachine ? ` · on ${config.daemonMachine}` : ""}`, true]]))
       .when(!single,el=>el.child(toolbar))
+      .when(!!olderDraft, el => el.child(h_flex().gap(6).items_center().flex_wrap()
+        .child(this.dim(t, currentDraft ? "An earlier draft of this spec also exists." : "An earlier draft of this spec was found. herdrig can't tell which OpenRig it was written for."))
+        .child(this.button(t, `spec-restore-older-${s.id}`, box.showOlderDraft ? "Hide it" : currentDraft ? "View it" : "Open it to check…",
+          (_e, cx) => this.openOlderSpecDraft(cx, s, box, config), { small: true }))))
+      .when(!!olderDraft && !!box.showOlderDraft, el => el.child(this.plain(t, olderDraft.text)))
+      .when(!!box.olderDraft, el => el.child(this.dim(t, "This text came from an earlier draft that may have been written for a different OpenRig. Check it before saving.")))
       .when(!!box.builtinEditNote && !guidance, (el) => el.child(this.dim(t, box.builtinEditNote)))
       .when(Boolean(box.confirmDiscardEdit || box.confirmRevert), (el) => el.child(
         h_flex().id(`spec-discard-bar-${s.id}`).gap(8).items_center()
@@ -3403,6 +3419,7 @@ export default class RigView extends View {
     box.state?.release?.();
     const state = EditorState.new({ language: "yaml", value, readonly: Boolean(readonly), font_family: settings().font_family });
     state.on("change", (_e, cx) => {
+      if (box.invalidated || box.state !== state) return;
       const now = state.value();
       const previous=box.lastText??value;
       const pending=box.secondaryEnterBase;
@@ -3413,13 +3430,13 @@ export default class RigView extends View {
       box.secondaryEnterTask?.cancel?.();
       if(box.secondaryEnterBase!=null)box.secondaryEnterTask=cx.timer.after(0,()=>{if(box.state===state)box.secondaryEnterBase=null;});
       box.prevText = box.lastText; box.lastText = now;
-      setDraft(key, now === box.loaded ? null : { text: now, baseText: box.loaded, baseHash: simpleHash(box.loaded) });
+      setDraft(key, now === box.loaded ? null : { text: now, baseText: box.loaded, baseHash: simpleHash(box.loaded), ...(box.olderDraft ? { olderDraft: box.olderDraft } : {}) });
       box.confirmRevert = false; box.confirmDiscardEdit = false; box.confirmReload = false; box.savedText = null;
       cx?.notify?.();
     });
     // Ctrl+Enter puts a newline in the text before it submits: Save gets the text without it.
     state.on("submit", (e, cx) => {
-      if (!e?.secondary) return;
+      if (!e?.secondary || box.invalidated || box.state !== state || specDraftKey(s.id, this.specConfig()) !== key) return;
       box.secondaryEnterTask?.cancel?.();
       const cleaned = box.secondaryEnterBase==null ? state.value() : stripSecondaryEnterNewline(box.secondaryEnterBase, state.value());
       box.secondaryEnterBase=null;
@@ -3549,6 +3566,7 @@ export default class RigView extends View {
     const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box) return;
     setDraft(specDraftKey(s.id,this.specConfig()), null);
+    box.olderDraft = null;
     box.editing = false;
     box.confirmDiscardEdit = false;
     box.confirmRevert = false;
@@ -3571,20 +3589,8 @@ export default class RigView extends View {
         if (!spec) throw new Error("This page's OpenRig is no longer set up, so its spec can't be read. Reopen the page.");
         const text = await this.specText(s, null, spec);
         if (this.closed || box.invalidated) return;
-        const key = spec.draftKey(s.id), raw = (shared("rig.drafts") ?? {})[key];
-        const draft = typeof raw === "string" ? { text: raw, baseText: text } : raw && typeof raw.text === "string" ? raw : null;
-        let initial = text;
-        box.loaded = text; box.diskText = null; box.restoredDraft = false;
-        if (draft && !isBuiltin && draft.text !== text) {
-          box.draftAt=draft.at;
-          initial = draft.text;
-          box.editing = true;
-          if (draft.baseText === text || (draft.baseHash && draft.baseHash === simpleHash(text))) box.restoredDraft = true;
-          else {
-            box.loaded = draft.baseText ?? text; box.diskText = text;
-            box.conflict = this.specConflictMessage(spec.config);
-          }
-        }
+        const draft = !isBuiltin && specDraft((shared("rig.drafts") ?? {})[spec.draftKey(s.id)]);
+        const initial = this.applySpecDraft(box, text, draft, spec.config);
         box.editing = Boolean(box.editing) && !isBuiltin;
         box.lastText = box.prevText = initial;
         this.queueSpecEditorState(s, box, initial, isBuiltin || !box.editing, spec.config);
@@ -3592,6 +3598,50 @@ export default class RigView extends View {
       } catch (e) { box.loading = false; box.error = errorDiagnostic(e); }
       cx.notify();
     });
+  }
+
+  applySpecDraft(box, text, draft, config) {
+    box.loaded = text; box.diskText = null; box.restoredDraft = false;
+    box.olderDraft = draft?.olderDraft ?? null;
+    if (!draft || draft.text === text) return text;
+    box.draftAt = draft.at;
+    box.editing = true;
+    if (draft.baseText === text || (draft.baseHash && draft.baseHash === simpleHash(text))) box.restoredDraft = true;
+    else {
+      box.loaded = draft.baseText ?? text;
+      box.diskText = text;
+      box.conflict = this.specConflictMessage(config);
+    }
+    return draft.text;
+  }
+
+  openOlderSpecDraft(cx, s, box, config) {
+    const spec = this.specOperation(config);
+    if (!spec?.onPage() || box.invalidated || this.specBoxes?.[spec.boxKey(s.id)] !== box || !box.state) return;
+    const drafts = shared("rig.drafts") ?? {}, key = olderSpecDraftKey(s.id, config), raw = drafts[key], older = specDraft(raw);
+    if (!older) return;
+    if (box.showOlderDraft) {
+      box.showOlderDraft = false;
+    } else if (this.specDirty(box) || specDraft(drafts[spec.draftKey(s.id)])) {
+      box.showOlderDraft = true;
+    } else {
+      const draft = { ...older, baseText: older.baseText ?? (older.baseHash ? undefined : box.loaded), olderDraft: { key, raw } };
+      const text = this.applySpecDraft(box, box.loaded, draft, config);
+      setDraft(spec.draftKey(s.id), draft);
+      box.view = "yaml";
+      const current = this.shownEntry();
+      if (current?.section === "specs" && (current.id === s.id || current.name === s.name)) this.push({ ...current, specTab: "yaml" });
+      this.makeSpecEditorState(s, box, text, false, config);
+    }
+    cx.notify();
+  }
+
+  forgetSavedOlderSpecDraft(box, id, config) {
+    const older = box.olderDraft;
+    if (!older) return;
+    box.olderDraft = null;
+    if (older.key === olderSpecDraftKey(id, config) &&
+        JSON.stringify((shared("rig.drafts") ?? {})[older.key]) === JSON.stringify(older.raw)) setDraft(older.key, null);
   }
 
   /** Reload from disk, losing the edits: with edits it asks first (a second press discards them). */
@@ -3611,7 +3661,7 @@ export default class RigView extends View {
     if (!box) return;
     box.conflict = null; box.confirmReload = false; box.editing = true;
     box.loaded = box.diskText ?? box.loaded; box.diskText = null;
-    if (box.state) setDraft(specDraftKey(s.id,this.specConfig()), this.specDirty(box) ? { text: box.state.value(), baseText: box.loaded, baseHash: simpleHash(box.loaded) } : null);
+    if (box.state) setDraft(specDraftKey(s.id,this.specConfig()), this.specDirty(box) ? { text: box.state.value(), baseText: box.loaded, baseHash: simpleHash(box.loaded), ...(box.olderDraft ? { olderDraft: box.olderDraft } : {}) } : null);
     cx.notify();
   }
 
@@ -3620,6 +3670,7 @@ export default class RigView extends View {
     const box = this.specBoxes?.[this.specBoxKey(s.id)];
     if (!box?.state) return;
     setDraft(specDraftKey(s.id,this.specConfig()), null);
+    box.olderDraft = null;
     box.restoredDraft = false; box.confirmRevert = false; box.confirmDiscardEdit = false; box.editing = false;
     this.makeSpecEditorState(s, box, box.loaded, true);
     cx.notify();
@@ -3632,6 +3683,7 @@ export default class RigView extends View {
     if (this.specDirty(box) && !box.confirmRevert) { box.confirmRevert = true; cx.notify(); return; }
     box.state.set_value(box.loaded);
     setDraft(specDraftKey(s.id,this.specConfig()), null);
+    box.olderDraft = null;
     box.confirmRevert = false; box.confirmDiscardEdit = false; box.errors = null; box.conflict = null; box.restoredDraft = false;
     cx.notify();
   }
@@ -3684,6 +3736,8 @@ export default class RigView extends View {
           return;
         }
         const synced = await this.syncLibrary(op, daemonUrl);
+        if (box.invalidated) return;
+        this.forgetSavedOlderSpecDraft(box, s.id, spec.config);
         box.loaded = edited; box.diskText = null; box.errors = null; box.conflict = null; box.restoredDraft = false;
         box.savedText = synced?.ok ? "Saved." : synced?.refused ? "Saved; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up." : "Saved; library re-index failed.";
         delete this.specCopyNotes?.[spec.boxKey(s.id)];
@@ -3926,7 +3980,7 @@ export default class RigView extends View {
     pending.box.awaitingPermission=false;
     if(decision==="allow"){
       const again=pending.began?this.specOperation(configOfConnection(this.config,pending.began.config.connectionId),pending.began.fromConn):null;
-      if(pending.began&&!again){pending.box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one.";cx.notify();return;}
+      if(pending.began&&(!again||!pending.began.stillConfigured())){pending.box.note="This page's OpenRig changed, so nothing more is sent from it. Reopen the page to use the new one.";cx.notify();return;}
       if(pending.request?.verb==="copy-folder")this.copyFolder(cx,pending.spec,pending.confirmation,again);else this.remoteSpecWrite(cx,pending.spec,pending.request,pending.confirmation,again);
     }else {pending.box.note="Nothing was saved on the box.";cx.notify();}
   }
@@ -4149,6 +4203,7 @@ export default class RigView extends View {
     // `spec`: the copy's operation (a bare config from a direct caller). Its marks are that connection's; the page moves to the copy only while
     // this tab still shows the page the copy began on, and the copy's page names the copy's connection.
     const op = typeof spec?.boxKey === "function" ? spec : null, config = op ? op.config : spec;
+    if (op && !op.stillConfigured()) return;
     const key = this.specBoxKey(copy.id, config);
     if (!this.specDirty(this.specBoxes?.[key])) delete this.specBoxes?.[key];
     (this.specAutoEdit ??= new Set()).add(key);
@@ -4164,13 +4219,15 @@ export default class RigView extends View {
   async openExistingCopy(cx, s, host, folder, box, spec = this.specOperation()) {
     const config = typeof spec?.boxKey === "function" ? spec.config : spec; // the copy's own connection (an operation, or a bare config)
     const found = await findExistingCopy(host, s, folder);
+    if (box.invalidated || spec?.stillConfigured?.() === false) return;
     if (found.state === "unindexed") {
       box.note = found.reason ?? "You already have a copy folder for this built-in, but the spec library doesn't list it yet. Refresh the library, then try again.";
       return;
     }
     if (found.state === "finished") { this.showSpecCopy(cx, found.entry, `You already have a copy of ${s.name}; this is it.`, spec); return; }
     const key=specDraftKey(found.entry.id,config),draft=(shared("rig.drafts")??{})[key];
-    const retained=this.specDirty(this.specBoxes?.[this.specBoxKey(found.entry.id, config)]) || typeof draft==='string' || typeof draft?.text==='string';
+    const retained=this.specDirty(this.specBoxes?.[this.specBoxKey(found.entry.id, config)]) || specDraft(draft)
+      || specDraft((shared("rig.drafts") ?? {})[olderSpecDraftKey(found.entry.id, config)]);
     if(!retained)setDraft(key, { text: found.rewritten, baseText: found.baseText, baseHash: simpleHash(found.baseText) });
     this.showSpecCopy(cx, found.entry, retained ? null
       : `An earlier copy of ${s.name} wasn't finished. The fixed agent paths are in the editor; press Save to finish it.`, spec);
@@ -4225,6 +4282,7 @@ export default class RigView extends View {
         if(!checked.ok||validation?.valid===false){box.errors=validation?.errors??[validation?.error??"Validation failed."];return;}
         op.check();
         const result=await this.remoteSpecController(cx,op,config).perform(config,operation,consent);
+        if (box.invalidated) return;
         if(result.needsConsent){
           if(this.specPermission)throw Error("Finish the open spec permission dialog first.");
           const token=`spec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -4235,7 +4293,9 @@ export default class RigView extends View {
         if(!result.ok)throw Error(result.reason??"The box did not confirm the write.");
         this.specConsentMachine=config.daemonMachine;
         const synced=await this.syncLibrary(op,daemonUrl);
+        if (box.invalidated) return;
         if(request.verb==="save"){
+          this.forgetSavedOlderSpecDraft(box, s.id, spec.config);
           box.loaded=content;box.diskText=null;box.conflict=null;box.errors=null;box.restoredDraft=false;
           box.savedText=synced?.ok?`Saved on ${config.daemonMachine}.`:synced?.refused?`Saved on ${config.daemonMachine}; the library wasn't re-indexed because OpenRig's settings changed. Refresh to catch up.`:`Saved on ${config.daemonMachine}; library re-index failed.`;
           delete this.specCopyNotes?.[spec.boxKey(s.id)];

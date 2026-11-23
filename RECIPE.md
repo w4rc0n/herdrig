@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.7
+Version: v0.5.8
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -484,7 +484,9 @@ that OpenRig uses another port), configured in the connection or discovered with
 `/api/gateway/participants`, `/api/gateway/human/*`, `/api/health`, `/api/scopes*`, `/api/specs/library`,
 `/api/terminal/*`, `/api/views/execution`, `/api/provider/usage*`, `/api/telemetry/usage/cost`,
 `/api/compaction/state?session=…`, `/api/telemetry/v1/nodes/:nodeId/tenures?limit=1`, `/api/usage*`, `/api/config*`), subscribes to
-`/api/activity/events` (SSE) for live state, and sends local HTTP `POST` requests only when you click an action
+`/api/events?replay=0` (with `/api/activity/events` as the fallback) for live state. A quiet sidebar on the full
+stream reconciles once a minute, with more frequent checks when the full stream is unavailable or recovery is
+pending. It sends local HTTP `POST` requests only when you click an action
 (`POST /api/mission-control/action` for **Needs** Decision Card acts — `approve`, `deny`, `answer`, `resolve` —
 and update dismissals after their 10-second Undo window;
 `POST /api/provider/usage/hosts/refresh` when refreshing per-host usage; `POST /api/agents/validate` or
@@ -518,7 +520,7 @@ on a currentColor fill, 16 px nominal, so they dim and tint with the theme rathe
 
 ## Watch out
 
-Herdr-app [v0.1.16](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.16) includes [#977](https://github.com/herdrdev/herdr-app/pull/977), which keeps the active space in view. Update Herdr if the person is using an older version.
+Tested with the official Herdr-app [v0.1.17](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.17) build. Herdr keeps the active space in view as of [#977](https://github.com/herdrdev/herdr-app/pull/977).
 
 **Activity and times.** A running seat with no usable activity report is **not reported**, in its own neutral
 group and filter, never Idle. Explicit idle remains idle. Absolute times honour UTC/Etc/UTC exactly; other

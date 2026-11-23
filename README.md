@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.7
+Version: v0.5.8
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -125,7 +125,8 @@ Check the `Version:` line in the README you copied, or open System and read **He
 ## What it does on your machine
 
 - **Network:** only OpenRig's local address (`127.0.0.1:7433` unless your OpenRig uses another port), over HTTP and SSE.
-  It reads live state; write requests follow your actions:
+  The sidebar uses OpenRig's full event stream for updates and reconciles once a minute when quiet. It checks more
+  often when the full stream is unavailable or a recovery check is pending. Write requests follow your actions:
   - a Decision Card act, or dismissal of your queue updates after the 10-second Undo window;
   - a usage refresh;
   - a restore-plan preview (`POST /api/up` with `plan: true`) when you open **Resume rig**;
@@ -308,7 +309,7 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
 
 ## Known limitations
 
-- Herdr-app [v0.1.16](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.16) includes [#977](https://github.com/herdrdev/herdr-app/pull/977), which keeps the active space in view. Update Herdr if you are using an older version.
+- Tested with the official Herdr-app [v0.1.17](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.17) build. Herdr keeps the active space in view as of [#977](https://github.com/herdrdev/herdr-app/pull/977).
 - **Some actions need your OpenRig name.** Sending, queueing, changing a seat's model, and editing quiet hours or
   modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
 - **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.

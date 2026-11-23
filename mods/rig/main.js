@@ -52,7 +52,7 @@ const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 import { RemoteMachine, detectDaemonMachine, offerForMachine, machineProbeExec, herdrIdentityOf, loopbackHealthFetch, goodHome } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViewsOnly, hasOldProviderStrip, ensureOldStripPage, oldViewsGone, oldStripCleanupOwner, oldStripCleanupBusy, oldStripBusyTip, releaseOldStripCleanup } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViewsOnly, hasOldProviderStrip, ensureOldStripPage, visibleOldViewsGone, pruneOldViewsGone, oldStripCleanupOwner, oldStripCleanupBusy, oldStripBusyTip, releaseOldStripCleanup } from "./rig-old-views.js";
 import { layouts } from "herdr";
 import { HostWorkerViews } from "./rig-worker-controller.js";
 import {migrateConnectionState} from './rig-connection-migration.js';
@@ -267,6 +267,7 @@ const FULL_ATTENTION_QUICK_MS = 1000;
 const FULL_ATTENTION_GAP_FACTOR = 8;
 /** Above this, the sidebar says that this OpenRig is slow to list its updates and how often they are read. */
 const FULL_ATTENTION_SLOW_MS = 3000;
+const QUIET_RECONCILE_MS = 60_000;
 /** Whether an OpenRig honoured `kind=action`: one that does names the narrowed read among its sources; an older one ignores the parameter
  *  and answers with the whole list. */
 const kindFiltered = (answer) => Array.isArray(answer?.sources) && answer.sources.some((s) => s?.source === "kind");
@@ -362,7 +363,7 @@ export default class RigSidebar extends View {
       }
       this.stream(cx);
     });
-    // Re-read the config whenever it may have changed: on any change under the app home, every second while missing, and every 5 s.
+    // Watch the config folder. Periodic reads cover a missing file, failed reads and missed changes.
     cx.spawn(async (cx) => {
       for (;;) {
         const dir = this.config && !this.config.missing ? `${appHome()}/openrig` : appHome();
@@ -544,10 +545,20 @@ export default class RigSidebar extends View {
     });
     // Still alive, so Attach waits for this sidebar. One beat per minute bounds the global refresh from changed shared state.
     cx.timer.every(ROUTE_RECEIVER_HEARTBEAT_MS, () => { if (!this.closed) setShared("rig.routeReceivers", receiversWithBeat(shared("rig.routeReceivers"), this.routeReceiverId)); });
-    // SSE accelerates updates; polling also covers lifecycle changes the stream does not announce.
+    // Check timers frequently for outages. A quiet public event stream only needs the bounded reconciliation.
     cx.timer.every(5000, (cx) => {
       if (this.closed) return;
-      cx.spawn(async (cx) => { try { await this.reloadConfig(cx); await this.refreshFeeds(cx,true); } catch (error) { this.sayConfigReadFailure(error); } });
+      const now = Date.now();
+      const configDue = this.configReadFailure || this.lastAutomaticConfigRead == null ||
+        now < this.lastAutomaticConfigRead || now - this.lastAutomaticConfigRead >= QUIET_RECONCILE_MS;
+      if (!configDue && !this.feeds.some(feed => this.automaticRefreshDue(feed, now))) return;
+      if (configDue) this.lastAutomaticConfigRead = now;
+      cx.spawn(async (cx) => {
+        if (configDue) {
+          try { await this.reloadConfig(cx); } catch (error) { this.sayConfigReadFailure(error); }
+        }
+        if (!this.closed) await this.refreshFeeds(cx,true);
+      });
     });
   }
 
@@ -2056,7 +2067,7 @@ export default class RigSidebar extends View {
           return current;
         };
         await fresh();
-        const host={layout,layouts,readTextFile,currentConfig:fresh,execFor,run,spaces,panes,shared,setShared,
+        const host={layout,layouts,readTextFile,currentConfig:fresh,execFor,fetchFor,run,spaces,panes,shared,setShared,
           currentLayout:()=>shared('layout'),wait:ms=>this.closed?Promise.resolve():new Promise(done=>cx.timer.after(ms,done,{owner:null})),beforeSwitch:fresh};
         if(request.returnLayout){
           const tab=await ensureOldStripPage(host);await fresh();
@@ -3088,6 +3099,8 @@ export default class RigSidebar extends View {
     // publishes nothing there. Small refresh times keep pages fresh; separate content versions decide when their live lists need invalidating.
     if (!sameRigData(value, this.publishedRigData)) {
       this.setRigData(value);
+      const config=this.primary.config;
+      pruneOldViewsGone(shared,setShared,config,id=>connectionCapabilities(shared,config,id,terminals()),value);
       cx.notify();
       return true;
     }
@@ -3184,13 +3197,22 @@ export default class RigSidebar extends View {
   /** The connected-assistant roster of one connection (each OpenRig has its own: its members, its 404 cache, its identity). */
   rosterOf(conn) { const feed = this.feeds.find((f) => f.id === conn) ?? this.primary; return feed.data?.hostedMembers ?? null; }
 
+  automaticRefreshDue(feed, now = Date.now(), event = false) {
+    if (feed.closed) return false;
+    const key = JSON.stringify([gateIdentity(feed.config), gateGeneration(feed.config?.connectionId)]);
+    if (feed.error && feed.refreshRetry?.key === key && now < feed.refreshRetry.nextAt) return false;
+    const fullEvents = feed.eventPath === "/api/events?replay=0" || feed.eventPath === "herdr";
+    if (event || !fullEvents || !feed.live || feed.error || !feed.data || feed.terminalOutage || feed.inflightRouteOps) return true;
+    // Only the primary refresh runs the grid sweep, which already has its own retry backoff.
+    if (feed === this.primary && (this.spaceSyncError || this.spaceAgain || this.spaceSweepRetry?.nextAt <= now)) return true;
+    return feed.quietRefresh?.key !== key || now < feed.quietRefresh.at || now - feed.quietRefresh.at >= QUIET_RECONCILE_MS;
+  }
+
   /** One refresh of one feed: the primary's full read, or a secondary connection's own read of its rows. */
   async refreshFeed(cx, feed, {automatic=false,event=false}={}) {
+    if (automatic && !this.automaticRefreshDue(feed, Date.now(), event)) return;
     if(feed.refreshing){feed.again=true;return;}
     const key=JSON.stringify([gateIdentity(feed.config),gateGeneration(feed.config?.connectionId)]),previous=feed.refreshRetry;
-    if(automatic&&feed.error&&previous?.key===key&&Date.now()<previous.nextAt)return;
-    // SSE brings real changes immediately; a quiet Herdr connection needs only a bounded lifecycle fallback.
-    if(automatic&&!event&&feed.live&&!feed.error&&String(feed.config?.daemonUrl??'').startsWith('herdr://')&&feed.quietRefresh?.key===key&&Date.now()>=feed.quietRefresh.at&&Date.now()-feed.quietRefresh.at<60000)return;
     if(!automatic){this.completedSpaceSweep=null;this.spaceSweepRetry=null;}
     await (feed===this.primary?this.refresh(cx,feed):this.refreshSecondary(cx,feed));
     if(!feed.error)feed.quietRefresh={key,at:Date.now()};
@@ -3467,6 +3489,8 @@ export default class RigSidebar extends View {
       while (!this.closed && !feed.closed) {
         if (!feed.config?.daemonUrl) { await new Promise((resolve) => cx.timer.after(1000, () => resolve(),{owner:null})); continue; }
         let pendingTimer=null;
+        // A planned replacement (the last stream ended "stale": every health check answered) missed nothing, so this connect reads nothing extra.
+        const planned=feed.plannedReplace===true;feed.plannedReplace=false;
         try {
           // herdr:// has no socket to parse: the helper's long-poll stands in (plain JS, the mod runtime need not have `URL`).
           const origin=feed.config.daemonUrl,url = String(origin??"").startsWith("herdr://") ? { protocol: "herdr:", origin } : addressParts(origin);
@@ -3495,13 +3519,17 @@ export default class RigSidebar extends View {
               },{owner:null});
             },{owner:null});
           });
+          feed.eventPath = opened.path;
           feed.live = true; feed.delay = 1000;
+          const readAll = !planned || feed.hadDisconnect;
           if (feed.hadDisconnect) { feed.hadDisconnect = false; feed.forceCapabilityProbe = true; }
-          await this.refreshFeed(cx, feed);
-          await this.workerController(cx).event(feed.config); // every connection's events drive its own worker views
+          if (readAll) {
+            await this.refreshFeed(cx, feed);
+            await this.workerController(cx).event(feed.config); // every connection's events drive its own worker views
+          }
           if(opened.initial.length){let text;[text,carry]=utf8(opened.initial,carry);parseEvents(text);}
           // An idle read timeout (Herdr's 30 s) is not a disconnect: one health request, then the same socket is read again.
-          await pumpEvents(feed.sock, {
+          const end = await pumpEvents(feed.sock, {
             onChunk: (chunk) => { let text; [text, carry] = utf8(chunk, carry); parseEvents(text); },
             // Bounded: a peer that is gone without closing the socket must not hang the check (no answer in 10 s counts as failed).
             alive: () => new Promise((resolve) => {
@@ -3511,11 +3539,17 @@ export default class RigSidebar extends View {
             }),
             stop: () => this.closed || feed.closed || feed.config?.daemonUrl !== origin,
           });
+          // Replaced after MAX_IDLE_TIMEOUTS quiet reads: not a disconnect. It stays live through the usual 1 s wait; the 5 s poll covers the gap.
+          // herdr:// polls skip for up to 60 s while live; clearing that lets the next 5 s poll read the gap once.
+          if (end === "stale") { feed.plannedReplace = true; feed.quietRefresh = null; }
         } catch (e) { this.sayStreamBug(feed, e); /* then reconnect below */ }
         finally{pendingTimer?.cancel?.();}
         try { feed.sock?.close(); } catch (_) {}
         // Publish the merged view (this connection's state goes under its own id): never replace rig.data with one connection's data.
-        if (feed.live) { feed.live = false; feed.hadDisconnect = true; this.publishData(cx); }
+        if (!feed.plannedReplace) {
+          feed.eventPath = null;
+          if (feed.live) { feed.live = false; feed.hadDisconnect = true; this.publishData(cx); }
+        }
         if (this.closed || feed.closed) return;
         // Each connection waits out its own backoff (1, 2, 4 ... 60 s); Retry wakes it at once.
         await new Promise((resolve) => { let timer;const wake=()=>{timer?.cancel?.();resolve();};feed.wake=wake;timer=cx.timer.after(feed.delay,wake,{owner:null}); });
@@ -4798,7 +4832,7 @@ export default class RigSidebar extends View {
       const cleanupResult=this.oldViewsCloseResult();
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(cleanupResult.ok===false?t.blocked:t.muted).child(cleanupResult.text));
-      const oldViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],oldViewsGone(shared,this.config)).filter(view=>view.current);
+      const oldViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],visibleOldViewsGone(shared,this.config,terminals())).filter(view=>view.current);
       if (hasOldProviderStrip(layout())||oldViews.length) {
         const closeActivation=activationPair(this,'system-close-old-worker-views');
         const openOldViews=()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,

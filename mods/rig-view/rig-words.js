@@ -61,7 +61,7 @@ export function plainError(error, { where = "OpenRig's machine", what = null, wh
   if (framed && /may (?:still )?have|write reached|answer couldn't be read|nothing (?:more )?was (?:sent|changed|started|stopped)|partly done|earlier part was recorded/i.test(framed[1] + framed[3])) {
     const inner = plainError(framed[2], { where, what, who, toast, readingReply });
     if (inner.text !== inner.detail) {
-      const clause = inner.text.replace(/\. (?:Try again in a moment|Details has the exact error|It's in the log)\./g, "")
+      const clause = inner.text.replace(/(?<=\.) (?:Try again(?: in a moment)?|Details has the exact error|The exact error is in the log|It's in the log)\./g, "")
         .replace(/has run out/g, "had run out").replace(/is out of/g, "was out of").replace(/is busy/g, "was busy")
         .replace(/[.!?]+$/, "");
       return { text: `${withoutPaths(framed[1])}(${clause})${withoutPaths(framed[3])}`, detail };
