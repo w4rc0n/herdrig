@@ -9,7 +9,8 @@ export function connectionIdentity(config){
  return origin?{origin,machine:config.daemonMachine??null,home:config.openrigHome??null,host:config.expectedHostId??null}:null;
 }
 const same=(a,b)=>!!a&&!!b&&a.origin===b.origin&&a.machine===b.machine&&a.home===b.home&&a.host===b.host;
-const configurations=config=>config&&!config.configInvalid?connectionsOf(config).connections.map(conn=>
+const listOf=config=>config.connectionsList===false||config.missing?connectionsOf({...config,connections:undefined}).connections:connectionsOf(config).connections;
+const configurations=config=>config&&!config.configInvalid?listOf(config).map(conn=>
  conn.id===LEGACY_CONNECTION_ID&&!config.connectionsList&&config.daemonUrlSource==='cli'
   ?connectionConfig(config,{...conn,daemonUrl:config.daemonUrl})
   :connectionConfig(config,conn)):[];

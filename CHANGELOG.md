@@ -9,6 +9,7 @@ Ctrl-click OpenRig links and API addresses in Herdr terminals to open them on th
 - A brief read failure in the Rig sidebar’s Needs list no longer brings answered requests back.
 - Saving an earlier spec draft clears its reminder, including drafts saved by older versions.
 - In the Rig page's Recent activity, an entry whose text is only a request ID reads "Untitled row" instead of "No work served".
+- Launching a spec where only some seats start now says which seats started and which didn't, with OpenRig's reason, and shows the rig in the sidebar. A launch where no seat starts gives OpenRig's reason instead of "stopped without saying why".
 
 ## v0.5.9
 

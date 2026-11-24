@@ -73,7 +73,7 @@ let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 const openOverlay = (spec) => rawOpenOverlay(messageDialogSpace(stampRows(spec, props()?.target?.rowsConfig ?? null))); // a dialog opened from a menu keeps the stamp of the target it was opened for
 import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
-  fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, LAUNCH_DIALOG_HEIGHT, navPush, actionArgs, appHomeArgsRefusal, writeOutcome, actionTitle, doneWords, startOneClick,
+  fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, LAUNCH_DIALOG_HEIGHT, navPush, actionArgs, appHomeArgsRefusal, writeOutcome, launchOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
   SWAP_RUNTIMES, changeModelPlan, filterAllowedModels,
@@ -1142,7 +1142,7 @@ export default class RigMenu extends View {
       if (this.gone && this.result?.notSent) { this.busy = null; this.result = null; return; }
       // Sent: the draft is done with. Not sent: it stays, for a retry from the menu.
       // A launch or create that may have gone through is remembered for this dialog: a form change (a spec pick, the mode) clears the result but never this.
-      if (this.result && !this.result.ok && this.result.uncertain) this.uncertainAttempt = true; // read only by launch and new rig (a dialog has one action)
+      if (this.result && !this.result.ok && (this.result.uncertain || this.result.partial)) this.uncertainAttempt = true; // read only by launch and new rig (a dialog has one action)
       if (this.result?.ok || knownHeldReceipt(this.result, props()?.step?.action)) this.dropDraft();
       this.busy = null;
       if (this.gone) return;
@@ -1911,12 +1911,13 @@ export default class RigMenu extends View {
         ? "It may still have been delivered: check the seat or `rig queue` before trying again."
         : step.action === "reply" ? "It may still have arrived: check the request in Needs-You before answering again."
         : step.action === "change-model" ? `The change may already have been queued: check ${this.changeQueuedFor ? `${this.changeQueuedFor}'s queue` : "the queue it was sent to"} (\`rig queue\`) before queueing it again.`
+        : (step.action === "launch-spec" || step.action === "new-rig") && r.partial ? "The rig is in the rig list with the seats that started. Fix what stopped the others, then resume the rig from there."
         : step.action === "launch-spec" ? (r.uncertain ? "The launch may already have started: check the rig list before launching again." : "Fix the fields above and press Launch, or check the rig list if Launch timed out.")
         : step.action === "new-rig" ? (r.uncertain ? "The rig may already have been created: check the rig list before creating it again." : "Check the rig list before trying again.")
         : step.action === "delete-rig" ? "Check the rig list before trying again; Retry runs the delete again."
         : step.action === "pause" || step.action === "resume" ? "Check the current state before trying again; Retry re-reads it first." : "Retry runs it again.")))
       // A launch or create that may have gone through offers the rig list instead of a second try; closing and reopening the dialog starts a fresh attempt.
-      .when(!r.ok && r.uncertain && (step.action === "launch-spec" || step.action === "new-rig"), (el) => el.child(this.dialogButton(t,div().id("rig-check-list").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
+      .when(!r.ok && (r.uncertain || r.partial) && (step.action === "launch-spec" || step.action === "new-rig"), (el) => el.child(this.dialogButton(t,div().id("rig-check-list").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
         (_e,cx)=>{ refreshSidebar(); this.navigate({ section: "topology" }, cx); },false,"Check the rig list")))
       // A message or an answer is never resent from here: it may have arrived. Anything else runs again.
       .when(this.retryable(step), (el) => el.child(this.dialogButton(t,div().id("rig-retry").px(10).h(24).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),null,
@@ -2183,11 +2184,12 @@ export default class RigMenu extends View {
       setShared("rig.drafts", { ...(shared("rig.drafts") ?? {}), "launch-folder": folder });
       const fromSpec = this.newMode === "spec", spec = this.newSpec?.name ?? this.newSpec?.sourcePath, runtime = this.newRuntime;
       this.run(cx, fromSpec ? "Launching" : "Creating", async () => {
-        const r = await this.write(args, fromSpec ? { env: launchSpecEnv("") } : undefined);
-        if (r.ok) refreshSidebar();
+        const r = launchOutcome(await this.write(args, fromSpec ? { env: launchSpecEnv("") } : undefined));
+        if (r.ok || r.partial) refreshSidebar(); // a partial launch made the rig too
         const createdRig = r.json?.rig?.id ?? r.json?.rigId ?? r.json?.rig?.name ?? r.json?.name ?? (name || spec);
         return r.ok ? { ...r, kind: "new-rig", createdRig, text: fromSpec ? `${spec} launched${name ? ` as ${name}` : ""}.` : `${name} created with one ${runtime} seat.` }
-          : r.notSent ? r /* refused before anything was sent: its own sentence, not "OpenRig refused" */ : { ...r, text: r.uncertain || /timed? ?out|timeout/i.test(r.text ?? "") ? "OpenRig didn't answer in time. Check the rig list before trying again." : `OpenRig refused: ${r.text || "no reason was reported."}` };
+          : r.notSent ? r /* refused before anything was sent: its own sentence, not "OpenRig refused" */
+          : r.partial ? { ...r, kind: "new-rig", createdRig } /* OpenRig's own account of which seats started */ : { ...r, text: r.uncertain || (!r.launchStatus && /timed? ?out|timeout/i.test(r.text ?? "")) /* OpenRig's own reason can say "timeout" */ ? "OpenRig didn't answer in time. Check the rig list before trying again." : `OpenRig refused: ${r.text || "no reason was reported."}` };
       });
       return;
     }
@@ -2201,7 +2203,7 @@ export default class RigMenu extends View {
       if (!folderProblem) drafts["launch-folder"] = folder.trim();
       setShared("rig.drafts", drafts);
       if (problem || !args) { this.result = { ok: false, notSent: true, text: problem ?? "Nothing to launch: the spec has no name or file." }; cx.notify(); return; }
-      this.run(cx, "Launching", async () => { const r = await this.write(args, { env: launchSpecEnv(host) }); if (r.ok) refreshSidebar(); return r; });
+      this.run(cx, "Launching", async () => { const r = launchOutcome(await this.write(args, { env: launchSpecEnv(host) })); if (r.ok || r.partial) refreshSidebar(); return r; });
       return;
     }
     if (step.action === "design-view") {

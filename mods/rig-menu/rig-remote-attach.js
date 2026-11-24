@@ -120,6 +120,7 @@ export async function attachRemoteSeat(host, seat, config, options = {}) {
     if (pendingReplace) {
       const stillStale = staleChangedViewer();
       if (stillStale) {
+        if (stillStale.terminal !== pendingReplace.terminal || stillStale.tab !== pendingReplace.tab) return staleViewerOffer(stillStale);
         const movedBeforeStop = changed(); if (movedBeforeStop) return movedBeforeStop; // nothing is stopped for settings that are gone
         // No `--on`: herdr-core routes terminal-addressed verbs by the address's `machine/` prefix (remote.rs ON_A_TERMINAL),
         // so the kill reaches the right core without a cross-machine verb (security rule S32: only run, exec and the relay's

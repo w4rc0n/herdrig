@@ -485,7 +485,10 @@ function lookup(host,config,names,{markedOnly=false,sessions=null,hostId=null,se
   // Another daemon's explicit origin on a rig terminal is positive evidence the space is theirs (an alias spelling of this daemon's address on a box is not another daemon), so under strictOrigin it vetoes the space (not for the marked lookup: our own mark is our own adoption record, and a copied-label terminal inside our grid is handled by the grid) even when
   // one of our origin-less legacy terminals sits in it.
   const foreign=context=>strictOrigin&&!markedOnly&&links(context).some(link=>rigNames.has(link.rig)&&link.origin&&!sameOrigin(link.origin,expected,machine));
-  const exact=onMachine.filter(context=>!foreign(context)&&links(context).some(link=>rigNames.has(link.rig)&&counts(link)));
+  // When the caller supplies a live host id, a space whose terminals for this rig carry another host's stamp belongs to that host even if the address was reassigned.
+  const ownHost=hostLabelValue(hostId);
+  const conflictingHost=context=>Boolean(ownHost&&context.rigLinks.some(link=>rigNames.has(link.rig)&&link.host&&link.host!==ownHost));
+  const exact=onMachine.filter(context=>!foreign(context)&&!conflictingHost(context)&&links(context).some(link=>rigNames.has(link.rig)&&counts(link)));
   if(exact.length)return {space:(exact.find(context=>context.space.active)??exact[0]).space,unconfirmed:null};
   if(strictOrigin){
     const bare=onMachine.filter(context=>{const mine=links(context).filter(link=>rigNames.has(link.rig));return mine.length>0&&mine.every(link=>!link.origin&&!link.ours);});
@@ -661,7 +664,7 @@ export function openRigSpaceContext(spaces = [], terminals = [], panes = [], sta
         rigOwned = true;
         const rig = labels["herdr-openrig.rig"] || labels["openrig.rig"];
         if (rig) {
-          const link={rig,origin:labels["herdr-openrig.origin"]??null,ours:Boolean(labels["herdr-openrig.rig"])};rigs.add(rig);rigLinks.push(link);
+          const link={rig,origin:labels["herdr-openrig.origin"]??null,ours:Boolean(labels["herdr-openrig.rig"]),host:labels["herdr-openrig.host"]??null};rigs.add(rig);rigLinks.push(link);
           if(labels["herdr-openrig.space"]==="1")markedRigLinks.push(link);
         }
       }

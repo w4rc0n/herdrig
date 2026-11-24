@@ -14,10 +14,30 @@ import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, co
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
 import { counted as countWords, plainError as errorWords, statusWord as stateWords, requestFailed as failedWords, requestWhat as requestWords } from './rig-words.js';
+import {
+  parseConfig as coreParseConfig,
+  isLoopbackDaemonUrl as coreIsLoopbackDaemonUrl,
+  sharedLoopbackDaemonUrl as coreSharedLoopbackDaemonUrl,
+  layoutHasMod as coreLayoutHasMod,
+  machineSpaceConn as coreMachineSpaceConn,
+  navKey as coreNavKey,
+  navPush as coreNavPush,
+  tabPagesPush as coreTabPagesPush,
+  pushTabPage as corePushTabPage,
+} from "./rig-core.js";
 // Local wrapper exports avoid indirect re-exports through the existing module cycles in QuickJS.
 export const counted = (n, one, many) => countWords(n, one, many);
 export const plainError = (error, options) => errorWords(error, options);
 export const statusWord = (token, kind) => stateWords(token, kind);
+export const parseConfig = (text) => coreParseConfig(text);
+export const isLoopbackDaemonUrl = (daemonUrl) => coreIsLoopbackDaemonUrl(daemonUrl);
+export const sharedLoopbackDaemonUrl = (config, published) => coreSharedLoopbackDaemonUrl(config, published);
+export const layoutHasMod = (node, mod) => coreLayoutHasMod(node, mod);
+export const machineSpaceConn = (config, space) => coreMachineSpaceConn(config, space);
+export const navKey = (entry) => coreNavKey(entry);
+export const navPush = (nav, entry) => coreNavPush(nav, entry);
+export const tabPagesPush = (all, tabId, entry, options) => coreTabPagesPush(all, tabId, entry, options);
+export const pushTabPage = (host, tabId, entry, options = {}) => corePushTabPage(host, tabId, entry, { viewMod: MOD_IDS.view, ...options });
 import { cleanSidebarViews, cleanAwayStates, cleanNotifiedNeeds, cleanNotifiedNeedsMap } from './rig-sidebar-view-state.js';
 const SYSTEM_VIEW_LABELS = new Map(SYSTEM_PAGE_VIEWS);
 
@@ -508,40 +528,6 @@ export const STATE_COPY = Object.freeze({
   S6: Object.freeze({ id: "S6", headline: null, suggestedUpgrade: SUGGESTED_UPGRADE_LINE }),
   S7: Object.freeze({ id: "S7", headline: "The rig command failed." }),
 });
-
-/** `<app home>/openrig/config.json`, optional overrides for `person`, `daemonUrl`, `rig`, and `openrigHome`. */
-export function parseConfig(text) {
-  let raw = null;
-  try { raw = JSON.parse(text ?? "null"); } catch { raw = null; }
-  if (!raw || typeof raw !== "object") { const { connections } = connectionsOf(null); return { person: null, daemonUrl: null, rig: ["rig"], openrigHome: null, missing: true, connectionId: connections[0].id, connections }; }
-  const person = typeof raw.person === "string" && /^[^@\s]+@external$/.test(raw.person) ? raw.person : null;
-  const daemonUrl = typeof raw.daemonUrl === "string" && /^https?:\/\/[^\s]+$/.test(raw.daemonUrl) ? raw.daemonUrl.replace(/\/+$/, "")
-    : typeof raw.daemonUrl === "string" && /^herdr:\/\/[a-z0-9][a-z0-9._-]{0,31}\/[A-Za-z0-9._:-]{1,128}$/.test(raw.daemonUrl) ? raw.daemonUrl : null; // over Herdr's connection
-  const daemonUrlSource = typeof raw.daemonUrlSource === "string" && raw.daemonUrlSource ? raw.daemonUrlSource : undefined;
-  const daemonState = typeof raw.daemonState === "string" && raw.daemonState ? raw.daemonState : undefined;
-  const daemonMessage = typeof raw.daemonMessage === "string" && raw.daemonMessage ? raw.daemonMessage : undefined;
-  // The configured CLI argv (its node and entry): the mods run that OpenRig, whatever PATH a process has.
-  const rig = Array.isArray(raw.rig) && raw.rig.length && raw.rig.every((x) => typeof x === "string" && x.length) ? raw.rig : ["rig"];
-  // The configured OpenRig home, pinned on every command (herdr-app's own environment may name another).
-  const openrigHome = typeof raw.openrigHome === "string" && raw.openrigHome.startsWith("/") ? raw.openrigHome : null;
-  const capabilities = raw.capabilities && typeof raw.capabilities === "object" && !Array.isArray(raw.capabilities) ? raw.capabilities : undefined;
-  // The connections this config describes (v0.5.0): the legacy daemonUrl / daemonMachine keys are connection one of a list of one, and
-  // nothing is rewritten. The config below is the first connection's, so a single-daemon setup is as it was.
-  const { connections, legacy, notes, invalid } = connectionsOf(raw);
-  // A list with no usable entry is an invalid config: inert (no address, no home, no machine, not even the legacy keys next to the list), and it says why. Nothing is sent.
-  if (invalid) return { person, daemonUrl: null, rig, openrigHome: null, missing: false, connectionId: LEGACY_CONNECTION_ID, connections: [], configInvalid: invalid, connectionNotes: notes, ...(raw.reducedMotion === true ? { reducedMotion: true } : {}) };
-  const first = connections[0];
-  return {
-    person, daemonUrl: legacy ? daemonUrl : first.daemonUrl, rig, openrigHome: legacy ? openrigHome : first.openrigHome, missing: false,
-    connectionId: first.id, connections, connectionsList: !legacy, ...(notes.length ? { connectionNotes: notes } : {}), ...(!legacy && first.expectedHostId ? { expectedHostId: first.expectedHostId } : {}),
-    ...(legacy ? (raw.daemonMachine !== undefined && raw.daemonMachine !== "" ? { daemonMachine: raw.daemonMachine } : {}) : (first.machine ? { daemonMachine: first.machine } : {})),
-    ...(daemonUrlSource ? { daemonUrlSource } : {}),
-    ...(daemonState ? { daemonState } : {}),
-    ...(daemonMessage ? { daemonMessage } : {}),
-    ...(capabilities ? { capabilities } : {}),
-    ...(raw.reducedMotion === true ? { reducedMotion: true } : {}),
-  };
-}
 
 /**
  * Parse `rig config get daemon.host --json` output.
@@ -1151,14 +1137,6 @@ export function preserveCliDiscoveredConfig(next, prev) {
  * What every command's environment drops (a seat's identity, database, and `OPENRIG_URL` herdr-app may have inherited)
  * and sets (`OPENRIG_URL` is exported ONLY when `daemonUrl` was explicitly configured in `config.json`).
  */
-/** The loopback daemon address another mod published in the shared `rig.data` config, for a mod whose own config names none. A refused connections
- *  list has NO address and gets none from here: a sidebar that ran before the list was added left one behind, and clears it only when its own refresh
- *  runs. Every reader of that shared address goes through this. */
-export function sharedLoopbackDaemonUrl(config, published) {
-  if (config?.configInvalid || !publishedUnder(config, published)) return null; // another home's, machine's or connection's address is not this reader's
-  const url = publishedConfigFor(config, published)?.daemonUrl; // the READER's connection's entry, never the primary's
-  return url && isLoopbackDaemonUrl(url) ? url : null;
-}
 /** What other mods published in the shared `rig.data` (rows, nodes, needs, versions), as a reader may RENDER or SUGGEST it. A refused connections list
  *  has none: whatever a sidebar published before the list was added is stale, and the sidebar replaces it only when its own refresh runs. Every
  *  reader of the shared rows goes through this (`undefined` reads like a sidebar that has published nothing). */
@@ -3066,34 +3044,6 @@ export function onScreenRigPage(host, environment, read) {
     return { conns: record?.space === space?.id ? Object.values(record.views ?? {}).filter(Boolean) : [] };
   } catch (_) { return null; }
 }
-/** The OpenRig of a machine space with exactly one OpenRig there, else null (a space on this computer, or a machine with none or two). */
-export function machineSpaceConn(config, space) {
-  const connections = config?.connections ?? [];
-  if (connections.length <= 1 || !space || !spaceMachine(space)) return null;
-  const picked = followedConnection({ connections, space });
-  return picked.why === "space" ? picked.id : null;
-}
-/** Appends a page to one Rig tab's own history. A tab with no history yet starts from the page the router last sent it (so Back returns there).
- *  A machine space with one OpenRig refuses another OpenRig's page. True when the page was added. */
-export function pushTabPage(host, tabId, entry, { spaceConn = null } = {}) {
-  if (!tabId || !entry) return false;
-  // A tab with two Rig panes split in it keeps the shared history (each pane draws its own OpenRig from rig.nav, which every open logs): no record is
-  // written for it, so none is waiting to make a pane jump when the tab is unsplit.
-  try {
-    const list = typeof host?.panes === "function" ? host.panes() : Array.isArray(host?.panes) ? host.panes : [];
-    if (list.filter((p) => p?.mod === MOD_IDS.view && p.tab === tabId).length > 1) {
-      if (!(spaceConn && entry.conn && entry.conn !== spaceConn)) host.setShared?.("rig.nav", navPush(host.shared?.("rig.nav"), entry)); // where its panes read
-      return false;
-    }
-  } catch (_) {}
-  const all = host.shared?.("rig.tabPages") ?? {};
-  const routed = host.shared?.("rig.pageRoutes")?.[tabId];
-  const base = all[tabId] || !routed ? all : { ...all, [tabId]: { stack: [routed], at: Date.now() } };
-  const next = tabPagesPush(base, tabId, entry, { spaceConn });
-  if (next === base) return false;
-  host.setShared?.("rig.tabPages", next);
-  return true;
-}
 /** The Rig tab in a space that an open with no source lands in: the active tab when it's a Rig tab, else the newest-changed unsettled one, else
  *  the first unsettled, else a settled one. */
 export function pickRigTab(space, rigTabIds, tabPages = {}) {
@@ -4729,19 +4679,35 @@ export function tuiArgv(config) {
   return [cmd.command, ...cmd.args];
 }
 
-/** A process argv that is OpenRig's TUI: `rig tui`, or the recorded CLI's entry followed by `tui`. */
+/** A process argv that is OpenRig's TUI: `rig tui`, or the recorded CLI's entry followed by `tui`,
+ *  at command position (with an optional leading `env` wrapper as launched by `tuiArgv` / remote `home()`). */
 export function isTuiArgv(argv, config) {
   const a = (Array.isArray(argv) ? argv : []).map(String);
+  if (a.length < 2) return false;
+  const baseOf = (token) => token.split("/").pop();
+  let cmd = 0;
+  if (baseOf(a[0]) === "env") {
+    cmd = 1;
+    while (cmd < a.length) {
+      if (a[cmd] === "--" || a[cmd] === "-") { cmd++; break; }
+      if (a[cmd] === "-i" || a[cmd] === "--ignore-environment" || a[cmd].startsWith("--unset=")) { cmd++; continue; }
+      if (a[cmd] === "-u" || a[cmd] === "--unset") { cmd += 2; continue; }
+      break;
+    }
+    while (cmd < a.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(a[cmd])) cmd++;
+  }
+  if (cmd + 1 >= a.length) return false;
   const entries = new Set((config?.rig ?? ["rig"]).slice(-1));
-  for (let i = 0; i + 1 < a.length; i++) {
-    const base = a[i].split("/").pop();
+  const token = a[cmd];
+  if (a[cmd + 1] === "tui" && (baseOf(token) === "rig" || entries.has(token))) return true;
+  if (cmd + 2 < a.length && a[cmd + 2] === "tui" && /^(?:node|nodejs)(?:\.exe)?$/.test(baseOf(token))) {
+    const entry = a[cmd + 1];
     // The installed `rig` symlink resolves to this Node entry in core's live
     // foreground argv. Require the package path and Node position, not merely
     // any script named bin-wrapper.js or a path after Node evaluation flags.
-    const installedEntry = i === 1 && /^(?:node|nodejs)(?:\.exe)?$/.test(a[0].split("/").pop())
-      && a[i].startsWith("/") && !a[i].split("/").includes("..")
-      && /\/@openrig\/cli\/dist\/bin-wrapper\.js$/.test(a[i]);
-    if (a[i + 1] === "tui" && (base === "rig" || entries.has(a[i]) || installedEntry)) return true;
+    const installedEntry = entry.startsWith("/") && !entry.split("/").includes("..")
+      && /\/@openrig\/cli\/dist\/bin-wrapper\.js$/.test(entry);
+    if (baseOf(entry) === "rig" || entries.has(entry) || installedEntry) return true;
   }
   return false;
 }
@@ -4822,55 +4788,6 @@ export function fileEntry(path, title) {
   return { section: "file", path, name: title ?? String(path).split(/[\\/]/).pop() };
 }
 
-/** What a page entry is, apart from how it is shown (its filter, tab or config narrowing): two entries with one key
- *  are the same page. */
-export function navKey(entry) {
-  if (!entry) return "";
-  const e = entry;
-  const base = (() => {
-    if (e.section === "file") return `file:${e.path ?? ""}`;
-    if (e.section === "topology") {
-      if (e.kind === "seat") return `seat:${e.rigId ?? e.rig}:${e.name}`;
-      if (e.kind === "pod") return `pod:${e.rigId ?? e.rig}:${e.pod ?? e.name}`;
-      if (e.kind === "rig") return `rig:${e.rigId ?? e.name}`;
-      if (e.kind === "host") return `host:${e.hostId ?? e.host ?? e.name}`;
-      if (e.focus === "pulse" || e.subview === "pulse") return "topology:pulse";
-      return "topology";
-    }
-    if (e.section === "specs") {
-      if (e.id) return `spec:${e.id}`;
-      if (e.specOf) return `spec-of:${e.specOf}`;
-      if (e.name && !e.kindFilter && !e.namespace) return `spec-name:${e.name}`;
-      if (e.namespace) return `specs:ns:${e.kindFilter ?? "all"}:${e.namespace}`;
-      if (e.kindFilter) return `specs:kind:${e.kindFilter}`;
-      return "specs";
-    }
-    if (e.section === "scopes") {
-      if(e.workflow)return `workflow:${e.project??''}:${e.mission}:${e.workflow}${e.packet?`:packet:${e.packet}`:''}`;
-      if (e.slice) return `slice:${e.mission}/${e.slice}`;
-      if (e.mission) return `mission:${e.mission}`;
-      if (e.project) return `project:${e.project}`;
-      return "scopes";
-    }
-    if (e.section === "terminals") {
-      if (e.view) return `view:${e.view}`;
-      if (e.group) return `terminals:${e.group}`;
-      return "terminals";
-    }
-    if (e.section === "needs") {
-      if (e.id) return `need:${e.id}`;
-      if (e.category) return `needs:${e.category}`;
-      return "needs";
-    }
-    if (e.section === "system") {
-      if (e.subview) return `system:${e.subview}`;
-      return "system";
-    }
-    return e.section ?? "";
-  })();
-  return e.conn ? `${e.conn}|${base}` : base;
-}
-
 /** The breadcrumb trail for the page shown: where the page sits, never the pages visited before it. Each
  *  crumb is `{ text, entry }`; an ancestor's entry opens it. At most four: section › parent › child › file. */
 export function crumbsFor(entry) {
@@ -4927,24 +4844,6 @@ export function crumbsFor(entry) {
   return [section(e.section)];
 }
 
-/** Opening a page: the back history gains it, bounded; the same page again replaces the top instead of
- *  stacking a copy; a file remembers the page it was opened from, for its breadcrumbs. */
-export function navPush(nav, entry) {
-  const stack = nav?.stack ?? [];
-  const top = stack.at(-1);
-  let next = entry;
-  if (entry?.section === "file" && !entry.from && top) next = { ...entry, from: top.section === "file" ? top.from ?? null : top };
-  if (next?.conn) {
-    let ownAt = -1;
-    for (let i = stack.length - 1; i >= 0; i--) if (stack[i]?.conn === next.conn) { ownAt = i; break; }
-    if (ownAt >= 0 && navKey(stack[ownAt]) === navKey(next)) {
-      return { stack: [...stack.slice(0, ownAt), ...stack.slice(ownAt + 1), next] };
-    }
-  }
-  if (top && navKey(top) === navKey(next)) return { stack: [...stack.slice(0, -1), next] };
-  return { stack: [...stack.slice(-29), next] };
-}
-
 function navConnIndices(stack, conn, primaryConn = null) {
   const out = [];
   for (let i = 0; i < stack.length; i++) {
@@ -4997,15 +4896,6 @@ export function navBack(nav, conn = null, { fallback = null, primaryConn = null 
   if (stack.length > 1) return { stack: stack.slice(0, -1) };
   const parent = crumbsFor(stack[0] ?? fallback).slice(0, -1).reverse().find((c) => c.entry)?.entry;
   return parent ? { stack: [parent] } : { stack };
-}
-
-/** Each Rig tab's own page history, `{ [tabId]: { stack, at } }`: a tab draws the last entry of its own stack, and nothing here
- *  changes another tab's record. `at` is when the record last changed. Each function returns the same object when nothing changes. */
-export function tabPagesPush(all, tabId, entry, { spaceConn = null, at = Date.now() } = {}) {
-  if (!tabId || !entry) return all ?? {};
-  // A machine space with one OpenRig shows only that OpenRig's pages.
-  if (spaceConn && entry.conn && entry.conn !== spaceConn) return all ?? {};
-  return { ...(all ?? {}), [tabId]: { stack: navPush(all?.[tabId], entry).stack, at } };
 }
 
 /** Back on one tab: its own visit order (never another tab's), else its page's breadcrumb parent. */
@@ -5094,11 +4984,6 @@ export async function findTuiNow(host, config) {
   const found = findTui(panes, tabs, records, config);
   if (found && records[found.terminal]?.labels?.["herdr-openrig.role"] !== "tui") await host.hc(["label", found.terminal, "herdr-openrig.role=tui"]).catch(() => null);
   return found;
-}
-
-/** Whether the shown layout has a mod in it (`content: { mod }` anywhere in the tree). */
-export function layoutHasMod(node, mod) {
-  return !!node && typeof node === "object" && (node.content?.mod === mod || (node.children ?? []).some((c) => layoutHasMod(c, mod)) || layoutHasMod(node.header, mod));
 }
 
 /** Command recipients in the published layout: hidden ancestors and inactive stack children do not receive commands.
@@ -7195,11 +7080,6 @@ export function sameDaemon(a, b) {
   return a.selfHostIdSource === "generated" && b.selfHostIdSource === "generated";
 }
 
-/** True when `daemonUrl` is a local HTTP(S) origin (or absent, pending discovery). */
-export function isLoopbackDaemonUrl(daemonUrl) {
-  return daemonUrl == null || daemonUrl === "" || Boolean(localDaemonOrigin(daemonUrl));
-}
-
 /**
  * Pure polling waits use a task context and must settle even if an unrelated
  * view drains the preceding promise and then closes.
@@ -7635,4 +7515,22 @@ export function requestWhat(path) {
 /** A rig command that stopped with no message. A read-only probe has nothing to warn about. */
 export const rigStoppedBare = (code) => `OpenRig's command stopped without saying why (exit ${code}).`;
 /** A rig command that changes things and stopped with no message: part of the work may have been done. */
+/** `rig up --json`'s own account of a launch, read over the exit code (OpenRig 0.7.22 exits 1 for a partial launch, 0.7.20 exited 0;
+ *  both exit 2 for a failed one). "partial": the rig exists with some seats; say which started and which didn't, with OpenRig's reason.
+ *  "failed": OpenRig's reasons from `errors`. Both carry `launchStatus`: OpenRig's own words, which no wording guess may replace.
+ *  Anything else is the write's own outcome, unchanged. */
+export function launchOutcome(r) {
+  const json = r?.json && typeof r.json === "object" ? r.json : null, status = String(json?.status ?? "");
+  if (status !== "partial" && status !== "failed") return r;
+  const firstSentence = (value) => { const s = singleLineText(value).trim(); const m = /^(.*?[.;!?])(?:\s|$)/u.exec(s); return (m ? m[1] : s).replace(/[.;]+$/u, "."); };
+  const reasons = (Array.isArray(json.errors) ? json.errors : []).filter((e) => typeof e === "string" && e.trim()).map(firstSentence);
+  if (status === "failed") return { ...r, ok: false, launchStatus: status, text: reasons.length ? reasons.join(" ") : r.text };
+  const nodes = (Array.isArray(json.stages) ? json.stages : []).flatMap((stage) => (Array.isArray(stage?.detail?.nodes) ? stage.detail.nodes : []));
+  const started = nodes.filter((n) => n?.status === "launched").map((n) => n.logicalId).filter(Boolean);
+  const stopped = nodes.filter((n) => n?.status && n.status !== "launched");
+  const parts = [started.length ? `Started: ${started.join(", ")}.` : "",
+    ...stopped.map((n) => `${n.logicalId ?? "A seat"} didn't start: ${firstSentence(String(n.error ?? "").trim() || n.status)}`),
+    ...(stopped.length ? [] : reasons)].filter(Boolean);
+  return { ...r, ok: false, partial: true, launchStatus: status, text: `Only part of the rig started. ${parts.join(" ")}`.trim() };
+}
 export const rigStoppedMaybeDone = (code) => `OpenRig's command stopped without saying why (exit ${code}). Check before trying again: it may have done part of the work.`;

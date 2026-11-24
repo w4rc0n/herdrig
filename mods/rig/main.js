@@ -3561,8 +3561,10 @@ export default class RigSidebar extends View {
           const readAll = !planned || reconnect;
           if (feed.hadDisconnect) { feed.hadDisconnect = false; feed.forceCapabilityProbe = true; }
           if (readAll) await this.refreshFeed(cx, feed);
-          if (!this.closed && !feed.closed && feed.config?.daemonUrl === origin)
-            await this.workerController(cx).event(feed.config,{workChanged:reconnect||planned}); // A replacement does not replay membership changes from the gap.
+          if (!this.closed && !feed.closed && feed.config?.daemonUrl === origin) {
+            const workerReconnect = this.workerController(cx).event(feed.config, { workChanged: reconnect || planned }); // A replacement does not replay membership changes from the gap; never block SSE pumping.
+            workerReconnect?.catch?.(() => {});
+          }
           if(opened.initial.length){let text;[text,carry]=utf8(opened.initial,carry);parseEvents(text);}
           // An idle read timeout (Herdr's 30 s) is not a disconnect: one health request, then the same socket is read again.
           const end = await pumpEvents(feed.sock, {

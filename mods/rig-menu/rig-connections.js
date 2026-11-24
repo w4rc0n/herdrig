@@ -138,7 +138,7 @@ export function connectionsOf(raw) {
       const n = index + 1;
       if (unreadable(entry?.daemonUrl)) { notes.push(connectionNote(n, `its address ${unreadableAddress(entry.daemonUrl)} ${UNREADABLE_FORM}`.replace(/\.$/, ""))); return; }
       const conn = normalizeConnection(entry);
-      if (!conn) notes.push(connectionNote(n, "it needs an id (letters, digits, dots or dashes), and an address or a machine"));
+      if (!conn || (!conn.daemonUrl && !conn.machine && !conn.openrigHome)) notes.push(connectionNote(n, "it needs an id (letters, digits, dots or dashes), and an address, machine, or OpenRig home"));
       else if (seen.has(conn.id)) notes.push(connectionNote(n, `the id ${conn.id} is already used by an earlier entry`));
       else { seen.add(conn.id); list.push(conn); }
     });
@@ -476,8 +476,10 @@ export async function removeConnection(host, before, id) {
   let raw;
   try { raw = JSON.parse(before ?? ""); } catch { throw new Error(CONFIG_NOT_JSON); }
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.connections)) throw new Error("This OpenRig has no connections list to remove from. Nothing was changed.");
-  const index = raw.connections.findIndex((c) => c && typeof c === "object" && c.id === id);
-  if (index < 0) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
+  const matches = raw.connections.filter((c) => c && typeof c === "object" && !Array.isArray(c) && c.id === id);
+  if (!matches.length) throw new Error("That connection is not in the configuration any more. Nothing was changed.");
+  if (matches.length > 1) throw new Error("More than one entry in config.json uses that connection id. Fix the duplicate in config.json first. Nothing was changed.");
+  const index = raw.connections.findIndex((c) => c && typeof c === "object" && !Array.isArray(c) && c.id === id);
   // Count USABLE entries, not raw ones: a list may hold null or unusable entries, and counting those allowed removing the last real
   // OpenRig (`[{conn-a}, null]` looked like two), leaving a list that reads as invalid - the person's only working setup gone.
   const remaining = raw.connections.filter((_, i) => i !== index);
