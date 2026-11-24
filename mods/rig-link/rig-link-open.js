@@ -1,6 +1,6 @@
 import { LEGACY_CONNECTION_ID, configOfConnection, connectionBoxLabel, connectionRows } from "./rig-connections.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { layoutHasMod, navPush, pushTabPage } from "./rig-core.js";
+import { navPush, pushTabPage } from "./rig-core.js";
 import { openRigSpaceContext, rigOrigin, sameDaemonOrigin } from "./rig-space-context.js";
 
 export const LINK_AMBIGUOUS = "That link doesn't say which OpenRig it belongs to, and there are several. Copy it from the Rig sidebar.";
@@ -126,7 +126,8 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
     const mark = marks[space.id];
     if (mark?.rig) {
       const mc = mark.conn ?? mark.spaceConn ?? null;
-      return mc ? mc === targetConn : !several;
+      if (mc) return mc === targetConn;
+      if (!several) return true;
     }
     const ctx = contexts.get(space.id);
     if (!ctx?.rigs?.length) return false;
@@ -140,13 +141,28 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
 
   const rigIdentifiers = new Set([entry?.rigId, entry?.rig].filter(Boolean));
   const hasTargetRig = rigIdentifiers.size > 0;
+  const spaceMatchesRig = (space) => {
+    if (!isRigSpaceForTarget(space)) return false;
+    const mark = marks[space.id];
+    if (mark?.rig) {
+      const mc = mark.conn ?? mark.spaceConn ?? null;
+      if ((mc ? mc === targetConn : (!several || spaceOwner(space) === targetConn))
+        && ((mark.rigId && rigIdentifiers.has(mark.rigId)) || rigIdentifiers.has(mark.rig))) {
+        return true;
+      }
+    }
+    const ctx = contexts.get(space.id);
+    if (!ctx?.rigs?.length) return false;
+    const links = ctx.rigLinks ?? [];
+    if (links.some(l => l.origin)) {
+      return Boolean(targetUrl) && links.some(l => l.origin
+        && sameDaemonOrigin(l.origin, targetUrl, targetMachine)
+        && rigIdentifiers.has(l.rig));
+    }
+    return (ctx.rigs ?? []).some(r => rigIdentifiers.has(r));
+  };
   if (hasTargetRig) {
-    const directMatch = spaces.some(space => {
-      if (!isRigSpaceForTarget(space)) return false;
-      const mark = marks[space.id], ctx = contexts.get(space.id);
-      return Boolean((mark?.rigId && rigIdentifiers.has(mark.rigId)) || (mark?.rig && rigIdentifiers.has(mark.rig))
-        || (ctx?.rigs ?? []).some(r => rigIdentifiers.has(r)));
-    });
+    const directMatch = spaces.some(spaceMatchesRig);
     if (!directMatch) {
       const topo = connectionRows(host.shared?.("rig.data"), targetConn)?.topology;
       if (Array.isArray(topo)) {
@@ -160,11 +176,41 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
       }
     }
   }
-  const matchesTargetRig = (space) => {
-    if (!hasTargetRig || !isRigSpaceForTarget(space)) return false;
-    const mark = marks[space.id], ctx = contexts.get(space.id);
-    return Boolean((mark?.rigId && rigIdentifiers.has(mark.rigId)) || (mark?.rig && rigIdentifiers.has(mark.rig))
-      || (ctx?.rigs ?? []).some(r => rigIdentifiers.has(r)));
+  const matchesTargetRig = (space) => hasTargetRig && spaceMatchesRig(space);
+
+  const layoutModNodes = (node, mod, out = []) => {
+    if (!node || typeof node !== "object") return out;
+    if (node.content?.mod === mod) out.push(node);
+    if (Array.isArray(node.children)) for (const child of node.children) layoutModNodes(child, mod, out);
+    if (node.header) layoutModNodes(node.header, mod, out);
+    return out;
+  };
+  const compatibleLayoutPage = (tree) => {
+    const nodes = layoutModNodes(tree, "rig-page");
+    if (!nodes.length) return false;
+    if (!several) return !active || compatibleSpace(active);
+    if (active && !compatibleSpace(active)) return false;
+    const activeTab = active?.tabs?.find(t => t.active) ?? (active?.tabs?.length === 1 ? active.tabs[0] : null);
+    const screen = activeTab ? pageOnScreen[activeTab.id] : null;
+    if (screen && active?.id && screen.space === active.id) {
+      const screenConns = [...new Set(Object.values(screen.views ?? {}).filter(Boolean))];
+      if (screenConns.some(c => c !== targetConn)) return false;
+    }
+    const navTopConn = host.shared?.("rig.nav")?.stack?.at(-1)?.conn ?? null;
+    const targetNodes = nodes.filter(n => n.id === "rig-page");
+    const checked = targetNodes.length ? targetNodes : nodes;
+    return checked.some(node => {
+      const p = node.content?.props;
+      const propConn = p?.entry?.conn ?? p?.conn ?? null;
+      if (propConn && propConn !== targetConn) return false;
+      const propSpaceId = typeof p?.space === "string" && p.space ? p.space : null;
+      const propSpace = propSpaceId ? spaces.find(s => s.id === propSpaceId) : null;
+      if (propSpaceId && (!propSpace || !compatibleSpace(propSpace))) return false;
+      if (!propConn && navTopConn && navTopConn !== targetConn) return false;
+      if (propConn === targetConn) return true;
+      const boundSpace = propSpaceId ? propSpace : active;
+      return Boolean(boundSpace && spaceOwner(boundSpace) === targetConn);
+    });
   };
 
   const log = () => host.setShared("rig.nav", navPush(host.shared("rig.nav"), entry));
@@ -183,7 +229,7 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
       return true;
     }
   }
-  if (layoutHasMod(host.layout(), "rig-page") && (!active || compatibleSpace(active))) {
+  if (compatibleLayoutPage(host.layout())) {
     log();
     host.run("layout.select", { stack: "rig-work", child: "rig-page" });
     return true;
