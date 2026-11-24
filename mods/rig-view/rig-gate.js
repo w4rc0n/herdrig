@@ -18,7 +18,7 @@
 // A refused call THROWS `GateRefusal`: every caller already has a catch for a failed request, and its message is the sentence for the person.
 import { LEGACY_CONNECTION_ID, NO_CONNECTION, UNKNOWN_CONNECTION, UNREADABLE_FORM, addressParts, unreadableAddress, isKnownUnsentError } from "./rig-connections.js";
 import { decodeRelayToken, relayDaemonOrigin } from "./rig-relay-payload.js";
-import { isHerdrUrl, parseHerdrUrl } from "./rig-openrig-http.js";
+import { isHerdrUrl, parseHerdrUrl } from "./rig-herdr-url.js";
 
 export const CONFIG_LOADING = "OpenRig's settings are still loading. Try again in a moment.";
 export const CONFIG_CHANGED_OPEN = "OpenRig's settings changed while this was open. Close it and open it again.";

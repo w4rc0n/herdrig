@@ -4,13 +4,14 @@
 // - a POST goes through the local bridge, its body on stdin, and is never retried;
 // - the event stream becomes a socket-shaped long-poll, so the sidebar's stream reader and its idle and reconnect rules stay as they are.
 // The mod runtime has no TextEncoder, so the stream's bytes are UTF-8-encoded here by hand.
-const MACHINE = "[a-z0-9][a-z0-9._-]{0,31}", HOST = "[A-Za-z0-9._:-]{1,128}";
-const HERDR_URL = new RegExp(`^herdr://(${MACHINE})/(${HOST})(/[^#\\s]*)?$`);
+import { herdrOrigin as rawHerdrOrigin, isHerdrUrl as rawIsHerdrUrl, parseHerdrUrl as rawParseHerdrUrl } from "./rig-herdr-url.js";
 const MAX_BATCH = 16;
 /** Herdr's own words for a socket read that waited 30 s with no bytes; the stream reader treats it as a quiet stream, not a closed one. */
 export const IDLE_ERROR = "Resource temporarily unavailable (os error 11)";
 
-export const herdrOrigin = (machine, hostId) => `herdr://${machine}/${hostId}`;
+export const herdrOrigin = (machine, hostId) => rawHerdrOrigin(machine, hostId);
+export const isHerdrUrl = (url) => rawIsHerdrUrl(url);
+export const parseHerdrUrl = (url) => rawParseHerdrUrl(url);
 /** Said for a rig CLI run the helper's rig verb doesn't carry (terminal views, specs add, CLI reads). */
 export const HERDR_CLI_REFUSED = "This isn't available over Herdr's connection yet. Nothing was sent.";
 
@@ -62,13 +63,6 @@ export function rigShapeOf(cliArgs) {
   }
   return null;
 }
-export const isHerdrUrl = (url) => typeof url === "string" && url.startsWith("herdr://");
-/** `{machine, hostId, origin, path}` of a herdr:// URL, or null. */
-export function parseHerdrUrl(url) {
-  const m = HERDR_URL.exec(String(url ?? ""));
-  return m ? { machine: m[1], hostId: m[2], origin: herdrOrigin(m[1], m[2]), path: m[3] || "/" } : null;
-}
-
 /** A text as UTF-8 bytes (no TextEncoder in the mod runtime). */
 export function utf8Bytes(text) {
   const out = [];

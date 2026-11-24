@@ -1,6 +1,38 @@
 import { addressParts } from "./rig-connections.js";
 import { followedConnection } from "./rig-follow.js";
+import { publishedConfigFor } from "./rig-gate.js";
+import { parseConfig, sharedLoopbackDaemonUrl } from "./rig-core.js";
 import { openRigSpaceContext } from "./rig-space-context.js";
+
+/** Parse openrig/config.json and, for a single-connection install with no configured address,
+ *  read the loopback address published by the Rig sidebar (`shared("rig.data")`).
+ *  Corrupt or invalid config files return null and are never enriched from shared state. */
+export function resolveLinkConfig(rawText, published) {
+  if (rawText !== null && rawText !== undefined) {
+    if (typeof rawText !== "string") return null;
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch { return null; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  }
+  const base = parseConfig(rawText);
+  if (base.configInvalid) return null;
+  if (base.daemonUrl || (base.connections?.length ?? 0) !== 1) return base.missing ? null : base;
+  const data = typeof published === "function" ? published() : published;
+  if (data?.byConnection && typeof data.byConnection === "object" && Object.keys(data.byConnection).length > 1) return null;
+  if (publishedConfigFor(base, data)?.configInvalid) return null;
+  const discovered = sharedLoopbackDaemonUrl(base, data);
+  const parts = discovered ? addressParts(discovered) : null;
+  if (!discovered || !parts || parts.hostname === "0.0.0.0") return null;
+  const normalized = discovered.replace(/\/+$/, "");
+  const [only] = base.connections;
+  return {
+    ...base,
+    missing: false,
+    daemonUrl: normalized,
+    daemonUrlSource: "cli",
+    connections: [{ ...only, daemonUrl: normalized }],
+  };
+}
 
 const pass = () => ({ ok: false, why: "pass" });
 const ambiguous = () => ({ ok: false, why: "ambiguous" });

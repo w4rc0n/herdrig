@@ -57,8 +57,8 @@ function payloadFrom(value){
 const inactive=node=>!node||node.sessionStatus!=="running"||["idle","idle-at-prompt","done","stopped","departed"]
   .includes(node.activityState?.activity??node.activityState?.display??node.agentActivity?.state);
 
-/** The worker view's screen scan (is a seat tile's viewer ended?): one budget for all its reads, and how many run at once. */
-const SCAN_BUDGET_MS=15000,SCAN_READERS=4;
+/** The worker view's screen scan and pane naming: one whole-pass budget for reads, and how many run at once. */
+const SCAN_BUDGET_MS=15000,SCAN_READERS=4,NAME_BUDGET_MS=10000;
 export class HostWorkerViews{
   constructor(host){this.host=host;this.generation=host.generation?.();this.pending=new Map();this.paneWork=new Map();this.paneWorkSessions=new Map();this.entries=new Map(Object.entries(host.loadViews?.()??{}));this.wakeVersion=0;}
   sync(config,view,options={}){
@@ -138,6 +138,7 @@ export class HostWorkerViews{
     // Worker view open reconciles it. Deferring is safer than inferring a close.
     if(!options.explicit&&previous&&["spaces","panes","terminals"].some(kind=>!list(host,kind).length))
       return {ok:false,reason:"Herdr's layout is still loading. Existing worker views were kept."};
+    let savedEntry=null;
     try{
       this.current(config);
       const remote=await host.prepareRemote(config);if(!remote.ok){
@@ -359,19 +360,21 @@ export class HostWorkerViews{
           this.current(config);this.run(config,"pane.close",{pane:tile.pane.pane});entry.pruned[tile.session]=true;
         }
       }
+      entry.pages=pages.map((tab,index)=>({tab,name:plan.pages[index]?.name??`${plan.name} · ${index+1}`}));entry.space=spaceId;
+      this.entries.set(key,entry);await this.save();savedEntry=entry;
+      if(options.explicit&&entry.pages.length){this.run(config,"space.select",{id:spaceId});this.run(config,"tab.select",{id:entry.pages[0].tab});}
       if (list(host,"commands").some(command => command.name === "pane.rename"))
         await this.nameWorkerPanes(config,view,key,remote,plan,options.explicit);
-      entry.pages=pages.map((tab,index)=>({tab,name:plan.pages[index]?.name??`${plan.name} · ${index+1}`}));entry.space=spaceId;
-      this.entries.set(key,entry);await this.save();this.schedule();
-      if(options.explicit&&entry.pages.length){this.run(config,"space.select",{id:spaceId});this.run(config,"tab.select",{id:entry.pages[0].tab});}
+      this.schedule();
       const leftEnded = options.explicit ? parked.size - reattached : 0;
       const reasons=[];
       if(reattached||leftEnded)reasons.push(`Reattached ${reattached} ended tile${reattached===1?"":"s"}.${leftEnded?` ${leftEnded} left as they were: they changed.`:""}`);
       if(additionalPages)reasons.push(`Focused worker tiles were kept; opened ${additionalPages} additional page${additionalPages===1?'':'s'}.`);
       return {ok:true,...entry,reattached,...(reasons.length?{reason:reasons.join(' ')}:{})};
     }catch(error){
-      if(previous){this.entries.set(key,{...previous,paused:true,error:errorDiagnostic(error)});await this.save();this.schedule();}
-      return {ok:false,paused:!!previous,reason:errorDiagnostic(error),kept:true};
+      const base=savedEntry??previous;
+      if(base){this.entries.set(key,{...base,paused:true,error:errorDiagnostic(error)});await this.save();this.schedule();}
+      return {ok:false,paused:!!base,reason:errorDiagnostic(error),kept:true};
     }
   }
   async nameWorkerPanes(config, view, key, remote, plan, explicit) {
@@ -382,30 +385,64 @@ export class HostWorkerViews{
     const id = identity(config);
     if (!this.paneWork.has(id)) this.paneWork.set(id, new Map());
     const cache = this.paneWork.get(id);
-    if (this.host.currentWorkerSlice) {
-      let index = 0;
+    const now = () => this.host.now?.() ?? Date.now();
+    if (this.host.currentWorkerSlice && sessions.length) {
+      // One whole-pass budget mirroring the screen scan: stalled slice reads stop after one budget,
+      // leaving unfinished sessions dirty with nextAt > 0 so a scheduled wake finishes them.
+      let index = 0, out = false, passDone = false;
+      const startedAt = now(), expired = Symbol("expired");
+      const budget = this.host.deadline ? this.host.deadline(NAME_BUDGET_MS).then(() => expired) : null;
+      const stop = () => { out = true; };
+      budget?.then(stop, stop);
       const read = async () => {
-        while (index < sessions.length) {
+        while (index < sessions.length && !out) {
+          if (now() - startedAt >= NAME_BUDGET_MS) { out = true; return; }
           const session = sessions[index++];
           this.current(config);
           if (!cache.has(session)) cache.set(session,{dirty:true,delay:0,nextAt:0});
           const work = cache.get(session);
           if (explicit) { work.dirty = true; work.nextAt = 0; }
-          if (!work.pending && work.dirty && work.nextAt <= (this.host.now?.()??Date.now())) {
+          if (!work.pending && work.dirty && work.nextAt <= now()) {
             work.dirty = false;
-            work.pending = this.timed(this.host.currentWorkerSlice(config, session), 10000, "Worker slice unavailable.")
-              .then(slice => { work.slice = slice; work.delay = 0; work.nextAt = 0; })
+            work.pending = this.timed(this.host.currentWorkerSlice(config, session), NAME_BUDGET_MS, "Worker slice unavailable.")
+              .then(slice => {
+                work.slice = slice;
+                work.delay = 0;
+                work.nextAt = passDone ? Math.max(1, now()) : 0;
+              })
               .catch(() => {
                 // An unavailable read is not a confirmed empty slice.
                 work.dirty = true;
                 work.delay = work.delay ? Math.min(60000,work.delay*2) : 5000;
-                work.nextAt = (this.host.now?.()??Date.now()) + work.delay;
-              }).finally(() => { work.pending = null; });
+                work.nextAt = now() + work.delay;
+              }).finally(() => {
+                work.pending = null;
+                if (passDone) this.schedule();
+              });
           }
-          await work.pending;
+          if (work.pending) {
+            const got = await (budget ? Promise.race([work.pending, budget]) : work.pending);
+            if (got === expired) return;
+          }
         }
       };
       await Promise.all(Array.from({length:Math.min(SCAN_READERS,sessions.length)},read));
+      passDone = true;
+      if (out) {
+        const currentNow = now(), retryAt = currentNow + 5000;
+        for (let i = 0; i < sessions.length; i++) {
+          const session = sessions[i];
+          if (i >= index) {
+            if (!cache.has(session)) cache.set(session, { dirty: true, delay: 0, nextAt: retryAt });
+            const work = cache.get(session);
+            if (explicit) { work.dirty = true; work.nextAt = retryAt; }
+            else if (!work.pending && work.dirty && work.nextAt <= currentNow) work.nextAt = retryAt;
+          } else {
+            const work = cache.get(session);
+            if (work?.pending && work.nextAt <= currentNow) work.nextAt = retryAt;
+          }
+        }
+      }
     }
     const titles = new Map(sessions.map(session => [session,
       workerPaneTitle({logicalId:seats.get(session),activeSlice:cache.get(session)?.slice})]));
@@ -419,9 +456,14 @@ export class HostWorkerViews{
       if (cache.get(tile.session)?.slice === undefined && pane.name?.startsWith(`${seats.get(tile.session)} · `)) continue;
       if (name && pane.pane && pane.name !== name) this.run(config,"pane.rename",{pane:pane.pane,name});
     }
+    for (const session of sessions) {
+      const work = cache.get(session);
+      if (work && !work.pending && !work.dirty) work.nextAt = 0;
+    }
   }
   async save(){if(this.closed||this.host.generation&&this.host.generation()!==this.generation)return;await this.host.saveViews?.(Object.fromEntries(this.entries));if(!this.closed&&(!this.host.generation||this.host.generation()===this.generation))this.host.changed?.(Object.fromEntries(this.entries));}
   schedule(){
+    if(this.closed||this.host.generation&&this.host.generation()!==this.generation)return;
     const version=++this.wakeVersion,now=this.host.now?.()??Date.now(),due=[],configs=new Map();
     for(const [key,entry] of this.entries) {
       if (!entry.following || entry.paused) continue;
