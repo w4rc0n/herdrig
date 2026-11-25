@@ -3246,7 +3246,7 @@ export default class RigSidebar extends View {
     return true;
   }
 
-  /** Record a planned stream replacement after quiet reads; while hidden, defer the gap refresh until unhide. */
+  /** Record a planned stream replacement and mark the next quiet poll or unhide catch-up. */
   markStreamStale(feed) {
     feed.plannedReplace = true;
     if (windowHidden()) { feed.hiddenCatchUp = true; this.wasHidden = true; }
@@ -3559,7 +3559,7 @@ export default class RigSidebar extends View {
       while (!this.closed && !feed.closed) {
         if (!feed.config?.daemonUrl) { await new Promise((resolve) => cx.timer.after(1000, () => resolve(),{owner:null})); continue; }
         let pendingTimer=null;
-        // A planned replacement (the last stream ended "stale": every health check answered) missed nothing, so this connect reads nothing extra.
+        // A planned replacement follows healthy idle timeouts. Ordinary polling covers its gap while visible.
         const planned=feed.plannedReplace===true;feed.plannedReplace=false;
         try {
           // herdr:// has no socket to parse: the helper's long-poll stands in (plain JS, the mod runtime need not have `URL`).
@@ -3601,7 +3601,8 @@ export default class RigSidebar extends View {
           feed.eventPath = opened.path;
           feed.live = true; feed.delay = 1000;
           const reconnect = feed.hadDisconnect;
-          const readAll = !planned || reconnect;
+          // The HTTP bus opens with replay=0. Hidden polling is paused, so read the gap once now that this stream is live.
+          const readAll = !planned || reconnect || (opened.path === "/api/events?replay=0" && windowHidden());
           if (feed.hadDisconnect) { feed.hadDisconnect = false; feed.forceCapabilityProbe = true; }
           if (readAll) await this.refreshFeed(cx, feed);
           if (!this.closed && !feed.closed && feed.config?.daemonUrl === origin) {
@@ -3620,7 +3621,8 @@ export default class RigSidebar extends View {
             }),
             stop: () => this.closed || feed.closed || feed.config?.daemonUrl !== origin,
           });
-          // Replaced after MAX_IDLE_TIMEOUTS quiet reads: not a disconnect. It stays live through the usual 1 s wait; the 5 s poll covers the gap.
+          // Replaced after MAX_IDLE_TIMEOUTS quiet reads: it stays live through the usual 1 s wait.
+          // Visible polling covers the gap; a hidden full HTTP stream reads it after opening its replacement.
           // herdr:// polls skip for up to 60 s while live; clearing that lets the next 5 s poll read the gap once.
           if (end === "stale") this.markStreamStale(feed);
         } catch (e) { this.sayStreamBug(feed, e); /* then reconnect below */ }
