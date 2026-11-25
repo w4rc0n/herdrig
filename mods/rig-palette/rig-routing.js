@@ -275,6 +275,22 @@ async function verifyLiveTui(host,config,terminal){
   }catch{return fail("Herdr could not verify the fresh TUI. The original tab was left here.");}
 }
 
+/** Synchronous pre-close check (zero awaits) that previously verified destination tabs, panes and terminals are still present in Herdr. */
+function destinationPresent(host,{tui=null,page=null}){
+  const spaces=list(host,"spaces"),panes=list(host,"panes"),terminals=list(host,"terminals");
+  const hasTab=(spaceId,tabId)=>Boolean(spaceId&&tabId)&&spaces.some(s=>s.id===spaceId&&(s.tabs??[]).some(t=>t.id===tabId));
+  if(tui){
+    const liveTerm=terminals.some(t=>t.address===tui.terminal&&(!t.state||['live','running'].includes(t.state)));
+    const livePane=panes.some(p=>p.tab===tui.tab&&p.terminal===tui.terminal);
+    if(!hasTab(tui.space,tui.tab)||!livePane||!liveTerm)return fail("The fresh TUI didn't stay running. The original tab was left here.");
+  }
+  if(page){
+    const livePage=panes.some(p=>p.tab===page.tab&&p.mod===MOD_IDS.view);
+    if(!hasTab(page.space,page.tab)||!livePage)return fail("The destination Rig page closed before moving. The original tab was left here.");
+  }
+  return {ok:true};
+}
+
 /** Only explicit Move calls this; one refused tab never prevents another safe tab from moving. */
 export async function migrateRigTabs(host, config, spaceId) {
   const source=contexts(host).find(c=>c.id===spaceId);
@@ -300,28 +316,32 @@ export async function migrateRigTabs(host, config, spaceId) {
       const hasPage=checked.panes.some(p=>p.mod===MOD_IDS.view);
       const hasTui=checked.panes.some(p=>p.terminal);
       let result=null;
-      let tuiTerminal=null;
+      let tuiDest=null;
+      let pageDest=null;
       if(hasTui){
         const opened=await routeOpen({...host,routeOwner:true},config,{kind:"tui"});
         if(!opened.ok){left.push({...checked,ok:false,replaceable:false,reason:opened.reason});continue;}
         const verified=await verifyLiveTui(host,config,opened.terminal);
         if(!verified.ok){left.push({...checked,ok:false,replaceable:false,reason:verified.reason});continue;}
         result=opened;
-        tuiTerminal=opened.terminal;
+        tuiDest={space:opened.space,tab:opened.tab,terminal:opened.terminal};
       }
       if(hasPage){
         const entry=tabPageOf(host,config,tab);
         const page=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
         if(!page.ok){left.push({...checked,ok:false,replaceable:false,reason:page.reason});continue;}
         result=page;
+        pageDest={space:page.space,tab:page.tab};
       }
       if(!result){left.push({...checked,ok:false,replaceable:false,reason:"the tab is no longer open"});continue;}
-      const current=await inspectMigrationTab(host,config,spaceId,tab);
-      if(!current.ok||current.fingerprint!==checked.fingerprint){left.push({...checked,ok:false,replaceable:false,reason:"the original tab changed while opening its destination"});continue;}
-      if(tuiTerminal){
-        const reverified=await verifyLiveTui(host,config,tuiTerminal);
+      if(tuiDest&&hasPage){
+        const reverified=await verifyLiveTui(host,config,tuiDest.terminal);
         if(!reverified.ok){left.push({...checked,ok:false,replaceable:false,reason:reverified.reason});continue;}
       }
+      const current=await inspectMigrationTab(host,config,spaceId,tab);
+      if(!current.ok||current.fingerprint!==checked.fingerprint){left.push({...checked,ok:false,replaceable:false,reason:"the original tab changed while opening its destination"});continue;}
+      const dest=destinationPresent(host,{tui:tuiDest,page:pageDest});
+      if(!dest.ok){left.push({...checked,ok:false,replaceable:false,reason:dest.reason});continue;}
       host.run("tab.close",{id:tab});
       if(!await adopted(host,()=>!list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.some(t=>t.id===tab))){
         left.push({...checked,ok:false,replaceable:false,pendingClose:true,destination:result.space,reason:"its destination opened, but closing the original tab was not confirmed"});continue;
@@ -341,10 +361,12 @@ export async function replaceMigrationTab(host,config,request) {
   const source=contexts(host).find(c=>c.id===request.spaceId);
   const checked=await inspectMigrationTab(host,config,request.spaceId,request.tabId);
   if(!checked.replaceable||checked.fingerprint!==request.fingerprint)return fail("The original tab changed. Review it again before replacing it.");
+  let pageDest=null;
   if(checked.panes.some(p=>p.mod===MOD_IDS.view)){
     const entry=tabPageOf(host,config,request.tabId);
     const page=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
     if(!page.ok)return page;
+    pageDest={space:page.space,tab:page.tab};
   }
   const opened=await routeOpen({...host,routeOwner:true},config,{kind:"tui"});
   if(!opened.ok)return opened;
@@ -352,6 +374,8 @@ export async function replaceMigrationTab(host,config,request) {
   if(!verified.ok)return verified;
   const current=await inspectMigrationTab(host,config,request.spaceId,request.tabId);
   if(!current.replaceable||current.fingerprint!==checked.fingerprint)return fail("The original tab changed while its replacement opened. It was left here.");
+  const dest=destinationPresent(host,{tui:{space:opened.space,tab:opened.tab,terminal:opened.terminal},page:pageDest});
+  if(!dest.ok)return dest;
   host.run("tab.close",{id:request.tabId,confirmed:true});
   if(!await adopted(host,()=>!list(host,"spaces").find(s=>s.id===request.spaceId)?.tabs?.some(t=>t.id===request.tabId)))
     return fail("The fresh TUI opened, but closing the original tab was not confirmed. Check the original before retrying.");

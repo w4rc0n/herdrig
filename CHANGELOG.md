@@ -10,6 +10,9 @@ Herdrig keeps your layout when OpenRig opens its Rig layout, starts safe Rig TUI
 - Herdrig now calls OpenRig's strip of views "OpenRig's Rig layout" (and its views "OpenRig's Rig views"). **Leave OpenRig's Rig layout…** preselects the layout you were using when Herdrig saw it. After you leave the Rig layout, System lists views still open inside OpenRig's saved layout ("OpenRig's Rig views: n still open · Close them…") and closes them without changing your layout while your seats keep running.
 - In the Leave dialog, the chosen layout (including the one you were using) is now visibly marked with a highlight, an accent bar, and a check in both light and dark themes.
 - Restored the Rig sidebar's clear message when no OpenRig home space can be opened.
+- Move keeps your original tab open if it changed while opening its destination, and confirms the destination is still there right before closing.
+- Needs alerts still arrive while Herdr is hidden even if a request lands during a planned event-stream reconnect.
+- The "herdrig restored your layout" notice now shows after each restore. Herdr reloads Herdrig while it switches layouts, and the notice used to be lost with it.
 
 ## v0.5.12
 

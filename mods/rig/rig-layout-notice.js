@@ -42,6 +42,21 @@ export function ownLayoutTarget(shared, names) {
 export function rigLayoutAppearance(shared, setShared, name, tree, names, now = Date.now()) {
   const notice = shared('rig.rigLayoutNotice') ?? {};
   if (!hasOldProviderStrip(tree)) {
+    // Herdr reloads every mod right after layout.switch, so the restore's own task usually never resumes to say it worked.
+    // The restore marked itself 'switching' first; the first copy to see its target shown confirms it and posts the toast.
+    if (notice.mode === 'switching' && name === notice.switchTarget && Number.isFinite(notice.switchingAt) && now - notice.switchingAt < SWITCH_CONFIRM_MS) {
+      setShared('rig.rigLayoutNotice', { ...notice, shown: false, mode: 'restored' });
+      if (!shared('rig.rigLayoutSeen')?.left) setShared('rig.rigLayoutSeen', { left: true });
+      const toast = restoredToast(shared, setShared, now);
+      return toast ? { kind: 'toast', toast } : null;
+    }
+    // Any other layout without the strip means the switch didn't land there: retire the marker, so a later visit to the
+    // target (the person's own choice) is never announced as herdrig's restore.
+    if (notice.mode === 'switching') {
+      setShared('rig.rigLayoutNotice', { ...notice, shown: false, mode: 'notice' });
+      if (!shared('rig.rigLayoutSeen')?.left) setShared('rig.rigLayoutSeen', { left: true });
+      return null;
+    }
     if (notice.shown) {
       setShared('rig.rigLayoutNotice', { ...notice, shown: false });
       if (!shared('rig.rigLayoutSeen')?.left) setShared('rig.rigLayoutSeen', { left: true });
@@ -106,6 +121,8 @@ export async function finishRigLayoutRestore(host, appHome, event, now = Date.no
     return due ? noticeToast(notice.isReturn, null) : null;
   }
   host.setShared('rig.rigLayoutRestored', [...(host.shared('rig.rigLayoutRestored') ?? []).filter(key => key !== event.key), event.key].slice(-RESTORED_KEYS_KEPT));
+  // The marker survives Herdr's reload of the mods during the switch (see rigLayoutAppearance).
+  setMode('switching', { switchTarget: event.target, switchingAt: now });
   let switched = false;
   try {
     const reply = await host.run('layout.switch', { name: event.target });
@@ -114,14 +131,25 @@ export async function finishRigLayoutRestore(host, appHome, event, now = Date.no
       if (!switched) await host.wait(50);
     }
   } catch { switched = false; }
+  // A timer tick may already have confirmed this switch and said so: only the copy that ends 'switching' speaks.
+  const current = host.shared('rig.rigLayoutNotice') ?? {};
+  if (current.instance !== event.instance || current.mode !== 'switching') return null;
   if (!switched) {
     setMode('failed');
     return { title: "herdrig couldn't restore your layout", body: "Herdr stayed on OpenRig's Rig layout. Leave it from System, or choose a Layout in the palette (Ctrl+Shift+P). Seats keep running.", level: 'warning', timeout: 10000 };
   }
   setMode('restored');
-  const toastAt = host.shared('rig.rigLayoutRestoreToastAt');
-  if (!notificationsOn(host.shared) || Number.isFinite(toastAt) && now - toastAt < RIG_LAYOUT_TOAST_GAP) return null;
-  host.setShared('rig.rigLayoutRestoreToastAt', now);
+  return restoredToast(host.shared, host.setShared, now);
+}
+
+/** How long after the switch a copy that sees the person's layout still counts it as this restore. */
+const SWITCH_CONFIRM_MS = 10000;
+
+/** "herdrig restored your layout": under Notifications, at most one every 2 minutes. */
+function restoredToast(shared, setShared, now) {
+  const toastAt = shared('rig.rigLayoutRestoreToastAt');
+  if (!notificationsOn(shared) || Number.isFinite(toastAt) && now - toastAt < RIG_LAYOUT_TOAST_GAP) return null;
+  setShared('rig.rigLayoutRestoreToastAt', now);
   return { title: 'herdrig restored your layout', body: 'OpenRig switched it to open a view. Seats keep running.', level: 'info' };
 }
 
