@@ -4676,7 +4676,10 @@ export function freshArgs(logicalId, rig, reason) {
  *  OpenRig home, never whatever `rig` a PATH finds. An argv for `tab.new`. */
 export function tuiArgv(config) {
   const cmd = readCommand(config, ["tui"]);
-  return [cmd.command, ...cmd.args];
+  // Without HC_TERMINAL_ID and HC_TERMINAL_SOCKET the TUI doesn't take this Herdr window for its own: its "Open terminals" opens a
+  // window of its own (or says it can't) instead of switching this window to OpenRig's Rig layout, which Herdr can't close.
+  const unset = ["-u", "HC_TERMINAL_ID", "-u", "HC_TERMINAL_SOCKET"];
+  return cmd.command.split("/").pop() === "env" ? [cmd.command, ...unset, ...cmd.args] : ["env", ...unset, "--", cmd.command, ...cmd.args];
 }
 
 /** A process argv that is OpenRig's TUI: `rig tui`, or the recorded CLI's entry followed by `tui`,

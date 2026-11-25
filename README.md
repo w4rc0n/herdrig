@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.11
+Version: v0.5.13
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -129,7 +129,9 @@ Check the `Version:` line in the README you copied, or open System and read **He
 
 - **Network:** only OpenRig's local address (`127.0.0.1:7433` unless your OpenRig uses another port), over HTTP and SSE.
   The sidebar uses OpenRig's full event stream for updates and reconciles once a minute when quiet. It checks more
-  often when the full stream is unavailable or a recovery check is pending. The terminal link handler (`rig-link`)
+  often when the full stream is unavailable or a recovery check is pending. On Herdr 0.1.18 and later, quiet
+  background checks pause while Herdr's window is hidden (mostly on macOS and X11; Wayland normally stays visible)
+  and catch up when it returns, while live events and Needs notifications stay active. The terminal link handler (`rig-link`)
   inspects only links Herdr hands it when you Ctrl-click, reads `<appHome>/openrig/config.json`, and makes local
   daemon reads (`/api/attention`, `/api/queue/<id>`, `/api/health/<id>`) when resolving or opening the target.
   Naming open Worker view panes on Herdr 0.1.17+ reads `/api/queue/whoami` for visible followed workers when a view
@@ -156,7 +158,7 @@ Check the `Version:` line in the README you copied, or open System and read **He
   `node rig-model-catalog.cjs` to read Codex's local cache or query the runtime with `claude --help`,
   `pi --list-models`, or `omp models --json --no-extensions`.
 - **Files:** it reads `<appHome>/openrig/config.json` (optional: your OpenRig name), `<appHome>/openrig/state.json`,
-  the saved layout files used to discover old views, `<appHome>/mods/spaces/main.js` for compatibility, and the
+  the saved layout files used to discover OpenRig's Rig views, `<appHome>/mods/spaces/main.js` for compatibility, and the
   spec and slice files you open in its viewer. Connection and layout actions also read and write `config.json`,
   `machine-consent.json`, `spec-consent.json` and `spaces-list.json` under `<appHome>/openrig/`.
   It writes `<appHome>/openrig/state.json` and the user spec files
@@ -225,10 +227,16 @@ Idle tiles stay until you set a prune time: optional **herdrig prune**, off by d
 30 minutes. Worker views work for this computer's OpenRig and a configured machine's alike. Saved views and
 Follow need an OpenRig that can plan worker views (0.7.12 or later); without one, Worker view opens the Seats tab.
 
-Older versions opened OpenRig's own worker views, with a pill strip. Use **Leave OpenRig's old strip…** in System,
-the palette or a strip pill's menu. Pick the layout you used before; herdrig cannot tell which it was. The confirmation
-closes the old views where possible, switches to your chosen layout and keeps the Rig page open. It reports those
-results separately; your seats keep running. Choosing **Herdr** uses its standard layout without the Rig sidebar.
+OpenRig shows its own Rig layout, with a pill strip, when a view is opened inside Herdr: from the Rig TUI's Terminals
+screen, or by an agent running `rig terminal open`. By default (**Keep my layout when OpenRig opens views** in
+**System → Layout**, on by default), Herdrig restores the layout you were using once per open while the Rig sidebar or
+a Rig page tab that you've looked at since Herdr started is running, leaving OpenRig's views in the background and your
+seats running. Use **Leave OpenRig's Rig layout…** in System, the palette or a strip
+pill's menu. The layout you were using is preselected when herdrig saw it; otherwise pick it. The confirmation
+closes OpenRig's views where possible, switches to your chosen layout and keeps the Rig page open. It reports those
+results separately; your seats keep running. OpenRig's views stay open inside its saved Rig layout after you leave it, so
+System lists them as **OpenRig's Rig views: n still open · Close them…**, which closes them without changing your layout.
+Choosing **Herdr** uses its standard layout without the Rig sidebar.
 You can also leave the strip with Herdr's palette: Ctrl+Shift+P, type **layout**, choose **Layout: Herdr** or your
 personal layout. Closing a space does not remove the strip. A focused worker tile stays untouched; rebuilding another tile
 may open an additional, numbered page, which the result explains.
@@ -318,7 +326,7 @@ page came from, and each Rig tab keeps to its own OpenRig's pages.
 
 ## Known limitations
 
-- Tested with the official Herdr-app [v0.1.17](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.17) build. Herdr keeps the active space in view as of [#977](https://github.com/herdrdev/herdr-app/pull/977).
+- Tested with the official Herdr-app [v0.1.18](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.18) build. Herdr keeps the active space in view as of [#977](https://github.com/herdrdev/herdr-app/pull/977).
 - **Some actions need your OpenRig name.** Sending, queueing, changing a seat's model, and editing quiet hours or
   modes stay disabled with a hint until `<appHome>/openrig/config.json` names you. Decision Cards work without it.
 - **Only `ctrl-alt-r` is bound.** Merge it, and ask before replacing a key you already use.

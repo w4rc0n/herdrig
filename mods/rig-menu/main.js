@@ -1291,7 +1291,7 @@ export default class RigMenu extends View {
       if(!hasOldProviderStrip(layout()))return;
       const views=knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],visibleOldViewsGone(shared,this.config,terminals())).filter(view=>view.current);
       const disabled=oldStripCleanupBusy(shared);
-      out.push({icon:"x",label:"Leave OpenRig's old strip…",disabled,reason:disabled?oldStripBusyTip:null,
+      out.push({icon:"x",label:"Leave OpenRig's Rig layout…",disabled,reason:disabled?oldStripBusyTip:null,
         act:()=>dialog({kind:"old-views"},{action:"close-old-views",views,confirm:true},480)});
     };
     if(target.kind==='assistant'){
@@ -2016,8 +2016,13 @@ export default class RigMenu extends View {
     return unknown?null:false;
   }
   oldStripCloseOnly(step){
-    return this.oldStripChoices?.length===0&&!!this.config&&!!step.views?.length
+    return (step.closeOnly||this.oldStripChoices?.length===0)&&!!this.config&&!!step.views?.length
       &&this.oldStripCloseAvailable()===true;
+  }
+  /** The layout the person was using before OpenRig's Rig layout, when it's still one Leave can switch to. */
+  rememberedOwnLayout(){
+    const name=shared("rig.ownLayout");
+    return this.oldStripChoices?.some(choice=>choice.name===name)?name:null;
   }
   /** Runs the dialog's action once (a second press while it runs does nothing). */
   go(cx, target, step) {
@@ -2062,13 +2067,18 @@ export default class RigMenu extends View {
       }
       if(!layoutShowsMod(layout(),MOD_IDS.sidebar)){this.result={ok:false,notSent:true,text:"Open the Rig sidebar, then try again. Nothing was closed."};cx.notify();return;}
       const closeOnly=this.oldStripCloseOnly(step);
+      // An explicit close-only request stays close-only: when its views or the means to close them are gone by now, stop and say so.
+      if(step.closeOnly&&!closeOnly){
+        this.result={ok:false,notSent:true,text:step.views?.length?"OpenRig's views can't be closed from here right now. Nothing was closed. Your seats keep running.":"OpenRig's views are already gone. Nothing was closed. Your seats keep running."};
+        cx.notify();return;
+      }
       if(!closeOnly&&!this.oldStripChoices?.some(choice=>choice.name===this.oldStripLayout))return;
       this.cleanupQueued=true;
       // Hand off before any await: closing this result must not cancel the confirmed operation or release its transport.
       const id=`old-views-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      setShared('rig.oldViewsClose',{...(shared('rig.oldViewsClose')??{}),[id]:{createdAt:Date.now(),config:this.openedOn??this.config,views:step.views??[],...(!closeOnly?{returnLayout:this.oldStripLayout}:{})}});
+      setShared('rig.oldViewsClose',{...(shared('rig.oldViewsClose')??{}),[id]:{createdAt:Date.now(),config:this.openedOn??this.config,views:step.views??[],...(!closeOnly&&!step.closeOnly?{returnLayout:this.oldStripLayout}:{})}});
       run('rig.close-old-views');
-      this.result={ok:true,text:closeOnly?`Closing OpenRig's old view${step.views.length===1?'':'s'}… The Rig sidebar will report the result; you can close this dialog. The strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout). Your seats keep running.`:"Leaving OpenRig's old strip… The result will show when it finishes; you can close this dialog. Your seats keep running."};cx.notify();return;
+      this.result={ok:true,text:closeOnly?`Closing OpenRig's view${step.views.length===1?'':'s'}… The Rig sidebar will report the result; you can close this dialog.${hasOldProviderStrip(layout())?' The strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout).':''} Your seats keep running.`:"Leaving OpenRig's Rig layout… The result will show when it finishes; you can close this dialog. Your seats keep running."};cx.notify();return;
     }
     if (["send", "queue", "reply"].includes(step?.action) && !this.inputCanSend(step)) return;
     if ((step?.action === "launch-spec" || step?.action === "new-rig") && this.uncertainAttempt) return; // a launch or create that may have gone through is never run again from this dialog (Enter in a field comes here too)
@@ -2754,7 +2764,7 @@ export default class RigMenu extends View {
    *  dialog is open, and the count shown is the count closed), otherwise the views it opened with, less those already closed. */
   oldStripViews(step){
     const gone=visibleOldViewsGone(shared,this.config,terminals());
-    if(hasOldProviderStrip(layout()))return knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],gone).filter(view=>view.current);
+    if(!step.closeOnly&&hasOldProviderStrip(layout()))return knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],gone).filter(view=>view.current);
     return (step.views??[]).filter(view=>!gone.includes(view.id));
   }
 
@@ -2780,7 +2790,7 @@ export default class RigMenu extends View {
           ? `${target.rig} deleted` : `Couldn't delete ${target.rig}`
       : step.action === 'confirm-seat-compaction' ? step.copy?.title??'Compact this seat?'
       : step.action === "typing-guard" ? "Typing guard"
-      : step.action === "close-old-views" ? "Leave OpenRig's old strip?"
+      : step.action === "close-old-views" ? (step.closeOnly ? "Close OpenRig's views?" : "Leave OpenRig's Rig layout?")
       : step.action === "spaces-list" ? (step.copy?.title ?? "Spaces list")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? `Copy built-in specs on ${step.confirmation?.machine}?` : `Save specs on ${step.confirmation?.machine}?`)
       : step.action === "adopt-address-space" ? "Use this existing rig space?"
@@ -2796,24 +2806,37 @@ export default class RigMenu extends View {
     else if(step.action==="close-old-views"){
       const choices=this.oldStripChoices;
       const count=step.views?.length??0,available=this.oldStripCloseAvailable(),canClose=available===true;
-      const switchText='This switches this window to the layout you pick.';
-      const intro=!count||available===null?switchText:canClose?`This closes OpenRig's ${count} old worker view${count===1?'':'s'} and switches this window to the layout you pick.`:
-        `${switchText} ${count===1?"The old view can't be closed from here, so it may stay open.":`The ${count} old views can't be closed from here, so they may stay open.`}`;
-      if(choices?.length===1&&choices[0].name==='main'&&!this.oldStripLayout)this.oldStripLayout='main';
+      const remembered=this.rememberedOwnLayout(),views=count===1?'view':'views';
+      const destination=remembered?'back to the layout you were using':'to the layout you pick';
+      const switchText=`This switches this window ${destination}.`;
+      const intro=!count||available===null?switchText:canClose?`This closes OpenRig's ${count} ${views} and switches this window ${destination}.`:
+        `${switchText} ${count===1?"OpenRig's view can't be closed from here, so it may stay open.":`OpenRig's ${count} views can't be closed from here, so they may stay open.`}`;
+      // Preselected once: Herdr when it's the only choice, else the layout the person was using. A later pick is theirs.
+      if(choices&&!step.closeOnly&&!this.oldStripPreselected){
+        this.oldStripPreselected=true;
+        if(!this.oldStripLayout)this.oldStripLayout=choices.length===1&&choices[0].name==='main'?'main':remembered??undefined;
+      }
       body=v_flex().gap(8).text_size(12).text_color(t.muted)
         .child(div().child(intro+' Your seats keep running, and the Rig page stays open.'));
-      if(!choices)body.child(div().child('Reading layouts…'));
+      if(step.closeOnly)body=v_flex().gap(8).text_size(12).text_color(t.muted).child(div().child(!count?"OpenRig's views are already gone. Your seats keep running."
+        :canClose?`This closes OpenRig's ${count} ${views}. This window's layout doesn't change. Your seats keep running.`
+        :available===null?`Checking whether OpenRig's ${views} can be closed from here…`:`OpenRig's ${views} can't be closed from here, so ${count===1?'it':'they'} may stay open. Your seats keep running.`));
+      else if(!choices)body.child(div().child('Reading layouts…'));
       else if(!choices.length){
-        const count=step.views?.length??0,closeOnly=this.oldStripCloseOnly(step);
-        const text=closeOnly?`herdrig couldn't find a layout to switch to, so this window stays in OpenRig's old layout. You can still close ${count===1?'the old view':`the ${count} old views`}; the strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout). Your seats keep running.`
-          :`herdrig couldn't find a layout to switch to${count&&available===false?`, and the old view${count===1?'':'s'} can't be closed from here`:''}. Open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running.`;
+        const closeOnly=this.oldStripCloseOnly(step);
+        const text=closeOnly?`herdrig couldn't find a layout to switch to, so this window stays in OpenRig's Rig layout. You can still close ${count===1?"OpenRig's view":`OpenRig's ${count} views`}; the strip stays until you choose a layout from the palette (Ctrl+Shift+P, then Layout). Your seats keep running.`
+          :`herdrig couldn't find a layout to switch to${count&&available===false?`, and OpenRig's ${views} can't be closed from here`:''}. Open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running.`;
         body=v_flex().gap(8).text_size(12).text_color(t.muted).child(div().child(text));
       }
       else body.child(div().child('Switch to')).children(choices.map(choice=>this.dialogButton(t,
-        v_flex().id(`old-strip-layout-${choice.name}`).gap(2).p(6).rounded(5).bg(this.oldStripLayout===choice.name?t.selected:t.raised),null,
+        // The sidebar's selected-row style: fill, 2 px accent bar and a check (not colour alone). Unchosen rows keep a clear bar so labels don't shift.
+        v_flex().id(`old-strip-layout-${choice.name}`).gap(2).p(6).rounded(5).border_l(2)
+          .bg(this.oldStripLayout===choice.name?(t.selection??t.selected):t.raised).border_color(this.oldStripLayout===choice.name?t.accent:'#00000000'),null,
         (_e,cx)=>{this.oldStripLayout=choice.name;cx.notify();},false,
-        v_flex().gap(2).child(div().child(choice.label)).when(choice.name==='main',el=>el.child(div().text_size(11).child("Herdr's standard layout, without the Rig sidebar"))))))
-        .child(div().child("Pick the layout you used before. herdrig can't tell which one that was."));
+        h_flex().gap(8).items_center()
+          .child(v_flex().flex_1().gap(2).child(div().child(choice.name===remembered?`${choice.label} · you were using this`:choice.label)).when(choice.name==='main',el=>el.child(div().text_size(11).child("Herdr's standard layout, without the Rig sidebar"))))
+          .when(this.oldStripLayout===choice.name,el=>el.child(svg(icon("check")).size(12).flex_none().text_color(t.accent))))))
+        .when(!remembered,el=>el.child(div().child("Pick the layout you used before. herdrig can't tell which one that was.")));
     }
     else if(step.action==="confirm-spec-write"){
       const c=step.confirmation??{};
@@ -2933,7 +2956,7 @@ export default class RigMenu extends View {
       ? swapPlan.buttonLabel
       : step.action === 'confirm-seat-compaction' ? step.copy?.confirm??'Compact now'
       : step.action === "typing-guard" ? (step.mode==='off'?'Turn it off':'Replace')
-      : step.action === "close-old-views" ? (this.oldStripChoices?.length===0?(this.oldStripCloseOnly(step)?`Close the old view${step.views.length===1?'':'s'}`:null):"Leave the strip")
+      : step.action === "close-old-views" ? (step.closeOnly||this.oldStripChoices?.length===0?(this.oldStripCloseOnly(step)?`Close the view${step.views.length===1?'':'s'}`:null):"Leave the Rig layout")
       : step.action === "spaces-list" ? (step.copy?.confirm ?? "Change")
       : step.action === "confirm-spec-write" ? (step.confirmation?.capability === "copy-folder" ? "Allow built-in copies" : "Allow spec saves")
       : step.action === "adopt-address-space" ? "Use it"

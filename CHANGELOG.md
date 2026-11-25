@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.5.13
+
+Herdrig keeps your layout when OpenRig opens its Rig layout, starts safe Rig TUI tabs, and names and closes OpenRig's Rig views cleanly.
+
+- When OpenRig switches your window to its Rig layout to open a view (from the Rig TUI, or an agent running `rig terminal open` inside Herdr), Herdrig switches back to the layout you were using once per open and posts "herdrig restored your layout". OpenRig's views stay open in the background and System lists them; your seats keep running. If the same views show again, Herdrig leaves them and offers Back. Turn this off in Rig page → System → Layout ("Keep my layout when OpenRig opens views", on by default) to get a notice and a card with Back, Close views… and Keep instead.
+- Known limit: Herdrig can only do this while one of its views is running in the window: the Rig sidebar, or a Rig page tab that you've looked at since Herdr started (it keeps running when you switch away). If neither is running, OpenRig's Rig layout stays until you open one, or until you switch layouts yourself (Ctrl+Shift+P, then Layout).
+- Open in TUI no longer pulls OpenRig's strip into your window: views the TUI opens go to a window of their own. To see seats in Herdr, use Attach or Open rig space. If you already have an older Rig TUI tab open from before this update, Herdrig leaves it open while starting a safe new Rig TUI tab and reminds you once to close the old Rig TUI tab.
+- Herdrig now calls OpenRig's strip of views "OpenRig's Rig layout" (and its views "OpenRig's Rig views"). **Leave OpenRig's Rig layout…** preselects the layout you were using when Herdrig saw it. After you leave the Rig layout, System lists views still open inside OpenRig's saved layout ("OpenRig's Rig views: n still open · Close them…") and closes them without changing your layout while your seats keep running.
+- In the Leave dialog, the chosen layout (including the one you were using) is now visibly marked with a highlight, an accent bar, and a check in both light and dark themes.
+- Restored the Rig sidebar's clear message when no OpenRig home space can be opened.
+
+## v0.5.12
+
+Quieter when Herdr is hidden on Herdr 0.1.18, whole-emoji space avatars, and safer tab-move and multi-OpenRig cleanup.
+
+- On Herdr 0.1.18 and later, Herdrig pauses quiet background polling while Herdr's window is hidden (dropping from about 40 to about 2 requests a minute in quiet checks) and catches up when the window returns. Live event updates keep running, and Needs-you notifications now fire while the window is hidden. This pause applies mainly on macOS and X11; Wayland windows normally stay reported as visible.
+- Tested with the official Herdr 0.1.18 build.
+- Herdrig's Spaces list follows Herdr 0.1.18: a space whose name starts with an emoji shows that whole emoji as its avatar, skin tones and flags included, and matches repo and branch names with or without that leading emoji.
+- Moving a tab that holds a live TUI checks again that the destination TUI is still running after the Rig page opens and before closing the original tab.
+- Earlier in-place open records saved without a connection owner stay with the default OpenRig and no longer block another OpenRig connection that shares the same rig ID.
+
 ## v0.5.11
 
 Clearer partial-launch results, safer Ctrl-click terminal links, and an up-to-date old-strip Leave dialog.

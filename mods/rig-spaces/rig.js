@@ -4,7 +4,9 @@
 // { home?: true, rig?: name, rigId?: id, status?: "working" | "needs" | "idle", needs?: count }. This file never talks to OpenRig.
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { shared, props, openOverlay, spaces } from "herdr";
+import { shared, props, openOverlay, spaces, window } from "herdr";
+
+const windowHidden = () => window()?.visible === false;
 
 export const KEY = "herdrig.spaces";
 const known = () => shared(KEY) ?? {};
@@ -58,18 +60,20 @@ const checkMachineFields = (machine) => {
 };
 
 export const rig = {
-  /** Idle git/layout checks need no 250ms wake-up. Keep that cadence only during a drag or reconnect. */
+  /** Idle git/layout checks need no 250ms wake-up. Keep that cadence only during a drag or reconnect; skip while hidden. */
   watchSpaces(view,cx) {
     if(view.rigPollArmed)return true;
     const arm=live=>{
       if(view.closed)return;
       view.rigPollArmed=true;
       const active=view.pressed||view.over||Object.values(view.reconnecting??{}).some(state=>state?.busy);
-      live.timer.after(active?250:1000,next=>{
+      const hidden=!active&&windowHidden();
+      live.timer.after(active?250:hidden?5000:1000,next=>{
         view.rigPollArmed=false;
         if(view.closed)return;
         const current=next??live;
-        try{view.checkNew(current);}finally{arm(current);}
+        const nowActive=view.pressed||view.over||Object.values(view.reconnecting??{}).some(state=>state?.busy);
+        try{if(nowActive||!windowHidden())view.checkNew(current);}finally{arm(current);}
       });
     };
     arm(cx);return true;
