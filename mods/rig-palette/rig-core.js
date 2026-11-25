@@ -102,6 +102,10 @@ export function navKey(entry) {
       return "needs";
     }
     if (e.section === "system") {
+      if (e.subview === "health") {
+        if (e.healthQitem) return `system:health:qitem:${e.healthQitem}`;
+        if (e.healthFinding) return `system:health:finding:${e.healthFinding}`;
+      }
       if (e.subview) return `system:${e.subview}`;
       return "system";
     }

@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.10
+Version: v0.5.11
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -103,7 +103,7 @@ you.
 
 Herdr doesn't review mods: check what your agent runs and which keys it changes.
 
-On Herdr 0.1.17 and later, Ctrl-click a recognized OpenRig link or `/api/…` address in any Herdr terminal to open it on the Rig page. Herdr enrolls `rig-link` the first time it sees it in a personal layout. Plain request IDs are not clickable because Herdr does not detect them as links. When no daemon address is set in `<appHome>/openrig/config.json`, open the Rig sidebar once so links can use the local OpenRig address it discovers; if the sidebar has not run yet, links pass through unchanged. Leave out `rig-link` when copying folders on older Herdr versions. When the standalone installer cannot verify Herdr 0.1.17 or later, it installs the other five mods and prints `"Skipped the OpenRig link handler. Terminal links require Herdr 0.1.17 or later. Re-run the installer after updating Herdr."` Use `--herdr-app /path/to/herdr-app` if the intended binary is outside `PATH`, or `--no-links` to opt out and keep native opening. Uninstalling removes the mod folders (`rig`, `rig-view`, `rig-palette`, `rig-menu`, `rig-link`, `rig-spaces`) after restoring personal layouts; Herdr ignores any saved link-handler entry left in a personal layout after `rig-link` is removed.
+On Herdr 0.1.17 and later, Ctrl-click a recognized OpenRig link or `/api/…` address in any Herdr terminal to open it on the Rig page. Herdr enrolls `rig-link` the first time it sees it in a personal layout. Plain request IDs are not clickable because Herdr does not detect them as links. When no daemon address is set in `<appHome>/openrig/config.json`, open the Rig sidebar once so links can use the local OpenRig address it discovers; if the sidebar has not run yet, links pass through unchanged. Leave out `rig-link` when copying folders on older Herdr versions. When the standalone installer cannot verify Herdr 0.1.17 or later, it installs the other five mods and prints `"Skipped the OpenRig link handler. Terminal links require Herdr 0.1.17 or later. Re-run the installer after updating Herdr."` Use `--herdr-app /path/to/herdr-app` (or `HERDR_APP_BIN`) if the intended binary is outside `PATH`, or `--no-links` to opt out and keep native opening. Uninstalling removes the mod folders (`rig`, `rig-view`, `rig-palette`, `rig-menu`, `rig-link`, `rig-spaces`) after restoring personal layouts; Herdr ignores any saved link-handler entry left in a personal layout after `rig-link` is removed.
 
 ## Updating
 

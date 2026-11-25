@@ -1,10 +1,11 @@
 import { LEGACY_CONNECTION_ID, configOfConnection, connectionBoxLabel, connectionRows } from "./rig-connections.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
 import { navPush, pushTabPage } from "./rig-core.js";
-import { openRigSpaceContext, rigOrigin, sameDaemonOrigin } from "./rig-space-context.js";
+import { publishedUnder } from "./rig-gate.js";
+import { hostLabelValue, openRigSpaceContext, rigOrigin, sameDaemonOrigin } from "./rig-space-context.js";
 
 export const LINK_AMBIGUOUS = "That link doesn't say which OpenRig it belongs to, and there are several. Copy it from the Rig sidebar.";
-const needSidebar = "Open the Rig sidebar, then try again.";
+export const LINK_NEED_SPACE = "Open an OpenRig page or space from the Rig sidebar first, then try again.";
 const outsideNeeds = "This request isn't in Needs here. Open it from its seat.";
 
 /** Choose a page without view registration, polling, or timers. */
@@ -20,6 +21,12 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
   const targetCfg = configOfConnection(config, targetConn) ?? config;
   const targetMachine = targetCfg?.daemonMachine || null;
   const targetUrl = targetCfg?.daemonUrl || null;
+  const publishedData = host.shared?.("rig.data");
+  const publishedConn = connectionRows(publishedData, targetConn);
+  const targetHostId = hostLabelValue(targetCfg?.expectedHostId)
+    ?? (publishedUnder(targetCfg, publishedData)
+      ? hostLabelValue(publishedConn?.healthz?.selfHostId ?? publishedConn?.config?.expectedHostId)
+      : null);
   const onTargetMachine = connections.filter(c => (c.machine ?? null) === targetMachine);
   const marks = host.shared?.("herdrig.spaces") ?? {};
   const spaceState = host.shared?.("rig.spaceState") ?? {};
@@ -83,8 +90,23 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
     }
     return null;
   };
+  const linkAppliesToOrigin = (link) => !link?.origin || (Boolean(targetUrl) && sameDaemonOrigin(link.origin, targetUrl, targetMachine));
+  const hostMatchesTarget = (link) => !targetHostId || !link?.host || link.host === targetHostId;
+  const linkConflictsHost = (link) => Boolean(targetHostId && link?.host && link.host !== targetHostId && linkAppliesToOrigin(link));
+  const spaceHasConflictingHost = (space) => {
+    if (!targetHostId || !space) return false;
+    const mark = marks[space.id];
+    if (mark?.home === true) {
+      const mc = mark.conn ?? mark.spaceConn ?? null;
+      if (mc ? mc === targetConn : (!several || homeRecordMatches(space.id, targetConn))) return false;
+    }
+    if (homeRecordMatches(space.id, targetConn)) return false;
+    const links = contexts.get(space.id)?.rigLinks ?? [];
+    return links.some(linkConflictsHost) && !links.some(l => linkAppliesToOrigin(l) && l.host === targetHostId);
+  };
   const compatibleSpace = (space) => {
     if (!space || spaceMachine(space) !== targetMachine) return false;
+    if (spaceHasConflictingHost(space)) return false;
     const owner = spaceOwner(space);
     return !owner || owner === targetConn;
   };
@@ -133,7 +155,7 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
     if (!ctx?.rigs?.length) return false;
     const links = ctx.rigLinks ?? [];
     if (links.some(l => l.origin)) {
-      return Boolean(targetUrl) && links.some(l => l.origin && sameDaemonOrigin(l.origin, targetUrl, targetMachine));
+      return Boolean(targetUrl) && links.some(l => l.origin && sameDaemonOrigin(l.origin, targetUrl, targetMachine) && hostMatchesTarget(l));
     }
     return !several;
   };
@@ -143,6 +165,9 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
   const hasTargetRig = rigIdentifiers.size > 0;
   const spaceMatchesRig = (space) => {
     if (!isRigSpaceForTarget(space)) return false;
+    const ctx = contexts.get(space.id);
+    const links = ctx?.rigLinks ?? [];
+    if (links.some(l => rigIdentifiers.has(l.rig) && linkConflictsHost(l))) return false;
     const mark = marks[space.id];
     if (mark?.rig) {
       const mc = mark.conn ?? mark.spaceConn ?? null;
@@ -151,20 +176,19 @@ export function openRigPageFromLink(host, config, entry, sourceSpace) {
         return true;
       }
     }
-    const ctx = contexts.get(space.id);
     if (!ctx?.rigs?.length) return false;
-    const links = ctx.rigLinks ?? [];
     if (links.some(l => l.origin)) {
       return Boolean(targetUrl) && links.some(l => l.origin
         && sameDaemonOrigin(l.origin, targetUrl, targetMachine)
-        && rigIdentifiers.has(l.rig));
+        && rigIdentifiers.has(l.rig)
+        && hostMatchesTarget(l));
     }
     return (ctx.rigs ?? []).some(r => rigIdentifiers.has(r));
   };
   if (hasTargetRig) {
     const directMatch = spaces.some(spaceMatchesRig);
     if (!directMatch) {
-      const topo = connectionRows(host.shared?.("rig.data"), targetConn)?.topology;
+      const topo = publishedConn?.topology;
       if (Array.isArray(topo)) {
         for (const r of topo) {
           if (r?.conn && r.conn !== targetConn) continue;
@@ -282,5 +306,5 @@ export async function handleResolvedRigLink(host, config, target, sourceSpace) {
       return notice(`Couldn't check that request in ${box}. Nothing was opened.`);
     }
   }
-  return openRigPageFromLink(host, config, entry, sourceSpace) ? "handled" : notice(needSidebar);
+  return openRigPageFromLink(host, config, entry, sourceSpace) ? "handled" : notice(LINK_NEED_SPACE);
 }

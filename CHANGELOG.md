@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.11
+
+Clearer partial-launch results, safer Ctrl-click terminal links, and an up-to-date old-strip Leave dialog.
+
+- After a launch that only partly started or may have started, the Launch dialog hides the form so the full result and Check the rig list fit without clipping, titles a partial launch "<rig> partly started", puts Close directly under the result, and moves keyboard focus to Check the rig list.
+- Ctrl-click terminal links refuse spaces stamped for a different OpenRig host, and when no OpenRig space or Rig tab is open yet the notice tells you to open an OpenRig page or space from the Rig sidebar first.
+- "Leave OpenRig's old strip" counts a single view as "1 view" instead of "1 views", and an open Leave confirmation stays up to date with the strip's current views while open.
+- Moving a tab that holds both a Rig page and a live TUI verifies the fresh TUI at home before closing the original tab, and multi-connection in-place open records stay separate per OpenRig when two connections share a rig ID.
+- System → Health keeps distinct Back history across the Health list, individual findings, and linked queue items, and clears finding detail state when switching to another System tab.
+- Listed OpenRig connections validate `openrigHome` paths so malformed values no longer count as usable entries in connection loading, targeting, or Remove.
+- TUI process detection recognizes configured `config.rig` commands that pass Node options before the CLI entry, while still rejecting `node -e` and non-command positions.
+- The standalone installer and `check` command now find `herdr-app` the same way (`--herdr-app`, then `HERDR_APP_BIN`, then `PATH`).
+
 ## v0.5.10
 
 Ctrl-click OpenRig links and API addresses in Herdr terminals to open them on the Rig page, and see "seat · slice" names on worker panes.

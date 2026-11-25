@@ -2054,8 +2054,7 @@ export default class RigMenu extends View {
     if(step.action==='resume'&&(this.resumePlan?.ready!==true||this.result))return;
     if(step.action==='resume')this.resetResumeRollCall();
     if(step.action==="close-old-views"){
-      const gone=visibleOldViewsGone(shared,this.config,terminals());
-      step={...step,views:(step.views??[]).filter(view=>!gone.includes(view.id))};
+      step={...step,views:this.oldStripViews(step)};
       if(this.cleanupQueued)return;
       if(oldStripCleanupBusy(shared)){
         this.result={ok:false,notSent:true,text:'A cleanup is already running in this window. Wait for its result.'};
@@ -2751,16 +2750,30 @@ export default class RigMenu extends View {
     return placed.length ? placed : attachable.map((s) => s.session);
   }
 
+  /** The views a Leave confirmation names and closes: the strip's own views while it is on screen (it can gain or lose views while the
+   *  dialog is open, and the count shown is the count closed), otherwise the views it opened with, less those already closed. */
+  oldStripViews(step){
+    const gone=visibleOldViewsGone(shared,this.config,terminals());
+    if(hasOldProviderStrip(layout()))return knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],gone).filter(view=>view.current);
+    return (step.views??[]).filter(view=>!gone.includes(view.id));
+  }
+
   dialogView(t, cx, target, step) {
     if(step.action==='close-old-views'){
-      const gone=visibleOldViewsGone(shared,this.config,terminals());
-      step={...step,views:(step.views??[]).filter(view=>!gone.includes(view.id))};
+      step={...step,views:this.oldStripViews(step)};
     }
     this.dialogRenderCx=cx;this.dialogButtonIndex=0;
     this.dialogFirstControl=step.action==='design-view'?this.handle:null;
     this.dialogLastControl=null;
     const result = this.result;
-    const title = ["delete-rig", "archive-rig", "unarchive-rig"].includes(step.action) && result
+    const launchLocked = (step.action === "launch-spec" || step.action === "new-rig") && !!this.uncertainAttempt;
+    // Focus was in the form (a field, the spec list or a mode pill) when the launch went: once the form is gone, it moves to the first drawn control.
+    if (launchLocked && this.lockFocusPending === undefined) { this.dialogFocusedField = null; this.typing = false; this.lockFocusPending = true; }
+    const lockedName = step.action === "launch-spec" ? target.name : this.rigName?.value?.()?.trim?.() || this.newSpec?.name;
+    // OpenRig named which seats started: say so. Without that account, the launch may or may not have gone through.
+    const title = launchLocked ? (this.result?.partial ? `${lockedName ?? (step.action === "launch-spec" ? "The rig" : "The new rig")} partly started`
+        : step.action === "launch-spec" ? `${lockedName ?? "The rig"} may have started` : `${lockedName ?? "The new rig"} may have been created`)
+      : ["delete-rig", "archive-rig", "unarchive-rig"].includes(step.action) && result
       ? result.kind === "archive" ? (result.ok ? `${target.rig} archived` : result.uncertain ? `${target.rig} may be archived` : `Couldn't archive ${target.rig}`)
         : result.kind === "unarchive" ? (result.ok ? `${target.rig} restored` : `Couldn't restore ${target.rig}`)
         : result.ok && result.json?.deleted && !result.json?.deleteBlocked && !result.json?.errors?.length
@@ -2895,11 +2908,11 @@ export default class RigMenu extends View {
         : "It hides the stopped rig from the list. Nothing is deleted. You can restore it any time from Archived.");
     } else if (step.action === "delete-rig" && !this.result && !this.busy) {
       body = this.deleteView(t, target);
-    } else if (step.action === "new-rig" && !this.result?.ok && !this.busy) {
+    } else if (step.action === "new-rig" && !this.result?.ok && !this.uncertainAttempt && !this.busy) {
       body = this.newRigView(t);
     } else if (step.action === "fresh" && !this.result && !this.busy) {
       body = div().child(`${target.logicalId} starts a new conversation; the old one is not resumed.`);
-    } else if (step.action === "launch-spec" && !this.result?.ok && !this.busy) {
+    } else if (step.action === "launch-spec" && !this.result?.ok && !this.uncertainAttempt && !this.busy) {
       const field = (label, state) => v_flex().gap(3).child(div().text_size(11.5).text_color(t.dim).child(label))
         .child(div().border(1).border_color(t.border).rounded(6).px(6).py(4).child(this.dialogField(state,Input)));
       // The exact source rig up is given, not only the spec's name: what the person approves is what runs.
@@ -2951,7 +2964,7 @@ export default class RigMenu extends View {
     this.heldFocusControls=null;
     const messageComposer = !!this.input && (this.inputCanSend(step) || ["send","queue","reply"].includes(step.action) && heldUncertain);
     const mac = window()?.platform === "macos";
-    return v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12.5)
+    const dialogTree = v_flex().id("rig-dialog").when(!!this.handle, (el) => el.track_focus(this.handle)).tab_stop(step.action==='design-view').size_full().p(14).gap(10).bg(t.surface).text_color(t.foreground).text_size(12.5)
       .key_context('RigDialog')
       .on_action('rig-dialog-next',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{}},cx))
       .on_action('rig-dialog-prev',(_e,cx)=>this.dialogTab({key:'tab',modifiers:{shift:true}},cx))
@@ -3013,13 +3026,16 @@ export default class RigMenu extends View {
       // Resume's explanation stays above its own scrolling seat rows, never inside another scroll area.
       .when(fixedResumePlan,el=>el.child(v_flex().id('rig-resume-review').flex_1().min_h(0).child(body)))
       // Long results and the model/harness form scroll; the action footer never shrinks into the body.
-      .when(!messageComposer && !heldDraft && !fixedResumePlan && (step.action !== "design-view" || !!this.result || !!this.busy), (el) => el.child(v_flex().id("rig-dialog-body").flex_1().min_h(0).overflow_y_scrollbar()
+      // A launch that can't run again from here (it may have started, or only part of the rig did) builds no form, so the result, its guidance and
+      // Check the rig list fit, and the body keeps its own height: Herdr can't shrink an open dialog, so Close sits right under them, not at its bottom edge.
+      .when(!messageComposer && !heldDraft && !fixedResumePlan && (step.action !== "design-view" || !!this.result || !!this.busy), (el) => el.child(v_flex().id("rig-dialog-body").min_h(0)
+        .when(launchLocked, content => content.overflow_y_scroll()).when(!launchLocked, content => content.flex_1().overflow_y_scrollbar())
         .when(["change-model","new-rig","confirm-spec-write","spaces-list","launch-spec","resume","close-old-views"].includes(step.action) && !!body&&(step.action!=='close-old-views'||!this.result||this.result.notSent), (content) => content.child(body))
         .child(this.resultView(t, cx, target, step) ?? div())))
       .child(h_flex().id("rig-dialog-footer").flex_none().gap(8).justify_end()
         .child(this.dialogButton(t,div().id("rig-cancel").px(12).h(26).rounded(6).bg(t.raised).flex().items_center().hover((s) => s.bg(t.hover)),this.dialogCancelHandle,
           () => { if(!done&&step.action==="rebuild-space"&&step.continueMove)notify({title:"Move not continued",body:"Both grids were left in place."});this.dismiss(!done); },!!this.compactionStarting,
-          done || heldDraft || this.compactionConfirmed || step.action==='resume'&&this.result&&!this.result.notSent || step.action==='close-old-views'&&(this.cleanupQueued||this.oldStripChoices?.length===0&&!this.oldStripCloseOnly(step)) ? "Close"
+          done || launchLocked || heldDraft || this.compactionConfirmed || step.action==='resume'&&this.result&&!this.result.notSent || step.action==='close-old-views'&&(this.cleanupQueued||this.oldStripChoices?.length===0&&!this.oldStripCloseOnly(step)) ? "Close"
             : step.action==='confirm-seat-compaction' ? step.copy?.dismiss??'Cancel' : step.action==='typing-guard'&&step.treatedAsHold ? "Keep" : "Cancel"))
         .when(done && step.action === "new-rig" && typeof result.createdRig === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(result.createdRig), el => el.child(
           this.dialogButton(t,div().id("new-rig-open-space").px(12).h(26).rounded(6).bg(t.accent).text_color(t.background ?? "#fff").flex().items_center().cursor_pointer(),this.dialogOpenSpaceHandle,
@@ -3033,6 +3049,13 @@ export default class RigMenu extends View {
           .bg(step.action === "pause" || step.action === "fresh" || step.action === "delete-rig" ? t.blocked : t.accent)
           .text_color(step.action === "delete-rig" ? (t.surface ?? t.background ?? "#fff") : (t.background ?? "#fff")).flex().items_center(),this.dialogConfirmHandle,
           (_e,cx)=>go(cx),reviewFailed,confirmLabel))));
+    // A button's handle is made after its first render, so this waits until no handle is still being made: the first control is then the first one drawn.
+    if (this.lockFocusPending && this.dialogFirstControl && !this.dialogHandleTask) {
+      const first = this.dialogFirstControl; this.lockFocusPending = false;
+      this.dialogBoundaryTask?.cancel?.();
+      this.dialogBoundaryTask = cx.timer.after(0, nextCx => { if (!this.gone) { first.focus(); nextCx.notify(); } });
+    }
+    return dialogTree;
   }
 
   heldDraftView(t,cx,target,step) {

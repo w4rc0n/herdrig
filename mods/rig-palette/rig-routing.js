@@ -265,6 +265,16 @@ export async function inspectMigrationTab(host,config,spaceId,tabId) {
   return {...result,ok:!stale,replaceable:stale,reason:stale?"its TUI isn't running (restored shell)":null,panes,fingerprint};
 }
 
+async function verifyLiveTui(host,config,terminal){
+  try{
+    const response=await host.hc(["get","--json","--",terminal]);
+    const fresh=JSON.parse(response.stdout);
+    if(response.code!==0||!fresh||fresh.state&&!['live','running'].includes(fresh.state)||!isTuiArgv(fresh.foreground?.argv??fresh.argv,config))
+      return fail("The fresh TUI didn't stay running. The original tab was left here.");
+    return {ok:true};
+  }catch{return fail("Herdr could not verify the fresh TUI. The original tab was left here.");}
+}
+
 /** Only explicit Move calls this; one refused tab never prevents another safe tab from moving. */
 export async function migrateRigTabs(host, config, spaceId) {
   const source=contexts(host).find(c=>c.id===spaceId);
@@ -287,10 +297,23 @@ export async function migrateRigTabs(host, config, spaceId) {
         left.push({...checked,...(page?{pageOnly:true,pageFingerprint:page.pageFingerprint,
           reason:checked.blockedPane?`${checked.blockedPane} in ${checked.name} stays here; you can move just the Rig page`:"other panes stay here; you can move just the Rig page"}:{})});continue;
       }
-      const entry=tabPageOf(host,config,tab);
-      const result=await routeOpen({...host,routeOwner:true},config,checked.panes.some(p=>p.mod===MOD_IDS.view)
-        ?{kind:"page",entry,home:true}:{kind:"tui"});
-      if(!result.ok){left.push({...checked,ok:false,replaceable:false,reason:result.reason});continue;}
+      const hasPage=checked.panes.some(p=>p.mod===MOD_IDS.view);
+      const hasTui=checked.panes.some(p=>p.terminal);
+      let result=null;
+      if(hasTui){
+        const opened=await routeOpen({...host,routeOwner:true},config,{kind:"tui"});
+        if(!opened.ok){left.push({...checked,ok:false,replaceable:false,reason:opened.reason});continue;}
+        const verified=await verifyLiveTui(host,config,opened.terminal);
+        if(!verified.ok){left.push({...checked,ok:false,replaceable:false,reason:verified.reason});continue;}
+        result=opened;
+      }
+      if(hasPage){
+        const entry=tabPageOf(host,config,tab);
+        const page=await routeOpen({...host,routeOwner:true},config,{kind:"page",entry,home:true});
+        if(!page.ok){left.push({...checked,ok:false,replaceable:false,reason:page.reason});continue;}
+        result=page;
+      }
+      if(!result){left.push({...checked,ok:false,replaceable:false,reason:"the tab is no longer open"});continue;}
       const current=await inspectMigrationTab(host,config,spaceId,tab);
       if(!current.ok||current.fingerprint!==checked.fingerprint){left.push({...checked,ok:false,replaceable:false,reason:"the original tab changed while opening its destination"});continue;}
       host.run("tab.close",{id:tab});
@@ -319,12 +342,8 @@ export async function replaceMigrationTab(host,config,request) {
   }
   const opened=await routeOpen({...host,routeOwner:true},config,{kind:"tui"});
   if(!opened.ok)return opened;
-  try{
-    const response=await host.hc(["get","--json","--",opened.terminal]);
-    const fresh=JSON.parse(response.stdout);
-    if(response.code!==0||!fresh||fresh.state&&!['live','running'].includes(fresh.state)||!isTuiArgv(fresh.foreground?.argv??fresh.argv,config))
-      return fail("The fresh TUI didn't stay running. The original tab was left here.");
-  }catch{return fail("Herdr could not verify the fresh TUI. The original tab was left here.");}
+  const verified=await verifyLiveTui(host,config,opened.terminal);
+  if(!verified.ok)return verified;
   const current=await inspectMigrationTab(host,config,request.spaceId,request.tabId);
   if(!current.replaceable||current.fingerprint!==checked.fingerprint)return fail("The original tab changed while its replacement opened. It was left here.");
   host.run("tab.close",{id:request.tabId,confirmed:true});
@@ -422,11 +441,14 @@ export function withInPlaceOpen(spaceState,rigId,conn,record){
   if(!safeRecordKey(rigId))return spaceState?.inPlaceOpen;
   const next={};
   for(const [k,v]of Object.entries(spaceState?.inPlaceOpen??{}))if(safeRecordKey(k)&&v&&typeof v==="object")next[k]=v;
-  const stamped={...record,...(conn?{conn}:{})};
-  if(conn&&conn!==LEGACY_CONNECTION_ID&&Object.hasOwn(next,rigId)&&next[rigId]?.conn&&next[rigId].conn!==conn){
-    next[`${conn}|${rigId}`]=stamped;
+  const owner=conn||LEGACY_CONNECTION_ID,stamped={...record,conn:owner};
+  if(owner!==LEGACY_CONNECTION_ID&&safeRecordKey(`${owner}|${rigId}`)&&Object.hasOwn(next,rigId)&&(!next[rigId]?.conn||next[rigId].conn!==owner)){
+    next[`${owner}|${rigId}`]=stamped;
   }else{
-    if(conn&&conn!==LEGACY_CONNECTION_ID)delete next[`${conn}|${rigId}`];
+    if(owner!==LEGACY_CONNECTION_ID)delete next[`${owner}|${rigId}`];
+    const existing=Object.hasOwn(next,rigId)?next[rigId]:null;
+    if(existing?.conn&&existing.conn!==LEGACY_CONNECTION_ID&&existing.conn!==owner&&safeRecordKey(`${existing.conn}|${rigId}`))
+      next[`${existing.conn}|${rigId}`]=existing;
     next[rigId]=stamped;
   }
   return next;
@@ -436,7 +458,10 @@ export function withoutInPlaceOpen(spaceState,rigId,conn=null){
   if(!prev||typeof prev!=="object"||!safeRecordKey(rigId))return undefined;
   const next={};
   for(const [k,v]of Object.entries(prev))if(safeRecordKey(k)&&v&&typeof v==="object")next[k]=v;
-  if(conn&&conn!==LEGACY_CONNECTION_ID)delete next[`${conn}|${rigId}`];
+  if(conn&&conn!==LEGACY_CONNECTION_ID){
+    const qualified=`${conn}|${rigId}`;
+    if(Object.hasOwn(next,qualified)){delete next[qualified];return Object.keys(next).length?next:undefined;}
+  }
   if(Object.hasOwn(next,rigId)&&(!next[rigId]?.conn||!conn||next[rigId].conn===conn))delete next[rigId];
   return Object.keys(next).length?next:undefined;
 }
