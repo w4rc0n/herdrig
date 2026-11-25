@@ -4876,7 +4876,7 @@ export default class RigSidebar extends View {
         const openOldViews=()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,
           props:{target:{kind:"old-views"},step:{action:"close-old-views",views:oldViews,confirm:true}}});
         const canClose = hasOldProviderStrip(layout())||oldViewCandidates(this.config, conn => connectionCapabilities(shared, this.config, conn, terminals())).length > 0;
-        const label = oldViews.length ? `OpenRig's old strip: ${oldViews.length} views · ` : "OpenRig's old strip is still on screen · ";
+        const label = oldViews.length ? `OpenRig's old strip: ${oldViews.length} view${oldViews.length===1?'':'s'} · ` : "OpenRig's old strip is still on screen · ";
         const oldRow = h_flex().id("system-old-worker-views").pl(treeIndent(1)).pr(8).h(22)
           .child(div().text_size(12).text_color(t.muted).tooltip(label).child(label).truncate());
         const cleanupBusy=oldStripCleanupBusy(shared);

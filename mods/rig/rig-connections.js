@@ -101,6 +101,14 @@ const LOOPBACK_ADDRESS = /^https?:\/\/(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?:
 const url = (value) => (typeof value === "string" && /^https?:\/\/[^\s]+$/.test(value) ? value.replace(/\/+$/, "") : null);
 /** An OpenRig over Herdr's connection: exactly herdr://<machine>/<hostId>, no path. */
 const herdrAddress = (value) => (typeof value === "string" && /^herdr:\/\/[a-z0-9][a-z0-9._-]{0,31}\/[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : null);
+/** The refusal for a connection's OpenRig home (a clean absolute folder path on THIS computer), or null when it is fine. */
+export const openrigHomeProblem = (value) => (typeof value === "string" && /^\/[^\x00-\x1f\x7f]*[^/\x00-\x1f\x7f]$/.test(value) && !value.split("/").some((part) => part === "." || part === "..")
+  ? null : "This connection needs its OpenRig home: an absolute folder path, such as /srv/openrig-home.");
+const cleanHomeFolder = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.length > 1 ? value.replace(/\/+$/, "") : value;
+  return openrigHomeProblem(trimmed) ? null : trimmed;
+};
 
 /** One connection from a raw record; null when it can't be one. `token` is reserved and always null: the mod sends no token today
  *  (reads are plain GETs, writes go through the rig CLI, which does its own authentication from its OpenRig home). */
@@ -138,7 +146,7 @@ export function connectionsOf(raw) {
       const n = index + 1;
       if (unreadable(entry?.daemonUrl)) { notes.push(connectionNote(n, `its address ${unreadableAddress(entry.daemonUrl)} ${UNREADABLE_FORM}`.replace(/\.$/, ""))); return; }
       const conn = normalizeConnection(entry);
-      if (!conn || (!conn.daemonUrl && !conn.machine && !conn.openrigHome)) notes.push(connectionNote(n, "it needs an id (letters, digits, dots or dashes), and an address, machine, or OpenRig home"));
+      if (!conn || (!conn.daemonUrl && !conn.machine && !cleanHomeFolder(conn.openrigHome))) notes.push(connectionNote(n, "it needs an id (letters, digits, dots or dashes), and an address, machine, or OpenRig home"));
       else if (seen.has(conn.id)) notes.push(connectionNote(n, `the id ${conn.id} is already used by an earlier entry`));
       else { seen.add(conn.id); list.push(conn); }
     });
@@ -211,7 +219,7 @@ export function targetConnection(config, target) {
   // Another connection's command runs with its own OpenRig home or none at all: the CLI authenticates from the home, and without one
   // it would send the inherited (another daemon's) credential. The legacy connection keeps today's behaviour.
   // Over Herdr's connection the helper runs on the machine with that machine's own OpenRig home: no local home is needed (or used).
-  if (id !== LEGACY_CONNECTION_ID && !view.openrigHome && view.transport !== "herdr" && !String(view.daemonUrl ?? "").startsWith("herdr://")) return { ok: false, reason: HOME_NEEDED };
+  if (id !== LEGACY_CONNECTION_ID && !cleanHomeFolder(view.openrigHome) && view.transport !== "herdr" && !String(view.daemonUrl ?? "").startsWith("herdr://")) return { ok: false, reason: HOME_NEEDED };
   return { ok: true, conn, config: view };
 }
 
@@ -361,15 +369,6 @@ export function pickSeat(rigs, match, { conn, rigId, allowFirst = false } = {}) 
 }
 
 const MACHINE_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
-/** The refusal for a connection's OpenRig home (a clean absolute folder path on THIS computer), or null when it is fine. */
-export const openrigHomeProblem = (value) => (typeof value === "string" && /^\/[^\x00-\x1f\x7f]*[^/\x00-\x1f\x7f]$/.test(value) && !value.split("/").some((part) => part === "." || part === "..")
-  ? null : "This connection needs its OpenRig home: an absolute folder path, such as /srv/openrig-home.");
-
-const cleanHomeFolder = (value) => {
-  if (typeof value !== "string") return null;
-  const trimmed = value.length > 1 ? value.replace(/\/+$/, "") : value;
-  return openrigHomeProblem(trimmed) ? null : trimmed;
-};
 const pathOrChild = (p, root) => Boolean(root) && (p === root || p.startsWith(`${root}/`));
 const hasTwoSegments = (p) => Boolean(p) && p.split("/").filter(Boolean).length >= 2;
 const matchesMachineFolder = (p, folder) => Boolean(folder) && (p === folder || (hasTwoSegments(folder) && p.startsWith(`${folder}/`)));

@@ -43,7 +43,7 @@ export function entryWithPageView(entry, view, {preserveScope=false}={}) {
   else if(kind==="system"){
     next.subview=view; // Explicit Overview must beat a remembered Health tab.
     if(!preserveScope){delete next.category;delete next.settingKey;delete next.openUsageHosts;}
-    if(view!=="health"){delete next.healthRigId;delete next.healthRigName;delete next.healthQitem;}
+    if(view!=="health"){delete next.healthRigId;delete next.healthRigName;delete next.healthFinding;delete next.healthQitem;}
   }
   return next;
 }

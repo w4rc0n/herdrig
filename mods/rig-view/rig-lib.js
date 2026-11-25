@@ -4697,9 +4697,15 @@ export function isTuiArgv(argv, config) {
     while (cmd < a.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(a[cmd])) cmd++;
   }
   if (cmd + 1 >= a.length) return false;
-  const entries = new Set((config?.rig ?? ["rig"]).slice(-1));
+  const configured = Array.isArray(config?.rig) && config.rig.length ? config.rig.map(String) : ["rig"];
+  const entries = new Set(configured.slice(-1));
   const token = a[cmd];
   if (a[cmd + 1] === "tui" && (baseOf(token) === "rig" || entries.has(token))) return true;
+  if (configured.length >= 2 && cmd + configured.length < a.length && a[cmd + configured.length] === "tui") {
+    const binMatches = token === configured[0]
+      || (/^(?:node|nodejs)(?:\.exe)?$/.test(baseOf(configured[0])) && /^(?:node|nodejs)(?:\.exe)?$/.test(baseOf(token)));
+    if (binMatches && configured.slice(1).every((part, idx) => a[cmd + 1 + idx] === part)) return true;
+  }
   if (cmd + 2 < a.length && a[cmd + 2] === "tui" && /^(?:node|nodejs)(?:\.exe)?$/.test(baseOf(token))) {
     const entry = a[cmd + 1];
     // The installed `rig` symlink resolves to this Node entry in core's live
