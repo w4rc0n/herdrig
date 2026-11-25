@@ -52,8 +52,9 @@ const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 import { RemoteMachine, detectDaemonMachine, offerForMachine, machineProbeExec, herdrIdentityOf, loopbackHealthFetch, goodHome } from "./rig-remote.js";
-import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViewsOnly, hasOldProviderStrip, ensureOldStripPage, visibleOldViewsGone, pruneOldViewsGone, oldStripCleanupOwner, oldStripCleanupBusy, oldStripBusyTip, releaseOldStripCleanup } from "./rig-old-views.js";
+import { knownOldProviderViews, readOldProviderViews, oldViewCandidates, closeOldViewsOnly, hasOldProviderStrip, ensureOldStripPage, visibleOldViewsGone, pruneOldViewsGone, oldStripCleanupOwner, oldStripCleanupBusy, oldStripBusyTip, releaseOldStripCleanup, rememberOwnLayout } from "./rig-old-views.js";
 import { layouts } from "herdr";
+import { rigLayoutAppearance, rigLayoutCardState, rigLayoutCard, keepRigLayout, finishRigLayoutRestore, RESTORE_AFTER_MS } from "./rig-layout-notice.js";
 import { HostWorkerViews } from "./rig-worker-controller.js";
 import {migrateConnectionState} from './rig-connection-migration.js';
 import {workerViewDetails} from "./rig-worker-views.js";
@@ -268,6 +269,8 @@ const FULL_ATTENTION_GAP_FACTOR = 8;
 /** Above this, the sidebar says that this OpenRig is slow to list its updates and how often they are read. */
 const FULL_ATTENTION_SLOW_MS = 3000;
 const QUIET_RECONCILE_MS = 60_000;
+/** Herdr 0.1.18 reports `window()?.visible === false` while hidden; older Herdr (undefined) and `herdr-app check` (null) count as visible. */
+const windowHidden = () => window()?.visible === false;
 /** Whether an OpenRig honoured `kind=action`: one that does names the narrowed read among its sources; an older one ignores the parameter
  *  and answers with the whole list. */
 const kindFiltered = (answer) => Array.isArray(answer?.sources) && answer.sources.some((s) => s?.source === "kind");
@@ -383,12 +386,15 @@ export default class RigSidebar extends View {
     });
     cx.timer.every(1000, (cx) => {
       if (this.closed) return;
+      this.checkRigLayoutNotice(cx);
+      const hidden = windowHidden();
+      if (hidden) this.wasHidden = true;
       this.checkInterruptedOpens(cx);
-      if (narrow()) this.publishSpaceMarks(); // the rail skips them in its render
+      if (narrow() && !hidden) this.publishSpaceMarks(); // the rail skips them in its render
       // A route request whose rig.route:<id> command hasn't reached this loop yet (Herdr can deliver it behind busy frames): taken here too.
       // acceptRigOpen consumes it before acknowledging, so a command that arrives later finds nothing; the request keeps its own connection.
       for (const id of Object.keys(shared("rig.routeRequests") ?? {})) { const request = acceptRigOpen({ shared, setShared }, id); if (request) this.routeRequest(cx, request); }
-      if (this.config?.missing) cx.spawn(async (cx) => { try { await this.reloadConfig(cx); } catch (error) { this.sayConfigReadFailure(error); } });
+      if (this.config?.missing && !hidden) cx.spawn(async (cx) => { try { await this.reloadConfig(cx); } catch (error) { this.sayConfigReadFailure(error); } });
       if (this.dismissalModels?.size && !this.dismissFlushing) cx.spawn(async (cx) => {
         this.dismissFlushing = true;
         try {
@@ -548,11 +554,14 @@ export default class RigSidebar extends View {
     // Check timers frequently for outages. A quiet public event stream only needs the bounded reconciliation.
     cx.timer.every(5000, (cx) => {
       if (this.closed) return;
-      const now = Date.now();
-      const configDue = this.configReadFailure || this.lastAutomaticConfigRead == null ||
+      const now = Date.now(), hidden = windowHidden();
+      if (hidden) this.wasHidden = true;
+      const rawConfigDue = this.configReadFailure || this.lastAutomaticConfigRead == null ||
         now < this.lastAutomaticConfigRead || now - this.lastAutomaticConfigRead >= QUIET_RECONCILE_MS;
+      const configDue = rawConfigDue && (!hidden || Boolean(this.configReadFailure));
+      if (rawConfigDue && !configDue) this.hiddenConfigDue = true;
       if (!configDue && !this.feeds.some(feed => this.automaticRefreshDue(feed, now))) return;
-      if (configDue) this.lastAutomaticConfigRead = now;
+      if (configDue) { this.lastAutomaticConfigRead = now; this.hiddenConfigDue = false; }
       cx.spawn(async (cx) => {
         if (configDue) {
           try { await this.reloadConfig(cx); } catch (error) { this.sayConfigReadFailure(error); }
@@ -853,7 +862,7 @@ export default class RigSidebar extends View {
     if (!feed) { notify({ title: "Open TUI", body: UNKNOWN_CONNECTION, level: "warning" }); return; }
     const config = feed.config, inRigLayout = inRigLayoutNow();
     cx.spawn(async (cx) => {
-      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r(), {owner:null})) }, config);
+      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, notify, inRigLayout, wait: (ms) => new Promise((r) => cx.timer.after(ms, () => r(), {owner:null})) }, config);
       if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
     });
   }
@@ -1129,7 +1138,7 @@ export default class RigSidebar extends View {
   }
 
   routeHost(cx, consent = null, feed = this.primary, attempt = null) {
-    return { ...this.attachHost(cx, consent, feed, attempt), currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], selfHostId: () => feed.healthz?.selfHostId,
+    return { ...this.attachHost(cx, consent, feed, attempt), notify, currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], selfHostId: () => feed.healthz?.selfHostId,
       saveRouteState: patch => this.trackRouteOp(feed, attempt, true, () => this.saveSpaceState(patch)),
       syncGrid: (rig, options) => this.spaceController(cx, consent, feed, attempt).sync(rig, feed.config, options) };
   }
@@ -2028,7 +2037,7 @@ export default class RigSidebar extends View {
     const [entry]=Object.entries(queued);
     if(!entry)return;
     if(oldStripCleanupOwner(shared)){
-      notify({title:'Old worker views',body:'A cleanup is already running in this window. Wait for its result.',level:'warning'});
+      notify({title:"OpenRig's views",body:'A cleanup is already running in this window. Wait for its result.',level:'warning'});
       return;
     }
     const [id,request]=entry;
@@ -2040,27 +2049,27 @@ export default class RigSidebar extends View {
       if(this.closed){
         release();
         const text='The Rig sidebar closed before cleanup started. Nothing was closed.';
-        setShared('rig.status',{id,busy:false,ok:false,text,at:Date.now()});notify({title:'Old worker views',body:text,level:'warning'});return;
+        setShared('rig.status',{id,busy:false,ok:false,text,at:Date.now()});notify({title:"OpenRig's views",body:text,level:'warning'});return;
       }
-      const title='Closing old views';
+      const title="Closing OpenRig's views";
       // cx is the sidebar command-loop context. The ownerless job has no view to notify.
       const publish=result=>{
         setShared('rig.oldViewsCloseResult',{id,session:this.cleanupSession,expiresAt:Date.now()+120000,...result});
-        setShared('rig.status',{id,busy:false,...result,at:Date.now()});notify({title:result.title??'Old worker views',body:result.text,level:result.ok?'info':'warning'});
+        setShared('rig.status',{id,busy:false,...result,at:Date.now()});notify({title:result.title??"OpenRig's views",body:result.text,level:result.ok?'info':'warning'});
         if(!this.closed){cx.notify();cx.timer?.after?.(120000,next=>{if(!this.closed&&shared('rig.oldViewsCloseResult')?.id===id){setShared('rig.oldViewsCloseResult',null);cx.notify();}},{owner:null});}
       };
-      if(!Number.isFinite(request?.createdAt)||Date.now()-request.createdAt>120000||request.createdAt>Date.now()+1000){release();publish({ok:false,text:'This cleanup confirmation expired. Nothing was started. Check the old views, then confirm again.'});return;}
+      if(!Number.isFinite(request?.createdAt)||Date.now()-request.createdAt>120000||request.createdAt>Date.now()+1000){release();publish({ok:false,text:"This cleanup confirmation expired. Nothing was started. Check OpenRig's views, then confirm again."});return;}
       if(this.oldViewsClosing){
         release();
         if(this.oldViewsClosing.deadline<=Date.now()){
           const old=this.oldViewsClosing;old.expired=true;this.oldViewsClosing=null;this.inFlightActions?.delete(old.id);
-          publish({ok:false,text:'The earlier close was not confirmed. Check the old views before confirming again. This confirmation was not started.'});
-        }else publish({ok:false,text:'Old views are already being closed. Check the result in System.'});
+          publish({ok:false,text:"The earlier close was not confirmed. Check OpenRig's views before confirming again. This confirmation was not started."});
+        }else publish({ok:false,text:"OpenRig's views are already being closed. Check the result in System."});
         return;
       }
       const ticket={id,deadline:Date.now()+300000};this.oldViewsClosing=ticket;
       (this.inFlightActions??=new Map()).set(id,{title,clearBusy:()=>{},rig:null,rigId:null,conn:null});
-      setShared('rig.oldViewsCloseResult',{id,session:this.cleanupSession,expiresAt:ticket.deadline,busy:true,text:'Closing old views…'});cx.notify();
+      setShared('rig.oldViewsCloseResult',{id,session:this.cleanupSession,expiresAt:ticket.deadline,busy:true,text:"Closing OpenRig's views…"});cx.notify();
       const deadline=cx.timer?.after?.(300000,()=>{
         if(this.closed||this.oldViewsClosing!==ticket)return;
         ticket.expired=true;this.oldViewsClosing=null;this.inFlightActions?.delete(id);
@@ -2087,7 +2096,7 @@ export default class RigSidebar extends View {
             if(!Object.hasOwn(pending,id))return; // A native page already took it and owns its result.
             const remaining={...pending};delete remaining[id];setShared('rig.stripRecovery',remaining);
             release();
-            publish({ok:false,recovery:true,title:"Still in OpenRig's old strip",text:"The Rig page didn't start the cleanup, so nothing was closed. Try again, or open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running."});
+            publish({ok:false,recovery:true,title:"Still in OpenRig's Rig layout",text:"The Rig page didn't start the cleanup, so nothing was closed. Try again, or open the palette (Ctrl+Shift+P) and choose a Layout. Your seats keep running."});
           },{owner:null});
           handedOff=true;
           this.inFlightActions?.delete(id); // The native page, not this layout copy, owns the operation from here.
@@ -3229,8 +3238,41 @@ export default class RigSidebar extends View {
     if (event || !fullEvents || !feed.live || feed.error || !feed.data || feed.terminalOutage || feed.inflightRouteOps) return true;
     if (feed.data.topology?.some(rig => rig.nodesUnavailable) || feed.fullAttention?.unpublished) return true;
     // Only the primary refresh runs the grid sweep, which already has its own retry backoff.
-    if (feed === this.primary && (this.spacePreflightRetry?.nextAt <= now || this.spaceAgain || this.spaceSweepRetry?.nextAt <= now)) return true;
-    return feed.quietRefresh?.key !== key || now < feed.quietRefresh.at || now - feed.quietRefresh.at >= QUIET_RECONCILE_MS;
+    const quietDue = Boolean(feed.hiddenCatchUp)
+      || (feed === this.primary && (this.spacePreflightRetry?.nextAt <= now || this.spaceAgain || this.spaceSweepRetry?.nextAt <= now))
+      || feed.quietRefresh?.key !== key || now < feed.quietRefresh.at || now - feed.quietRefresh.at >= QUIET_RECONCILE_MS;
+    if (!quietDue) return false;
+    if (windowHidden()) { feed.hiddenCatchUp = true; this.wasHidden = true; return false; }
+    return true;
+  }
+
+  /** Record a planned stream replacement after quiet reads; while hidden, defer the gap refresh until unhide. */
+  markStreamStale(feed) {
+    feed.plannedReplace = true;
+    if (windowHidden()) { feed.hiddenCatchUp = true; this.wasHidden = true; }
+    else feed.quietRefresh = null;
+  }
+
+  /** Coalesced single catch-up when the window becomes visible again after skipping quiet work. */
+  resumeHiddenCatchUp(cx, { configDue = false, refreshDue = false } = {}) {
+    if (this.closed || (!configDue && !refreshDue) || !cx?.timer?.after) return;
+    this.resumeCatchUpConfig = Boolean(this.resumeCatchUpConfig || configDue);
+    this.resumeCatchUpRefresh = Boolean(this.resumeCatchUpRefresh || refreshDue);
+    if (this.resumeCatchUpPending) return;
+    this.resumeCatchUpPending = true;
+    cx.timer.after(0, (next) => {
+      const doConfig = Boolean(this.resumeCatchUpConfig), doRefresh = Boolean(this.resumeCatchUpRefresh);
+      this.resumeCatchUpPending = false; this.resumeCatchUpConfig = false; this.resumeCatchUpRefresh = false;
+      if (this.closed) return;
+      if (windowHidden()) { this.wasHidden = true; if (doConfig) this.hiddenConfigDue = true; return; }
+      next.spawn(async (live) => {
+        if (doConfig) {
+          this.lastAutomaticConfigRead = Date.now();
+          try { await this.reloadConfig(live); } catch (error) { this.sayConfigReadFailure(error); }
+        }
+        if (doRefresh && !this.closed) await this.refreshFeeds(live, true);
+      });
+    });
   }
 
   /** One refresh of one feed: the primary's full read, or a secondary connection's own read of its rows. */
@@ -3242,7 +3284,7 @@ export default class RigSidebar extends View {
     if(!automatic){this.completedSpaceSweep=null;this.spaceSweepRetry=null;}
     const consumeFull = automatic && !event && feed.fullAttention?.unpublished === true;
     await (feed===this.primary?this.refresh(cx,feed,consumeFull):this.refreshSecondary(cx,feed,consumeFull));
-    if(!feed.error)feed.quietRefresh={key,at:Date.now()};
+    if(!feed.error){feed.quietRefresh={key,at:Date.now()};feed.hiddenCatchUp=false;}
     if(feed.error){const delay=previous?.key===key?Math.min(previous.delay*2,60000):10000;feed.refreshRetry={key,delay,nextAt:Date.now()+delay};}
     else feed.refreshRetry=null;
     if(previous?.delay!==feed.refreshRetry?.delay){this.publishData(cx);cx.notify();}
@@ -3453,9 +3495,10 @@ export default class RigSidebar extends View {
     const connId = feed === this.primary ? this.primaryStateId() : feed.id;
     const stateKey = this.notifiedNeedsKey(connId);
     const lists = this.hostLists();
+    const hidden = windowHidden();
     const { toasts, nextState } = diffPriorityNotifications(topology, attentionItems, feed.prioritySeeded ? shared(stateKey) : null, {
-      quiet: Boolean(quietChip), needsVisible: isNeedsVisible({ nav: this.shownNav(), activeChild: shownChild(lists) }), notificationsEnabled: (shared("rig.settings")?.notifications ?? true) !== false, sources,
-      focusedSession: this.focusedSeat(topology, lists), terminals: lists.terminals, spaces: lists.spaces, config: this.config,
+      quiet: Boolean(quietChip), needsVisible: !hidden && isNeedsVisible({ nav: this.shownNav(), activeChild: shownChild(lists) }), notificationsEnabled: (shared("rig.settings")?.notifications ?? true) !== false, sources,
+      focusedSession: hidden ? null : this.focusedSeat(topology, lists), terminals: lists.terminals, spaces: lists.spaces, config: this.config,
     });
     feed.prioritySeeded = true;
     const notificationChanged=!sameValue(shared(stateKey),nextState);
@@ -3579,7 +3622,7 @@ export default class RigSidebar extends View {
           });
           // Replaced after MAX_IDLE_TIMEOUTS quiet reads: not a disconnect. It stays live through the usual 1 s wait; the 5 s poll covers the gap.
           // herdr:// polls skip for up to 60 s while live; clearing that lets the next 5 s poll read the gap once.
-          if (end === "stale") { feed.plannedReplace = true; feed.quietRefresh = null; }
+          if (end === "stale") this.markStreamStale(feed);
         } catch (e) { this.sayStreamBug(feed, e); /* then reconnect below */ }
         finally{pendingTimer?.cancel?.();}
         try { feed.sock?.close(); } catch (_) {}
@@ -4870,22 +4913,29 @@ export default class RigSidebar extends View {
       const cleanupResult=this.oldViewsCloseResult();
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(cleanupResult.ok===false?t.blocked:t.muted).child(cleanupResult.text));
-      const oldViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],visibleOldViewsGone(shared,this.config,terminals())).filter(view=>view.current);
-      if (hasOldProviderStrip(layout())||oldViews.length) {
+      // While OpenRig's Rig layout is shown, Leave closes its views and switches back. Once the window has left it, its views stay
+      // open inside the saved layout and come back with OpenRig's next open: they're counted here too and can be closed on their own.
+      const shown = hasOldProviderStrip(layout());
+      const knownViews = knownOldProviderViews(layout(),shared("rig.oldProviderViews")??[],visibleOldViewsGone(shared,this.config,terminals()));
+      const oldViews = shown ? knownViews.filter(view=>view.current) : knownViews;
+      if (shown||oldViews.length) {
         const closeActivation=activationPair(this,'system-close-old-worker-views');
         const openOldViews=()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,
-          props:{target:{kind:"old-views"},step:{action:"close-old-views",views:oldViews,confirm:true}}});
-        const canClose = hasOldProviderStrip(layout())||oldViewCandidates(this.config, conn => connectionCapabilities(shared, this.config, conn, terminals())).length > 0;
-        const label = oldViews.length ? `OpenRig's old strip: ${oldViews.length} view${oldViews.length===1?'':'s'} · ` : "OpenRig's old strip is still on screen · ";
+          props:{target:{kind:"old-views"},step:{action:"close-old-views",views:oldViews,confirm:true,...(shown?{}:{closeOnly:true})}}});
+        const canClose = shown||oldViewCandidates(this.config, conn => connectionCapabilities(shared, this.config, conn, terminals())).length > 0;
+        const plural = oldViews.length===1?'':'s';
+        const label = !shown ? `OpenRig's Rig views: ${oldViews.length} still open · `
+          : oldViews.length ? `OpenRig's Rig layout: ${oldViews.length} view${plural} · ` : "OpenRig's Rig layout is still on screen · ";
+        const action = shown ? "Leave it…" : "Close them…";
         const oldRow = h_flex().id("system-old-worker-views").pl(treeIndent(1)).pr(8).h(22)
           .child(div().text_size(12).text_color(t.muted).tooltip(label).child(label).truncate());
         const cleanupBusy=oldStripCleanupBusy(shared);
-        if (canClose&&cleanupBusy)oldRow.child(div().id("system-close-old-worker-views").text_size(12).text_color(t.dim).tooltip(oldStripBusyTip).child("Leave it…"));
+        if (canClose&&cleanupBusy)oldRow.child(div().id("system-close-old-worker-views").text_size(12).text_color(t.dim).tooltip(oldStripBusyTip).child(action));
         if (canClose&&!cleanupBusy) oldRow.child(div().id("system-close-old-worker-views").role("button").tab_stop(true)
           .text_size(12).text_color(t.accent).cursor_pointer().focus(el=>el.border_1().border_color(t.accent))
           .on_mouse_down('left',closeActivation.pointer())
           .on_key_down(closeActivation.key((event,cx)=>{if(['enter','space',' '].includes(String(event.key??'').toLowerCase())){cx.stop_propagation();openOldViews();}}))
-          .on_click(closeActivation.click(openOldViews)).child("Leave it…"));
+          .on_click(closeActivation.click(openOldViews)).child(action));
         out.push(oldRow);
       }
       for (const item of orderedSys) {
@@ -5674,6 +5724,7 @@ export default class RigSidebar extends View {
    *  nothing is swapped and the draw is what it always was. Clicks run later, outside the draw, and read the sidebar's own (first) connection as before. */
   render(cx) {return withFocusContext(this,cx,()=>this.renderFocused(cx));}
   renderFocused(cx) {
+    rememberOwnLayout(shared, setShared, shared("layout"), layout()); // Leave offers this layout again
     // One read of herdr's lists for the whole render, the follow rule's included.
     this.renderMemo = { selRead: false, sel: undefined, nav: undefined, siblingStrings: new WeakMap(),healthDrawn:new Set() };
     // Everything after the memo opens is inside one try: whatever throws (the follow rule, a publish), the memo and the drawn feed are cleared.
@@ -5809,6 +5860,15 @@ export default class RigSidebar extends View {
   }
 
   renderShown(cx) {
+    const hidden = windowHidden();
+    if (hidden) this.wasHidden = true;
+    else if (this.wasHidden) {
+      this.wasHidden = false;
+      const configDue = Boolean(this.hiddenConfigDue || this.config?.missing);
+      this.hiddenConfigDue = false;
+      const refreshDue = this.feeds.some(feed => feed.hiddenCatchUp || this.automaticRefreshDue(feed));
+      if (configDue || refreshDue) this.resumeHiddenCatchUp(cx, { configDue, refreshDue });
+    }
     if (this.workerViews) { const now = focused(); for (const feed of this.feeds) if (feed.config) this.workerViews.focusChanged(feed.config, now); } // each connection's own views
     const t = theme();
     this.observeDaemonMachines(cx);
@@ -5948,8 +6008,44 @@ export default class RigSidebar extends View {
     });
   }
 
+/** OpenRig switched this window to its Rig layout: one toast per appearance, whichever herdrig copy sees it first (rig-layout-notice.js). */
+  checkRigLayoutNotice(cx){
+    // A hidden Rig page doesn't draw, so the person's layout is also recorded here (never OpenRig's Rig layout).
+    rememberOwnLayout(shared,setShared,shared("layout"),layout());
+    const event=rigLayoutAppearance(shared,setShared,shared("layout"),layout(),layouts?.()??[]);
+    if(!event)return;
+    if(event.kind==="toast"){notify(event.toast);return;}
+    // Let OpenRig finish its open first (it counts a view as opened once shown and selected), then switch back. The timer
+    // has no owner: it survives this view being replaced by the switch it makes.
+    cx?.timer?.after?.(RESTORE_AFTER_MS,next=>next.spawn(async spawned=>{
+      // The spawn's own cx stays valid across its awaits (the timer's does not).
+      const wait=ms=>new Promise(done=>(spawned??next).timer.after(ms,done,{owner:null}));
+      const toast=await finishRigLayoutRestore({layout,layouts,readTextFile,run,shared,setShared,wait,currentLayout:()=>shared("layout")},appHome(),event);
+      if(toast)notify(toast);
+    }),{owner:null});
+  }
+  /** The Rig layout card: Back (Herdr's built-in layout.switch), Close views… (the Leave dialog) and Keep. */
+  rigLayoutNoticeCard(t,cx){
+    const state=rigLayoutCardState(shared,layout(),layouts?.()??[]);
+    if(!state){this.rigLayoutBackFailed=false;return null;}
+    return rigLayoutCard(this,t,cx,state,{
+      back:cx=>this.rigLayoutBack(cx,state.target),
+      closeViews:()=>this.open({mod:MOD_IDS.menu,kind:"dialog",width:600,height:480,props:{target:{kind:"old-views"},step:{action:"close-old-views",views:state.viewList,confirm:true}}}),
+      keep:cx=>{keepRigLayout(shared,setShared);cx.notify();}});
+  }
+  /** Back only switches the layout; OpenRig's views stay open in its Rig layout (System lists them). The switch is checked, never assumed. */
+  rigLayoutBack(cx,target){
+    this.rigLayoutBackFailed=false;
+    try{run("layout.switch",{name:target});}catch{this.rigLayoutBackFailed=true;cx.notify?.();return;}
+    cx.timer?.after?.(1500,next=>{
+      if(this.closed)return;
+      if(shared("layout")!==target||hasOldProviderStrip(layout())){this.rigLayoutBackFailed=true;next?.notify?.();}
+    },{owner:null});
+  }
+
   listRows(t,cx,state) {
     const out=[];
+    if(!this.viewFeed||this.viewFeed===this.primary){const layoutCard=this.rigLayoutNoticeCard(t,cx);if(layoutCard)out.push(layoutCard);}
     if(this.spaceSyncError)out.push(errorBlock(this,t,"rig-space-sync-read-error",this.spaceSyncError));
     const ownCards = !this.viewFeed || this.viewFeed === this.primary; // the cards below act through the first connection: they are not drawn for another box
     const relocationHint = ownCards ? this.relocationHintFor(this.primary) : null;

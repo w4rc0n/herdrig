@@ -42,9 +42,10 @@ import { filterAttentionHealth, isHealthAttention, saveStateFile, stateSaveFailu
 import { h_flex, v_flex, TextView, Editor, EditorState, TextareaState, Textarea, HoverCard } from "gpui-base";
 import { appHome, home, readTextFile, writeTextFile, theme, run as rawRun, exec as rawExec, props, shared, setShared as rawSetShared, settings, openOverlay as rawOpenOverlay, nextCommand, watchFolder, spaces, panes, terminals, hc as rawHc, layout, layouts, window, notify as rawNotify, machines } from "herdr";
 const notify = value => errorNotice(rawNotify, value);
+import { rigLayoutAppearance, rigLayoutCardState, rigLayoutCard, keepRigLayout, finishRigLayoutRestore, RESTORE_AFTER_MS, restoreLayoutOn } from "./rig-layout-notice.js";
 import { installHerdrTransport } from "./rig-openrig-wire.js";
 import { gatedFetch, gatedExec, gatedHc, gatedRun, gatedConnect, observeConfig, rethrowGate, gatedOperation, gatedOperationOrRefusal, numberedConfigReads, gateSameConfig } from "./rig-gate.js";
-import {leaveOldStrip,hasOldProviderStrip,oldStripCleanupOwner,releaseOldStripCleanup} from './rig-old-views.js';
+import {leaveOldStrip,hasOldProviderStrip,oldStripCleanupOwner,releaseOldStripCleanup,rememberOwnLayout} from './rig-old-views.js';
 import {connectionCapabilities} from './rig-lib.js';
 // THE SEND GATE (rig-gate.js): every request, CLI run, process-starting Herdr command and stream connection below goes through it, checked at send time.
 // A read for one connection names that connection: with several, the gate refuses a bare request (it never defaults to the first OpenRig).
@@ -105,6 +106,9 @@ const STACK = "rig-work", PAGE = "rig-page";
 const NEEDS_PAGE_ROWS = 50;
 /** How recently the page must have seen its connection's sidebar refresh (rig.refreshed) for its own 5 s timer to leave re-reading to it. */
 const SIDEBAR_FRESH_MS = 75_000;
+/** Brief grace on unhide while the sidebar's catch-up refresh lands, so a page hidden > SIDEBAR_FRESH_MS does not double-fetch on frame 1. */
+const HIDDEN_SIDEBAR_GRACE_MS = 10_000;
+const windowHidden = () => window()?.visible === false;
 /** Answers that land within this long of the last re-render share the next one (one frame at 60 Hz). */
 const ANSWER_COALESCE_MS = 16;
 const CONFIG = () => `${appHome()}/openrig/config.json`;
@@ -272,23 +276,27 @@ export default class RigView extends View {
         catch (error) { this.sayConfigReadFailure(error); }
       }
     });
-    cx.timer.every(1000, (cx) => { if (!this.config || this.config.missing) this.loadConfig(cx); });
+    cx.timer.every(1000, (cx) => { if (!windowHidden() && (!this.config || this.config.missing)) this.loadConfig(cx); });
     cx.timer.every(5000, (cx) => {
       if (this.closed) return;
+      if (windowHidden()) { this.wasHidden = true; return; }
       this.loadConfig(cx);
       // A page can be open without the sidebar, and lifecycle changes need not emit SSE. While the sidebar is in the layout and this page saw its
       // connection's refresh in the last SIDEBAR_FRESH_MS, the sidebar supplies freshness and content versions: only changed content invalidates
       // the page. A second invalidation here would fetch unchanged lists and redraw an idle page.
       this.observeSidebarRefresh();
       const seen = this.refreshSeen;
-      if (layoutHasMod(layout(), MOD_IDS.sidebar) && seen?.conn === this.activeConnId() && Date.now() - seen.at <= SIDEBAR_FRESH_MS) { this.refreshUnmirrored(cx); return; }
+      if (layoutHasMod(layout(), MOD_IDS.sidebar) && seen?.conn === this.activeConnId()
+        && (Date.now() - seen.at <= SIDEBAR_FRESH_MS || Date.now() < (this.hiddenSidebarGraceUntil ?? 0))) { this.refreshUnmirrored(cx); return; }
       this.invalidateLiveReads({ seatStatus: true });
       cx.notify();
     });
     // The header's status line and a reply's confirmation come and go by time: redraw while one shows or a new one arrives.
     cx.timer.every(1000, (cx) => {
+      this.checkRigLayoutNotice(cx);
       this.compaction?.tick(cx);
       this.consumeStripRecovery(cx);
+      if (windowHidden()) return;
       if (this.ticking || shared("rig.status")?.at !== this.statusAt) cx.notify();
     });
     cx.spawn(async (cx) => {
@@ -303,11 +311,46 @@ export default class RigView extends View {
   }
 
   publishStripRecovery(job,result,cx=null){
-    setShared('rig.oldViewsCloseResult',{id:job.id,session:job.session,tab:job.tab,recovery:true,expiresAt:Date.now()+120000,title:result.title??"Still in OpenRig's old strip",...result});
+    setShared('rig.oldViewsCloseResult',{id:job.id,session:job.session,tab:job.tab,recovery:true,expiresAt:Date.now()+120000,title:result.title??"Still in OpenRig's Rig layout",...result});
     setShared('rig.status',{id:job.id,busy:false,...result,at:Date.now()});
-    notify({title:result.title??"Still in OpenRig's old strip",body:result.text,level:result.ok?'info':'warning'});
+    notify({title:result.title??"Still in OpenRig's Rig layout",body:result.text,level:result.ok?'info':'warning'});
     if(cx&&!this.closed)cx.notify();
   }
+/** OpenRig switched this window to its Rig layout: one toast per appearance, whichever herdrig copy sees it first (rig-layout-notice.js). */
+  checkRigLayoutNotice(cx){
+    // A hidden Rig page doesn't draw, so the person's layout is also recorded here (never OpenRig's Rig layout).
+    rememberOwnLayout(shared,setShared,shared("layout"),layout());
+    const event=rigLayoutAppearance(shared,setShared,shared("layout"),layout(),layouts?.()??[]);
+    if(!event)return;
+    if(event.kind==="toast"){notify(event.toast);return;}
+    // Let OpenRig finish its open first (it counts a view as opened once shown and selected), then switch back. The timer
+    // has no owner: it survives this view being replaced by the switch it makes.
+    cx?.timer?.after?.(RESTORE_AFTER_MS,next=>next.spawn(async spawned=>{
+      // The spawn's own cx stays valid across its awaits (the timer's does not).
+      const wait=ms=>new Promise(done=>(spawned??next).timer.after(ms,done,{owner:null}));
+      const toast=await finishRigLayoutRestore({layout,layouts,readTextFile,run,shared,setShared,wait,currentLayout:()=>shared("layout")},appHome(),event);
+      if(toast)notify(toast);
+    }),{owner:null});
+  }
+  /** The Rig layout card: Back (Herdr's built-in layout.switch), Close views… (the Leave dialog) and Keep. Shown here only when the layout has no Rig sidebar, so it never shows in both places. */
+  rigLayoutNoticeCard(t,cx){
+    const state=layoutShowsMod(layout(),MOD_IDS.sidebar)?null:rigLayoutCardState(shared,layout(),layouts?.()??[]);
+    if(!state){this.rigLayoutBackFailed=false;return null;}
+    return rigLayoutCard(this,t,cx,state,{
+      back:cx=>this.rigLayoutBack(cx,state.target),
+      closeViews:null, // closing needs the Rig sidebar (it runs the cleanup); the card says so instead of offering a refused confirmation
+      keep:cx=>{keepRigLayout(shared,setShared);cx.notify();}});
+  }
+  /** Back only switches the layout; OpenRig's views stay open in its Rig layout (System lists them). The switch is checked, never assumed. */
+  rigLayoutBack(cx,target){
+    this.rigLayoutBackFailed=false;
+    try{run("layout.switch",{name:target});}catch{this.rigLayoutBackFailed=true;cx.notify?.();return;}
+    cx.timer?.after?.(1500,next=>{
+      if(this.closed)return;
+      if(shared("layout")!==target||hasOldProviderStrip(layout())){this.rigLayoutBackFailed=true;next?.notify?.();}
+    },{owner:null});
+  }
+
   stripRecoveryNotice(t){
     const result=shared('rig.oldViewsCloseResult');
     if(!result?.recovery||result.busy||result.tab!==this.tabId||result.expiresAt<=Date.now()||result.switched&&hasOldProviderStrip(layout()))return null;
@@ -325,9 +368,9 @@ export default class RigView extends View {
     const [id,request]=match,next={...pending};delete next[id];setShared('rig.stripRecovery',next);
     const job={...request,id,deadline:Date.now()+300000};this.stripRecoveryJob=job;
     if(!Number.isFinite(request.createdAt)||Date.now()-request.createdAt>120000||request.createdAt>Date.now()+1000){
-      this.publishStripRecovery(job,{ok:false,text:'This cleanup confirmation expired. Nothing was started. Check the old views, then confirm again.'},cx);this.stripRecoveryJob=null;releaseOldStripCleanup(shared,setShared,id);return;
+      this.publishStripRecovery(job,{ok:false,text:"This cleanup confirmation expired. Nothing was started. Check OpenRig's views, then confirm again."},cx);this.stripRecoveryJob=null;releaseOldStripCleanup(shared,setShared,id);return;
     }
-    setShared('rig.oldViewsCloseResult',{id,session:job.session,recovery:true,expiresAt:job.deadline,busy:true,text:"Leaving OpenRig's old strip…"});
+    setShared('rig.oldViewsCloseResult',{id,session:job.session,recovery:true,expiresAt:job.deadline,busy:true,text:"Leaving OpenRig's Rig layout…"});
     const deadline=cx.timer.after(300000,next=>{
       if(this.stripRecoveryJob!==job)return;job.expired=true;
       this.publishStripRecovery(job,{ok:false,text:'The result was not confirmed in time. Some views may have closed. Check the layout before trying again. Your seats keep running.'},next);
@@ -658,7 +701,7 @@ export default class RigView extends View {
     const config = this.activeConfig(), rigLayout = inRigLayout(); // the connection the page shows; none when it is no longer set up
     if (!config) { notify({ title: "Open TUI", body: UNKNOWN_CONNECTION, level: "warning" }); return; } // never another connection's TUI
     cx.spawn(async (cx) => {
-      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout: rigLayout, wait: waitWith(cx) }, config);
+      const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, notify, inRigLayout: rigLayout, wait: waitWith(cx) }, config);
       if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
     });
   }
@@ -1313,7 +1356,7 @@ export default class RigView extends View {
     // The heartbeat is throttled to one minute. Its successful-read time, including the first one seen, expires after 75 s;
     // observing an unchanged leftover value never renews it. A missing sidebar still takes the immediate fallback above.
     const readAt=Date.parse(at),now=Date.now();
-    if(Number.isFinite(readAt)&&readAt<=now&&now-readAt<=SIDEBAR_FRESH_MS)this.refreshSeen={conn,at:readAt};
+    if(Number.isFinite(readAt)&&readAt<=now&&now-readAt<=SIDEBAR_FRESH_MS){this.refreshSeen={conn,at:readAt};this.hiddenSidebarGraceUntil=0;}
     if(at&&(at!==this.dataAt||conn!==this.dataAtConn)){this.dataAt=at;this.dataAtConn=conn;}
     return {refreshed,conn,several};
   }
@@ -4090,6 +4133,14 @@ export default class RigView extends View {
           .child(h_flex().gap(8)
             .child(this.button(t, "spaces-list-keep", "Keep", (_e, ctx) => this.keepSpacesList(ctx ?? cx), { tip: "Keep herdrig's Spaces list and hide this note", small: true }))
             .child(this.button(t, "spaces-list-switch-back", "Switch back", (_e, ctx) => this.chooseSpacesMode(ctx ?? cx, "herdr"), { tip: "Go back to Herdr's own Spaces list", small: true }))))),
+      // OpenRig's Rig layout shouldn't stay on screen: on by default; off brings back the notice and card.
+      v_flex().id("system-restore-layout").gap(4)
+        .child(h_flex().gap(8).items_center().flex_wrap()
+          .child(div().text_size(12).child("Keep my layout when OpenRig opens views"))
+          .child(this.restoreLayoutPill(t)))
+        .child(div().id("system-restore-layout-note").text_size(11.5).text_color(t.muted).child(restoreLayoutOn(shared)
+          ? "herdrig switches back to your layout and leaves OpenRig's views open in the background."
+          : "OpenRig's Rig layout stays until you leave it.")),
     ];
     return this.card(t, "Layout", card);
   }
@@ -6015,6 +6066,27 @@ export default class RigView extends View {
     return next;
   }
 
+  /** Rig page → System → Layout: "Keep my layout when OpenRig opens views" (rig.settings.restoreLayout, default on). Turning it on
+   *  applies from OpenRig's next open; the card's Back covers a Rig layout already shown. */
+  toggleRestoreLayout(cx) {
+    const next = !restoreLayoutOn(shared);
+    setShared("rig.settings", { ...(shared("rig.settings") ?? {}), restoreLayout: next });
+    cx?.notify?.();
+    return next;
+  }
+
+  restoreLayoutPill(t) {
+    const on = restoreLayoutOn(shared);
+    return h_flex().id("system-restore-layout-toggle").px(8).h(24).gap(6).rounded(6).items_center().flex_none().cursor_pointer()
+      .tooltip(on ? "Leave OpenRig's Rig layout on screen when it opens views" : "Switch back to your layout when OpenRig opens views")
+      .bg(t.raised).border_1().border_color(t.border).hover((s) => s.bg(t.hover))
+      .text_size(11.5).text_color(on ? t.foreground : t.dim)
+      .on_click((_e, cx) => this.toggleRestoreLayout(cx))
+      .child(div().w(13).h(13).flex_none().rounded(3).border_1().border_color(on ? t.accent : t.border).flex().items_center().justify_center()
+        .when(on, (box) => box.bg(t.accent).child(svg(icon("check")).size(10).text_color(t.solid_foreground ?? t.background))))
+      .child(on ? "On" : "Off");
+  }
+
   notifyTogglePill(t, id = "needs-notify-toggle") {
     const on = (shared("rig.settings")?.notifications ?? true) !== false;
     return h_flex().id(id).px(8).h(24).gap(6).rounded(6).items_center().flex_none().cursor_pointer().tooltip(`Turn herdrig's notifications ${on ? "off" : "on"}`)
@@ -6821,6 +6893,8 @@ export default class RigView extends View {
     const narrow = (this.pageWidth ?? 960) < 480;
     const tiny = (this.pageWidth ?? 960) < 320;
     const tuiLabel = labelledTui(terminals(), this.drawSpaces(), this.config) ? "Switch to TUI" : "Open in TUI";
+    // herdrig's TUI opens its views in a window of its own; seats show here through Attach and Open rig space.
+    const tuiTip = tuiLabel === "Open in TUI" ? "OpenRig's TUI in a tab. To see seats here, use Attach or Open rig space." : tuiLabel;
     return v_flex().flex_none()
       .child(h_flex().id("page-location-bar").h(38).px(14).gap(8).items_center()
         .when(!tiny, row => row.child(div().id("rig-back").size(24).flex().items_center().justify_center().flex_none()
@@ -6839,14 +6913,14 @@ export default class RigView extends View {
         .when(!!entry.filter,el=>el.child(div().id("rig-clear-filter").text_size(12).text_color(t.accent).cursor_pointer()
           .tooltip(`Clear the filter /${entry.filter}`).on_click(()=>this.clearFilter()).child(`/${entry.filter} ×`)))
         .when(!tiny,el=>el.child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search this page (/)"})))
-        .when(!tiny&&!!this.activeConfig(),el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel})))
+        .when(!tiny&&!!this.activeConfig(),el=>el.child(this.button(t,"rig-open-tui",narrow?"":tuiLabel,(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiTip})))
         .when(!tiny,el=>el.child(div().id("rig-close").size(24).flex_none().flex().items_center().justify_center().cursor_pointer().tooltip("Close")
           .on_click(()=>this.closePage()).child(svg(icon("x")).size(14).text_color(t.muted)))))
       // Below 320 px, controls get their own row so the remaining location links still take clicks.
       .when(tiny,el=>el.child(h_flex().id("page-compact-controls").px(14).pb(6).gap(6).items_center()
         .child(this.button(t,"rig-back","",()=>this.back(),{iconName:"chevron-left",tooltip:"Back (Backspace)",disabled:!backTo}).px(6))
         .child(this.button(t,"rig-filter-btn","",()=>this.palette(entry.filter?`/${entry.filter}`:"/"),{iconName:"search",tooltip:"Search this page (/)"}).px(6))
-        .when(!!this.activeConfig(),row=>row.child(this.button(t,"rig-open-tui","",(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiLabel}).px(6)))
+        .when(!!this.activeConfig(),row=>row.child(this.button(t,"rig-open-tui","",(_e,cx)=>this.tui(cx),{iconName:"terminal",tooltip:tuiTip}).px(6)))
         .child(div().id("rig-close").size(20).flex_none().cursor_pointer().tooltip("Close").on_click(()=>this.closePage()).child(svg(icon("x")).size(14).text_color(t.muted)))))
       .child(h_flex().id("page-title-bar").px(14).pb(10).gap(12).items_center().flex_wrap()
         .child(v_flex().flex_1().min_w(Math.min(240, Math.max(80, (this.pageWidth ?? 960) - 28))).gap(3)
@@ -6867,6 +6941,7 @@ export default class RigView extends View {
   }
   render(cx) {return withFocusContext(this,cx,()=>this.renderFocused(cx));}
   renderFocused(cx) {
+    rememberOwnLayout(shared, setShared, shared("layout"), layout()); // Leave offers this layout again
     this.configPanel?.consumeWriteWatches?.(cx);
     // Values read once per render (see rawRigData); cleared after it, so nothing outside a render sees a stale one.
     this.renderMemo = {};
@@ -6994,9 +7069,31 @@ export default class RigView extends View {
       this.invalidateLiveReads();
     }
     {
+      // Track visibility so unhide grants a brief grace window while the sidebar's catch-up lands and triggers one coalesced page catch-up.
+      const hidden = windowHidden();
+      if (hidden) this.wasHidden = true;
+      else if (this.wasHidden) {
+        this.wasHidden = false;
+        const conn = this.activeConnId();
+        if (conn && this.refreshSeen?.conn === conn && layoutHasMod(layout(), MOD_IDS.sidebar)) {
+          this.hiddenSidebarGraceUntil = Date.now() + HIDDEN_SIDEBAR_GRACE_MS;
+        }
+        if (!this.resumeCatchUpPending && cx?.timer?.after) {
+          this.resumeCatchUpPending = true;
+          cx.timer.after(0, (next) => {
+            this.resumeCatchUpPending = false;
+            if (this.closed) return;
+            if (windowHidden()) { this.wasHidden = true; return; }
+            this.loadConfig(next);
+            this.refreshUnmirrored(next);
+          });
+        }
+      }
       // Whether this connection's sidebar is running now (its refresh was seen advancing lately and it is in the layout): read once per render.
-      const conn = this.activeConnId(), seen = this.refreshSeen;
-      this.attentionFromSidebar = conn && seen?.conn === conn && Date.now() - seen.at <= SIDEBAR_FRESH_MS && layoutHasMod(layout(), MOD_IDS.sidebar) ? conn : null;
+      const conn = this.activeConnId(), seen = this.refreshSeen, now = Date.now();
+      this.attentionFromSidebar = conn && seen?.conn === conn
+        && (now - seen.at <= SIDEBAR_FRESH_MS || now < (this.hiddenSidebarGraceUntil ?? 0))
+        && layoutHasMod(layout(), MOD_IDS.sidebar) ? conn : null;
     }
     const rawNav = shared("rig.nav");
     const stack = rawNav?.stack ?? [];
@@ -7060,6 +7157,7 @@ export default class RigView extends View {
     // After the body: its reads are what the note checks.
     const note = file ? null : this.refreshNote(t);
     const recoveryNotice=file?null:this.stripRecoveryNotice(t);
+    const layoutCard=file?null:this.rigLayoutNoticeCard(t,cx);
     this.refreshNowTails(cx);
     return v_flex().id("rig-view-root").size_full().bg(t.surface).text_color(t.foreground).track_focus(this.handle)
       .when(entry?.section==='system'&&entry.subview==='config',el=>el.key_context('HerdrigSettings')
@@ -7094,7 +7192,7 @@ export default class RigView extends View {
       .when(!file, (el) => {const resolved=this.pageSpec?{...entry,id:this.pageSpec.id}:entry;
         const tabs=this.objectTabs(t,resolved??{section:"topology"},this.pageSpec??spec,{cx});return tabs?el.child(tabs):el;})
       .child(file ? v_flex().id("rig-view-body").flex_1().min_h(0).child(body)
-        : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(pageBodyLayout(this.pageWidth).padding).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!inPlaceNote, (el) => el.child(inPlaceNote)).when(!!note, (el) => el.child(note)).when(!!recoveryNotice,el=>el.child(recoveryNotice)).child(body)));
+        : v_flex().id(entry?.section === "system" && entry.subview === "health" ? `rig-view-body-health-${entry.healthRigId ?? "all"}` : "rig-view-body").flex_1().min_h(0).overflow_y_scrollbar().p(pageBodyLayout(this.pageWidth).padding).child(v_flex().when(!this.wideGraph,el=>el.max_w(960)).when(this.wideGraph,el=>el.w_full()).gap(12).when(!!inPlaceNote, (el) => el.child(inPlaceNote)).when(!!note, (el) => el.child(note)).when(!!layoutCard,el=>el.child(layoutCard)).when(!!recoveryNotice,el=>el.child(recoveryNotice)).child(body)));
   }
 }
 

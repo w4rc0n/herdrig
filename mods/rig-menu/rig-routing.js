@@ -300,12 +300,14 @@ export async function migrateRigTabs(host, config, spaceId) {
       const hasPage=checked.panes.some(p=>p.mod===MOD_IDS.view);
       const hasTui=checked.panes.some(p=>p.terminal);
       let result=null;
+      let tuiTerminal=null;
       if(hasTui){
         const opened=await routeOpen({...host,routeOwner:true},config,{kind:"tui"});
         if(!opened.ok){left.push({...checked,ok:false,replaceable:false,reason:opened.reason});continue;}
         const verified=await verifyLiveTui(host,config,opened.terminal);
         if(!verified.ok){left.push({...checked,ok:false,replaceable:false,reason:verified.reason});continue;}
         result=opened;
+        tuiTerminal=opened.terminal;
       }
       if(hasPage){
         const entry=tabPageOf(host,config,tab);
@@ -316,6 +318,10 @@ export async function migrateRigTabs(host, config, spaceId) {
       if(!result){left.push({...checked,ok:false,replaceable:false,reason:"the tab is no longer open"});continue;}
       const current=await inspectMigrationTab(host,config,spaceId,tab);
       if(!current.ok||current.fingerprint!==checked.fingerprint){left.push({...checked,ok:false,replaceable:false,reason:"the original tab changed while opening its destination"});continue;}
+      if(tuiTerminal){
+        const reverified=await verifyLiveTui(host,config,tuiTerminal);
+        if(!reverified.ok){left.push({...checked,ok:false,replaceable:false,reason:reverified.reason});continue;}
+      }
       host.run("tab.close",{id:tab});
       if(!await adopted(host,()=>!list(host,"spaces").find(s=>s.id===spaceId)?.tabs?.some(t=>t.id===tab))){
         left.push({...checked,ok:false,replaceable:false,pendingClose:true,destination:result.space,reason:"its destination opened, but closing the original tab was not confirmed"});continue;
@@ -423,7 +429,7 @@ export function readInPlaceOpen(spaceState,rigId,conn=null){
   }
   if(Object.hasOwn(map,rigId)){
     const rec=map[rigId];
-    if(rec&&typeof rec==="object"&&(!rec.conn||!conn||rec.conn===conn))return rec;
+    if(rec&&typeof rec==="object"&&(!conn||(rec.conn||LEGACY_CONNECTION_ID)===conn))return rec;
   }
   return null;
 }
@@ -462,7 +468,7 @@ export function withoutInPlaceOpen(spaceState,rigId,conn=null){
     const qualified=`${conn}|${rigId}`;
     if(Object.hasOwn(next,qualified)){delete next[qualified];return Object.keys(next).length?next:undefined;}
   }
-  if(Object.hasOwn(next,rigId)&&(!next[rigId]?.conn||!conn||next[rigId].conn===conn))delete next[rigId];
+  if(Object.hasOwn(next,rigId)&&(!conn||(next[rigId]?.conn||LEGACY_CONNECTION_ID)===conn))delete next[rigId];
   return Object.keys(next).length?next:undefined;
 }
 export const inPlaceSpaceRefusal=rigName=>`${rigName}'s page is open here; close it before opening ${rigName}'s space.`;
@@ -550,6 +556,10 @@ async function home(host,config,needTui=true,mayCreate=true){
     if(!space&&multiple&&candidates.some(c=>c.home&&spaceMachine(c.space)===machine))
       return fail("This home space has no confirmed OpenRig connection. Choose its own connection or close it after saving work; no page or terminal was opened.");
     if(space && !needTui) return {ok:true,space:space.id};
+    if(!space&&!mayCreate) return fail(NO_HOME_SPACE);
+    if(typeof host.hc!=="function") return fail("Open the Rig sidebar to create OpenRig's home space.");
+    const argv=remote?["env","-i","--",`HOME=${remote.home}`,`PATH=${remote.searchPath}`,`OPENRIG_URL=${remote.daemonUrl}`,"rig","tui"]:tuiArgv(config);
+    let olderTui=false;
     if(space){
       // Reuse only a live TUI still represented by a pane in this home, never retained terminal history.
       for(const terminal of known.tuis){
@@ -557,16 +567,20 @@ async function home(host,config,needTui=true,mayCreate=true){
         const pane=list(host,"panes").find(p=>p.terminal===terminal.address && space.tabs?.some(t=>t.id===p.tab));
         if(!pane) continue;
         let record=null;
-        try{record=JSON.parse((await host.hc(["get","--json","--",terminal.address])).stdout);}catch{}
-        const argv=record?.foreground?.argv ?? record?.argv;
-        if(record && (!record.state || ["live","running"].includes(record.state)) && isTuiArgv(argv,config))
-          return {ok:true,reused:true,space:space.id,tab:pane.tab,terminal:terminal.address};
+        try{
+          const response=await host.hc(["get","--json","--",terminal.address]);
+          if(response.code===0)record=JSON.parse(response.stdout);
+        }catch{}
+        if(record && (!record.state || ["live","running"].includes(record.state)) && isTuiArgv(record.foreground?.argv??record.argv,config)){
+          // The live foreground argv no longer includes the env wrapper after exec.
+          // Only the original launch argv can prove this TUI started with ambient routing cleared.
+          if(Array.isArray(record.argv)&&record.argv.length===argv.length&&argv.every((arg,index)=>record.argv[index]===arg))
+            return {ok:true,reused:true,space:space.id,tab:pane.tab,terminal:terminal.address};
+          olderTui=true;
+        }
       }
     }
-    if(!space&&!mayCreate) return fail(NO_HOME_SPACE);
-    if(typeof host.hc!=="function") return fail("Open the Rig sidebar to create OpenRig's home space.");
     const id=space?.id ?? machineId("sp-openrig-home-"+nonce(),machine), tab=machineId("tb-openrig-home-"+nonce(),machine);
-    const argv=remote?["env","-i","--",`HOME=${remote.home}`,`PATH=${remote.searchPath}`,`OPENRIG_URL=${remote.daemonUrl}`,"rig","tui"] /* the machine's own default home: a connection's openrigHome is this computer's folder */:tuiArgv(config);
     if(!configUnchanged(host,config))return fail("OpenRig's connection changed. No terminal was started.");
     if(remote){
       const checked=await host.prepareHome(config);if(!checked.ok)return checked;
@@ -585,6 +599,7 @@ async function home(host,config,needTui=true,mayCreate=true){
     if(!space) host.run("space.rename",{id,name:"OpenRig"});
     host.run("tab.rename",{id:tab,name:"Rig TUI"});
     await save(host,{...legacyHome(config,id),homeSpaces:{...(state(host).homeSpaces??{}),[key]:id}});
+    if(olderTui)host.notify?.({title:"Started a new Rig TUI",body:"Your older Rig TUI tab can open OpenRig’s Rig layout here. Close it when you’re done with it.",level:"info"});
     return {ok:true,reused:false,space:id,tab,terminal:address};
   })();
   homeJobs.set(key,task);

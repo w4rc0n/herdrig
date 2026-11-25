@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.11
+Version: v0.5.13
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -407,7 +407,7 @@ need a later restart, and Herdrig never restarts the daemon. Other actions run a
 
 **Blocks.** Four self-contained GUI mods, each a folder in `mods/` with its own `main.js`, `mod.json`, the shared
 helpers reachable from its imports, and 41 `rig-*.svg` icons. The packaged JavaScript/CommonJS file counts are
-54 for `rig`, 71 for `rig-view`, 38 for `rig-palette`, and 50 for `rig-menu`; shared files outside a mod's import
+55 for `rig`, 72 for `rig-view`, 38 for `rig-palette`, and 50 for `rig-menu`; shared files outside a mod's import
 closure are not copied there. `rig-link` has `link.js`, `mod.json`, and 12 packaged JavaScript files in total (no SVGs),
 and `rig-spaces` contains three packaged JavaScript files and three SVGs, Herdr's own Spaces list with rig marks (below).
 This repository ships these six mods (five are installed on Herdr versions before 0.1.17 or with `--no-links`):
@@ -457,7 +457,7 @@ right-clicked (`seat`, `rig`, `pod`, `need`, `cell`, `spec`, `slice`, `view`) an
 sidebar reads `rig-cell-header`'s pane props (`seat`, `title`, `views`) when the installed chrome provides them, and
 keeps working when it does not.
 
-**Herdr functions and commands it calls.** `run` (`tab.new`, `tab.select`, `tab.rename`, `layout.select`, `layout.resize`,
+**Herdr functions and commands it calls.** `run` (`tab.new`, `tab.select`, `tab.rename`, `layout.select`, `layout.switch`, `layout.resize`,
 `layout.clone`, `layout.set`, `tab.close`, `pane.close`, `pane.split`, `pane.rename`, `pane.focus`, `pane.zoom`, `mod.open`),
 `shared` / `setShared`, `commands()`, `layout()`, `layouts()`, `spaces()`, `panes()`, `terminals()`, `machines()`, `settings()`,
 `window()`, `home()`, `theme()`, `openOverlay`, `closeOverlay`, `notify`, `exec`, `hc`, `appHome`, `readTextFile`, `writeTextFile`, `watchFolder`.
@@ -490,7 +490,7 @@ that OpenRig uses another port), configured in the connection or discovered with
 `/api/compaction/state?session=…`, `/api/telemetry/v1/nodes/:nodeId/tenures?limit=1`, `/api/usage*`, `/api/config*`), subscribes to
 `/api/events?replay=0` (with `/api/activity/events` as the fallback) for live state. A quiet sidebar on the full
 stream reconciles once a minute, with more frequent checks when the full stream is unavailable or recovery is
-pending. `rig-link` reads only links Herdr hands it on Ctrl-click (plus `<appHome>/openrig/config.json`) and makes local `GET` reads (`/api/attention`, `/api/queue/<id>`, `/api/health/<id>`) when resolving or opening the target; naming open Worker view panes on Herdr 0.1.17+ reads `/api/queue/whoami` for visible followed workers when a view opens, reconnects, or sees a seat's active work change, with no idle reads. It sends local HTTP `POST` requests only when you click an action
+pending. On Herdr 0.1.18+, quiet background checks pause while the window is hidden (mostly on macOS and X11; Wayland normally stays visible) and catch up on return, while live events and Needs notifications stay active. `rig-link` reads only links Herdr hands it on Ctrl-click (plus `<appHome>/openrig/config.json`) and makes local `GET` reads (`/api/attention`, `/api/queue/<id>`, `/api/health/<id>`) when resolving or opening the target; naming open Worker view panes on Herdr 0.1.17+ reads `/api/queue/whoami` for visible followed workers when a view opens, reconnects, or sees a seat's active work change, with no idle reads. It sends local HTTP `POST` requests only when you click an action
 (`POST /api/mission-control/action` for **Needs** Decision Card acts — `approve`, `deny`, `answer`, `resolve` —
 and update dismissals after their 10-second Undo window;
 `POST /api/provider/usage/hosts/refresh` when refreshing per-host usage; `POST /api/agents/validate` or
@@ -525,7 +525,7 @@ on a currentColor fill, 16 px nominal, so they dim and tint with the theme rathe
 
 ## Watch out
 
-Tested with the official Herdr-app [v0.1.17](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.17) build. Herdr keeps the active space in view as of [#977](https://github.com/herdrdev/herdr-app/pull/977).
+Tested with the official Herdr-app [v0.1.18](https://github.com/herdrdev/herdr-app/releases/tag/v0.1.18) build. Herdr keeps the active space in view as of [#977](https://github.com/herdrdev/herdr-app/pull/977).
 
 **Activity and times.** A running seat with no usable activity report is **not reported**, in its own neutral
 group and filter, never Idle. Explicit idle remains idle. Absolute times honour UTC/Etc/UTC exactly; other
@@ -546,8 +546,11 @@ close and reopen; live viewers are never silently replaced or have their termina
 
 API/CLI compatibility was also smoke-tested on OpenRig 0.7.13, which includes attach-command session quoting (#2971). Herdrig still refuses session names outside its own safe charset.
 
-**Older provider views.** Use **Leave OpenRig's old strip…** in System, the palette or a strip pill's menu.
-Pick your previous layout from Herdr's list; layouts containing a strip are excluded. Viewer closes and the
+**OpenRig's Rig layout.** By default (**Keep my layout when OpenRig opens views** in System → Layout), Herdrig restores
+your previous layout once per open while the Rig sidebar or a Rig page tab that you've looked at since Herdr started is
+running. Use **Leave OpenRig's Rig layout…** in System, the palette or a strip pill's menu.
+Pick a layout from Herdr's list (the one you were using is preselected when herdrig saw it); layouts containing a strip are excluded.
+Views left open in saved layouts show in System as "OpenRig's Rig views: n still open · Close them…", which closes them without a layout switch. Viewer closes and the
 layout switch are reported separately, the Rig page stays open and seats keep running. **Herdr** uses its standard
 layout without the Rig sidebar. Closing a space does not remove a strip. A focused worker tile stays untouched;
 rebuilding another may open an additional numbered page, which the result explains. Provider-only grid and cell

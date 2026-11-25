@@ -475,8 +475,8 @@ export default class RigPalette extends View {
       };
       const own = [];
       if (hasOldProviderStrip(layout())
-        && ("leave openrig's old strip".includes(q)||"close old worker views".includes(q))) {
-        own.push({line:"leave-old-strip",label:"Leave OpenRig's old strip…",hint:oldStripCleanupBusy(shared)?oldStripBusyTip:"Close old views and switch to the layout you pick"});
+        && ("leave openrig's rig layout".includes(q)||"close openrig's views".includes(q))) {
+        own.push({line:"leave-old-strip",label:"Leave OpenRig's Rig layout…",hint:oldStripCleanupBusy(shared)?oldStripBusyTip:"Close OpenRig's views and switch back to your layout"});
       }
       for (const o of OWN) {
         if (matchesOwn(o.line, o.line.split(" ")[0], o.label, Boolean(o.conn))) {
@@ -611,7 +611,7 @@ export default class RigPalette extends View {
       this.busy = true; this.running = "tui"; cx.notify();
       cx.spawn(async (cx) => {
         try {
-          const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, inRigLayout, wait: waitWith(cx) }, config);
+          const result = await openOrFocusTui({ spaces, panes, terminals, hc: hcFor(config), run: runFor(config), layout, notify, inRigLayout, wait: waitWith(cx) }, config);
           if (result?.ok === false) notify({ title: "Open TUI", body: result.reason, level: "warning" });
         }
         finally { this.running = null; this.dismiss(); }
