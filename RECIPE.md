@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.15
+Version: v0.5.16
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -259,8 +259,8 @@ The sidebar and these steps use the same words.
 | "OpenRig is installed, but it isn't running." | Daemon stopped | `rig daemon start`, or the **Start OpenRig** button |
 | "OpenRig isn't answering." | The CLI and the window disagree, or the daemon is unhealthy | `rig status`, then OpenRig's help: `rig context get help` |
 | "OpenRig's operator is starting." | Kernel booting | Wait. It clears by itself. |
-| "OpenRig's operator isn't running." | Kernel skipped or stopped | Run `rig up kernel --existing` in a terminal on that machine. **Copy command** copies it. |
-| "OpenRig's operator can't start: Claude Code and Codex aren't signed in." | No working login | **Copy command** copies `rig doctor`. Run it in a terminal on that machine, then follow OpenRig's sign-in steps. |
+| "OpenRig's operator isn't running." | Kernel skipped or stopped | Click **Start operator** on this computer, or run `rig up kernel --existing` in a terminal on that machine (**Copy command** copies it). |
+| "OpenRig's operator can't start: Claude Code and Codex aren't signed in." | No working login | **Copy command** copies `rig doctor`. Run it in a terminal on that machine and follow the sign-in steps. Then run `rig daemon stop` followed by `rig daemon start`. |
 | "The operator isn't running." | Kernel failed or degraded | `rig ps --nodes --rig kernel`, then OpenRig's "Incomplete setup and restart" table |
 | "The rig command failed." | `rig` exists but errors | Read its message, then `rig context get help` |
 
@@ -400,7 +400,8 @@ Opening **Resume rig** sends `POST /api/up` with the selected rig as `sourceRef`
 System → Configuration saves or resets one setting through `POST` or `DELETE`
 on `/api/config/:key`; environment-sourced and withheld instructions stay read-only. A saved boot setting can
 need a later restart, and Herdrig never restarts the daemon. Other actions run a `rig` command you could have typed (`rig send`, `rig queue`,
-`rig gateway human quiet|mode …`, `rig specs add …`, `rig snapshot`, `rig seat …`, `rig terminal …`, `rig compact …`, or
+`rig gateway human quiet|mode …`, `rig specs add …`, `rig snapshot`, `rig seat …`, `rig terminal …`, `rig compact …`,
+`rig up kernel --existing --json` when you click **Start operator** on this computer, or
 `rig daemon start` when you click **Start OpenRig**).
 
 ## Built from

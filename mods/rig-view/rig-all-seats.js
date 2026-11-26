@@ -31,7 +31,7 @@ export function allSeatsModel(models=[],attention=[],{order='rig',pulse=null,fil
   const seats=(model.pods??[]).flatMap(p=>p.seats);
   const rows=(state==='ready'?seats:[]).filter(s=>matchesPulseFilter(s,model,pulse,attention)&&(!filter||[s.logicalId,rig.name,s.runtime,s.model,s.word].some(v=>String(v??'').toLowerCase().includes(filter.toLowerCase())))).map(seat=>{
    const ids=[...new Set(asks.filter(n=>!!n.session&&n.session===seat.session||(!n.ownerAttributed&&n.rig===rig.name&&(n.logicalId??n.seat)===seat.logicalId)).map(n=>n.id))];
-   const status=matchesPulseFilter(seat,model,'needs',attention)?'needs_input':seat.status;
+   const status=seat.status==='stopping'||seat.restartNeedsAttention?seat.status:matchesPulseFilter(seat,model,'needs',attention)?'needs_input':seat.status;
    const raw=model.nodesState?.data?.find(n=>n.canonicalSessionName===seat.session)??{};
    return {rig,seat,status,needIds:ids,rigIndex,key:`all-seat:${rig.id}:${seat.session??seat.logicalId}`,
     since:raw.activityState?.since??raw.agentActivity?.eventAt??raw.lastActivityAt??null,

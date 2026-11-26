@@ -269,9 +269,9 @@ export function needsRequestCount(topology = [], items = []) {
     if (session) attributed.add(session);
   }
   for (const rig of topology ?? []) for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) {
-    if (!seat.terminal && !["terminal", "stopped", "detached", "exited", "unknown"].includes(seat.status)
-      && !["stopped", "detached", "exited"].includes(seat.sessionStatus) && ["needs_input", "attention_required", "failed"].includes(seat.status)
-      && !attributed.has(seat.session)) ids.add(`prompt:${seat.session}`);
+    if (!attributed.has(seat.session) && (seat.restartNeedsAttention || (!seat.terminal
+      && !["stopped", "detached", "exited"].includes(seat.sessionStatus)
+      && ["needs_input", "attention_required", "failed"].includes(seat.status)))) ids.add(`prompt:${seat.session}`);
   }
   return ids.size;
 }
@@ -409,9 +409,17 @@ export function observeNeedDecision(box, row, readAt = 0) {
     : Boolean(box.observedIdentity && box.observedIdentity !== identity);
   box.observedIdentity = identity;
   if (!changed) return false;
+  // The re-read triggered by a conflict refusal brings the card up to date while keeping the refusal line visible.
+  if (box.result?.conflict && box.conflictAwaitingRefresh) {
+    box.conflictAwaitingRefresh = false;
+    box.confirmResolve = false;
+    box.recordedChoiceByQuestion = {};
+    return true;
+  }
   box.changedSinceAnswered = Boolean(receipt || box.result?.ok);
   box.result = null; box.receipt = null; box.confirmResolve = false;
-  box.composerOpen = false;
+  // Keep an open composer while the person is still drafting so their open-time snapshot refuses on submit instead of closing mid-typing.
+  if (receipt || box.changedSinceAnswered || !box.composerSnapshot) box.composerOpen = false;
   box.recordedChoiceByQuestion = {};
   return true;
 }
@@ -523,7 +531,7 @@ export const STATE_COPY = Object.freeze({
   "5c": Object.freeze({
     id: "5c",
     headline: "OpenRig's operator can't start: Claude Code and Codex aren't signed in.",
-    detail: "Sign in to one of them in a terminal. rig doctor shows what's missing.",
+    detail: "Sign in to Claude Code or Codex, then run rig daemon stop and rig daemon start, all in a terminal on this computer. rig doctor checks the sign-in. Your agents keep running.",
     actionLabel: "Copy command",
     copyText: "rig doctor",
   }),
@@ -744,6 +752,10 @@ export async function discoverDaemonFromCli(config, execFn, { timeoutKind = "rea
   }
 }
 
+/** The live kernel-status endpoint marks historical ready sessions as down. */
+export const kernelOperatorReady = kernel => Array.isArray(kernel?.agents)
+  && kernel.agents.some(agent => agent?.session_name === "operator-agent@kernel" && agent.startup_status === "ready" && !agent.down);
+
 /**
  * Pure state selector for the seven sidebar states (`S0`–`S7`) and four `S5` sub-states (`5a`–`5d`).
  */
@@ -841,8 +853,7 @@ export function selectSidebarState({
     : (typeof k?.kernel_state === "string" ? k.kernel_state : null);
   // The boot result can stay skipped after `rig up kernel --existing`. The endpoint
   // derives agents from current sessions, including whether a historical ready seat is down.
-  const liveReady = (bootState === "skipped" || bootState === "auth_blocked") && Array.isArray(k?.agents)
-    && k.agents.some(agent => agent?.session_name === "operator-agent@kernel" && agent.startup_status === "ready" && !agent.down);
+  const liveReady = (bootState === "skipped" || bootState === "auth_blocked") && kernelOperatorReady(k);
   const operatorDisabled = bootState === "skipped" && k?.detail === "OPENRIG_NO_KERNEL=1" && !liveReady;
   const kState = liveReady ? "ready" : bootState;
   const explainOperator = !liveReady && !operatorDisabled;
@@ -2375,8 +2386,17 @@ export function rigTerminalsGone(rig) {
  *  running terminal seat is `terminal`, never `active`: its attention and lifecycle states still show. A seat whose tmux server OpenRig reports
  *  unreachable (`terminalServerGone`, see withTerminalOutage) is `terminal_gone`, over every other state: it says why nothing reaches it. */
 export function seatStatus(node) {
+  if (node?.stopRequested === true) return "stopping";
   if (node?.terminalServerGone === true) return "terminal_gone";
   const act = node.activityState ?? {};
+  const incident = keepAliveIncident(node);
+  if (incident && !runningSeat(node)) {
+    const needsInput = node.needsAttention === true ? (node.arbitratedNeedsInput ?? node.agentActivity?.state === "needs_input")
+      : node.needsAttention == null && (act.display === "needs-input" || node.agentActivity?.state === "needs_input");
+    if (incident.exhausted && node.lifecycleState === "attention_required") return "attention_required";
+    if (needsInput) return "needs_input";
+    if (!incident.exhausted) return providerSeatReason(node, "attention_required") ? "attention_required" : "restarting";
+  }
   if (node.identityVerdict?.reason === "session_missing" && node.sessionStatus === "detached" && node.lifecycleState !== "attention_required") return "detached";
   if (node.startupStatus === "failed") return "failed";
   if (node.needsAttention == null && (node.lifecycleState === "attention_required" || node.startupStatus === "attention_required")) return "attention_required";
@@ -2410,6 +2430,59 @@ export function providerSeatReason(node, status = seatStatus(node)) {
   return null;
 }
 
+const runningSeat = node => node.sessionStatus === "running" || node.sessionStatus === "ready";
+function keepAliveIncident(node) {
+  const incident = node.keepAliveIncident;
+  return node.keepAlive === true && node.intentionallyStopped !== true && Number.isSafeInteger(incident?.attempts)
+    && incident.attempts >= 0 && typeof incident.exhausted === "boolean" ? incident : null;
+}
+
+// Only authored outcomes leave this boundary. Restart diagnostics can include
+// arbitrary launch output, including paths and credentials.
+function restartFailureText(detail, rigId) {
+  if (typeof detail !== "string" || !detail || detail === "the recovery attempts ran out") return null;
+  if (typeof rigId === "string" && rigId && detail === `No usable snapshot for rig ${rigId}`) {
+    return "OpenRig couldn't find a usable snapshot to restart it from.";
+  }
+  return "OpenRig couldn't restart this seat. Its daemon log has the details: rig daemon logs.";
+}
+
+/** OpenRig reports the current incident, including failed attempts, rather than a lifetime count. */
+export function seatRestartReason(node, status = seatStatus(node)) {
+  if (status === "stopping") return { line: "Stopping. OpenRig asked it to stop and is waiting for it to end." };
+  const incident = keepAliveIncident(node);
+  if (!incident || status === "terminal_gone") return null;
+  const { attempts, exhausted } = incident;
+  const count = `${attempts} restart${attempts === 1 ? "" : "s"}`;
+  const gaveUp = attempts ? `OpenRig gave up restarting it after ${count}` : "OpenRig couldn't restart it";
+  if (runningSeat(node)) {
+    const recovered = attempts ? `OpenRig restarted it ${attempts} time${attempts === 1 ? "" : "s"} after it stopped.` : null;
+    const line = exhausted ? `${gaveUp}, but it's running again now.` : recovered;
+    return line ? { line: `${line} It counts as recovered once it keeps running.` } : null;
+  }
+  if (!exhausted) return { line: `It stopped, and OpenRig is restarting it${attempts ? ` (try ${attempts})` : ""}.` };
+  if (node.lifecycleState !== "attention_required") return null;
+  return {
+    ...(status === "attention_required" ? { word: "gave up" } : {}),
+    line: `${gaveUp}. It waits for you: start it again or stop it.`,
+    lastError: restartFailureText(incident.lastError, node.rigId),
+    needsAttention: true,
+  };
+}
+
+function seatStatusFields(node, status) {
+  const provider = providerSeatReason(node, status);
+  const restart = seatRestartReason(node, status);
+  if (!provider && !restart) return {};
+  const word = provider?.word ?? restart?.word;
+  return {
+    ...(word ? { word } : {}),
+    ...(provider ? { providerStatusLine: provider.line } : {}),
+    statusLine: [provider?.line, restart?.line, restart?.lastError && `Last error: ${restart.lastError}`].filter(Boolean).join("\n"),
+    ...(restart?.needsAttention ? { restartNeedsAttention: true } : {}),
+  };
+}
+
 /** herdr's status vocabulary (theme().working, .blocked, .idle, .done) and the word shown, for a TUI status. */
 export function statusLook(status) {
   switch (status) {
@@ -2424,6 +2497,8 @@ export function statusLook(status) {
     case "unknown": return { tone: "done", word: "not reported" };
     // Neutral: not counted as working, needs you or idle, and never raises a rig's dot.
     case "terminal": return { tone: "done", word: "terminal" };
+    case "stopping": return { tone: "done", word: "stopping…" };
+    case "restarting": return { tone: "done", word: "restarting…" };
     case "detached": return { tone: "done", word: "detached" };
     case "stopped": return { tone: "done", word: "stopped" };
     case "exited": return { tone: "done", word: "exited" };
@@ -2471,9 +2546,9 @@ export function statusMark(key) {
     case "terminal_gone": case "gone": return { shape: "cross", color: "blocked", word: "blocked" };
     case "completed": return { shape: "check", color: "done", word: "done" };
     // The tone "done" is statusLook's for every seat that isn't running, so as a tone it reads stopped, not finished.
-    case "done": case "stopped": case "detached": case "exited": return { shape: "square", color: "muted", word: "muted" };
+    case "done": case "stopping": case "stopped": case "detached": case "exited": return { shape: "square", color: "muted", word: "muted" };
     case "terminal": return { shape: "prompt", color: "muted", word: "muted" };
-    case "unknown": return { shape: "dashed-ring", color: "muted", word: "dim" };
+    case "unknown": case "restarting": return { shape: "dashed-ring", color: "muted", word: "dim" };
     default: return { shape: "ring", color: "muted", word: "muted" };
   }
 }
@@ -2501,7 +2576,7 @@ export function statusMarkElement(ui, t, key, { cell = 14, iconOf, pulse = null 
     case "check": return box.child(svg(iconOf("check")).size(Math.round(cell * 0.8)).text_color(c));
     case "square": return box.child(div().size(Math.round(cell / 2)).rounded(1).border(1.5).border_color(c));
     case "prompt": return box.child(svg(iconOf("rig-terminal-prompt")).size(Math.round(cell * 0.8)).text_color(c));
-    case "dashed-ring": return box.tooltip("OpenRig is running this seat but hasn't reported whether it's working.")
+    case "dashed-ring": return box.tooltip(key === "restarting" ? "OpenRig is restarting this seat." : "OpenRig is running this seat but hasn't reported whether it's working.")
       .child(svg(iconOf("rig-unreported")).size(dot+2).text_color(c));
     default: return box.child(div().size(dot).rounded(dot).border(1.5).border_color(c));
   }
@@ -2552,7 +2627,7 @@ export function worstTone(tones) {
  *  (it runs, though no agent counts); the square ("done") stays for a rig with nothing running. */
 export function rigTone(seats) {
   const list = seats ?? [];
-  const agents = list.filter((s) => !s.terminal);
+  const agents = list.filter((s) => !s.terminal || s.restartNeedsAttention);
   const worst = agents.length ? worstTone(agents.map((s) => s.tone)) : "done";
   // Terminal seats count here too: a terminal-only rig whose tmux server is gone reads gone, not stopped.
   if (worst !== "blocked" && list.some((s) => s.tone === "gone")) return "gone";
@@ -2588,7 +2663,6 @@ export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null
       const pod = n.podNamespace ?? n.podId ?? "";
       const status = seatStatus(n);
       const look = statusLook(status);
-      const reason = providerSeatReason(n, status);
       const glyphInfo = rowStatusGlyph(status);
       if (!pods.has(pod)) pods.set(pod, []);
       pods.get(pod).push({
@@ -2606,7 +2680,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null
         slice: n.slice ?? n.activeSlice ?? null,
         status,
         ...look,
-        ...(reason ? { word: reason.word, statusLine: reason.line } : {}),
+        ...seatStatusFields(n, status),
         glyph: glyphInfo.glyph,
         glyphTone: glyphInfo.tone,
         work: n.assignedWorkCount ?? 0,
@@ -2667,7 +2741,6 @@ export function rigModel(rig, nodes, nativeSeats = [], conn = null) {
   const seats = (nodes ?? []).filter((n) => n.nodeKind !== "service").map((n) => {
     const status = seatStatus(n);
     const look = statusLook(status);
-    const reason = providerSeatReason(n, status);
     const glyphInfo = rowStatusGlyph(status);
     return {
       ...(conn ? { conn } : {}),
@@ -2703,7 +2776,7 @@ export function rigModel(rig, nodes, nativeSeats = [], conn = null) {
       needsInputEvidence: n.needsInputEvidence ?? null,
       status,
       ...look,
-      ...(reason ? { word: reason.word, statusLine: reason.line } : {}),
+      ...seatStatusFields(n, status),
       glyph: glyphInfo.glyph,
       glyphTone: glyphInfo.tone,
       ...(n.native ? { native: n.native } : native.has(n.canonicalSessionName) ? { native: nativeInfo(native.get(n.canonicalSessionName)) } : {}),
@@ -4100,7 +4173,7 @@ const withEarlierParts = (message, done, total) => (done > 0 ? `${/[.!?]$/.test(
 /** Shown when `POST /api/mission-control/action` fails due to a network error. */
 export const NETWORK_UNCONFIRMED_MESSAGE = "Not confirmed. It may have been recorded: check the request before sending again.";
 
-function resolveMissionVerb(item, act = {}) {
+export function resolveMissionVerb(item, act = {}) {
   if (typeof act?.verb === "string" && act.verb.trim()) return act.verb.trim();
   const mode = act?.mode ?? act?.kind ?? null;
   if (mode === "approve") return "approve";
@@ -4237,6 +4310,28 @@ export function isDecisionAsk(_item, queueRow) {
   return queueRow?.humanIntent === "decision";
 }
 export const REQUEST_NOT_A_DECISION = "This request asks you to do something; mark it done from its card. Nothing was sent.";
+
+const CLOSED_QUEUE_STATES = new Set(["done", "canceled", "denied", "handed-off", "failed", "closed"]);
+export function isClosedQueueState(state) {
+  return CLOSED_QUEUE_STATES.has(String(state ?? "").trim());
+}
+/** Format a safe-close refusal across all Mission Control verbs (Design §2). */
+export function formatSafeCloseConflict({ code = "decision_revision_changed", currentState = null, expectedState = null, partial = false, idx = 0, total = 1 } = {}) {
+  const cur = typeof currentState === "string" && currentState.trim() ? currentState.trim() : null;
+  const exp = typeof expectedState === "string" && expectedState.trim() ? expectedState.trim() : null;
+  if (code === "decision_revision_changed" && partial && !(cur && CLOSED_QUEUE_STATES.has(cur))) {
+    return idx > 1
+      ? `${earlierParts(idx, total)} recorded; choose the rest again.`
+      : "Your earlier part was recorded; choose the rest again.";
+  }
+  if ((cur && CLOSED_QUEUE_STATES.has(cur)) || (code === "qitem_already_terminal" && !cur)) {
+    return withEarlierParts(`Not recorded: this request was already ${statusWord(cur ?? "done", "queue")}.`, idx, total);
+  }
+  if (cur && (code === "qitem_already_terminal" || code === "qitem_state_changed" || (exp && cur !== exp))) {
+    return withEarlierParts(`Not recorded: this request is now ${statusWord(cur, "queue")}. Here it is now.`, idx, total);
+  }
+  return withEarlierParts("Not recorded: the request changed while you had it open. Here it is now; check it and answer again.", idx, total);
+}
 
 export async function submitMissionActions(config, item, act = {}, postOrOpts = {}) {
   // Approve only a decision: refused before any read or send, so a request is never closed with nothing sent back to its asker.
@@ -4398,12 +4493,12 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
     }
     if (!res?.ok) {
       const errCode = data?.error ?? "action_failed";
+      const expectedState = act?.expectedState ?? item?.state ?? null;
       if (status === 409 && errCode === "decision_revision_changed") {
         const lastOpId = String(data?.lastAction?.auditNotes?.operationId ?? "");
         const partial = idx > 0 || Boolean(hashPrefix && lastOpId.startsWith(hashPrefix));
-        const message = partial
-          ? (idx > 1 ? `${earlierParts(idx, steps.length)} recorded; choose the rest again.` : "Your earlier part was recorded; choose the rest again.") // one recorded part keeps the sentence it always had
-          : "The request changed since you opened it. Here it is now.";
+        const currentState = data?.state ?? data?.currentState ?? null;
+        const message = formatSafeCloseConflict({ code: errCode, currentState, expectedState, partial, idx, total: steps.length });
         return {
           ok: false,
           status: 409,
@@ -4411,6 +4506,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
           conflict: true,
           tokenProtected: false,
           partial,
+          currentState,
           operationHashPrefix: hashPrefix,
           message,
           text: message,
@@ -4420,8 +4516,8 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         };
       }
       if (status === 409 && errCode === "qitem_already_terminal") {
-        const settledState = String(data?.state ?? data?.currentState ?? "done");
-        const message = withEarlierParts(`This request was already settled: ${settledState === "handed-off" ? "it was " : ""}${statusWord(settledState, "queue")}.`, idx, steps.length); // parts recorded before it was settled are named too
+        const currentState = data?.state ?? data?.currentState ?? "done";
+        const message = formatSafeCloseConflict({ code: errCode, currentState, expectedState, partial: false, idx, total: steps.length });
         return {
           ok: false,
           status: 409,
@@ -4429,6 +4525,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
           conflict: true,
           tokenProtected: false,
           partial: idx > 0,
+          currentState,
           operationHashPrefix: hashPrefix,
           message,
           text: message,
@@ -5583,6 +5680,7 @@ function rigHasNeedsSeat(seats, rigName, actionableNeeds) {
 
 export function matchesPulseFilter(seat, rig, pulseFilter, attentionItems = [], _allSeats = []) {
   if (!pulseFilter) return true;
+  if (seat.restartNeedsAttention) return pulseFilter === "needs";
   // Neutral lifecycle states have a home in Idle; their individual row marks stay unchanged.
   if (["detached", "stopped", "exited"].includes(seat.status)) return pulseFilter === "idle";
   const actionableNeeds = actionableNeedsOf(attentionItems);
@@ -6752,7 +6850,7 @@ export function parseSidebarState(text) {
 }
 
 /** Serialize `{ open, order, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId }` into `<appHome>/openrig/state.json`, preserving any unrelated keys in `prevText`. */
-export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, sidebarViews, notifiedNeeds, notifiedNeedsByConnection, awayStates, operatorBannerChange } = {}) {
+export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, sidebarViews, notifiedNeeds, notifiedNeedsByConnection, awayStates, operatorBannerChanges = [] } = {}) {
   let base = {};
   try {
     const parsed = JSON.parse(String(prevText ?? "{}"));
@@ -6773,11 +6871,12 @@ export function serializeSidebarState(prevText, { open = {}, order = {}, lastSee
     }
   }
   const next = { ...base, open: cleanOpen, order: cleanOrder };
-  if (operatorBannerChange) {
-    const { scope, substate } = operatorBannerChange;
+  if (operatorBannerChanges.length) {
     const hidden = { ...next.operatorBannerHidden };
-    if (substate) hidden[scope] = substate;
-    else delete hidden[scope];
+    for (const { scope, substate } of operatorBannerChanges) {
+      if (substate) hidden[scope] = substate;
+      else delete hidden[scope];
+    }
     if (Object.keys(hidden).length) next.operatorBannerHidden = hidden;
     else delete next.operatorBannerHidden;
   }

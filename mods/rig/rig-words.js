@@ -10,7 +10,7 @@ const STATUS_WORDS = {
   seat: { pending: "waiting", needs_input: "needs you", attention_required: "needs you", active: "working", unknown: "not reported" },
   severity: { warning: "Warning", critical: "Critical" },
   health: { active: "open", indeterminate: "unclear", resolved: "resolved" },
-  queue: { pending: "waiting", claimed: "picked up", "in-progress": "in progress", blocked: "blocked", "handed-off": "handed on", done: "done", canceled: "canceled" },
+  queue: { pending: "waiting", claimed: "picked up", "in-progress": "in progress", blocked: "blocked", "handed-off": "handed on", done: "done", canceled: "canceled", denied: "denied", failed: "failed" },
   policy: { auto_decline: "declines new asks", auto_decide: "decides routine work itself", hold: "holds new asks for you" },
   gateway: { needs_reauth: "needs signing in again", reconnect: "reconnect it" },
   workflow: { active: "in progress", closed: "closed", blocked: "blocked" },
@@ -87,7 +87,7 @@ export function plainError(error, { where = "OpenRig's machine", what = null, wh
     else if (/^[a-z][a-z0-9]*(_[a-z0-9]+)+$/.test(token)) {
       text = token === "qitem_not_found" ? "That request isn't in OpenRig's queue any more."
         : token === "action_failed" ? what ? `OpenRig couldn't ${what}.` : "OpenRig couldn't do that."
-        : token === "decision_revision_changed" ? "The request changed since you opened it. Here it is now."
+        : token === "decision_revision_changed" ? "Not recorded: the request changed while you had it open. Here it is now; check it and answer again."
         : `OpenRig answered "${statusWord(token)}".`;
     } else text = withoutPaths(detail);
   }

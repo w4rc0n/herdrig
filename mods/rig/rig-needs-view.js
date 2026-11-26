@@ -12,8 +12,8 @@ export const PRIORITY_GROUPS = [
   { rank: 0, label: "Not reported", tone: "dim" },
 ];
 const RANK = { needs: 4, gone: 3.5, done: 3, working: 2, idle: 1, unreported: 0 };
-const excluded = (seat) => seat.terminal || ["stopped", "detached", "exited"].includes(seat.sessionStatus) || ["terminal", "stopped", "detached", "exited", "unknown"].includes(seat.status);
-const needs = (seat) => !excluded(seat) && ["needs_input", "attention_required", "failed"].includes(seat.status);
+const excluded = (seat) => seat.terminal || ["stopped", "detached", "exited"].includes(seat.sessionStatus) || ["terminal", "stopped", "detached", "exited", "unknown", "stopping", "restarting"].includes(seat.status);
+const needs = (seat) => seat.restartNeedsAttention || (!excluded(seat) && ["needs_input", "attention_required", "failed"].includes(seat.status));
 const helperStatus = (child) => ["blocked", "error", "needs_input"].includes(child.status) ? "needs" : child.status === "working" ? "working" : "idle";
 function helpersOf(seat, terminals) {
   const known = seat.native?.children ?? [];
@@ -86,7 +86,7 @@ export class NeedsTracker {
       const s = row.seat;
       // A request still needs the person whatever its seat's terminal says; otherwise a seat whose tmux server is gone has its own group.
       const raw = s.status==="unknown" ? "unreported" : row.asks.length ? "needs" : s.status === "terminal_gone" ? "gone"
-        : excluded(s) ? "idle" : needs(s) ? "needs" : ["active", "blocked"].includes(s.status) ? "working" : "idle";
+        : needs(s) ? "needs" : excluded(s) ? "idle" : ["active", "blocked"].includes(s.status) ? "working" : "idle";
       const prev = Object.hasOwn(this.changed, row.key) ? this.changed[row.key] : null;
       // Attaching viewers can briefly trip window sampling. Require a working stretch or stronger evidence.
       const worked = prev?.s === "working" && (prev.strong === true || (Number.isFinite(prev.at) && now - prev.at >= 10000));
@@ -108,8 +108,8 @@ export class NeedsTracker {
       if (!excluded(s)) row.rank = Math.max(row.rank, ...row.helpers.map((c) => RANK[helperStatus(c)]));
       // No age on a terminal-gone row: OpenRig's `since` is when it recorded the outage, which a daemon restart resets.
       row.noAge = row.rank === RANK.gone;
-      row.mark = row.rank === 4 ? "needs_input" : row.rank === RANK.gone ? "terminal_gone" : row.rank === 3 ? "completed" : row.rank === 2 ? (s.status==='blocked'?'blocked':"active")
-        : ["stopped", "detached", "exited"].includes(s.sessionStatus) ? s.sessionStatus : s.terminal ? "terminal" : s.status;
+      row.mark = s.status === "stopping" || s.restartNeedsAttention ? s.status : row.rank === 4 ? "needs_input" : row.rank === RANK.gone ? "terminal_gone" : row.rank === 3 ? "completed" : row.rank === 2 ? (s.status==='blocked'?'blocked':"active")
+        : s.status === "restarting" ? s.status : ["stopped", "detached", "exited"].includes(s.sessionStatus) ? s.sessionStatus : s.terminal ? "terminal" : s.status;
       row.focused = looking;
       Object.defineProperty(this.changed, row.key, { value: record, writable: true, enumerable: true, configurable: true });
     }
@@ -128,7 +128,7 @@ export class NeedsTracker {
 export function diffPriorityNotifications(topology, attention, previous, options = {}) {
   const candidates = (attention ?? []).map(needsToastFor).filter(Boolean).map((c) => ({ ...c, id: `ask:${c.id}` }));
   for (const rig of topology ?? []) for (const pod of rig.pods) for (const seat of pod.seats) {
-    if (!needs(seat)) continue;
+    if (seat.restartNeedsAttention || !needs(seat)) continue;
     const evidence = String(seat.arbitratedNeedsInput?.kind ?? seat.needsInputEvidence?.kind ?? "").toLowerCase();
     const reason = seat.status === "failed" ? "startup failed" : evidence.includes("mcp") ? "an MCP approval" : /perm|auth|trust/.test(evidence) ? "a permission prompt" : /question|input/.test(evidence) ? "a question" : "";
     candidates.push({ id: qualifyKey(rig.conn, `seat:${seat.session}`), at: "", isUrgent: true, isEscalation: false,
