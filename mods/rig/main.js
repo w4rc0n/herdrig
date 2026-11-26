@@ -74,7 +74,7 @@ import {
   utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine,
   buildTopology, readRigRepresentative, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
-  asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, requestHeadline, sweepFinding, checkLabel,
+  asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, isOpenNeed, requestHeadline, sweepFinding, checkLabel,
   readCommand, writeCommand, writeOutcome, actionArgs, actionTitle, doneWords, startOneClick, qualifyBusyKey, oneClickBusyKey, ONE_CLICK, PROVIDER_HOME_ACTIONS, providerHomeRefusal, appHomeArgsRefusal, listAddedMachine, RIG_SECTIONS, SECTION_TITLES, CONFIG_CATEGORIES,
   navPush, navBack, backTarget, navKey, onScreenRigTab, pushTabPage, tabPagesBack, machineSpaceConn,
   probeCapabilities, currentCapabilities, connectionCapabilities, capabilityDisableReason, herdrAppAvailability, isNeedsVisible, openNeed, worstHealthChip,
@@ -298,6 +298,11 @@ function attentionAnswer(full, asks) {
     perspective: asks.perspective ?? whole?.perspective,
     complete: Boolean(whole),
   };
+}
+function attentionListOf(data) {
+  return Array.isArray(data?.attentionItems)
+    ? { data: { items: data.attentionItems, sources: data.attentionSources ?? [], perspective: data.attentionPerspective ?? null }, at: data.at }
+    : null;
 }
 /** An approvals file that exists but can't be read: what the person can do (the sidebar's detail line and the follow row's tooltip). It names the
  *  real file under Herdr's home (HERDR_APP_HOME moves it), written with ~ when that is under the home folder. */
@@ -3769,7 +3774,7 @@ export default class RigSidebar extends View {
       return sortNeedsByTier(visible.map(item => {
         const match = enrichedById.get(`${item?.conn ?? ""}\0${item?.id}`);
         return needTarget(match ? { ...item, ...match } : item);
-      }));
+      }).filter(item => item.update || isOpenNeed(item)));
     });
   }
 
@@ -3851,7 +3856,6 @@ export default class RigSidebar extends View {
     const rows = this.priorityRows();
     if (this.sidebarState?.id === "S4" && !this.data?.topology?.some((r) => r.name !== "kernel")) return this.topologyRows(t, cx);
     const folds = this.viewState("rig.open.sidebar") ?? {};
-    const reqCount = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
     const many = rows.filter((r) => r.kind === "seat").length > 12;
     for (const group of PRIORITY_GROUPS) {
       const members = rows.filter((r) => r.rank === group.rank);
@@ -3868,14 +3872,13 @@ export default class RigSidebar extends View {
           entry: null,
           title: group.label,
           tone: group.tone,
-          count: String(group.rank === 4 && reqCount !== null ? reqCount : members.length),
+          count: String(members.length),
           stateConn,
         });
       }
     }
     const registered=[];
     const elements=priorityElements({ div, svg, h_flex }, t, rows, {
-      requestCount: reqCount,
       askOwner:ask=>{if(ask?.reply==='resolve'||ask?.answer?.verb==='resolve')return ask.waiting?.owner??ask.destinationSession??null;const member=assistantForNeed(ask,this.rosterOf(ask?.conn));return member?assistantOwner(member):null;},
       folds, selected: this.viewState("rig.sel")?.key, iconOf: icon,
       register: (row) => {this.visibleTreeRows.push(row);registered.push(row);},
@@ -4726,12 +4729,14 @@ export default class RigSidebar extends View {
   /** Lazy-load a branch API list when first expanded and again on refresh. */
   list(cx, path, feed = this.viewFeed ?? this.primary) {
     if(path==='/api/health'&&this.renderMemo)this.renderMemo.healthDrawn?.add(feed.id??feed.config?.connectionId);
+    if (path === FULL_ATTENTION_PATH) {
+      // The badge and the sidebar list must use the same current feed, including when the daemon ignores kind=action.
+      const current = attentionListOf(feed.data);
+      if (current) return current;
+    }
     if (path === FULL_ATTENTION_PATH && feed.fullAttention && !feed.fullAttention.unsupported && feed.fullAttention.key === fullAttentionKey(feed.config)) {
       // The whole list has one reader per connection (startFullAttention): this list shows its last answer and never starts a second read.
-      // An OpenRig that ignores `kind` keeps the list's own read, as before.
       this.startFullAttention(feed);
-      // The feed's own items are the fresh requests merged with the whole list, enriched and prepared after each refresh: the list is those.
-      if (Array.isArray(feed.data?.attentionItems)) return { data: { items: feed.data.attentionItems, sources: feed.data.attentionSources ?? [], perspective: feed.data.attentionPerspective ?? null }, at: feed.data.at };
       const whole = feed.fullAttention.data;
       if (!whole) return feed.fullAttention.error && !feed.fullAttention.pending ? { error: feed.fullAttention.error } : { loading: true };
       return { data: { ...whole, items: this.memoBy(`attention:${feed.id ?? ""}:${path}`, [whole.items, feed.data?.attentionHealth], () => filterAttentionHealth(whole.items, feed.data?.attentionHealth ?? [])) } };
@@ -4889,8 +4894,10 @@ export default class RigSidebar extends View {
     const catalog = this.list(cx, "/api/scopes/projects").data;
     return effectiveScopeProject(null, readScopeProject(shared, this.primary.config ?? this.config, this.sidebarConnection(), catalog), catalog);
   }
+  needsBranchRead(cx) { return attentionListOf(this.data) ?? this.list(cx, FULL_ATTENTION_PATH); }
+
   /** Render the children of `Specs`, `Scopes`, `Terminals`, `Needs`, or `System` when expanded. */
-  sectionBranchChildren(t, cx, section) {
+  sectionBranchChildren(t, cx, section, needsRead = null) {
     const stateConn=this.sidebarConnection();
     // The connection these rows were read from (list()'s own feed), captured now: a right-click lands after the draw, when `this.config` is the
     // first connection's again. With one connection it is that connection, exactly as before.
@@ -4999,9 +5006,7 @@ export default class RigSidebar extends View {
 
     const selectedProject=section==='scopes'?this.scopesProject(cx):null;
     const path = { specs: "/api/specs/library", scopes: "/api/scopes?counts=1"+(selectedProject?`&project=${encodeURIComponent(selectedProject)}`:''), terminals: "/api/terminal/views", needs: "/api/attention" }[section];
-    const got = section === "needs" && Array.isArray(this.data?.attentionItems) && !this.lists[path]
-      ? { data: { items: this.data.attentionItems }, at: this.data.at }
-      : this.list(cx, path);
+    const got = section === "needs" ? needsRead ?? this.needsBranchRead(cx) : this.list(cx, path);
     const out = [];
     if (got.error) {
       if (section === "terminals" && /\b401\b/.test(String(got.error))) {
@@ -5019,7 +5024,7 @@ export default class RigSidebar extends View {
           cx.notify();
         }).child("Retry"));
       if (!got.data) return out;
-    } else if (got.data === undefined) {
+    } else if (got.data == null) {
       return [div().px(18).py(4).text_size(12).text_color(t.dim).child("Reading…")];
     }
     const d = got.data;
@@ -5302,7 +5307,10 @@ export default class RigSidebar extends View {
           : `${hiddenChecks} more check${hiddenChecks===1?'':'s'}` }));
       out.push(...this.sidebarUpdates(t, cx, orderedNeeds.filter((n) => n.update)));
       if (!orderedNeeds.length && !this.dismissalModel()?.hidden().length) {
-        out.push(div().px(18).py(4).text_size(12).text_color(t.dim).child("No pending Needs-You requests."));
+        const promptOnly = this.requestCountOf(this.data?.topology) > 0;
+        out.push(div().px(18).py(4).text_size(12).text_color(t.dim).child(promptOnly
+          ? "No pending Needs-You requests. Answer seat prompts in their terminal from Topology."
+          : "No pending Needs-You requests."));
       }
     }
 
@@ -5358,7 +5366,9 @@ export default class RigSidebar extends View {
           out.push(...(this.viewState("rig.topology.view") === "rig" ? this.topologyRows(t, cx) : this.priorityView(t, cx)));
         }
       } else if (section === "needs") {
-        const needsCount = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
+        const read = openBranch ? this.needsBranchRead(cx) : null;
+        const rawNeeds = read ? read.data?.items : this.data?.attentionItems ?? this.lists[FULL_ATTENTION_PATH]?.data?.items;
+        const needsCount = rawNeeds ? this.requestCountOf(null, this.sidebarNeedsItems(this.viewFeed ?? this.primary, rawNeeds, !this.viewFeed && this.feeds.length > 1)) : 0;
         const quietChip = this.data?.quietModeChip ?? null;
         const quietChipEl = quietChip?.label
           ? h_flex().id("rig-quiet-mode-chip").px(5).h(18).gap(4).rounded(4).items_center().cursor_pointer()
@@ -5380,7 +5390,7 @@ export default class RigSidebar extends View {
           siblingIds: orderedSections,
         }));
         if (openBranch) {
-          out.push(...this.sectionBranchChildren(t, cx, "needs"));
+          out.push(...this.sectionBranchChildren(t, cx, "needs", read));
         }
       } else if (section === "system") {
         const healthGot = Array.isArray(this.data?.health) ? { data: { records: this.data.health } } : this.list(cx, "/api/health");
@@ -6047,7 +6057,8 @@ export default class RigSidebar extends View {
 
   listRows(t,cx,state) {
     const out=[];
-    if(!this.viewFeed||this.viewFeed===this.primary){const layoutCard=this.rigLayoutNoticeCard(t,cx);if(layoutCard)out.push(layoutCard);}
+    // OpenRig's Rig layout is about this window, not a connection: the card shows whichever connection the sidebar follows.
+    {const layoutCard=this.rigLayoutNoticeCard(t,cx);if(layoutCard)out.push(layoutCard);}
     if(this.spaceSyncError)out.push(errorBlock(this,t,"rig-space-sync-read-error",this.spaceSyncError));
     const ownCards = !this.viewFeed || this.viewFeed === this.primary; // the cards below act through the first connection: they are not drawn for another box
     const relocationHint = ownCards ? this.relocationHintFor(this.primary) : null;

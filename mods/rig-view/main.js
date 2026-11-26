@@ -71,9 +71,9 @@ import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, TERMINAL_TOKEN_PROTECTE
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
+  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, isOpenNeed, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
   tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, missionActionPreflight, isDecisionAsk, sweepFinding, checkLabel, checkReason, checkSeat, needsCheckCount, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
-  viewsPropsFromLayout, openOrFocusRigTab, rigPageOnScreen as rigPageOnScreenIn, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, formatStaleAge, attachRelayPath, waitWith,
+  viewsPropsFromLayout, openOrFocusRigTab, rigPageOnScreen as rigPageOnScreenIn, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, formatStaleAge, attachRelayPath, waitWith, queueListPage,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
 import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
@@ -804,16 +804,15 @@ export default class RigView extends View {
     const items = this.attentionRead(null).items;
     const health=data.health?.records??this.cache?.["/api/health"]?.data?.records;
     this.navigationMenu(pageSectionChoices({ topology: counted(topology.length, "rig"), specs: data.specs?.length??this.cache?.["/api/specs/library"]?.data?.length,
-      terminals: (data.ps ?? []).length, needs: needsRequestCount(topology, items),
+      terminals: (data.ps ?? []).length, needs: needsRequestCount(null, items),
       system: Array.isArray(health)?healthCounts(health).problems||"ok":null }));
   }
 
   objectTabs(t, entry, spec, {prefix="page",active=this.activePageView,cx=null}={}) {
     let counts = this.pageNeedsCounts;
     if (!counts && pageViewKind(entry) === "needs") {
-      const data = this.pageRigData() ?? {};
       const attItems = this.attentionRead(null).items;
-      counts = { requests: needsRequestCount(data.topology, attItems), checks: needsCheckCount(attItems), updates: attItems.filter(isUpdateNeed).length };
+      counts = { requests: needsRequestCount(null, attItems), checks: needsCheckCount(attItems.filter(isOpenNeed)), updates: attItems.filter(isUpdateNeed).length };
     }
     const options = pageViewOptions(entry, spec, {...(counts ?? {}),...this.workflowCounts});
     if (!options.length) return null;
@@ -1295,9 +1294,12 @@ export default class RigView extends View {
         // A cached successful read can advance observation metadata without redrawing the same content. Explicit reads, callbacks,
         // first load, lost reads and errors still announce completion; no operation or permission is cached here.
         answerChanged = Boolean(force || onData || as || lost || hit?.data === undefined || hit?.error || !outcome.ok
-          || (hit?.status !== undefined && hit.status !== outcome.status) || !canSkipReadAnswer(path, hit.data, outcome.data));
+          || (hit?.status !== undefined && hit.status !== outcome.status) || !canSkipReadAnswer(path, hit.data, outcome.data)
+          || hit?.queuePage?.limit !== outcome.queuePage?.limit || hit?.queuePage?.truncated !== outcome.queuePage?.truncated);
+        const queuePage = outcome.ok ? outcome.queuePage : pending?.queuePage;
         cache[path] = {
           ...settleRead(pending, outcome),
+          ...(queuePage && { queuePage }),
           ...generation,
           sharedAt: outcome.ok ? sharedAt : pending?.sharedAt,
           // Consume invalidation when starting, not when finishing: another update may arrive mid-read.
@@ -1329,7 +1331,7 @@ export default class RigView extends View {
           // onData runs here, after the await: outside render, so it may create view state (an EditorState).
           if (r.ok && onData) onData(data);
           finish(r.ok
-            ? { ok: true, data, status: r.status }
+            ? { ok: true, data, status: r.status, ...(path.startsWith("/api/queue/list?") && { queuePage: queueListPage(r) }) }
             : { ok: false, error: `GET ${path} → ${r.status}${data?.error ? `: ${data.error}` : ""}`, status: r.status, errorData: data });
         } catch (e) { if (epoch === (this.cacheEpoch ?? 0)) { const failure = plainError(e); finish({ ok: false, error: failure.text, errorDetail: failure.detail }); } }
         if (answerChanged) this.noteAnswer(cx);
@@ -1762,7 +1764,8 @@ export default class RigView extends View {
     this.pageActions=h_flex().gap(8).items_center().flex_wrap()
       .child(this.button(t,'assistant-queue','Queue work…',()=>this.open({mod:MOD_IDS.menu,kind:'dialog',width:460,height:300,props:{target,step:{input:true,placeholder:'One-line summary; the body follows on the next lines',action:'queue',multiLine:true}}}),{ tip: "Give this assistant a task: opens Queue work",iconName:'rig-queue'}))
       .child(this.button(t,'assistant-open-rig','Open rig page',()=>this.push({section:'topology',kind:'rig',conn:member.conn,rigId:entry.rigId,name:member.rig}),{ tip: "Open the rig this assistant belongs to",small:true}));
-    const path=seatQueuePaths(member.seat).open,got=this.read(cx,path),queue=seatQueueDetails(got.data,null);
+    // Use the running sidebar's version when available. The assistant card reads only its queue.
+    const paths=seatQueuePaths(member.seat,this.pageHealthz(null)?.semver),got=this.read(cx,paths.open),queue=seatQueueDetails(got.data,null,{...got.queuePage,requested:paths.openLimit});
     const records=[...queue.current,...queue.pending,...queue.blocked];
     const sentence=assistantSentence(member,value=>this.time(value));
     return v_flex().id('assistant-detail').gap(12)
@@ -2877,9 +2880,9 @@ export default class RigView extends View {
       r.scope?.session === n.canonicalSessionName),
     );
 
-    const queuePaths = seatQueuePaths(n.canonicalSessionName);
+    const queuePaths = seatQueuePaths(n.canonicalSessionName, this.pageHealthz(cx)?.semver);
     const qGot = this.read(cx, queuePaths.open), finishedGot = this.read(cx, queuePaths.finished);
-    const queue = seatQueueDetails(qGot.data, finishedGot.data);
+    const queue = seatQueueDetails(qGot.data, finishedGot.data, { ...qGot.queuePage, requested: queuePaths.openLimit });
     const currentWork = queue.current, upNext = queue.pending, blockedWork = queue.blocked, recentlyFinished = queue.finished;
     const queueWarnings = [qGot.error, finishedGot.error].filter(Boolean);
     const depthText = queue.partial ? `at least ${queue.count}` : formatHonestCount(queue.count, { unknown: !queue.available });
@@ -5081,9 +5084,10 @@ export default class RigView extends View {
     // The daemon names each source it read; one that is down makes an empty list unknown, not empty.
     const coverage = attentionCoverage(att.data.sources ?? []);
     const awayCard = this.sinceYouWereAwayCard(t, cx, items);
-    const actionableItems = sortNeedsByTier(items.filter((n) => !n.update));
+    const actionableItems = sortNeedsByTier(items.filter(isOpenNeed));
     const updateItems = items.filter((n) => n.update);
-    this.pageNeedsCounts={requests:needsRequestCount(this.pageRigData()?.topology??this.currentTopology(cx),items),checks:needsCheckCount(items),updates:updateItems.length};
+    const promptOnly = !actionableItems.length && needsRequestCount(this.pageRigData()?.topology ?? this.currentTopology(cx)) > 0;
+    this.pageNeedsCounts={requests:needsRequestCount(null,actionableItems),checks:needsCheckCount(actionableItems),updates:updateItems.length};
     const requestsView=(entry.needsTab??"requests")==="requests";
     if(requestsView){this.selectedUpdate=null;this.visibleUpdates=[];}
     const updateDisplay = [...updateItems];
@@ -5095,7 +5099,8 @@ export default class RigView extends View {
       .when(!!entry.notice, (el) => el.child(div().id("need-expired-notice").text_size(12).text_color(t.muted).child(entry.notice)))
       .when(requestsView,el=>el.child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
         .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).tooltip(String(a.text ?? a.summary??"")).child(a.text ?? a.summary))),
-        this.needRows(t, cx, "needs", actionableItems, att.data?.perspective)])))
+        this.needRows(t, cx, "needs", actionableItems, att.data?.perspective),
+        ...(promptOnly ? [this.dim(t, "Answer seat prompts in their terminal from Topology.")] : [])])))
       .when(!requestsView,el=>{
         const dismissedRows = dismissals.show && dismissals.hidden().length ? [
           this.dim(t, "Dismissed"),
