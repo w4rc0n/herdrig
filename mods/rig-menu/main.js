@@ -80,7 +80,7 @@ import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, ACTION_REFUSED, parseCo
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
   SWAP_RUNTIMES, changeModelPlan, filterAllowedModels,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, closeRigInspection, selectWorkerView,
-  currentCapabilities, connectionCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, attachToSeat, resetGroupOrder, submitMissionActions, missionActionPreflight, attachRelayPath, waitWith, layoutShowsMod, isLoopbackDaemonUrl,
+  currentCapabilities, connectionCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, attachToSeat, resetGroupOrder, submitMissionActions, missionActionPreflight, isClosedQueueState, attachRelayPath, waitWith, layoutShowsMod, isLoopbackDaemonUrl,
   statusMarkElement, deleteOutcome, rigNameProblem, newRigFromSpecArgs, newRigOneSeatArgs, commandLine, NEW_RIG_RUNTIMES,
   readRigSpecPreview, singleLineText } from "./rig-lib.js";
 
@@ -1483,7 +1483,7 @@ export default class RigMenu extends View {
       // Resume when paused, Pause when not; with the state unknown or mixed, both.
       const stoppedRig = isRigStopped(target.lifecycle, this.rigSeats(target));
       if (!stoppedRig && target.lifecycle !== "stopped") item("rig-pause", "Pause rig…", () => dialog(target, { action: "pause", load: "pause" }, 360));
-      if (stoppedRig || target.lifecycle !== "running") item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
+      if (!target.operatorDisabled && (stoppedRig || target.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
       // Delete, with Archive beside it as the reversible choice. Never for the kernel: it's the daemon's own rig.
       if (target.rig !== "kernel" && !target.archived) item("rig-archive", "Archive rig…", () => dialog(target, { action: "archive-rig", load: "pause" }, 320), "archive-rig");
       if (target.rig !== "kernel") item("rig-trash", "Delete rig…", () => dialog(target, { action: "delete-rig", load: "pause" }, 540), "delete-rig");
@@ -2332,10 +2332,11 @@ export default class RigMenu extends View {
           kind: target.reply === "resolve" ? "resolve" : "answer-text",
           text,
           revision: target.decisionRevision ?? null,
+          expectedState: target.state ?? null,
         }, { fetch: op.fetch });
-        if (r.ok) refreshSidebar();
-        if (!r.ok && r.code === "decision_revision_changed" && !r.partial) {
-          const msg = "The request changed since you opened it. Open it in Needs-You to read the latest version before answering.";
+        if (r.ok || r.conflict) refreshSidebar();
+        if (!r.ok && r.code === "decision_revision_changed" && !r.partial && !isClosedQueueState(r.currentState)) {
+          const msg = "Not recorded: the request changed while you had it open. Open it in Needs to read the latest version.";
           return { ...r, message: msg, text: msg };
         }
         return r;

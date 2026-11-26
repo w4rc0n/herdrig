@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.15
+Version: v0.5.16
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -149,7 +149,7 @@ Check the `Version:` line in the README you copied, or open System and read **He
   legacy `RIGGED_*` address variables. Pin a custom address in Herdrig’s connection settings. Otherwise the CLI
   discovers the daemon from the selected OpenRig home. Herdrig also clears inherited seat identity, including
   `TMUX_PANE`, so the CLI cannot infer a sender from the pane that launched Herdr.
-- **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**); for Attach, `hc` starts `node` on the
+- **Programs:** `rig` (and `rig daemon start` when you click **Start OpenRig**, or `rig up kernel --existing --json` when you click **Start operator** on this computer); for Attach, `hc` starts `node` on the
   mod's own `rig-attach-relay.cjs`, which runs `tmux attach-session -t =<session>` directly, with no shell, for a
   session name OpenRig makes; `hc` also opens the TUI tab. For the local spec editor, `printenv OPENRIG_HOME` and `realpath`; for Add a machine, `test -d` to check whether a typed OpenRig home folder exists here.
   On a configured machine, pinned helpers run through `hc exec`; spec content travels on stdin, without staging

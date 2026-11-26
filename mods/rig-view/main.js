@@ -71,8 +71,8 @@ import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, TERMINAL_TOKEN_PROTECTE
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, isOpenNeed, providerSeatReason, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
-  tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, missionActionPreflight, isDecisionAsk, sweepFinding, checkLabel, checkReason, checkSeat, needsCheckCount, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
+  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, isOpenNeed, providerSeatReason, seatRestartReason, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
+  tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, missionActionPreflight, isDecisionAsk, resolveMissionVerb, formatSafeCloseConflict, sweepFinding, checkLabel, checkReason, checkSeat, needsCheckCount, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, rigPageOnScreen as rigPageOnScreenIn, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, formatStaleAge, attachRelayPath, waitWith, queueListPage,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
 import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails, seatUsageLimitWords } from "./rig-seat-details.js";
@@ -254,6 +254,8 @@ export default class RigView extends View {
     this.replies = {}; // need id → { input, key, target, busy, result }: the inline reply boxes
     // Keyed by ids the daemon sends: null-prototype maps, so an id such as `__proto__` is just a key.
     this.answered = Object.create(null); // need id → { summary, words, at }: replies sent from here, said for a moment after the item goes
+    this.refused = Object.create(null); // need id → { id, qitemId, summary, text, state, at, conn, listEpoch }: safe-close refusals kept visible if the row left Needs
+    this.needsPageEpoch = 0;
     this.questionChoices = Object.create(null); // need id → { [questionId]: optionId }
     this.askerNotes = Object.create(null); // need id → string note when Open seat fails or seat isn't loaded
     this.peopleBusy = false;
@@ -2566,7 +2568,8 @@ export default class RigView extends View {
   /** A seat as an indented tree row (rig > pod > seat > helper) with runtime/model badge, slice badge, and quick actions. */
   seatChip(t, rig, s, lifecycle, { nativeSeat = null, seatNeed = null } = {}) {
     const { compact, tight } = pageBodyLayout(this.pageWidth);
-    const rowStatus = seatNeed ? "needs_input" : s.status;
+    const showNeed = seatNeed && s.status !== "stopping" && !s.restartNeedsAttention;
+    const rowStatus = showNeed ? "needs_input" : s.status;
     const limit = rowStatus === "unknown" ? seatUsageLimitWords(s, Date.now(), this.uiTimezone) : null;
     if (!s.terminal) { const seat = this.nowSeat(s); this.nowSeats?.set(seat.key, seat); }
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
@@ -2647,8 +2650,8 @@ export default class RigView extends View {
             .child(tight ? s.logicalId?.split(".").at(-1) ?? s.logicalId : s.logicalId))
           .when(Boolean(s.isRepresentative), el => el.child(div().text_size(11).text_color(t.dim).tooltip("This rig's lead, as OpenRig reports it.").child("Lead")))
           .when(!tight, el => el.child(div().id(`seat-status-${s.session}`).text_size(11.5).text_color(t[statusMark(rowStatus).word] ?? t.muted)
-            .when(!seatNeed && s.status === "terminal_gone", (w) => w.tooltip(TERMINAL_GONE_TOOLTIP))
-            .when(!seatNeed && Boolean(s.statusLine), (w) => w.tooltip(s.statusLine)).child(seatNeed ? "needs you" : limit?.word ?? s.word)))
+            .when(!showNeed && s.status === "terminal_gone", (w) => w.tooltip(TERMINAL_GONE_TOOLTIP))
+            .when(!showNeed && Boolean(s.statusLine), (w) => w.tooltip(s.statusLine)).child(showNeed ? "needs you" : limit?.word ?? s.word)))
           .when(!!runtimeBadge && !compact, (el) => el.child(div().id(`seat-runtime-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .font_family(settings().font_family).text_size(11).text_color(t.dim).child(runtimeBadge)))
           .when(!!s.slice && !compact, (el) => el.child(div().id(`seat-slice-${s.session}`).tooltip(`Open slice ${s.slice} in Scopes`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
@@ -2963,8 +2966,11 @@ export default class RigView extends View {
     const typing=tab==='activity'&&!isTerminalSeat(n)?this.read(cx,`/api/seat/status/${encodeURIComponent(n.canonicalSessionName??`${entry.name}@${entry.rig}`)}`).data?.typingGuard:null;
     const typingState=typingGuardState(typing);
     const limit = !seatRequests && rawStatus === "unknown" ? seatUsageLimitWords(n, Date.now(), this.uiTimezone) : null;
-    const providerReason = seatRequests ? null : providerSeatReason(n, rawStatus);
-    this.pageHeading={title:entry.name,tone:seatRequests?"needs_input":rawStatus,session:n.canonicalSessionName,status:[seatRequests?"needs you":providerReason?.word ?? limit?.word ?? look.word,n.runtime,n.model??n.resolvedModel,entry.rig].filter(Boolean).join(" · ")};
+    const restart = seatRestartReason(n, rawStatus);
+    const restartFailure = restart?.lastError ? plainError(restart.lastError).text : null;
+    const showSeatNeeds = seatRequests && rawStatus !== "stopping" && !restart?.needsAttention;
+    const providerReason = showSeatNeeds ? null : providerSeatReason(n, rawStatus);
+    this.pageHeading={title:entry.name,tone:showSeatNeeds?"needs_input":rawStatus,session:n.canonicalSessionName,status:[showSeatNeeds?"needs you":providerReason?.word ?? restart?.word ?? limit?.word ?? look.word,n.runtime,n.model??n.resolvedModel,entry.rig].filter(Boolean).join(" · ")};
     this.inPageActions=true;
     const terminalAction = live.kind !== "card"
       ? this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { tip: "Show this seat's pane in Herdr", primary: true, small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason })
@@ -3007,6 +3013,7 @@ export default class RigView extends View {
           ["Model", n.model ?? n.resolvedModel ?? "default"],
           ["Session", n.canonicalSessionName, true],
           ["Effort", effortText],
+          ...(n.keepAlive === true ? [["Restarts", "On: OpenRig restarts it if it stops"]] : []),
           ...(typingState?[["Typing guard",`${typingState.word}${typingState.pending?(typing.desiredMode==='off'?' · turning off…':' · turning on…'):''}${typingState.heldCount?` · ${typingState.heldCount} held`:''}`]]:[]),
           ["Attach command", attachCmd, true],
         ]),
@@ -3029,7 +3036,9 @@ export default class RigView extends View {
       .when(tab === "activity", el => el.child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
         showProviderLine ? h_flex().w_full().min_w(0).gap(8).items_center()
           .child(div().flex_1().min_w(0).whitespace_normal().text_size(12.5).child(providerReason.line))
-          .child(terminalAction) : div().text_size(12.5).child(limit?.line ?? activityWords.line),
+          .child(terminalAction) : div().text_size(12.5).child(limit?.line ?? restart?.line ?? activityWords.line),
+        ...(restart && (showProviderLine || limit) ? [div().whitespace_normal().text_size(12.5).child(restart.line)] : []),
+        ...(restartFailure ? [div().truncate().text_size(12).text_color(t.dim).tooltip(restartFailure).child(`Last error: ${restartFailure}`)] : []),
         ...[activityWords.note, activityWords.changed, activityWords.stale].filter(Boolean).map(text => this.dim(t, text)),
         h_flex().id("seat-evidence-fold").tooltip("Show or hide how OpenRig knows this seat's activity").gap(5).items_center().cursor_pointer().text_color(t.muted)
           .on_click((_e, cx) => { this.activityEvidenceOpen = !this.activityEvidenceOpen; cx.notify(); })
@@ -5071,7 +5080,31 @@ export default class RigView extends View {
         if (hidden) return v_flex().gap(8).child(this.dim(t, hidden.note ?? "Dismissed here."))
           .child(this.button(t, "restore-open-update", "Restore", () => this.updateAction("restore", hidden.key), { small: true, tip: "Bring this update back to the Updates list" }));
         const entryConn = entry.conn ?? ((this.config?.connections?.length ?? 0) > 1 ? this.awayConnId() : null);
-        const answered = this.answered[this.replyKey(entryConn ? { ...entry, conn: entryConn } : entry)]; // the page's request: its id on its own OpenRig
+        const entryKey = this.replyKey(entryConn ? { ...entry, conn: entryConn } : entry); // the page's request: its id on its own OpenRig
+        const refused = this.refused?.[entryKey];
+        if (refused) {
+          const qid = refused.qitemId ?? (String(entry.id).startsWith("queue:") ? String(entry.id).slice(6) : null);
+          const qRes = qid ? this.read(cx, `/api/queue/${encodeURIComponent(qid)}`) : null;
+          const qRow = !qRes?.error && qRes?.data && typeof qRes.data === "object" && !qRes.data.error ? qRes.data : null;
+          const qBody = typeof qRow?.body === "string" && qRow.body.trim() ? qRow.body.trim() : null;
+          const qResText = typeof qRow?.resolution === "string" && qRow.resolution.trim() ? qRow.resolution.trim() : null;
+          return v_flex().gap(10).min_w(0)
+            .child(this.title(t, rowTitle(qRow?.summary || refused.summary)))
+            .child(h_flex().id(`need-result-${entry.id}`).gap(6).items_start().min_w(0)
+              .child(svg(icon("rig-alert")).size(12).flex_none().text_color(t.blocked))
+              .child(div().flex_1().min_w(0).text_size(12).text_color(t.blocked).child(this.errorText(t, `need-result-error-${entry.id}`, refused.text))))
+            .when(Boolean(qRow), (el) => el.child(v_flex().id(`need-refused-current-${entry.id}`).gap(8).p(12).rounded(8).border_1().border_color(t.border).bg(t.raised)
+              .child(this.kv(t, [
+                ["State", statusWord(qRow.state ?? "not reported", "queue")],
+                ...(qRow.sourceSession ? [["From", qRow.sourceSession]] : []),
+                ...(qRow.destinationSession ? [["To", qRow.destinationSession]] : []),
+                ...(qResText ? [["Resolution", qResText]] : []),
+              ]))
+              .when(Boolean(qBody), (c) => c.child(requestMarkdownView(qBody, { TextView, div, v_flex, id: `need-refused-body-${entry.id}` }).text_size(12.5).text_color(t.foreground)))))
+            .when(!qRow && Boolean(qRes?.loading), (el) => el.child(this.dim(t, "Reading current request…")))
+            .when(!qRow && !qRes?.loading, (el) => el.child(this.dim(t, "It has left Needs.")));
+        }
+        const answered = this.answered[entryKey];
         if (answered?.text) return v_flex().gap(10).child(this.title(t, rowTitle(answered.summary)))
           .child(h_flex().id(`need-result-${entry.id}`).gap(6).items_start().min_w(0)
             .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(this.dim(t, answered.text).flex_1().min_w(0)));
@@ -5092,6 +5125,9 @@ export default class RigView extends View {
     const gone = Object.entries(this.answered).filter(([key, a]) => Date.now() - a.at < STATUS_MS && (a.conn ?? pageConn) === pageConn
       && !items.some((n) => this.replyKey(n) === key));
     if (gone.length) this.ticking = true;
+    const refusedStubs = Object.entries(this.refused ?? {}).filter(([key, r]) =>
+      (r.conn ?? pageConn) === pageConn && r.listEpoch === (this.needsPageEpoch ?? 0)
+      && !items.some((n) => this.replyKey(n) === key));
     // The daemon names each source it read; one that is down makes an empty list unknown, not empty.
     const coverage = attentionCoverage(att.data.sources ?? []);
     const awayCard = this.sinceYouWereAwayCard(t, cx, items);
@@ -5104,13 +5140,15 @@ export default class RigView extends View {
     const updateDisplay = [...updateItems];
     const receipts = dismissals.receiptRows();
     for (const receipt of receipts.filter((r) => r.keys.length === 1)) updateDisplay.splice(Math.min(receipt.position, updateDisplay.length), 0, { receipt });
+    this.needUnfilteredPositions = Object.create(null);
+    actionableItems.forEach((n, idx) => { this.needUnfilteredPositions[this.replyKey(n)] = idx; });
     return v_flex().gap(12)
       .when(!!whoseRow, (el) => el.child(whoseRow))
       .when(!!awayCard&&requestsView, (el) => el.child(awayCard))
       .when(!!entry.notice, (el) => el.child(div().id("need-expired-notice").text_size(12).text_color(t.muted).child(entry.notice)))
       .when(requestsView,el=>el.child(this.card(t, "Requests", [...gone.map(([id, a]) => h_flex().id(`need-answered-${id}`).px(8).gap(8).items_center()
         .child(svg(icon("check")).size(12).flex_none().text_color(t.working)).child(div().flex_1().truncate().text_size(12).text_color(t.muted).tooltip(String(a.text ?? a.summary??"")).child(a.text ?? a.summary))),
-        this.needRows(t, cx, "needs", actionableItems, att.data?.perspective),
+        this.needRows(t, cx, "needs", actionableItems, att.data?.perspective, refusedStubs),
         ...(promptOnly ? [this.dim(t, "Answer seat prompts in their terminal from Topology.")] : [])])))
       .when(!requestsView,el=>{
         const dismissedRows = dismissals.show && dismissals.hidden().length ? [
@@ -5223,8 +5261,8 @@ export default class RigView extends View {
 
   /** Needs-You rows: a click opens the Decision Card in place (`shared("rig.open.page")`, `needs:<id>`, so the palette and the
    *  sidebar agree); right-click is the menu. A palette filter narrows them, as it does a table. */
-  needRows(t, cx, idPrefix, list, perspective = null) {
-    if (idPrefix === "needs") return this.requestRows(t, cx, list, perspective);
+  needRows(t, cx, idPrefix, list, perspective = null, refusedStubs = []) {
+    if (idPrefix === "needs") return this.requestRows(t, cx, list, perspective, refusedStubs);
     const f = this.filter?.toLowerCase();
     if (f) list = list.filter((n) => [n.summary, n.urgency, n.asker, n.scope, n.tier].some((c) => String(c ?? "").toLowerCase().includes(f)));
     const open = shared("rig.open.page") ?? {};
@@ -5291,23 +5329,47 @@ export default class RigView extends View {
   }
 
   /** A request opened in place or on its own item page: renders the full Decision Card. */
-  requestRows(t, cx, items, perspective) {
-    const filter = this.filter?.toLowerCase();
-    if (filter) items = items.filter(n => [n.summary, n.asker].some(s => String(s ?? "").toLowerCase().includes(filter)));
-    const toggle = (n) => { if (n.criticalHealth) { this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) }); return; } this.selectedNeed = this.replyKey(n); this.selectedNeedId = n.id; if (n.reply !== "none") this.replies[this.replyKey(n)] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
+  requestRows(t, cx, items, perspective, refusedStubs = []) {
+    const filter = this.filter?.toLowerCase() ?? "";
+    const matchesFilter = (summary, asker) => [summary, asker].some(s => String(s ?? "").toLowerCase().includes(filter));
+    if (filter) items = items.filter(n => matchesFilter(n.summary, n.asker));
+    const visibleStubs = filter
+      ? refusedStubs.filter(([, r]) => matchesFilter(r.summary, r.asker))
+      : refusedStubs;
+    const display = [...items];
+    const stubPos = (r) => (filter && r.filter === filter ? r.position : r.unfilteredPosition) ?? display.length;
+    for (const [key, r] of [...visibleStubs].sort((a, b) => stubPos(a[1]) - stubPos(b[1]))) {
+      display.splice(Math.min(stubPos(r), display.length), 0, { refusedStub: { key, ...r } });
+    }
+    const toggle = (n) => { if (n.refusedStub) return; if (n.criticalHealth) { this.push({ section: "system", subview: "health", ...(n.conn ? { conn: n.conn } : {}) }); return; } this.selectedNeed = this.replyKey(n); this.selectedNeedId = n.id; if (n.reply !== "none") this.replies[this.replyKey(n)] ??= this.makeReply(n); setOpen(`needs:${n.id}`, !(shared("rig.open.page") ?? {})[`needs:${n.id}`]); };
     const open = shared("rig.open.page") ?? {};
-    const { rows, offset, pager } = this.needsListPage(t, cx, "needs", items);
-    this.drawnNeedKeys = new Set(rows.map((n) => this.replyKey(n))); // the requests on screen: a card key acts only on one of them (routeNeedKey)
+    const { rows, offset, pager } = this.needsListPage(t, cx, "needs", display);
+    const liveRows = rows.filter((n) => !n.refusedStub);
+    this.drawnNeedKeys = new Set(liveRows.map((n) => this.replyKey(n))); // the requests on screen: a card key acts only on one of them (routeNeedKey)
+    this.needPositions ??= Object.create(null);
     return v_flex().id("need-request-list").on_key_down((e, cx) => {
       if (!["up", "down", "enter"].includes(e.key)) return;
       cx.stop_propagation();
       // Up, Down and Enter move over the shown page's rows only; Previous / Next change the page.
-      let i = rows.findIndex(n => this.replyKey(n) === this.selectedNeed);
-      if (e.key === "enter") { if (i >= 0) toggle(rows[i]); }
-      else { i = Math.max(0, Math.min(rows.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = rows[i] ? this.replyKey(rows[i]) : undefined; this.selectedNeedId = rows[i]?.id; }
+      let i = liveRows.findIndex(n => this.replyKey(n) === this.selectedNeed);
+      if (e.key === "enter") { if (i >= 0) toggle(liveRows[i]); }
+      else if (liveRows.length) { i = Math.max(0, Math.min(liveRows.length - 1, i + (e.key === "down" ? 1 : -1))); this.selectedNeed = liveRows[i] ? this.replyKey(liveRows[i]) : undefined; this.selectedNeedId = liveRows[i]?.id; }
       cx.notify();
-    }).children(items.length ? rows.map((n, at) => {
+    }).children(display.length ? rows.map((n, at) => {
       const i = offset + at;
+      if (n.refusedStub) {
+        const r = n.refusedStub;
+        return v_flex().id(`need-refused-stub-${r.id}`).gap(6).p(10).rounded(8).border_1().border_color(t.border).bg(t.raised).opacity(0.85)
+          .child(div().text_size(12.5).text_color(t.muted).truncate().child(r.summary || r.id))
+          .child(h_flex().gap(6).items_start().min_w(0)
+            .child(svg(icon("rig-alert")).size(12).flex_none().text_color(t.blocked))
+            .child(div().flex_1().min_w(0).text_size(12).text_color(t.blocked).child(this.errorText(t, `need-refused-error-${r.id}`, r.text))))
+          .child(h_flex().child(this.button(t, `need-refused-ok-${r.id}`, "OK", (_e, cx) => {
+            delete this.refused?.[r.key];
+            cx.notify();
+          }, { small: true, tip: "Dismiss this notice" })));
+      }
+      this.needPositions[this.replyKey(n)] = i;
       if (n.criticalHealth) return this.healthNeedsLine(t, n);
       // A blank summary needs the same body the expanded card uses; fetch it only for these rows.
       const queue = n.summaryIsFallback && !n.body && n.qitemId ? this.read(cx, `/api/queue/${encodeURIComponent(n.qitemId)}`).data : null;
@@ -5432,9 +5494,16 @@ export default class RigView extends View {
     const busy = Boolean(box?.busy), receipt = box?.result?.ok && qState.openCount === 0 && !qState.needsResume;
     const whose = whoseQueueSummary(perspective, this.config, n);
     const targetBox = () => this.replies[this.replyKey(n)] ??= this.makeReply(n);
+    const snapshotShown = () => ({
+      revision: queueRow?.decisionRevision ?? detailItem?.decisionRevision ?? n.decisionRevision ?? null,
+      state: queueRow?.state ?? detailItem?.state ?? n.state ?? null,
+      hadRow: Boolean(queueRow),
+    });
     const openComposer = (cx, denying = false) => {
       if (!verb || n.native || busy || check) return;
       const b = targetBox(); b.cardMode = true; b.composerOpen = true; b.denying = denying; b.result = null;
+      b.composerSnapshot = snapshotShown();
+      delete this.refused?.[this.replyKey(n)];
       this.bindReplyInput(b, denying ? `Why not? ${asker ?? "the asking seat"} reads this.` : resolve ? "Your decision, in your own words" : request ? "Your answer, what you did, or the output it asked for" : "Your answer, in your own words");
       b.input.focus(); cx?.notify?.();
     };
@@ -5443,6 +5512,8 @@ export default class RigView extends View {
     const openConfirm = (cx, which) => {
       if (!verb || n.native || busy) return;
       const b = targetBox(); b.cardMode = true; b.confirm = which; b.result = null;
+      b.confirmSnapshot = snapshotShown();
+      delete this.refused?.[this.replyKey(n)];
       if (which === "done" && !b.doneInput) {
         b.doneInput = TextareaState.new({ placeholder: "What you did", rows: 2, value: "" });
         b.doneInput.on("change", (_e, cx) => cx?.notify?.());
@@ -5504,13 +5575,15 @@ export default class RigView extends View {
     const confirming = box?.confirm === "done" || box?.confirm === "approve" ? box.confirm : null;
     const doneWords = confirming === "done" ? String(box.doneInput?.value() ?? "").trim() : "";
     const confirmReady = confirming === "approve" || !!doneWords;
-    const closeConfirm = (cx) => { if (box) box.confirm = null; this.typing = false; cx?.notify?.(); };
+    const closeConfirm = (cx) => { if (box) { box.confirm = null; box.confirmSnapshot = null; } this.typing = false; cx?.notify?.(); };
     const confirmGo = (cx) => {
       if (busy || !confirming || !confirmReady) return;
-      const which = confirming; box.confirm = null; this.typing = false;
+      const which = confirming, snap = box.confirmSnapshot ?? null;
+      box.confirm = null; box.confirmSnapshot = null; this.typing = false;
+      const snapOpts = snap ? { expectedRevision: snap.revision, expectedState: snap.state, snapshotHadRow: snap.hadRow } : {};
       // Mark done sends the person's words as their answer, so the asker hears; it never sends approve.
-      if (which === "done") send({ mode: "answer-text", text: `Done: ${doneWords}`, doneResult: `Sent to ${logical}. This request is closed.` }, cx);
-      else send({ mode: "approve" }, cx);
+      if (which === "done") send({ mode: "answer-text", text: `Done: ${doneWords}`, doneResult: `Sent to ${logical}. This request is closed.`, ...snapOpts }, cx);
+      else send({ mode: "approve", ...snapOpts }, cx);
     };
     const confirmPanel = confirming ? v_flex().id(`need-confirm-${id}`).gap(8).p(12).rounded(6).border_1().border_color(t.border).bg(t.raised)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -5704,7 +5777,13 @@ export default class RigView extends View {
       cx.timer.after(0, (next) => {
         try {
           const box = this.replies[this.replyKey(n)] ??= this.makeReply(n);
-          if (want && !box.busy) box.composerOpen = true;
+          if (want && !box.busy) {
+            box.composerOpen = true;
+            const qid = n?.qitemId ?? (String(n?.id ?? "").startsWith("queue:") ? String(n.id).slice(6) : null);
+            const row = qid ? this.cacheFor(adoptConnection(this.config, n?.conn) ?? this.activeConnId())[`/api/queue/${encodeURIComponent(qid)}`]?.data : null;
+            box.composerSnapshot = { revision: row?.decisionRevision ?? n?.decisionRevision ?? null, state: row?.state ?? n?.state ?? null, hadRow: Boolean(row) };
+            delete this.refused?.[this.replyKey(n)];
+          }
           if (want && !box.busy) { box.input.set_value((shared("rig.drafts") ?? {})[box.key] ?? ""); box.result = null; box.input.focus(); }
         } finally { this.making.delete(this.replyKey(n)); } // a box that failed to be made is tried again on the next render, never stuck
         next?.notify?.();
@@ -5768,13 +5847,13 @@ export default class RigView extends View {
     box.discardDraftUntil = 0;
     this.keepDraft(box);
     if (box.cardMode) {
-      box.composerOpen = false; box.confirmResolve = false; box.denying = false;
+      box.composerOpen = false; box.confirmResolve = false; box.denying = false; box.composerSnapshot = null;
     } else if (box.denying) {
       box.denying = false; box.result = null;
       this.bindReplyInput(box, n.reply === "resolve" || n.verb === "resolve" ? "Your decision, in your own words" : "Your answer, in your own words");
     } else {
       if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
-      box.composerOpen = false; box.confirmResolve = false; box.result = null;
+      box.composerOpen = false; box.confirmResolve = false; box.result = null; box.composerSnapshot = null;
       setOpen(`needs:${n.id}`, false);
     }
     this.typing = false;
@@ -5854,7 +5933,9 @@ export default class RigView extends View {
           return;
         }
         const qid = n.qitemId ?? detailItem?.answer?.qitemId ?? queueRow?.id ?? (String(n.id ?? "").startsWith("queue:") ? String(n.id).slice(6) : null);
-        let latestRevision = queueRow?.decisionRevision ?? detailItem?.decisionRevision ?? n.decisionRevision ?? null;
+        const hasSnapRev = act.expectedRevision !== undefined;
+        let latestRevision = hasSnapRev ? act.expectedRevision : (queueRow?.decisionRevision ?? detailItem?.decisionRevision ?? n.decisionRevision ?? null);
+        const expectedState = act.expectedState ?? queueRow?.state ?? detailItem?.state ?? n.state ?? null;
         if ((latestRevision === null || latestRevision === undefined) && qid) {
           try {
             const qr = await op.fetch(`${daemonUrl}/api/queue/${encodeURIComponent(qid)}`);
@@ -5874,9 +5955,12 @@ export default class RigView extends View {
           destinationSession: queueRow?.destinationSession ?? n.destinationSession,
           qitemId: qid,
           decisionRevision: latestRevision ?? undefined,
+          ...(expectedState ? { state: expectedState } : {}),
         };
         const actWithProgress = {
           ...act,
+          expectedRevision: latestRevision ?? undefined,
+          ...(expectedState ? { expectedState } : {}),
           queueRow, // the guard in submitMissionActions sends approve only for a row saying humanIntent "decision"
           onStep: (step, total) => {
             box.stepProgress = { step, total };
@@ -5889,22 +5973,88 @@ export default class RigView extends View {
             }
           },
         };
-        const outcome = await submitMissionActions(config, itemForAction, actWithProgress, async (req) => {
-          posted = true; // from here a POST may have left: nothing that escapes later is "nothing was sent"
-          const r = await op.fetch(`${daemonUrl}${req.path}`, {
-            method: req.method ?? "POST",
-            headers: req.headers ?? { "content-type": "application/json" },
-            body: JSON.stringify(req.body),
+        // Guaranteed vs best-effort boundary:
+        // - Daemon-atomic: every revision-changing transition (closed, blocked, body/question/answer edits) via `expectedRevision`,
+        //   plus `pending -> in-progress` on Mark done / Reply / Choices / Resume (`verb: "answer"`, rejected by daemon `answerAsk`).
+        // - Client best-effort pre-check (below): OpenRig's `POST /api/mission-control/action` has no `expectState` parameter, and
+        //   `decisionRevision` collapses `pending` and `in-progress` into `phase: "open"` while `approve`/`deny` allow `in-progress`.
+        //   When the daemon supports `decisionRevision` and we snapshotted the shown state, verify `GET /api/queue/:qid` before POSTing
+        //   and refuse honestly on any mismatch or failed/malformed read (never silently falling through to POST). A transition landing
+        //   between this GET and the POST that keeps the same open-phase revision cannot be rejected atomically on this API.
+        let outcome = null;
+        const resolvedVerb = resolveMissionVerb(itemForAction, actWithProgress);
+        if ((resolvedVerb === "approve" || resolvedVerb === "deny")
+          && (resolvedVerb !== "approve" || isDecisionAsk(itemForAction, queueRow))
+          && latestRevision !== null && latestRevision !== undefined && expectedState && qid) {
+          const stateCheckFailed = (reason) => ({
+            ok: false,
+            status: 0,
+            code: "state_check_failed",
+            conflict: false,
+            notSent: true,
+            message: reason,
+            text: reason,
+            committedQuestionIds: [],
+            stepsCompleted: 0,
           });
-          let data = null;
-          const rawText = await r.text();
-          try { data = JSON.parse(rawText); } catch (_) { data = { error: rawText }; }
-          return { ok: r.ok, status: r.status, data, error: data?.error ?? data?.message ?? null };
-        });
+          try {
+            const qr = await op.fetch(`${daemonUrl}/api/queue/${encodeURIComponent(qid)}`);
+            if (!qr.ok) {
+              outcome = stateCheckFailed(qr.status === 404
+                ? "That request isn't in OpenRig's queue any more. Nothing was sent."
+                : `OpenRig couldn't check this request's current state (HTTP ${qr.status}). Nothing was sent.`);
+            } else {
+              let qd = null;
+              try { qd = await qr.json(); } catch (_) { qd = null; }
+              if (!qd || typeof qd !== "object" || qd.error || typeof qd.state !== "string" || !qd.state.trim()) {
+                outcome = stateCheckFailed("OpenRig returned an unreadable queue row while checking its current state. Nothing was sent.");
+              } else {
+                this.cacheFor(config.connectionId)[`/api/queue/${encodeURIComponent(qid)}`] = { data: qd, status: qr.status, at: Date.now() };
+                const stateMoved = qd.state !== expectedState;
+                const revMoved = qd.decisionRevision !== undefined && qd.decisionRevision !== null && String(qd.decisionRevision) !== String(latestRevision);
+                if (stateMoved || revMoved) {
+                  const code = stateMoved ? "qitem_state_changed" : "decision_revision_changed";
+                  const message = formatSafeCloseConflict({ code, currentState: qd.state, expectedState });
+                  outcome = {
+                    ok: false,
+                    status: 409,
+                    code,
+                    conflict: true,
+                    notSent: true,
+                    currentState: qd.state,
+                    message,
+                    text: message,
+                    data: qd,
+                    committedQuestionIds: [],
+                    stepsCompleted: 0,
+                  };
+                }
+              }
+            }
+          } catch (e) {
+            rethrowGate(null)(e);
+            outcome = stateCheckFailed("OpenRig couldn't be checked for this request's current state. Nothing was sent.");
+          }
+        }
+        if (!outcome) {
+          outcome = await submitMissionActions(config, itemForAction, actWithProgress, async (req) => {
+            posted = true; // from here a POST may have left: nothing that escapes later is "nothing was sent"
+            const r = await op.fetch(`${daemonUrl}${req.path}`, {
+              method: req.method ?? "POST",
+              headers: req.headers ?? { "content-type": "application/json" },
+              body: JSON.stringify(req.body),
+            });
+            let data = null;
+            const rawText = await r.text();
+            try { data = JSON.parse(rawText); } catch (_) { data = { error: rawText }; }
+            return { ok: r.ok, status: r.status, data, error: data?.error ?? data?.message ?? null };
+          });
+        }
 
         box.busy = false;
         box.stepProgress = null;
         if (outcome.ok) {
+          delete this.refused?.[this.replyKey(n)];
           if (act.mode === "choices") {
             const nextChoices = { ...(this.questionChoices[this.replyKey(n)] ?? {}) };
             for (const c of act.choices ?? []) delete nextChoices[c.questionId];
@@ -5920,6 +6070,7 @@ export default class RigView extends View {
               box.pendingPlaceholder = (n.reply === "resolve" || n.verb === "resolve") ? "Your decision, in your own words" : "Your answer, in your own words";
             }
             box.confirmResolve = false;
+            box.composerSnapshot = null;
             delete this.questionChoices[this.replyKey(n)];
           }
           if (shared("rig.focusNeed") === n.id) setShared("rig.focusNeed", null);
@@ -5940,14 +6091,35 @@ export default class RigView extends View {
             if (qid) this.read(cx, `/api/queue/${encodeURIComponent(qid)}`, true, null, rereadCfg);
           }
         } else {
+          if (outcome.conflict) {
+            box.conflictAwaitingRefresh = true;
+            box.composerSnapshot = null;
+            (this.refused ??= Object.create(null))[this.replyKey(n)] = {
+              id: n.id,
+              qitemId: qid,
+              summary: requestHeadline(n),
+              asker: n.asker ?? n.sourceSession ?? queueRow?.sourceSession ?? null,
+              text: outcome.text || "Not recorded: the request changed while you had it open. Here it is now; check it and answer again.",
+              state: outcome.currentState ?? outcome.data?.state ?? null,
+              at: Date.now(),
+              conn: adoptConnection(this.config, n?.conn) ?? null,
+              listEpoch: this.needsPageEpoch ?? 0,
+              filter: this.filter?.toLowerCase() ?? "",
+              position: this.needPositions?.[this.replyKey(n)] ?? 0,
+              unfilteredPosition: this.needUnfilteredPositions?.[this.replyKey(n)] ?? this.needPositions?.[this.replyKey(n)] ?? 0,
+            };
+            refreshSidebar();
+          }
           if (outcome.conflict || outcome.settingsChanged || outcome.partial) { // a settings change or partial stop mid-answer also leaves recorded steps: the card drops them and re-reads the item
             if (Array.isArray(outcome.committedQuestionIds) && outcome.committedQuestionIds.length > 0) {
               const nextChoices = { ...(this.questionChoices[this.replyKey(n)] ?? {}) };
               for (const qId of outcome.committedQuestionIds) delete nextChoices[qId];
               this.questionChoices[this.replyKey(n)] = nextChoices;
             }
+            const viewParam = shared("rig.needsView") ?? null;
             const rereadCfg = configOfConnection(this.config, config.connectionId);
             if (rereadCfg) {
+              if (outcome.conflict) this.read(cx, viewParam ? `/api/attention?view=${encodeURIComponent(viewParam)}` : "/api/attention", true, null, rereadCfg);
               this.read(cx, `/api/attention?item=${encodeURIComponent(n.id)}`, true, null, rereadCfg);
               if (qid) this.read(cx, `/api/queue/${encodeURIComponent(qid)}`, true, null, rereadCfg);
             }
@@ -5956,7 +6128,7 @@ export default class RigView extends View {
             box.result = {
               ok: false,
               networkError: true,
-              retryAct: { ...act, operationHashPrefix: outcome.operationHashPrefix },
+              retryAct: { ...act, expectedRevision: latestRevision ?? undefined, ...(expectedState ? { expectedState } : {}), operationHashPrefix: outcome.operationHashPrefix },
               text: outcome.text || NETWORK_UNCONFIRMED_MESSAGE,
             };
           } else {
@@ -5998,15 +6170,17 @@ export default class RigView extends View {
     const cache = this.cacheFor(adoptConnection(this.config, n?.conn) ?? this.activeConnId()); // the request's own OpenRig's reads, not the page shown now
     const queueRow = qid ? cache[`/api/queue/${encodeURIComponent(qid)}`]?.data : null;
     const detailItem = cache[`/api/attention?item=${encodeURIComponent(n.id)}`]?.data?.detail?.item ?? null;
+    const snap = box.composerSnapshot ?? null;
+    const snapOpts = snap ? { expectedRevision: snap.revision, expectedState: snap.state, snapshotHadRow: snap.hadRow } : {};
     if (box.denying) {
-      this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "deny", decision: text });
+      this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "deny", decision: text, ...snapOpts });
       return;
     }
     if (n?.reply === "resolve" || n?.verb === "resolve") {
-      this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "resolve", decision: text });
+      this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "resolve", decision: text, ...snapOpts });
       return;
     }
-    this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "freeform", decision: text });
+    this.submitCardDecision(cx, n, detailItem, queueRow, { mode: "freeform", decision: text, ...snapOpts });
   }
 
   replyBox(t, cx, n, { detailItem = null, queueRow = null, onSomeoneAskText = null } = {}) {
@@ -7051,7 +7225,13 @@ export default class RigView extends View {
     // events and operations resolve it afresh after render's finally has cleared the memo.
     if (this.renderMemo) this.renderMemo.routeReady = true;
     const graphShown=this.shownEntry(),graphNav=navKey(graphShown)+":"+(graphShown?.tab??"");
-    if(this.graphNav!==graphNav){for(const graph of this.graphs?.values()??[])graph.reset();this.graphWork?.leave();this.graphNav=graphNav;}
+    if(this.graphNav!==graphNav){
+      if(this.graphNav!==undefined){
+        this.needsPageEpoch=(this.needsPageEpoch??0)+1;
+        if(this.refused)for(const[k,v]of Object.entries(this.refused))if(v.listEpoch!==this.needsPageEpoch)delete this.refused[k];
+      }
+      for(const graph of this.graphs?.values()??[])graph.reset();this.graphWork?.leave();this.graphNav=graphNav;
+    }
     this.textSeq = 0;
     // Collect only rows the active native render actually builds (expanded rigs/pods and the open seat).
     // Existing timers merely mark refresh due; hidden page copies never start tail reads from a timer.

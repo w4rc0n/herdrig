@@ -46,7 +46,7 @@ const hc = (args, bytes) => gatedHc(rawHc, args, bytes);
 const run = (name, args) => gatedRun(rawRun, name, args);
 // A send for a CONNECTION names its gate scope (several OpenRigs: a bare sink refuses). `config` is that connection's own config.
 const fetchFor = (config) => (url, init) => gatedFetch(url, init, undefined, config?.connectionId);
-const execFor = (config) => (command, args, options) => gatedExec(rawExec, command, args, options, undefined, config?.connectionId, appHome());
+const execFor = (config, since) => (command, args, options) => gatedExec(rawExec, command, args, options, since, config?.connectionId, appHome());
 const hcFor = (config) => (args, bytes) => gatedHc(rawHc, args, bytes, undefined, config?.connectionId);
 const runFor = (config) => (name, args) => gatedRun(rawRun, name, args, config?.connectionId);
 
@@ -72,7 +72,7 @@ const net = { connect: (host, port) => gatedConnect((h, p) => rawNet.connect(h, 
 const netFor = (config) => (host, port) => gatedConnect((h, p) => rawNet.connect(h, p), host, port, config?.connectionId);
 import {
   stampRows, messageDialogSpace, rowsIdentityOf, ROWS_STALE, MOD_IDS, STATE_COPY, NO_PERSON, ACTION_REFUSED, TERMINAL_TOKEN_PROTECTED, REMOTE_OPERATOR_REASON, s1CopyLine, routeRigOpen, registerRigRouting,
-  utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine, sameDaemon,
+  utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine, sameDaemon, kernelOperatorReady, cliRefusal,
   buildTopology, readRigRepresentative, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
   asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, isOpenNeed, requestHeadline, sweepFinding, checkLabel,
@@ -273,6 +273,26 @@ const QUIET_RECONCILE_MS = 60_000;
 /** Herdr 0.1.18 reports `window()?.visible === false` while hidden; older Herdr (undefined) and `herdr-app check` (null) count as visible. */
 const windowHidden = () => window()?.visible === false;
 const dismissibleOperatorBanner = sub => sub === "5b" || sub === "5c";
+const OPERATOR_RECHECK_MS = [5000, 15000, 30000, 60000];
+const OPERATOR_FOCUS_GAP_MS = 10000;
+const OPERATOR_START_FAILED = "OpenRig couldn't start its operator. Copy the command to run it yourself.";
+
+function operatorStartFailure(stdout) {
+  if (typeof stdout !== "string") return OPERATOR_START_FAILED;
+  const tail = stdout.slice(-16384).trimEnd();
+  const newline = tail.lastIndexOf("\n");
+  if (newline < 0 && stdout.length > 16384) return OPERATOR_START_FAILED;
+  let reply;
+  try { reply = JSON.parse(tail.slice(newline + 1)); } catch { return OPERATOR_START_FAILED; }
+  switch (reply?.code ?? reply?.error) {
+    case "rig_not_found": return "OpenRig couldn't find its operator rig, so there was nothing to start.";
+    case "rig_not_stopped": return "Some of the operator's sessions are still running, so OpenRig didn't start it again.";
+    case "rig_archived": return "OpenRig's operator rig is archived. Restore it, then start it again.";
+    case "ambiguous_name": return "OpenRig has more than one rig named kernel, so it didn't start either. rig ps lists them.";
+    default: return OPERATOR_START_FAILED;
+  }
+}
+const KERNEL_STATES = new Set(["skipped", "auth_blocked", "spec_missing", "booting", "partial_ready", "ready", "bootstrap_failed", "degraded"]);
 const operatorBannerScope = config => config?.daemonUrl
   ? JSON.stringify([config.connectionId ?? LEGACY_CONNECTION_ID, config.daemonMachine ?? null, config.daemonUrl]) : null;
 /** Whether an OpenRig honoured `kind=action`: one that does names the narrowed read among its sources; an older one ignores the parameter
@@ -396,6 +416,7 @@ export default class RigSidebar extends View {
     cx.timer.every(1000, (cx) => {
       if (this.closed) return;
       this.checkRigLayoutNotice(cx);
+      this.tickOperatorChecks(cx);
       const hidden = windowHidden();
       if (hidden) this.wasHidden = true;
       this.checkInterruptedOpens(cx);
@@ -714,10 +735,12 @@ export default class RigSidebar extends View {
     notify({ title: "OpenRig", level: "warning", body });
   }
 
-  persistSidebarState(openMap = this.viewState("rig.open.sidebar"), orderMap = shared("rig.order"), operatorBannerChange) {
+  persistSidebarState(openMap = this.viewState("rig.open.sidebar"), orderMap = shared("rig.order")) {
     if (typeof appHome !== "function" || typeof writeTextFile !== "function") return;
     const path = `${appHome()}/openrig/state.json`;
     this.sidebarPersist=(this.sidebarPersist??Promise.resolve()).catch(()=>{}).then(async () => {
+      const pending = this.pendingOperatorBannerChanges;
+      const operatorBannerChanges = pending ? [...pending.values()] : [];
       const error = await saveStateFile({ path, read: (p) => readTextFile?.(p), write: writeTextFile, build: (prevText) => {
         const primary=this.primaryStateId(),views=cleanSidebarViews(shared('rig.sidebar.views'));
         views[primary]=cleanSidebarView({topologyView:this.viewState('rig.topology.view',primary),open:this.viewState('rig.open.sidebar',primary),selection:this.viewState('rig.sel',primary)});
@@ -744,10 +767,13 @@ export default class RigSidebar extends View {
           needsView: shared("rig.needsView"),
           lastEndedModeApplicationId: shared("rig.lastEndedModeApplicationId"),
           lastActiveModeApplicationId: shared("rig.lastActiveModeApplicationId"),
-          operatorBannerChange,
+          operatorBannerChanges,
         });
       } });
-      this.sayStateSave(error, operatorBannerChange ? "which operator notice you dismissed" : undefined);
+      if (!error) for (const change of operatorBannerChanges) {
+        if (pending.get(change.scope) === change) pending.delete(change.scope);
+      }
+      this.sayStateSave(error, operatorBannerChanges.length ? "which operator notice you dismissed" : undefined);
     }).catch(() => {});
     return this.sidebarPersist;
   }
@@ -755,14 +781,30 @@ export default class RigSidebar extends View {
   saveOperatorBannerDismissal(scope, substate) {
     const hidden = shared("rig.operatorBannerHidden") ?? {};
     setShared("rig.operatorBannerHidden", { ...hidden, [scope]: substate });
-    return this.persistSidebarState(undefined, undefined, { scope, substate });
+    (this.pendingOperatorBannerChanges ??= new Map()).set(scope, { scope, substate });
+    return this.persistSidebarState();
   }
 
   observeOperatorBanner(feed) {
     const scope = operatorBannerScope(feed.config);
     const hidden = scope && shared("rig.operatorBannerHidden")?.[scope];
+    if (feed.operatorStart && !feed.operatorStart.busy && feed.sidebarState?.substate !== "5b") feed.operatorStart = null;
     // Only a successful read retires a dismissal for a previous condition.
     if (hidden && hidden !== feed.sidebarState?.substate) this.saveOperatorBannerDismissal(scope, null);
+  }
+
+  beginOperatorRead(feed) {
+    feed.operatorReadGeneration = (feed.operatorReadGeneration ?? 0) + 1;
+    return feed.operatorReadGeneration;
+  }
+
+  /** Apply only observations at least as recent as the last published read for this connection. */
+  publishOperatorState(feed, generation, state, observed) {
+    if (generation < (feed.operatorStateGeneration ?? 0)) return false;
+    feed.operatorStateGeneration = generation;
+    feed.sidebarState = state;
+    if (observed) this.observeOperatorBanner(feed);
+    return true;
   }
 
   /** Reads the config again; a change takes effect at once: a new daemon reconnects the stream. */
@@ -952,6 +994,131 @@ export default class RigSidebar extends View {
       }
     });
     return true;
+  }
+
+  canStartOperator(feed, config) {
+    return this.stillCurrent(feed, config) && !feed.error && feed.sidebarState?.substate === "5b"
+      && !config?.daemonMachine && isLoopbackDaemonUrl(config?.daemonUrl)
+      && Boolean(feed.healthz?.selfHostId) && !cliRefusal(config);
+  }
+
+  scheduleOperatorChecks(feed, config) {
+    const now = Date.now();
+    feed.operatorChecks = { config, due: OPERATOR_RECHECK_MS.map(ms => now + ms) };
+  }
+
+  /** Use the sidebar's owning timer and coalesce elapsed deadlines after sleep or a busy read. */
+  tickOperatorChecks(cx, now = Date.now()) {
+    const active = window()?.active;
+    const focusedFeed = active === true && this.operatorWindowActive === false
+      && now - (this.lastOperatorFocusCheck ?? -Infinity) >= OPERATOR_FOCUS_GAP_MS ? this.followedFeed() : null;
+    if (typeof active === "boolean") this.operatorWindowActive = active;
+    for (const feed of this.feeds) {
+      let checks = feed.operatorChecks;
+      if (checks && !this.stillCurrent(feed, checks.config)) feed.operatorChecks = checks = null;
+      if (feed.operatorReading || !feed.config?.daemonUrl) continue;
+      const onFocus = feed === focusedFeed;
+      if (!onFocus && !(checks?.due[0] <= now)) continue;
+      if (onFocus) this.lastOperatorFocusCheck = now;
+      if (checks) checks.due = checks.due.filter(at => at > now);
+      this.runOperatorCheck(cx, feed, feed.config, checks);
+    }
+  }
+
+  runOperatorCheck(cx, feed, config, checks) {
+    feed.operatorReading = true;
+    cx.spawn(async task => {
+      try { await this.recheckOperator(task, feed, config); }
+      finally {
+        feed.operatorReading = false;
+        if (checks && feed.operatorChecks === checks && !checks.due.length) {
+          feed.operatorChecks = null;
+          const start = feed.operatorStart;
+          if (start?.confirming && sameConnectionConfig(start.config, config) && this.stillCurrent(feed, config)) {
+            start.busy = false;
+            start.confirming = false;
+            start.error = "OpenRig accepted the start command. Its operator hasn't reported ready yet.";
+            task.notify();
+          }
+        }
+      }
+    });
+  }
+
+  async recheckOperator(cx, feed, config) {
+    if (!this.stillCurrent(feed, config)) return;
+    const op = gatedOperationOrRefusal(config.connectionId);
+    try {
+      if (config.daemonUrlSource === "cli") {
+        const expected = feed.healthz;
+        const health = await this.get("/healthz", feed, op);
+        if (!sameDaemon(expected, health)) return; // normal refresh will rediscover the CLI address
+      }
+      const generation = this.beginOperatorRead(feed);
+      const kernelStatus = await this.get("/api/kernel/status", feed, op);
+      op.check();
+      if (!this.stillCurrent(feed, config) || !KERNEL_STATES.has(kernelStatus?.kernel_state)) return;
+      const ready = kernelOperatorReady(kernelStatus)
+        || (kernelStatus.kernel_state === "ready" && !Array.isArray(kernelStatus.agents));
+      if (!ready && ["ready", "partial_ready"].includes(kernelStatus.kernel_state)) return;
+      const state = selectSidebarState({ kernelStatus, capabilities: feed.data?.capabilities });
+      const changed = !sameValue(state, feed.sidebarState);
+      if (!this.publishOperatorState(feed, generation, state, true)) return;
+      if (changed) {
+        if (feed.data) feed.data = { ...feed.data, sidebarState: state };
+        this.publishData(cx, feed);
+      }
+      if (state.id === "S4") {
+        feed.operatorChecks = null;
+        const start = feed.operatorStart;
+        if (state.operatorDisabled && start?.confirming) feed.operatorStart = null;
+        if (ready && start?.confirming && this.stillCurrent(feed, start.config)) {
+          feed.operatorStart = null;
+          notify({ title: "OpenRig's operator is running", level: "info" });
+          cx.notify();
+        }
+      }
+    } catch {
+      // This is an extra read. Keep the last known state and let ordinary connection recovery report failures.
+    }
+  }
+
+  startOperator(cx, feed, config, expected) {
+    if (!this.canStartOperator(feed, config) || (feed.operatorStart?.busy && this.stillCurrent(feed, feed.operatorStart.config))) return;
+    const start = feed.operatorStart = { config, busy: true, confirming: false, error: null };
+    const op = gatedOperationOrRefusal(config.connectionId);
+    cx.notify();
+    return cx.spawn(async task => {
+      try {
+        const kernelStatus = await this.get("/api/kernel/status", feed, op);
+        const health = await this.get("/healthz", feed, op);
+        op.check();
+        if (!this.canStartOperator(feed, config) || !sameDaemon(expected, health)) {
+          start.error = "The OpenRig connection changed. Refresh it before trying again.";
+          return;
+        }
+        if (selectSidebarState({ kernelStatus }).substate !== "5b") {
+          await this.recheckOperator(task, feed, config);
+          return;
+        }
+        const cmd = readCommand({ ...config, daemonUrlSource: "config" }, ["up", "kernel", "--existing", "--json"],
+          { env: ["OPENRIG_HOST_SELECTED=local"] });
+        const result = await execFor(config, op.since)(cmd.command, cmd.args, { timeout: 180000 });
+        if (!this.stillCurrent(feed, config)) return;
+        if (result?.code !== 0) {
+          start.error = operatorStartFailure(result?.stdout);
+          return;
+        }
+        start.confirming = true;
+        this.scheduleOperatorChecks(feed, config);
+        await this.recheckOperator(task, feed, config);
+      } catch {
+        start.error = "herdrig couldn't confirm whether OpenRig started its operator. This note goes once it's up; check Topology before trying again.";
+      } finally {
+        if (!start.confirming) start.busy = false;
+        if (this.stillCurrent(feed, config)) task.notify();
+      }
+    });
   }
 
   /** Start the OpenRig daemon from S2 (`rig daemon start`, 180 s timeout). */
@@ -2872,6 +3039,7 @@ export default class RigSidebar extends View {
     if (!feed.config || feed.refreshing) { feed.again = true; return; }
     feed.refreshing = true;
     let probed = null;
+    let operatorRead = this.beginOperatorRead(feed);
     // ONE operation for the whole refresh, taken before the first await: every read below goes through it, so a settings change that lands between two reads refuses the rest
     // instead of mixing two daemons' answers, and nothing is published for the config that is gone.
     op = gatedOperationOrRefusal(feed.config.connectionId); // the scope is this feed's connection (the gate keys by it)
@@ -2905,7 +3073,7 @@ export default class RigSidebar extends View {
         if (probed.cliVersion) feed.cliVersion = probed.cliVersion;
         if (probed.healthzProbe?.data) feed.healthz = steadyHealthz(probed.healthzProbe.data);
         if (!probed.daemonUrl || probed.state.id === "S1" || probed.state.id === "S2" || probed.state.id === "S3" || probed.state.id === "S7") {
-          feed.sidebarState = probed.state;
+          this.publishOperatorState(feed, operatorRead, probed.state, false);
           if (probed.state.id === "S1" || probed.state.id === "S2" || probed.state.id === "S7") {
             feed.data = null;
             feed.live = false;
@@ -2954,6 +3122,7 @@ export default class RigSidebar extends View {
         const initialPerson=feed.config.person?String(feed.config.person).replace(/@external$/i,''):null;
         // Kick independent reads together; only nodes and detail rows wait on their own parent response.
         // The transport can batch these without a debounce timer or a captured post-await view context.
+        operatorRead = this.beginOperatorRead(feed);
         const [tz,summary,hostedMembers,attention,attentionHealth,attentionAgg,native,hzRes,krRes,initialQuiet]=await Promise.all([
           get('/api/config/ui.timezone').catch(rethrowGate(null)),summaryRead,
           feed.hostedReader.read(op.fetch,feed.config,(ms,done)=>cx.timer.after(ms,done,{owner:null})),attentionRead,detailRead,
@@ -3035,7 +3204,7 @@ export default class RigSidebar extends View {
         const kernelRig = summary.find((r) => r && !r.archivedAt && r.name === "kernel") ?? null;
         const kernelNodes = kernelRig ? (nodesByRig[kernelRig.id] ?? null) : null;
         const strictKernel = Boolean(probed?.statusProbe || kernelStatus !== null || feed.config?.missing || feed.config?.daemonUrlSource === "cli");
-        feed.sidebarState = selectSidebarState({
+        const sidebarState = selectSidebarState({
           versionProbe: probed?.versionProbe ?? { installed: true, code: 0, cliVersion: feed.cliVersion },
           statusProbe: probed?.statusProbe ?? null,
           healthzProbe: probed?.healthzProbe ?? (feed.healthz ? { ok: true, data: feed.healthz } : null),
@@ -3046,7 +3215,7 @@ export default class RigSidebar extends View {
           sidebarModId: MOD_IDS.sidebar,
           strictKernel,
         });
-        if (kernelStatus || kernelNodes?.length) this.observeOperatorBanner(feed);
+        this.publishOperatorState(feed, operatorRead, sidebarState, kernelStatus || kernelNodes?.length);
         const versionLine = formatOpenRigVersionLine({ healthz: feed.healthz, cliVersion: feed.cliVersion });
         const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
         feed.data = {
@@ -3081,6 +3250,7 @@ export default class RigSidebar extends View {
       const errMsg = e?.code === "GATE_REFUSED" ? e.message : runtimeError ? codeErrorMessage(e) : refreshFailureMessage(e, "Couldn't refresh OpenRig. Check the connection and retry.", { single: this.feeds.length < 2, machine: feed.config?.daemonMachine ?? null });
       feed.error = errMsg;
       feed.needsApproval = needsHelperApproval(e, feed.config); feed.approvalUpdated = feed.needsApproval && e?.confirmation?.updated === true; feed.approvalsUnreadable = e?.approvalsUnreadable === true; // a herdr:// connection asking for its helper approval again: "Approve helper…"
+      let sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Couldn't read OpenRig: a herdrig error." : STATE_COPY.S3.headline, detail: errMsg };
       if (!feed.data) {
         // Display only (what the sidebar says while the feed is down): a refusal here (several connections, a changed config) is not worth escaping the error handler for, and it must never
         // keep the other feeds from starting.
@@ -3090,13 +3260,10 @@ export default class RigSidebar extends View {
           { exec: execFor(feed.config), fetch: op.fetch, sidebarModId: MOD_IDS.sidebar },
         ).catch(() => null);
         if (fallbackProbe && (fallbackProbe.state.id === "S1" || fallbackProbe.state.id === "S2" || fallbackProbe.state.id === "S7")) {
-          feed.sidebarState = fallbackProbe.state;
-        } else {
-          feed.sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Couldn't read OpenRig: a herdrig error." : STATE_COPY.S3.headline, detail: errMsg };
+          sidebarState = fallbackProbe.state;
         }
-      } else {
-        feed.sidebarState = { id: "S3", substate: null, headline: runtimeError ? "Couldn't read OpenRig: a herdrig error." : STATE_COPY.S3.headline, detail: errMsg };
       }
+      this.publishOperatorState(feed, operatorRead, sidebarState, false);
       if (!shared("rig.capabilities") && !feed.config?.capabilities) {
         setShared("rig.capabilities", { probed: false });
       }
@@ -3420,6 +3587,7 @@ export default class RigSidebar extends View {
         rig.hostKnown = Boolean(known);
         if (rig.nodesUnavailable) rig.host = known || "Host unknown";
       }
+      const operatorRead = this.beginOperatorRead(feed);
       const kernelStatus = await get("/api/kernel/status").catch(rethrowGate(null));
       const providerStatus = await get("/api/terminal/status?provider=herdr-app").catch(rethrowGate(null));
       const measured = herdrAppAvailability(providerStatus, feed.config.daemonMachine), force = Boolean(feed.forceCapabilityProbe);
@@ -3429,13 +3597,13 @@ export default class RigSidebar extends View {
       op.check(); // a change of this connection while the refresh ran: nothing of it is published
       const kernelRig = summary.find(r => !r.archivedAt && r.name === "kernel");
       const kernelNodes = kernelRig ? nodesByRig[kernelRig.id] : null;
-      feed.sidebarState = selectSidebarState({
+      const sidebarState = selectSidebarState({
         versionProbe: { installed: true, code: 0, cliVersion: feed.cliVersion },
         healthzProbe: feed.healthz ? { ok: true, data: feed.healthz } : null,
         summary, kernelStatus, kernelNodes,
         strictKernel: kernelStatus !== null, sidebarModId: MOD_IDS.sidebar,
       });
-      if (kernelStatus || kernelNodes?.length) this.observeOperatorBanner(feed);
+      this.publishOperatorState(feed, operatorRead, sidebarState, kernelStatus || kernelNodes?.length);
       const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
       feed.data = { daemonUrl: feed.config.daemonUrl, topology, attention: attentionItems ? needsRequestCount(topology, attentionItems) : null, attentionItems, attentionRaw: raw ?? [], hostedMembers,
         attentionHealth: attentionHealth?.records ?? [], attentionPerspective: attention?.perspective ?? null,
@@ -4050,16 +4218,8 @@ export default class RigSidebar extends View {
     const baseHeadline = this.sidebarState.headline ?? STATE_COPY[sub]?.headline ?? STATE_COPY["5d"].headline;
     const machine = feed.config?.daemonMachine ?? (isLoopbackDaemonUrl(feed.config?.daemonUrl) ? "this computer" : "OpenRig's machine");
     const headline = this.feeds.length > 1 ? baseHeadline.replace(/^OpenRig's operator\b/, `OpenRig's operator on ${machine}`) : baseHeadline;
-    const copyText = this.sidebarState.copyText ?? STATE_COPY[sub]?.copyText ?? null;
-    const actionLabel = this.sidebarState.actionLabel ?? STATE_COPY[sub]?.actionLabel ?? null;
+    const detail = STATE_COPY[sub]?.detail?.replace("on this computer", `on ${machine}`);
     const stateWord = this.sidebarState.stateWord ?? null;
-    const copyKey = `s5:${scope}:${sub}`;
-    const copied = this.copiedKey === copyKey;
-    const copy = cx => {
-      if (!this.copyToClipboard(cx, copyText, copyKey) || !dismissibleOperatorBanner(sub)) return;
-      const next = sub === "5b" ? " This note goes once the operator is up." : "";
-      notify({ title: `Copied: ${copyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
-    };
     return v_flex().id(`rig-banner-${sub}`).mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
       .child(h_flex().gap(6).items_start().justify_between()
         .child(v_flex().flex_1().min_w_0().child(div().text_size(11.5).text_color(t.muted).child(headline)))
@@ -4072,15 +4232,43 @@ export default class RigSidebar extends View {
             this.saveOperatorBannerDismissal(scope, sub);
             cx?.notify?.();
           }, el => el.border_1().border_color(t.accent)))))
-      .when(Boolean(STATE_COPY[sub]?.detail), el => el.child(div().text_size(11).text_color(t.dim).child(STATE_COPY[sub].detail)))
+      .when(Boolean(detail), el => el.child(div().text_size(11).text_color(t.dim).child(detail)))
       .when(Boolean(stateWord), el => el.child(div().text_size(11).text_color(t.dim).child(statusWord(stateWord, "startup"))))
-      .when(Boolean(actionLabel && copyText), el => el.child(h_flex().child(
-          focusTarget(this,this.focusRenderCx,`rig-s5-copy-${sub}`,
-            div().id(`rig-s5-copy-${sub}`).flex_none().px(7).h(20).rounded(4).bg(t.chrome).flex().items_center().cursor_pointer()
-              .text_size(11).text_color(copied ? (t.working ?? t.accent) : t.accent).hover((s) => s.bg(t.hover)),
-            copy,el=>el.border_1().border_color(t.accent))
-            .child(copied ? "Copied" : actionLabel)
-        )));
+      .child(this.operatorRecoveryActions(t, this.focusRenderCx, feed, sub, machine, false));
+  }
+
+  operatorRecoveryActions(t, cx, feed, sub, machine, system) {
+    const config = feed.config;
+    const expected = feed.healthz;
+    const copyText = feed.sidebarState?.copyText ?? STATE_COPY[sub]?.copyText;
+    const actionLabel = feed.sidebarState?.actionLabel ?? STATE_COPY[sub]?.actionLabel;
+    if (!copyText || !actionLabel) return null;
+    const start = feed.operatorStart && this.stillCurrent(feed, feed.operatorStart.config) ? feed.operatorStart : null;
+    const copyKey = `s5:${operatorBannerScope(config)}:${sub}`;
+    const copied = this.copiedKey === copyKey;
+    const copy = child => {
+      if (!this.copyToClipboard(child, copyText, copyKey) || !dismissibleOperatorBanner(sub)) return;
+      const next = sub === "5b" ? " This note goes once the operator is up." : "";
+      notify({ title: `Copied: ${copyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
+      if (this.stillCurrent(feed, config) && !start?.confirming) this.scheduleOperatorChecks(feed, config);
+    };
+    const button = (id, label, action, color, background) => {
+      const row = div().id(id).flex_none().px(7).h(20).rounded(4).bg(background).flex().items_center()
+        .text_size(11).text_color(color).child(label);
+      return action ? focusTarget(this, cx, id, row.cursor_pointer().hover(el => el.bg(t.hover)), action,
+        el => el.border_1().border_color(t.accent)) : row;
+    };
+    const startId = system ? "system-operator-start" : `rig-s5-start-${sub}`;
+    const copyId = system ? "system-operator-copy" : `rig-s5-copy-${sub}`;
+    return v_flex().gap(4)
+      .child(h_flex().gap(5)
+        .when(this.canStartOperator(feed, config), el => el.child(button(startId,
+          start?.busy ? "Starting…" : system ? "Start…" : "Start operator",
+          start?.busy ? null : child => this.startOperator(child, feed, config, expected),
+          start?.busy ? t.dim : t.accent, t.hover)))
+        .child(button(copyId, copied ? "Copied" : actionLabel, copy, copied ? (t.working ?? t.accent) : t.accent, t.chrome)))
+      .when(Boolean(start?.error) && sub === "5b", el => el.child(div().id(system ? "system-operator-error" : "rig-operator-start-error")
+        .text_size(11).text_color(t.blocked).child(plainError(start.error).text)));
   }
 
   /** The always-visible marker under the header after a failed read while the sidebar still holds data: "Not answering · as of HH:MM"
@@ -4388,18 +4576,22 @@ export default class RigSidebar extends View {
       const rKey = rigKey(rig.id);
       const openRig = rigFoldOpen(rig, rigSeats, folds);
       const stoppedRig = isRigStopped(rig.lifecycle, rigSeats);
+      const kernelDisabled = rig.name === "kernel" && this.sidebarState?.operatorDisabled;
+      const rigMenu = () => this.menu({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle,
+        ...(kernelDisabled ? { operatorDisabled: true } : {}), orderGroupKey: `rig:${rig.id}:pods` }, 320, rKey);
       const views = this.otherConnection(rig) ? [] : viewsForRig(strip, rig.pods.flatMap((p) => p.seats.map((s) => s.session)), rig.name); // worker views are not per connection yet
       const rigEntry = { section: "topology", kind: "rig", rigId: rig.id, conn: rig.conn, name: rig.name };
       this.visibleTreeRows.push({ key: rKey, foldKey: rKey, expandable: true, isOpen: openRig, parentKey: hostParentKey, entry: rigEntry });
 
       const rigRow = h_flex().id(`rig-${rig.id}`).pl(baseIndent).pr(8).h(24).gap(6).items_center().hover((s) => s.bg(t.hover))
         .on_click((_e, cx) => { this.selectRow(rigEntry,rKey);cx.notify(); })
-        .on_mouse_down("right", () => this.menu({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle, orderGroupKey: `rig:${rig.id}:pods` }, 320, rKey))
+        .on_mouse_down("right", rigMenu)
         .child(div().id(`rig-fold-${rig.id}`).w(12).text_color(t.dim).hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { cx.stop_propagation(); this.fold(rKey, !openRig, rigSeats,stateConn); cx.notify(); })
           .child(svg(icon(openRig ? "chevron-down" : "chevron-right")).size(11)))
         .child(div().flex_1().truncate().text_size(12.5).font_semibold().text_color(stoppedRig ? t.dim : t.foreground).tooltip(String(rig.name??"")).child(rig.name))
-        .when(stoppedRig, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("stopped"))
+        .when(kernelDisabled, el => el.child(div().text_size(10.5).text_color(t.dim).child("turned off")))
+        .when(stoppedRig && !kernelDisabled, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("stopped"))
           .child(div().id(`rig-resume-${rig.id}`).px(5).h(18).rounded(4).bg(t.raised).flex().items_center().text_size(10.5).text_color(t.accent).hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => {
               cx.stop_propagation();
@@ -4437,10 +4629,11 @@ export default class RigSidebar extends View {
         rig,
         seats: rigSeats,
         stoppedRig,
+        kernelDisabled,
         stale,
         views,
         stateConn,
-        onMenu: () => this.menu({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle: rig.lifecycle, orderGroupKey: `rig:${rig.id}:pods` }, 320, rKey),
+        onMenu: rigMenu,
       });
 
       // Pods under Rig
@@ -4980,6 +5173,13 @@ export default class RigSidebar extends View {
       const out = [];
       if (this.sidebarState?.operatorDisabled) out.push(div().id("system-operator-disabled").pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(t.muted).child("OpenRig's operator is turned off here."));
+      const operatorSub = rowFeed.sidebarState?.substate;
+      if (dismissibleOperatorBanner(operatorSub)) {
+        const machine = rowConfig?.daemonMachine ?? (isLoopbackDaemonUrl(rowConfig?.daemonUrl) ? "this computer" : "OpenRig's machine");
+        out.push(v_flex().id("system-operator-warning").pl(treeIndent(1)).pr(8).py(3).gap(4)
+          .child(div().text_size(12).text_color(t.muted).child(operatorSub === "5b" ? "Operator: not running" : "Operator: no sign-in"))
+          .child(this.operatorRecoveryActions(t, cx, rowFeed, operatorSub, machine, true)));
+      }
       const cleanupResult=this.oldViewsCloseResult();
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(cleanupResult.ok===false?t.blocked:t.muted).child(cleanupResult.text));
@@ -5656,7 +5856,7 @@ export default class RigSidebar extends View {
     const rows = pinned.map((spec) => {
       const isSelected = selKey === spec.key;
       if (spec.kind === "rig") {
-        const { rig, stoppedRig, stale, views = [] } = spec;
+        const { rig, stoppedRig, stale, kernelDisabled, views = [] } = spec;
         let row = h_flex().id(`sticky-row-${spec.key}`).pl(spec.indent).pr(8).h(24).gap(6).items_center().cursor_pointer().hover((s) => s.bg(t.hover))
           .when(isSelected, (s) => s.bg(t.selection ?? `${t.accent}1f`).border_l(2).border_color(t.accent))
           .when(this.activeSpaceContext?.rigs?.some((name) => name === rig.name || name === rig.id), (s) => s.border_l(2).border_color(t.accent))
@@ -5669,7 +5869,8 @@ export default class RigSidebar extends View {
             .on_click((_e, cx) => collapseSpec(spec, cx))
             .child(svg(icon("chevron-down")).size(11)))
           .child(div().flex_1().truncate().text_size(12.5).font_semibold().text_color(stale || stoppedRig ? t.dim : t.foreground).tooltip(String(rig.name ?? "")).child(rig.name))
-          .when(stoppedRig, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("stopped"))
+          .when(kernelDisabled, el => el.child(div().text_size(10.5).text_color(t.dim).child("turned off")))
+          .when(stoppedRig && !kernelDisabled, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("stopped"))
             .child(div().id(`sticky-resume-${rig.id}`).px(5).h(18).rounded(4).bg(t.raised).flex().items_center().text_size(10.5).text_color(t.accent).hover((s) => s.bg(t.hover))
               .on_click((_e, cx) => {
                 cx.stop_propagation();

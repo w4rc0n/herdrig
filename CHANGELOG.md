@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.16
+
+Start a stopped local operator from Herdrig, see when OpenRig is restarting or gave up on a kept-alive seat, and refuse stale Needs actions if someone else changed the request while your dialog was open.
+
+- **Start a local operator in place:** when OpenRig's operator is stopped on this computer, click **Start operator** from its warning or **Start…** under System (**Copy command** stays available on every connection; start failures show a plain message rather than raw CLI output). Herdrig checks again after Copy, Start, or returning to the window, no longer offers **Resume…** in Topology for an operator turned off on purpose, and updates the sign-in steps to stop and start the daemon.
+- **Kept-alive seat restarts and stops:** seats that OpenRig keeps alive show **restarting…** while OpenRig brings them back and **gave up** when OpenRig stops retrying, with the restart count and a plain-words reason on the seat page (raw launch output stays in OpenRig's daemon log; tooltips in All seats match the shown status). A seat awaiting a stop shows **stopping…**.
+- **Safe closes in Needs:** **Mark done**, **Approve**, **Reply**, **Deny**, and **Resolve** refuse to overwrite a request if someone else changed or closed it while your dialog or composer was open. Herdrig tells you what state it is in now, refreshes the request, and keeps the refusal visible (as a dimmed row with **OK** if it left Needs, including under filters). Works on OpenRig 0.7.9 or later; older versions behave as before.
+
 ## v0.5.15
 
 The operator warning clears when the operator is up, seats show Claude sign-out, billing, usage-limit, and Send-stuck reasons in plain words, and Connected Assistant cards mark cut-off queues.
