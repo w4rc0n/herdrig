@@ -148,7 +148,7 @@ export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
   return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
 }
 
-export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, requestCount = null, mark, askOwner, machineOf = null, now = Date.now(), staleTip = null }) {
+export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, mark, askOwner, machineOf = null, now = Date.now(), staleTip = null }) {
   const { div, svg, h_flex } = ui;
   const out = [];
   const many = rows.filter((r) => r.kind === "seat").length > 12;
@@ -161,7 +161,7 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
       .on_click((_e, cx) => fold(key, !expanded, cx))
       // After a failed read the group words and counts are the last known ones: dimmed, with when OpenRig said them.
       .child(div().id(`priority-label-${group.rank}`).text_color(staleTip ? t.dim : t[group.tone] ?? t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(group.label))
-      .child(div().id(`priority-count-${group.rank}`).text_color(t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(String(group.rank === 4 && requestCount !== null ? requestCount : members.length)))
+      .child(div().id(`priority-count-${group.rank}`).text_color(t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(String(members.length)))
       .child(div().flex_1()).child(svg(iconOf(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim)));
     if (!expanded) continue;
     for (const row of members) {

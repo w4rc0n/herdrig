@@ -72,7 +72,7 @@ const runFor = (config) => (name, args) => sidebarRun({ layout, notify }, (n, a)
 let flatOwner = null; // the view this mod copy is acting for
 const setShared = rawSetShared; // several connections key their own state (qualifyKey); no flat-store guard
 const openOverlay = (spec) => rawOpenOverlay(messageDialogSpace(stampRows(spec, props()?.target?.rowsConfig ?? null))); // a dialog opened from a menu keeps the stamp of the target it was opened for
-import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, draftKey, iconsAt, transcriptPath, isTerminalSeat,
+import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, ACTION_REFUSED, parseConfig, discoverDaemonFromCli, writeCommand, readCommand, personDisableReason, pauseSummary, pauseOutcome, resumeOutcome, sliceForSeat, queueListPage, draftKey, iconsAt, transcriptPath, isTerminalSeat,
   fileEntry, launchSpecArgs, launchSpecEnv, launchFolderProblem, launchSourceProblem, LAUNCH_DIALOG_HEIGHT, navPush, actionArgs, appHomeArgsRefusal, writeOutcome, launchOutcome, actionTitle, doneWords, startOneClick,
   autoGridForSeats, presetGrid, gridPlaceSeat, gridClearCell, gridRemoveCell, gridSplitCell, gridSeats, gridShells, gridPanes, gridFind, cloneGrid, isPad, isShell, cellLabel,
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
@@ -274,9 +274,19 @@ async function openSlice(target, file = null) {
   if (!config.daemonUrl) return info(target, config.daemonMessage || "OpenRig daemon is not running (run 'rig daemon start' or 'rig up').");
   const op = gatedOperation(config.connectionId); // the address above is this operation's: every request below refuses to go once the settings change
   try {
-    const get = async (path) => { const r = await op.fetch(`${config.daemonUrl}${path}`); if (!r.ok) throw new Error(requestFailed(requestWhat(path), r.status)); return r.json(); };
-    const [rows, scopes] = await Promise.all([get(`/api/queue/list?destinationSession=${encodeURIComponent(target.session)}`), get("/api/scopes?counts=1")]);
-    const hit = sliceForSeat(Array.isArray(rows) ? rows : rows?.items ?? [], scopes?.missions ?? []);
+    const get = async (path) => { const r = await op.fetch(`${config.daemonUrl}${path}`); if (!r.ok) throw new Error(requestFailed(requestWhat(path), r.status)); return r; };
+    const [queue, scopes] = await Promise.all([
+      get(`/api/queue/list?destinationSession=${encodeURIComponent(target.session)}&state=pending,in-progress,blocked&limit=1000`)
+        .then(async (response) => ({ data: await response.json(), ...queueListPage(response) })),
+      get("/api/scopes?counts=1").then((response) => response.json()),
+    ]);
+    op.check();
+    const rows = Array.isArray(queue.data) ? queue.data : queue.data?.items;
+    if (!Array.isArray(rows)) return info(target, "OpenRig couldn't show this seat's queue.");
+    const hit = sliceForSeat(rows, scopes?.missions ?? []);
+    if (!hit && (queue.truncated ?? rows.length >= (queue.limit ?? 100))) {
+      return info(target, "No slice was found in the queue rows returned. There may be more open work.");
+    }
     if (!hit) return notify({ title: `${target.logicalId ?? target.session} has no open work naming a slice.`, level: "info" });
     if (!file) return page({ section: "scopes", mission: hit.mission, slice: hit.slice, name: hit.name });
     const folder = (await slicePaths(config, op)).get(hit.slice);

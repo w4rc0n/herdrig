@@ -36,20 +36,26 @@ export function seatActivityWords(node, now = Date.now(), timezone = null) {
     stale: a.stale === true && ago ? `Last confirmed ${ago}` : "" };
 }
 
-export function seatQueuePaths(session) {
+export function seatQueuePaths(session, version) {
   const base = `/api/queue/list?destinationSession=${encodeURIComponent(session)}`;
-  return { open: `${base}&state=pending,in-progress,blocked&limit=100`,
+  const parts = typeof version === "string" ? /^(\d+)\.(\d+)\.(\d+)(?:\+[^\s]+)?$/.exec(version) : null;
+  const [major, minor, patch] = parts ? parts.slice(1).map(Number) : [];
+  // The published daemon honors 101 explicitly. One extra row tells a native fetch client if its 100-row view is partial.
+  const openLimit = major > 0 || minor > 7 || minor === 7 && patch >= 23 ? 101 : 100;
+  return { openLimit, open: `${base}&state=pending,in-progress,blocked&limit=${openLimit}`,
     finished: `${base}&state=done,handed-off&sort=updated&limit=3` };
 }
-export function seatQueueDetails(openData, finishedData) {
-  const rows = Array.isArray(openData) ? openData : null;
+export function seatQueueDetails(openData, finishedData, { limit, truncated, requested = 100 } = {}) {
+  const rows = Array.isArray(openData) ? openData.slice(0, 100) : null;
+  const length = rows ? openData.length : 0;
+  const partial = rows !== null && (length > 100 || (truncated ?? length >= (limit ?? requested)));
   const finished = Array.isArray(finishedData) ? finishedData : null;
   return {
     current: (rows ?? []).filter((r) => r.state === "in-progress"),
     pending: (rows ?? []).filter((r) => r.state === "pending"),
     blocked: (rows ?? []).filter((r) => r.state === "blocked"),
     finished: (finished ?? []).filter((r) => ["done", "handed-off"].includes(r.state)),
-    count: rows?.length ?? null, partial: (rows?.length ?? 0) >= 100,
+    count: rows?.length ?? null, partial,
     available: !!rows, finishedAvailable: !!finished,
   };
 }

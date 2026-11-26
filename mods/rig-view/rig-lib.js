@@ -252,11 +252,17 @@ export function openingMoreText(moreLines, wrapsOver) {
   return moreLines > 0 ? `${moreLines} more ${moreLines === 1 ? "line" : "lines"} in Details` : wrapsOver ? "More in Details" : null;
 }
 
-/** One request id each, plus prompt-only seats. A seat's attributed asks replace its extra prompt count. */
+/** A request or check still present in Needs, separate from updates and seat prompts. */
+export function isOpenNeed(item) {
+  return Boolean(item?.id) && item.kind !== "update" && !item.update && !isUpdateNeed(item)
+    && !["done", "closed", "denied", "canceled", "handed-off"].includes(item.state);
+}
+
+/** One request id each, plus prompt-only seats when topology is supplied. */
 export function needsRequestCount(topology = [], items = []) {
   const ids = new Set(), attributed = new Set();
   for (const item of filterAttentionHealth(items)) {
-    if (!item?.id || isUpdateNeed(item) || ["done", "closed", "denied", "canceled", "handed-off"].includes(item.state)) continue;
+    if (!isOpenNeed(item)) continue;
     if (sweepFinding(item)) continue; // OpenRig's check on another row: counted apart (needsCheckCount), and its sender asked nothing
     ids.add(item.id);
     const session = item.answer?.verb === "resolve" || item.reply === "resolve" ? item.waiting?.owner ?? item.destinationSession : item.asker ?? item.sourceSession;
@@ -3685,6 +3691,7 @@ export function needTarget(item) {
     ...(item?.criticalHealth ? { criticalHealth: true, healthFinding: item.healthFinding, source: item.source } : {}),
     id,
     qitemId,
+    ...(item?.state ? { state: item.state } : {}),
     reply,
     verb: verb ?? (reply === "resolve" ? "resolve" : reply === "answer" ? (Array.isArray(item?.humanQuestions) && item.humanQuestions.length > 0 ? "answer" : "approve") : null),
     tier,
@@ -3739,7 +3746,7 @@ export function needsToastFor(rawItem) {
         action: { name: `rig.open-need:${rawItem.id}`, args: { id: rawItem.id } } } };
   }
   const target = needTarget(rawItem);
-  if (!target.id || target.update) return null;
+  if (!isOpenNeed(target)) return null;
   if (sweepFinding(rawItem)) return null; // a check toasts nothing: the row it names has its own toast if it's the person's
   const reply = target.native || rawItem.reply === "native"
     ? "native"
@@ -4658,6 +4665,15 @@ export function sliceForSeat(rows, missions) {
     }
   }
   return null;
+}
+
+/** Optional queue list metadata. Herdr's native fetch and older daemons can omit it. */
+export function queueListPage(response) {
+  const rawLimit = response?.headers?.get?.("x-openrig-limit");
+  const rawTruncated = response?.headers?.get?.("x-openrig-truncated");
+  const limit = typeof rawLimit === "string" && /^\d+$/.test(rawLimit) ? Number(rawLimit) : null;
+  return { limit: Number.isSafeInteger(limit) ? limit : null,
+    truncated: rawTruncated === "0" ? false : rawTruncated === "1" ? true : null };
 }
 
 /** A Markdown doc without its leading YAML frontmatter (Markdown would read its closing `---` as a heading rule). */

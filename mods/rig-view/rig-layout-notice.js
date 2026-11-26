@@ -98,11 +98,14 @@ function noticeToast(isReturn, target) {
  * this appearance. The remembered layout must still be `ready` (a readable layout without OpenRig's strip).
  */
 export async function finishRigLayoutRestore(host, appHome, event, now = Date.now()) {
+  // `now` is when the restore began; the layout read below can take a while, so the switch marker uses the dispatch time.
+  const startedAt = Date.now();
   // The person's own choice always wins: this exact appearance must still be waiting, still shown, and restore still on,
   // both now and again right before the switch (after the file read). Completion updates touch only this appearance.
   const live = () => {
     const current = host.shared('rig.rigLayoutNotice') ?? {};
-    return current.instance === event.instance && current.mode === 'restoring' && current.shown && hasOldProviderStrip(host.layout()) ? current : null;
+    return current.instance === event.instance && current.mode === 'restoring' && current.shown && current.kept !== current.appearance
+      && hasOldProviderStrip(host.layout()) ? current : null;
   };
   const setMode = (mode, extra = {}) => {
     const current = host.shared('rig.rigLayoutNotice') ?? {};
@@ -122,7 +125,7 @@ export async function finishRigLayoutRestore(host, appHome, event, now = Date.no
   }
   host.setShared('rig.rigLayoutRestored', [...(host.shared('rig.rigLayoutRestored') ?? []).filter(key => key !== event.key), event.key].slice(-RESTORED_KEYS_KEPT));
   // The marker survives Herdr's reload of the mods during the switch (see rigLayoutAppearance).
-  setMode('switching', { switchTarget: event.target, switchingAt: now });
+  setMode('switching', { switchTarget: event.target, switchingAt: now + (Date.now() - startedAt) });
   let switched = false;
   try {
     const reply = await host.run('layout.switch', { name: event.target });
@@ -138,7 +141,10 @@ export async function finishRigLayoutRestore(host, appHome, event, now = Date.no
     setMode('failed');
     return { title: "herdrig couldn't restore your layout", body: "Herdr stayed on OpenRig's Rig layout. Leave it from System, or choose a Layout in the palette (Ctrl+Shift+P). Seats keep running.", level: 'warning', timeout: 10000 };
   }
-  setMode('restored');
+  // The switch is confirmed, so this appearance has ended now: a quick second open is a new one, not this one (no waiting
+  // for a timer to see the layout without the strip).
+  setMode('restored', { shown: false });
+  if (!host.shared('rig.rigLayoutSeen')?.left) host.setShared('rig.rigLayoutSeen', { left: true });
   return restoredToast(host.shared, host.setShared, now);
 }
 
@@ -165,9 +171,10 @@ export function rigLayoutCardState(shared, tree, names, now = Date.now()) {
     restoreOff: !restoreLayoutOn(shared), target, label: target ? oldStripLayoutLabel(target) : null };
 }
 
+/** Keep always wins: it also cancels a restore that is still pending, whatever its age (finishRigLayoutRestore re-checks). */
 export function keepRigLayout(shared, setShared) {
   const notice = shared('rig.rigLayoutNotice') ?? {};
-  setShared('rig.rigLayoutNotice', { ...notice, kept: notice.appearance ?? null });
+  setShared('rig.rigLayoutNotice', { ...notice, kept: notice.appearance ?? null, ...(notice.mode === 'restoring' ? { mode: 'notice' } : {}) });
 }
 
 /**

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.14
+
+The Needs count and the list under it now always agree, seat queue counts and slice lookup stay accurate past 100 rows, auto-restore is steadier, and Spaces pauses cleanly after empty-list drags and refreshes remote branches on return.
+
+- The Needs count and the list under it now always agree; a request from another rig is listed with its rig, and the "Needs you" heading counts what it lists.
+- The seat Queue tab shows an exact 100 on OpenRig 0.7.23 when that is the whole list. Open slice searches past the first 100 queue rows and tells you when a miss may be incomplete.
+- Opening a connected assistant's detail page without the Rig sidebar no longer makes an extra OpenRig queue request.
+- Keeping your layout is steadier: a second OpenRig open right after a restore is restored too; choosing **Keep** on the Rig layout card always stops a restore that was still on its way; the card shows even when the Rig sidebar follows another OpenRig connection; and the "herdrig restored your layout" notice also shows when reading your layout took a long time.
+- Herdrig's Spaces list no longer keeps fast polling running after a drag ends over empty list space, and refreshes cached remote Git branches once when Herdr returns from hidden instead of waiting for the 60-second fallback.
+
 ## v0.5.13
 
 Herdrig keeps your layout when OpenRig opens its Rig layout, starts safe Rig TUI tabs, and names and closes OpenRig's Rig views cleanly.

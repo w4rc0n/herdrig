@@ -59,24 +59,57 @@ const checkMachineFields = (machine) => {
   return { ok: validName && validTarget && validSession && validVia, validName, hasTarget, name };
 };
 
+const isPollActive = (view) => Boolean(view.pressed) || Object.values(view.reconnecting ?? {}).some((state) => state?.busy);
+const remoteGitKeys = (view) => {
+  const out = new Set();
+  for (const key of Object.values(view.at ?? {})) {
+    if (typeof key !== "string" || !(view.git?.[key] || view.unsure?.has?.(key))) continue;
+    let parsed;
+    try { parsed = JSON.parse(key); } catch { continue; }
+    const [on, cwd] = Array.isArray(parsed) ? parsed : [];
+    if (!on || !cwd) continue;
+    if (view.folded?.has?.(on) || view.ready?.[on] === false) continue;
+    out.add(key);
+  }
+  return [...out];
+};
+
 export const rig = {
-  /** Idle git/layout checks need no 250ms wake-up. Keep that cadence only during a drag or reconnect; skip while hidden. */
-  watchSpaces(view,cx) {
-    if(view.rigPollArmed)return true;
-    const arm=live=>{
-      if(view.closed)return;
-      view.rigPollArmed=true;
-      const active=view.pressed||view.over||Object.values(view.reconnecting??{}).some(state=>state?.busy);
-      const hidden=!active&&windowHidden();
-      live.timer.after(active?250:hidden?5000:1000,next=>{
-        view.rigPollArmed=false;
-        if(view.closed)return;
-        const current=next??live;
-        const nowActive=view.pressed||view.over||Object.values(view.reconnecting??{}).some(state=>state?.busy);
-        try{if(nowActive||!windowHidden())view.checkNew(current);}finally{arm(current);}
+  /** Idle git/layout checks need no 250ms wake-up. Keep that cadence only during a live drag or reconnect; skip while hidden, and refresh current remote Git places once on return. */
+  watchSpaces(view, cx) {
+    if (view.rigPollArmed) return true;
+    let skippedHidden = false;
+    const arm = (live) => {
+      if (view.closed) return;
+      view.rigPollArmed = true;
+      const active = isPollActive(view);
+      const hidden = !active && windowHidden();
+      if (hidden) skippedHidden = true;
+      live.timer.after(active ? 250 : hidden ? 5000 : 1000, (next) => {
+        view.rigPollArmed = false;
+        if (view.closed) return;
+        const current = next ?? live;
+        const nowActive = isPollActive(view);
+        const hiddenNow = windowHidden();
+        try {
+          if (!nowActive && hiddenNow) {
+            skippedHidden = true;
+          } else {
+            const recoverRemote = !hiddenNow && skippedHidden;
+            view.checkNew(current);
+            if (recoverRemote) {
+              skippedHidden = false;
+              const remoteDue = remoteGitKeys(view);
+              if (remoteDue.length && typeof view.refreshGit === "function") view.refreshGit(remoteDue, current);
+            }
+          }
+        } finally {
+          arm(current);
+        }
       });
     };
-    arm(cx);return true;
+    arm(cx);
+    return true;
   },
   /** Keep birth-time measurements only for spaces still in the current host snapshot. */
   pruneBorn(born, at) {
@@ -177,7 +210,7 @@ export const rig = {
         .when(!collapsed, (el) => el.child("Rig spaces")))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(view.scroll)
         .on_size_change((_size, cx) => { if (view.activeAt >= 0) { view.scroll.scroll_to_item(view.activeAt); cx.notify(); } })
-        .on_mouse_up("left", (_e, cx) => { view.pressed = null; cx.notify(); })
+        .on_mouse_up("left", (_e, cx) => { view.pressed = null; view.over = null; cx.notify(); })
         .children(any ? list : [div().id("rig-spaces-empty").px(8).py(6).text_size(11.5).text_color(t.dim)
           .child(collapsed ? "·" : "No rig spaces yet. Open a rig's space from the OpenRig block.")]));
   },

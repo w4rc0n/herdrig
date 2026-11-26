@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.13
+Version: v0.5.14
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
