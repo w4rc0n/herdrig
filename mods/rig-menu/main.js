@@ -17,6 +17,8 @@ import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './r
 import { View, div, svg } from "gpui-kit";
 import {readRestorePlan,readConversationRollCall,restorePlanIdentity,restorePlanView,rollCallView} from './rig-resume.js';
 import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat, withFocusContext, releaseFocusTargets } from "./rig-lib.js";
+import { sendStuckLines } from "./rig-lib.js";
+import { timezoneValue } from "./rig-time.js";
 import { registerRigRouting, stampRows, messageDialogSpace, ROWS_STALE, tabPagesScrub } from "./rig-lib.js";
 import { targetConnection, pickRig, configOfConnection, adoptConnection, UNKNOWN_CONNECTION, NO_CONNECTION, commandFor, operatorCommandFor, tuiCommandFor, connectionBoxLabel, logExecError, plainExecError, parseExecTimeout, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
@@ -1914,6 +1916,8 @@ export default class RigMenu extends View {
     return v_flex().gap(6)
       .child(r.ok ? div().text_size(12.5).text_color(t.foreground).child(r.text || this.doneWords(target, step.action)) : errorBlock(this,t,"menu-result-error",r.text || "It didn't work, and the CLI gave no reason.",{where,outcomeUnknown:r.outcomeUnknown || r.uncertain,tone:knownHold?t.ansi3:undefined}))
       .when(!!r.warning, (el) => el.child(div().text_size(11).text_color(t.dim).child(r.warning)))
+      // OpenRig delivered it, but the seat may not read it yet: herdrig's line, with OpenRig's own notice in its tooltip.
+      .children(step.action === "send" && r.ok ? this.sendStuckRows(t, cx, target, r) : [])
       // A refusal that happened before anything left says so, for EVERY action; the uncertain line is only for a request that did leave (the CLI ran, or a refusal came after the send).
       .when(!r.ok && r.notSent && !/nothing was sent/i.test(String(r.text ?? "")),
         (el) => el.child(div().text_size(11.5).text_color(t.dim).child("Nothing was sent.")))
@@ -1956,6 +1960,32 @@ export default class RigMenu extends View {
     return true;
   }
 
+  /** "Sent to <seat>." is followed by these when OpenRig says the seat may not read it yet (sendStuckLines): herdrig's line, with
+   *  OpenRig's own notice in its tooltip, and after the permission line the menu's own Attach for this seat, as its row offers it. */
+  sendStuckRows(t, cx, target, r) {
+    // The reset time follows the person's timezone: the read starts from this draw (the view's own call, never after an await).
+    if (r.wantsTimezone) { r.wantsTimezone = false; this.readSendTimezone(cx, r); }
+    const lines = sendStuckLines(r.json, { timezone: r.timezone ?? null });
+    if (!lines.length) return [];
+    const attach = lines.some((line) => line.kind === "input") ? this.items(target).find((item) => item?.label === "Attach" && !item.disabled) : null;
+    return lines.map((line, i) => h_flex().gap(6).items_center()
+      // The text wraps in the dialog's width (min_w(0)): a long usage-limit line was clipped natively.
+      .child(div().id(`send-stuck-${i}`).flex_1().min_w(0).text_size(11.5).text_color(t.muted).when(!!line.tip, (el) => el.tooltip(line.tip))
+        .child(h_flex().gap(6).items_start().child(div().mt(5).size(6).rounded(3).flex_none().bg(t.working ?? t.accent)).child(div().flex_1().min_w(0).child(line.text))))
+      .when(line.kind === "input" && !!attach, (el) => el.child(this.dialogButton(t, div().id("send-stuck-attach").px(8).h(22).rounded(5).bg(t.raised)
+        .flex().items_center().text_size(11.5).hover((x) => x.bg(t.hover)), null, (_e, cx) => attach.act(cx), false, "Attach"))));
+  }
+  /** The person's timezone for a delivered send's usage-limit line, read after the receipt is shown (never delaying it); until it
+   *  arrives, or if it can't be read, the time is local. Called from a draw: the task is the view's own, and it only waits and notifies. */
+  readSendTimezone(cx, r) {
+    if (typeof cx?.spawn !== "function") return;
+    cx.spawn(async (task) => {
+      let zone = null;
+      try { zone = timezoneValue(await this.read(["config", "get", "ui.timezone"])); } catch (_) { zone = null; }
+      if (this.gone || !zone) return;
+      r.timezone = zone; task.notify();
+    });
+  }
   /** What a success says when the CLI printed no message of its own. */
   doneWords(target, action) {
     return action === "change-model" && this.changeQueuedFor
@@ -2338,7 +2368,10 @@ export default class RigMenu extends View {
           return null;
         }
       }
-      return this.write(this.argsFor(target, step.action, text),undefined,taskCx);
+      const r = await this.write(this.argsFor(target, step.action, text),undefined,taskCx);
+      // The receipt is shown now; the next draw starts the timezone read for a usage-limit line (no task is made here, after an await).
+      if (step.action === "send" && r?.ok && r.json?.usageLimit) r.wantsTimezone = true;
+      return r;
     });
   }
 

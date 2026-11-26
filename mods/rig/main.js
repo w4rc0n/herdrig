@@ -24,6 +24,7 @@ import { effectiveScopeProject, readScopeProject } from './rig-project.js';
 import { workflowPath,workflowView,workflowEntry,workflowWord } from './rig-workflow.js';
 import { resolveAskerSeat,relativeTimeText,requestFailed,requestWhat,focusTarget,releaseFocusTargets,liveFocus } from './rig-lib.js';
 import { timezoneValue } from './rig-time.js';
+import { seatUsageLimitWords } from './rig-seat-details.js';
 import { healthCounts } from "./rig-health.js";
 import { counted, plainError, statusWord, errorDiagnostic } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
@@ -71,7 +72,7 @@ const net = { connect: (host, port) => gatedConnect((h, p) => rawNet.connect(h, 
 const netFor = (config) => (host, port) => gatedConnect((h, p) => rawNet.connect(h, p), host, port, config?.connectionId);
 import {
   stampRows, messageDialogSpace, rowsIdentityOf, ROWS_STALE, MOD_IDS, STATE_COPY, NO_PERSON, ACTION_REFUSED, TERMINAL_TOKEN_PROTECTED, REMOTE_OPERATOR_REASON, s1CopyLine, routeRigOpen, registerRigRouting,
-  utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine,
+  utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine, sameDaemon,
   buildTopology, readRigRepresentative, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
   asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, isOpenNeed, requestHeadline, sweepFinding, checkLabel,
@@ -271,6 +272,9 @@ const FULL_ATTENTION_SLOW_MS = 3000;
 const QUIET_RECONCILE_MS = 60_000;
 /** Herdr 0.1.18 reports `window()?.visible === false` while hidden; older Herdr (undefined) and `herdr-app check` (null) count as visible. */
 const windowHidden = () => window()?.visible === false;
+const dismissibleOperatorBanner = sub => sub === "5b" || sub === "5c";
+const operatorBannerScope = config => config?.daemonUrl
+  ? JSON.stringify([config.connectionId ?? LEGACY_CONNECTION_ID, config.daemonMachine ?? null, config.daemonUrl]) : null;
 /** Whether an OpenRig honoured `kind=action`: one that does names the narrowed read among its sources; an older one ignores the parameter
  *  and answers with the whole list. */
 const kindFiltered = (answer) => Array.isArray(answer?.sources) && answer.sources.some((s) => s?.source === "kind");
@@ -664,6 +668,7 @@ export default class RigSidebar extends View {
       const parsed = parseSidebarState(raw);
       try {
         const saved = JSON.parse(raw);
+        setShared("rig.operatorBannerHidden", { ...saved.operatorBannerHidden, ...shared("rig.operatorBannerHidden") });
         const spaceState = { homeSpace: saved.homeSpace, homeSpaces:saved.homeSpaces, inPlaceOpen:saved.inPlaceOpen, machineDeclined:saved.machineDeclined,machineSearchDeclined:saved.machineSearchDeclined,machineAddDeclined:saved.machineAddDeclined,
           sidebarSize: saved.sidebarSize, autoFoldRetired: saved.autoFoldRetired, tabMigration: saved.tabMigration,workerViews:saved.workerViews };
         setShared("rig.spaceState", { ...spaceState, ...(shared("rig.spaceState") ?? {}) });
@@ -701,15 +706,15 @@ export default class RigSidebar extends View {
   }
 
   /** A state save that could not be done is said once per distinct message, and a save that works clears it (the same failure on every later save is not said again). */
-  sayStateSave(error) {
+  sayStateSave(error, subject = "the sidebar's folds, order and what you last saw") {
     if (!error) { this.stateSaveSaid = null; return; }
-    const body = stateSaveFailure("the sidebar's folds, order and what you last saw", error);
+    const body = stateSaveFailure(subject, error);
     if (this.stateSaveSaid === body) return;
     this.stateSaveSaid = body;
     notify({ title: "OpenRig", level: "warning", body });
   }
 
-  persistSidebarState(openMap = this.viewState("rig.open.sidebar"), orderMap = shared("rig.order")) {
+  persistSidebarState(openMap = this.viewState("rig.open.sidebar"), orderMap = shared("rig.order"), operatorBannerChange) {
     if (typeof appHome !== "function" || typeof writeTextFile !== "function") return;
     const path = `${appHome()}/openrig/state.json`;
     this.sidebarPersist=(this.sidebarPersist??Promise.resolve()).catch(()=>{}).then(async () => {
@@ -739,11 +744,25 @@ export default class RigSidebar extends View {
           needsView: shared("rig.needsView"),
           lastEndedModeApplicationId: shared("rig.lastEndedModeApplicationId"),
           lastActiveModeApplicationId: shared("rig.lastActiveModeApplicationId"),
+          operatorBannerChange,
         });
       } });
-      this.sayStateSave(error);
+      this.sayStateSave(error, operatorBannerChange ? "which operator notice you dismissed" : undefined);
     }).catch(() => {});
     return this.sidebarPersist;
+  }
+
+  saveOperatorBannerDismissal(scope, substate) {
+    const hidden = shared("rig.operatorBannerHidden") ?? {};
+    setShared("rig.operatorBannerHidden", { ...hidden, [scope]: substate });
+    return this.persistSidebarState(undefined, undefined, { scope, substate });
+  }
+
+  observeOperatorBanner(feed) {
+    const scope = operatorBannerScope(feed.config);
+    const hidden = scope && shared("rig.operatorBannerHidden")?.[scope];
+    // Only a successful read retires a dismissal for a previous condition.
+    if (hidden && hidden !== feed.sidebarState?.substate) this.saveOperatorBannerDismissal(scope, null);
   }
 
   /** Reads the config again; a change takes effect at once: a new daemon reconnects the stream. */
@@ -922,7 +941,8 @@ export default class RigSidebar extends View {
 
   /** Copy `text` to the clipboard and flip the `Copy` / `Copy fix` pill to `Copied` for 2 s. */
   copyToClipboard(cx, text, key = "copy") {
-    try { cx?.write_to_clipboard?.(text); } catch (_) {}
+    if (typeof cx?.write_to_clipboard !== "function") return false;
+    try { cx.write_to_clipboard(text); } catch (_) { return false; }
     this.copiedKey = key;
     cx?.notify?.();
     cx?.timer?.after?.(2000, (cx) => {
@@ -931,6 +951,7 @@ export default class RigSidebar extends View {
         cx?.notify?.();
       }
     });
+    return true;
   }
 
   /** Start the OpenRig daemon from S2 (`rig daemon start`, 180 s timeout). */
@@ -2831,7 +2852,7 @@ export default class RigSidebar extends View {
     this.oldViewsSignature=signature;this.oldViewsDirty=(this.oldViewsRevision??0)!==revision;
     if(!sameValue(shared("rig.oldProviderViews"),views)){setShared("rig.oldProviderViews",views);cx.notify();}return views;
   }
-  async refresh(cx, feed = this.primary, consumeFull = false) {
+  async refresh(cx, feed = this.primary, consumeFull = false, automatic = false) {
     if(feed===this.primary)await this.refreshOldViews(cx);
     let notifyArgs = null; // the needs notifications to run once the read is done (runNotifyNeeds)
     let observeRaw = false; // this feed's live updates were read: its dismissals are observed against them once the read is done (observeDismissals)
@@ -2858,7 +2879,18 @@ export default class RigSidebar extends View {
       const startCfg = feed.config;
       const hasExplicitConfigUrl = Boolean(startCfg.daemonUrl && startCfg.daemonUrlSource !== "cli" && startCfg.daemonUrlSource !== "default");
       let unreachableState = false;
-      if (!hasExplicitConfigUrl) {
+      let verifiedDiscovery = false;
+      if (automatic && feed === this.primary && this.feeds.length === 1 && startCfg.daemonUrlSource === "cli" &&
+          !feed.error && feed.data?.daemonUrl === startCfg.daemonUrl && feed.healthz?.selfHostId) {
+        // A discovered port can be reused by another daemon. Verify it before reading any feed data.
+        const previousHealth = feed.healthz;
+        const health = await op.fetch(`${startCfg.daemonUrl}/healthz`)
+          .then(response => response.ok ? response.json() : null).catch(rethrowGate(null));
+        op.check();
+        verifiedDiscovery = health?.ok !== false && sameDaemon(previousHealth, health);
+        if (verifiedDiscovery) feed.healthz = steadyHealthz(health);
+      }
+      if (!hasExplicitConfigUrl && !verifiedDiscovery) {
         const probeFetch = (url, init) => {
           if (feed === this.primary && this.feeds.length === 1 && !this.primary.config?.configInvalid && gateSameConfig(this.primary.config, startCfg)) {
             const found = addressParts(String(url))?.origin ?? null;
@@ -2927,7 +2959,7 @@ export default class RigSidebar extends View {
           feed.hostedReader.read(op.fetch,feed.config,(ms,done)=>cx.timer.after(ms,done,{owner:null})),attentionRead,detailRead,
           get('/api/queue/attention-aggregate').catch(rethrowGate(null)),get('/api/native-seats').catch(rethrowGate(null)),
           hasExplicitConfigUrl?op.fetch(`${feed.config.daemonUrl}/healthz`).catch(rethrowGate(null)):null,
-          !probed?.statusProbe?.kernel&&feed.config.daemonUrl?op.fetch(`${feed.config.daemonUrl}/api/kernel/status`).catch(rethrowGate(null)):null,
+          feed.config.daemonUrl?op.fetch(`${feed.config.daemonUrl}/api/kernel/status`).catch(rethrowGate(null)):null,
           initialPerson?Promise.all([get(`/api/gateway/human/${encodeURIComponent(initialPerson)}/quiet`).catch(rethrowGate(null)),get(`/api/gateway/human/${encodeURIComponent(initialPerson)}/mode`).catch(rethrowGate(null))]):null,
           nodesRead,
         ]);
@@ -2954,12 +2986,7 @@ export default class RigSidebar extends View {
             if (hzBody) feed.healthz = steadyHealthz(hzBody);
           }
         }
-        let kernelStatus = probed?.statusProbe?.kernel ?? null;
-        if (!kernelStatus && feed.config.daemonUrl) {
-          if (krRes?.ok) {
-            kernelStatus = await krRes.json().catch(rethrowGate(null));
-          }
-        }
+        const kernelStatus = (krRes?.ok ? await krRes.json().catch(rethrowGate(null)) : null) ?? probed?.statusProbe?.kernel ?? null;
         let capabilities;
         const forceProbe = Boolean(feed.forceCapabilityProbe);
         feed.forceCapabilityProbe = false;
@@ -3019,6 +3046,7 @@ export default class RigSidebar extends View {
           sidebarModId: MOD_IDS.sidebar,
           strictKernel,
         });
+        if (kernelStatus || kernelNodes?.length) this.observeOperatorBanner(feed);
         const versionLine = formatOpenRigVersionLine({ healthz: feed.healthz, cliVersion: feed.cliVersion });
         const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
         feed.data = {
@@ -3288,7 +3316,7 @@ export default class RigSidebar extends View {
     const key=JSON.stringify([gateIdentity(feed.config),gateGeneration(feed.config?.connectionId)]),previous=feed.refreshRetry;
     if(!automatic){this.completedSpaceSweep=null;this.spaceSweepRetry=null;}
     const consumeFull = automatic && !event && feed.fullAttention?.unpublished === true;
-    await (feed===this.primary?this.refresh(cx,feed,consumeFull):this.refreshSecondary(cx,feed,consumeFull));
+    await (feed===this.primary?this.refresh(cx,feed,consumeFull,automatic):this.refreshSecondary(cx,feed,consumeFull));
     if(!feed.error){feed.quietRefresh={key,at:Date.now()};feed.hiddenCatchUp=false;}
     if(feed.error){const delay=previous?.key===key?Math.min(previous.delay*2,60000):10000;feed.refreshRetry={key,delay,nextAt:Date.now()+delay};}
     else feed.refreshRetry=null;
@@ -3400,12 +3428,14 @@ export default class RigSidebar extends View {
       capabilities.hostWorkerViews = await this.hostWorkerViewsOf(feed, get, summary, measured, force);
       op.check(); // a change of this connection while the refresh ran: nothing of it is published
       const kernelRig = summary.find(r => !r.archivedAt && r.name === "kernel");
+      const kernelNodes = kernelRig ? nodesByRig[kernelRig.id] : null;
       feed.sidebarState = selectSidebarState({
         versionProbe: { installed: true, code: 0, cliVersion: feed.cliVersion },
         healthzProbe: feed.healthz ? { ok: true, data: feed.healthz } : null,
-        summary, kernelStatus, kernelNodes: kernelRig ? nodesByRig[kernelRig.id] : null,
+        summary, kernelStatus, kernelNodes,
         strictKernel: kernelStatus !== null, sidebarModId: MOD_IDS.sidebar,
       });
+      if (kernelStatus || kernelNodes?.length) this.observeOperatorBanner(feed);
       const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
       feed.data = { daemonUrl: feed.config.daemonUrl, topology, attention: attentionItems ? needsRequestCount(topology, attentionItems) : null, attentionItems, attentionRaw: raw ?? [], hostedMembers,
         attentionHealth: attentionHealth?.records ?? [], attentionPerspective: attention?.perspective ?? null,
@@ -3893,7 +3923,12 @@ export default class RigSidebar extends View {
       helper: (child) => run("terminal.peek", { terminal: child.address }),
       hovered: this.priorityHovered, hover: (key, cx) => { this.priorityHovered = key; cx.notify(); },
       // A failed read: the mark is the last known one too, so it dims with its words.
-      mark: row => { const m = needsMark({div,svg},t,row.mark,true,icon,this.statusMotion.observe(qualifyKey(row.rig?.conn,row.seat?.session??row.key),row.mark,row.asks.map(n=>n.id))); return this.error && this.data?.at ? div().opacity(0.45).child(m) : m; },
+      mark: row => {
+        const m = needsMark({div,svg},t,row.mark,true,icon,this.statusMotion.observe(qualifyKey(row.rig?.conn,row.seat?.session??row.key),row.mark,row.asks.map(n=>n.id)));
+        const line = row.kind === "seat" && !row.asks.length ? row.seat.statusLine : null;
+        if (line) m.tooltip(line);
+        return this.error && this.data?.at ? div().opacity(0.45).child(m) : m;
+      },
       machineOf: null, // one connection is drawn: no machine label on its rows
       staleTip: this.error && this.data?.at ? asOf(this.data.at, this.uiTimezone) : null, // a failed read: last known words, dimmed
     });
@@ -3953,7 +3988,7 @@ export default class RigSidebar extends View {
     const showTitle = !(this.activeSpaceContext?.rigs?.length && (this.headerWidth ?? 268) < 340);
     const key = paletteKey(keys(), window()?.platform);
     const needs = this.requestCountOf(this.data?.topology, this.data?.attentionItems);
-    const showOperatorIcon = Boolean(this.sidebarState?.id === "S4");
+    const showOperatorIcon = this.sidebarState?.id === "S4" && !this.sidebarState.operatorDisabled;
     const remoteOperator = Boolean(this.config?.daemonUrl && !isLoopbackDaemonUrl(this.config.daemonUrl));
     const iconButton = (id, name, onClick, label = null) => h_flex().id(id).flex_none().px(compact ? 2 : 4).h(20).gap(3).rounded(4).items_center().text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_click(onClick).child(svg(icon(name)).size(compact ? 10 : 12).flex_none()).when(!!label, (el) => el.child(div().text_size(10.5).child(label)));
@@ -4008,22 +4043,42 @@ export default class RigSidebar extends View {
   s5Banner(t) {
     if (this.sidebarState?.id !== "S5") return null;
     const sub = this.sidebarState.substate ?? "5d";
+    const feed = this.viewFeed ?? this.primary;
+    const scope = operatorBannerScope(feed.config);
+    const canDismiss = dismissibleOperatorBanner(sub) && Boolean(scope);
+    if (canDismiss && shared("rig.operatorBannerHidden")?.[scope] === sub) return null;
     const baseHeadline = this.sidebarState.headline ?? STATE_COPY[sub]?.headline ?? STATE_COPY["5d"].headline;
-    const headline = this.feeds.length > 1 ? baseHeadline.replace(/^OpenRig\b/, `OpenRig on ${this.config?.daemonMachine ?? "this computer"}`) : baseHeadline;
+    const machine = feed.config?.daemonMachine ?? (isLoopbackDaemonUrl(feed.config?.daemonUrl) ? "this computer" : "OpenRig's machine");
+    const headline = this.feeds.length > 1 ? baseHeadline.replace(/^OpenRig's operator\b/, `OpenRig's operator on ${machine}`) : baseHeadline;
     const copyText = this.sidebarState.copyText ?? STATE_COPY[sub]?.copyText ?? null;
     const actionLabel = this.sidebarState.actionLabel ?? STATE_COPY[sub]?.actionLabel ?? null;
     const stateWord = this.sidebarState.stateWord ?? null;
-    const copied = this.copiedKey === `s5:${sub}`;
+    const copyKey = `s5:${scope}:${sub}`;
+    const copied = this.copiedKey === copyKey;
+    const copy = cx => {
+      if (!this.copyToClipboard(cx, copyText, copyKey) || !dismissibleOperatorBanner(sub)) return;
+      const next = sub === "5b" ? " This note goes once the operator is up." : "";
+      notify({ title: `Copied: ${copyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
+    };
     return v_flex().id(`rig-banner-${sub}`).mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
-      .child(h_flex().gap(6).items_center().justify_between()
-        .child(v_flex().flex_1().min_w_0().gap(2)
-          .child(div().text_size(11.5).text_color(t.muted).child(headline))
-          .when(Boolean(stateWord), (el) => el.child(div().text_size(11).text_color(t.dim).child(statusWord(stateWord, "startup")))))
-        .when(Boolean(actionLabel && copyText), (el) => el.child(
+      .child(h_flex().gap(6).items_start().justify_between()
+        .child(v_flex().flex_1().min_w_0().child(div().text_size(11.5).text_color(t.muted).child(headline)))
+        .when(canDismiss, el => el.child(focusTarget(this, this.focusRenderCx, `rig-s5-dismiss-${sub}`,
+          div().id(`rig-s5-dismiss-${sub}`).flex_none().px(4).rounded(4).cursor_pointer()
+            .text_color(t.muted).hover(s => s.text_color(t.foreground)).tooltip("Don't show this again for this OpenRig")
+            .child(svg(icon("x")).size(14)),
+          cx => {
+            if (feed.closed || operatorBannerScope(feed.config) !== scope || feed.sidebarState?.substate !== sub) return;
+            this.saveOperatorBannerDismissal(scope, sub);
+            cx?.notify?.();
+          }, el => el.border_1().border_color(t.accent)))))
+      .when(Boolean(STATE_COPY[sub]?.detail), el => el.child(div().text_size(11).text_color(t.dim).child(STATE_COPY[sub].detail)))
+      .when(Boolean(stateWord), el => el.child(div().text_size(11).text_color(t.dim).child(statusWord(stateWord, "startup"))))
+      .when(Boolean(actionLabel && copyText), el => el.child(h_flex().child(
           focusTarget(this,this.focusRenderCx,`rig-s5-copy-${sub}`,
             div().id(`rig-s5-copy-${sub}`).flex_none().px(7).h(20).rounded(4).bg(t.chrome).flex().items_center().cursor_pointer()
               .text_size(11).text_color(copied ? (t.working ?? t.accent) : t.accent).hover((s) => s.bg(t.hover)),
-            (cx) => this.copyToClipboard(cx, copyText, `s5:${sub}`),el=>el.border_1().border_color(t.accent))
+            copy,el=>el.border_1().border_color(t.accent))
             .child(copied ? "Copied" : actionLabel)
         )));
   }
@@ -4308,8 +4363,8 @@ export default class RigSidebar extends View {
     const nonKernelRigs = this.data.topology.filter((r) => r.name !== "kernel");
     const remoteOperator = Boolean(this.config?.daemonUrl && !isLoopbackDaemonUrl(this.config.daemonUrl));
     const renderNoTeamsRow = () => v_flex().id("topology-no-teams").px(18).py(4).gap(5).text_size(11.5).text_color(t.dim)
-      .child(div().child(STATE_COPY.S4.noRigsText))
-      .when(this.sidebarState?.id === "S4", (el) => el.child(h_flex().child(
+      .child(div().child(this.sidebarState?.operatorDisabled ? "No teams yet." : STATE_COPY.S4.noRigsText))
+      .when(this.sidebarState?.id === "S4" && !this.sidebarState.operatorDisabled, (el) => el.child(h_flex().child(
         div().id("topology-open-operator").px(7).h(20).rounded(4).bg(t.raised).flex().items_center().cursor_pointer()
           .text_size(11).text_color(t.accent).hover((s) => s.bg(t.hover))
           .when(remoteOperator, (b) => b.opacity(0.45))
@@ -4453,6 +4508,10 @@ export default class RigSidebar extends View {
 
           const ctxLabel = stale ? null : formatSeatContextPct(seat);
           const ctxWarn = !stale && isSeatContextWarning(seat);
+          const limit = !stale && seat.status === "unknown" ? seatUsageLimitWords(seat, Date.now(), this.uiTimezone) : null;
+          const mark = this.dot(t, seat.status, 14, seat.session, this.statusMotion.seatNeeds(seat.session, rig.name, seat.logicalId));
+          const statusLine = seat.statusLine ?? limit?.line;
+          if (statusLine) mark.tooltip(statusLine);
           const seatRow = h_flex().id(`seat-${sess}`).pl(baseIndent + 2 * TREE_STEP).pr(8).h(22).gap(6).items_center().hover((s) => s.bg(t.hover))
             .on_click((_e,cx) => { this.selectRow(seatEntry,sKey); cx?.notify?.(); })
             .on_mouse_down("right", () => this.menu({
@@ -4475,10 +4534,10 @@ export default class RigSidebar extends View {
                 .on_click((_e, cx) => { cx.stop_propagation(); this.fold(hKey, !openHelpers,[],stateConn); cx.notify(); })
                 .child(svg(icon(openHelpers ? "chevron-down" : "chevron-right")).size(11))
               : leafCell())
-            .child(staleTip ? div().opacity(0.45).child(this.dot(t, seat.status,14,seat.session,this.statusMotion.seatNeeds(seat.session,rig.name,seat.logicalId))) : this.dot(t, seat.status,14,seat.session,this.statusMotion.seatNeeds(seat.session,rig.name,seat.logicalId)))
+            .child(staleTip ? div().opacity(0.45).child(mark) : mark)
             .child(div().flex_1().truncate().text_size(12).text_color(seat.tone === "idle" || seat.tone === "done" ? t.muted : t.foreground).tooltip(String(seat.logicalId ?? seat.member??"")).child(seat.member))
             .when(Boolean(seat.isRepresentative), (el) => el.child(div().text_size(10.5).text_color(t.dim).tooltip("This rig's lead, as OpenRig reports it.").child("Lead")))
-            .child(div().id(`seat-word-${sess}`).text_size(11).text_color(stale ? t.dim : t[statusMark(seat.status).word] ?? t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(seat.word))
+            .child(div().id(`seat-word-${sess}`).text_size(11).text_color(stale ? t.dim : t[statusMark(seat.status).word] ?? t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(limit?.word ?? seat.word))
             .when(Boolean(ctxLabel), (el) => el.child(div().id(`seat-ctx-${sess}`).text_size(10.5).text_color(ctxWarn ? t.blocked : t.dim).child(ctxLabel)));
 
           out.push(this.decorateRow(t, seatRow, {
@@ -4919,6 +4978,8 @@ export default class RigSidebar extends View {
       const orderedSys = orderSiblings(sysItems, "system:items", orderMap, (x) => x.id);
       const sysSiblingIds = orderedSys.map((x) => x.id);
       const out = [];
+      if (this.sidebarState?.operatorDisabled) out.push(div().id("system-operator-disabled").pl(treeIndent(1)).pr(8).text_size(12)
+        .text_color(t.muted).child("OpenRig's operator is turned off here."));
       const cleanupResult=this.oldViewsCloseResult();
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(cleanupResult.ok===false?t.blocked:t.muted).child(cleanupResult.text));

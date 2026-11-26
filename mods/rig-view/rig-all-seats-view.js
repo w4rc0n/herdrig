@@ -5,6 +5,7 @@ import {statusLook,statusMark,relativeTimeText,iconsAt,MOD_IDS,needsYouWord} fro
 import {assistantWord,assistantTarget} from './rig-connected-assistants.js';
 import {assistantEntry} from './rig-connected-assistants-view.js';
 import {pageBodyLayout} from './rig-page-layout.js';
+import {seatUsageLimitWords} from './rig-seat-details.js';
 
 /** Uses the page's existing row keys, marks, Attach and seat menu. No data reads. */
 export function allSeatsView(page,t,_cx,models,attention,{navigate,menu,attach,openSpecs,orderMap={},hostedMembers=null}){
@@ -39,7 +40,9 @@ export function allSeatsView(page,t,_cx,models,attention,{navigate,menu,attach,o
   const open=()=>navigate(entry);
   page.pageRows.push({key:r.key,entry,target,expandable:false,open});
   const look=statusLook(r.status),age=r.since&&r.status!=='unknown'&&r.status!=='terminal_gone'?relativeTimeText(r.since).replace(/ ago$/,'').replace('just now','<1m').replace(' min','m').replace(' hr','h').replace(/ days?$/,'d'):'';
-  const words=`${look.word}${age?` · ${age}`:''}`,runtime=[seat.runtime,seat.model].filter(Boolean).join(' · ');
+  const limit=r.status==='unknown'?seatUsageLimitWords(seat,Date.now(),page.uiTimezone):null;
+  const word=r.status===seat.status&&seat.statusLine?seat.word:limit?.word??look.word;
+  const words=`${word}${age?` · ${age}`:''}`,runtime=[seat.runtime,seat.model].filter(Boolean).join(' · ');
   const actions=()=>h_flex().w(layout.attach?110:20).gap(4).items_center().flex_none()
    .when(layout.attach&&r.attachable,el=>el.child(page.button(t,`all-seat-attach-${id}`,'Attach',(_e,cx)=>{cx?.stop_propagation?.();attach(target,cx);},{small:true,iconName:'terminal',tip:`Attach to ${seat.logicalId??seat.session}'s terminal in a new tab`})))
    .child(page.moreButton(t,`all-seat-more-${id}`,()=>menu(target)));
@@ -47,7 +50,7 @@ export function allSeatsView(page,t,_cx,models,attention,{navigate,menu,attach,o
   const name=h_flex().id(`all-seat-name-${id}`).min_w(120).flex_1().gap(0).items_center().tooltip([logical,runtime].filter(Boolean).join('\n'))
    .when(dot>=0,el=>el.child(div().min_w(0).max_w(80).truncate().text_color(t.dim).text_size(12.5).child(logical.slice(0,dot+1))))
    .child(div().min_w(0).truncate().text_color(t.foreground).text_size(12.5).child(logical.slice(dot+1)));
-  const mark=()=>page.dot(t,r.status,14,seat.session,r.needIds);
+  const mark=()=>page.dot(t,r.status,14,seat.session,r.needIds).when(!!limit, el=>el.tooltip(limit.line));
   const el=v_flex().id(`all-seat-row-${id}`).tooltip(`Double-click to open ${seat.logicalId??seat.session}'s page; right-click for its actions`).py(layout.compact?6:0).min_h(layout.compact?48:34).gap(4).rounded(5)
    .bg(selected?(t.selection??t.selected):t.background).hover(el=>el.bg(t.hover)).on_hover(hover(r.key)).cursor_pointer()
    .on_click((e,cx)=>{if((e?.click_count??1)>=2)open();else page.selectPageRow(r.key,cx);})

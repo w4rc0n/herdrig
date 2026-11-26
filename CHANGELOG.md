@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.15
+
+The operator warning clears when the operator is up, seats show Claude sign-out, billing, usage-limit, and Send-stuck reasons in plain words, and Connected Assistant cards mark cut-off queues.
+
+- The operator warning clears when OpenRig's operator is ready. **Copy command** copies the command with a "Copied" confirmation, closing the warning hides it for that connection until the situation changes, and turning the operator off shows under System.
+- Claude seats show in plain words when they stop because Claude is signed out or has a billing problem. Open the seat page to see what happened and attach to its terminal.
+- A seat at its usage limit shows its reset time in plain words ("limit · 14:00", or "was Tue 14:00" after the reported reset has passed, or when the reset time is unknown).
+- After you send a message, the Send dialog says when the seat may not read it yet: "It may be waiting on a permission prompt. Check its terminal." (with Attach), or that it was at its usage limit and when that resets. Needs OpenRig 0.7.22 or later (usage limit: 0.7.23); with an older OpenRig the result is unchanged.
+  - Tested live: a Send to a Claude seat with nothing pending still shows only "Sent to …" (checked with a real, signed-out Claude seat on Herdr 0.1.17 and 0.1.18). The permission-prompt and usage-limit lines follow OpenRig's published behaviour; OpenRig hasn't emitted either notice in our live tests yet.
+- Connected Assistant cards say "at least 100" when OpenRig cut off the assistant's open queue list.
+
 ## v0.5.14
 
 The Needs count and the list under it now always agree, seat queue counts and slice lookup stay accurate past 100 rows, auto-restore is steadier, and Spaces pauses cleanly after empty-list drags and refreshes remote branches on return.
