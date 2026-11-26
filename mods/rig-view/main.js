@@ -71,11 +71,11 @@ import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, TERMINAL_TOKEN_PROTECTE
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, isOpenNeed, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
+  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, isOpenNeed, providerSeatReason, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
   tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, missionActionPreflight, isDecisionAsk, sweepFinding, checkLabel, checkReason, checkSeat, needsCheckCount, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, rigPageOnScreen as rigPageOnScreenIn, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, formatStaleAge, attachRelayPath, waitWith, queueListPage,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
-import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails } from "./rig-seat-details.js";
+import { seatActivityDetails, seatActivityWords, seatQueuePaths, seatQueueDetails, seatUsageLimitWords } from "./rig-seat-details.js";
 import { archivedElements, withArchivedHosts } from "./rig-archived.js";
 import { dismissible, dismissalSnapshot, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
 import { HERDRIG_VERSION } from "./rig-version.js";
@@ -1771,9 +1771,11 @@ export default class RigView extends View {
     return v_flex().id('assistant-detail').gap(12)
       .child(this.card(t,'Check-in',[this.dim(t,sentence),this.kv(t,[['Address',member.seat,true],['Last check-in',member.lastCheckInAt?this.time(member.lastCheckInAt,{exact:true}):'No check-in yet'],
         ['Expected cadence',member.expectedMinutes?`Every ${member.expectedMinutes} min`:member.onRequest?'On request':'Not reported'],['Evidence',member.reporter==='openrig-observed'?'Observed by OpenRig':['openrig-adapter','outside-adapter'].includes(member.reporter)?'Reported by an adapter':'Not reported'],...(member.reason?[['Reason',member.reason]]:[])])]))
-      .child(this.card(t,'Queued to it',got.error?[this.dim(t,'Queue unavailable.')]:!got.data?[this.dim(t,'Reading queue…')]:records.length?records.map(item=>
+      .child(this.card(t,'Queued to it',got.error?[this.dim(t,'Queue unavailable.')]:!got.data?[this.dim(t,'Reading queue…')]:records.length?[
+        ...(queue.partial?[this.dim(t,`Open queue: at least ${queue.count} items.`).id('assistant-queue-partial')]:[]),
+        ...records.map(item=>
         v_flex().id(`assistant-queue-${item.qitemId??item.id}`).gap(3).child(div().text_size(12).text_color(t.foreground).child(rowTitle(item.summary, item.body)))
-          .child(this.dim(t,statusWord(item.state??'not reported',"queue")))):[this.dim(t,'No open queue items.')]));
+          .child(this.dim(t,statusWord(item.state??'not reported',"queue"))))]:[this.dim(t,'No open queue items.')]));
   }
 
   topology(t, cx, entry) {
@@ -2565,6 +2567,7 @@ export default class RigView extends View {
   seatChip(t, rig, s, lifecycle, { nativeSeat = null, seatNeed = null } = {}) {
     const { compact, tight } = pageBodyLayout(this.pageWidth);
     const rowStatus = seatNeed ? "needs_input" : s.status;
+    const limit = rowStatus === "unknown" ? seatUsageLimitWords(s, Date.now(), this.uiTimezone) : null;
     if (!s.terminal) { const seat = this.nowSeat(s); this.nowSeats?.set(seat.key, seat); }
     // With herdr's panes and terminals, as the sidebar passes them: an attached seat tab is found and focused, not skipped.
     const click = this.seatTarget(s.session, s.conn);
@@ -2637,13 +2640,15 @@ export default class RigView extends View {
             .child(svg(icon(openHelpers ? "chevron-down" : "chevron-right")).size(12))
           : div().w(compact ? 0 : 12).flex_none())
         .child(h_flex().id(`seat-chip-${s.session}`).flex_1().min_w(0).h(24).gap(6).items_center()
-          .child(this.dot(t, rowStatus,14,s.session,this.statusMotion.seatNeeds(s.session,rig.name,s.logicalId)))
+          .child(this.dot(t, rowStatus,14,s.session,this.statusMotion.seatNeeds(s.session,rig.name,s.logicalId)).when(!!limit, el => el.tooltip(limit.line)))
           .child(div().id(`seat-name-${s.session}`).tooltip(`Open ${s.logicalId}'s page`).text_size(12.5).text_color(t.foreground).hover((e) => e.text_color(t.accent))
             .when(compact, el => el.flex_1().min_w(0).truncate())
             .on_click((_e, cx) => { cx?.stop_propagation?.(); go(); })
             .child(tight ? s.logicalId?.split(".").at(-1) ?? s.logicalId : s.logicalId))
           .when(Boolean(s.isRepresentative), el => el.child(div().text_size(11).text_color(t.dim).tooltip("This rig's lead, as OpenRig reports it.").child("Lead")))
-          .when(!tight, el => el.child(div().id(`seat-status-${s.session}`).text_size(11.5).text_color(t[statusMark(rowStatus).word] ?? t.muted).when(!seatNeed && s.status === "terminal_gone", (w) => w.tooltip(TERMINAL_GONE_TOOLTIP)).child(seatNeed ? "needs you" : s.word)))
+          .when(!tight, el => el.child(div().id(`seat-status-${s.session}`).text_size(11.5).text_color(t[statusMark(rowStatus).word] ?? t.muted)
+            .when(!seatNeed && s.status === "terminal_gone", (w) => w.tooltip(TERMINAL_GONE_TOOLTIP))
+            .when(!seatNeed && Boolean(s.statusLine), (w) => w.tooltip(s.statusLine)).child(seatNeed ? "needs you" : limit?.word ?? s.word)))
           .when(!!runtimeBadge && !compact, (el) => el.child(div().id(`seat-runtime-${s.session}`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
             .font_family(settings().font_family).text_size(11).text_color(t.dim).child(runtimeBadge)))
           .when(!!s.slice && !compact, (el) => el.child(div().id(`seat-slice-${s.session}`).tooltip(`Open slice ${s.slice} in Scopes`).px(6).h(18).rounded(4).flex().items_center().bg(t.raised)
@@ -2957,13 +2962,17 @@ export default class RigView extends View {
 
     const typing=tab==='activity'&&!isTerminalSeat(n)?this.read(cx,`/api/seat/status/${encodeURIComponent(n.canonicalSessionName??`${entry.name}@${entry.rig}`)}`).data?.typingGuard:null;
     const typingState=typingGuardState(typing);
-    this.pageHeading={title:entry.name,tone:seatRequests?"needs_input":rawStatus,session:n.canonicalSessionName,status:[seatRequests?"needs you":look.word,n.runtime,n.model??n.resolvedModel,entry.rig].filter(Boolean).join(" · ")};
+    const limit = !seatRequests && rawStatus === "unknown" ? seatUsageLimitWords(n, Date.now(), this.uiTimezone) : null;
+    const providerReason = seatRequests ? null : providerSeatReason(n, rawStatus);
+    this.pageHeading={title:entry.name,tone:seatRequests?"needs_input":rawStatus,session:n.canonicalSessionName,status:[seatRequests?"needs you":providerReason?.word ?? limit?.word ?? look.word,n.runtime,n.model??n.resolvedModel,entry.rig].filter(Boolean).join(" · ")};
     this.inPageActions=true;
+    const terminalAction = live.kind !== "card"
+      ? this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { tip: "Show this seat's pane in Herdr", primary: true, small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason })
+      : this.button(t, "seat-attach", "Attach", doAttach, { tip: "Attach to this seat's terminal in a new tab", primary: !attachReason, small: true, iconName: "terminal", disabled: !!attachReason, tooltip: attachReason });
+    const showProviderLine = tab === "activity" && Boolean(providerReason);
     this.pageActions=h_flex().gap(6).items_center().flex_none()
         .when((this.pageWidth??960)<320,el=>el.flex_wrap().max_w(Math.max(100,this.pageWidth-28)))
-        .child(live.kind !== "card"
-          ? this.button(t, "seat-focus-pane", "Focus pane", doFocusPane, { tip: "Show this seat's pane in Herdr", primary: true, small: true, iconName: "rig-target", disabled: !!focusReason, tooltip: focusReason })
-          : this.button(t, "seat-attach", "Attach", doAttach, { tip: "Attach to this seat's terminal in a new tab", primary: !attachReason, small: true, iconName: "terminal", disabled: !!attachReason, tooltip: attachReason }))
+        .when(!showProviderLine, el => el.child(terminalAction))
         // A terminal seat is a person's shell, not an agent: no message, work or model to give it.
         .when(!isTerminalSeat(n), (el) => el
           .child(this.button(t, "seat-act-send", "Send…", () => dialog({ input: true, placeholder: `Message to ${target.session}`, action: "send", multiLine: true, ...(outageGone ? { note: TERMINAL_GONE_SEND_NOTE } : {}) }, outageGone ? 290 : 260), { tip: "Send this seat a message", small: true, iconName: "rig-send", disabled: !!sendReason, tooltip: sendReason }))
@@ -3018,7 +3027,9 @@ export default class RigView extends View {
       .when(tab==='activity'&&!isTerminalSeat(n)&&Boolean(typingState?.heldCount||this.heldMessagesOpen),el=>el.child(this.heldMessagesCard(t,cx,{...entry,session:n.canonicalSessionName},typingState)))
       // 2. CURRENT ACTIVITY section
       .when(tab === "activity", el => el.child(v_flex().id("seat-section-activity").child(this.card(t, "CURRENT ACTIVITY", [
-        div().text_size(12.5).child(activityWords.line),
+        showProviderLine ? h_flex().w_full().min_w(0).gap(8).items_center()
+          .child(div().flex_1().min_w(0).whitespace_normal().text_size(12.5).child(providerReason.line))
+          .child(terminalAction) : div().text_size(12.5).child(limit?.line ?? activityWords.line),
         ...[activityWords.note, activityWords.changed, activityWords.stale].filter(Boolean).map(text => this.dim(t, text)),
         h_flex().id("seat-evidence-fold").tooltip("Show or hide how OpenRig knows this seat's activity").gap(5).items_center().cursor_pointer().text_color(t.muted)
           .on_click((_e, cx) => { this.activityEvidenceOpen = !this.activityEvidenceOpen; cx.notify(); })

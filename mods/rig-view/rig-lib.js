@@ -515,14 +515,16 @@ export const STATE_COPY = Object.freeze({
   "5a": Object.freeze({ id: "5a", headline: "OpenRig's operator is starting.", actionLabel: null, copyText: null }),
   "5b": Object.freeze({
     id: "5b",
-    headline: "OpenRig is running without its operator.",
-    actionLabel: "Copy fix",
+    headline: "OpenRig's operator isn't running.",
+    detail: "It sets up teams and answers you. Your teams keep running without it.",
+    actionLabel: "Copy command",
     copyText: "rig up kernel --existing",
   }),
   "5c": Object.freeze({
     id: "5c",
-    headline: "The operator can't start: no Claude Code or Codex sign-in.",
-    actionLabel: "Copy fix",
+    headline: "OpenRig's operator can't start: Claude Code and Codex aren't signed in.",
+    detail: "Sign in to one of them in a terminal. rig doctor shows what's missing.",
+    actionLabel: "Copy command",
     copyText: "rig doctor",
   }),
   "5d": Object.freeze({
@@ -834,9 +836,16 @@ export function selectSidebarState({
   }
 
   const k = kernelStatus ?? statusProbe?.kernel ?? null;
-  const kState = typeof k?.state === "string"
+  const bootState = typeof k?.state === "string"
     ? k.state
     : (typeof k?.kernel_state === "string" ? k.kernel_state : null);
+  // The boot result can stay skipped after `rig up kernel --existing`. The endpoint
+  // derives agents from current sessions, including whether a historical ready seat is down.
+  const liveReady = (bootState === "skipped" || bootState === "auth_blocked") && Array.isArray(k?.agents)
+    && k.agents.some(agent => agent?.session_name === "operator-agent@kernel" && agent.startup_status === "ready" && !agent.down);
+  const operatorDisabled = bootState === "skipped" && k?.detail === "OPENRIG_NO_KERNEL=1" && !liveReady;
+  const kState = liveReady ? "ready" : bootState;
+  const explainOperator = !liveReady && !operatorDisabled;
 
   if (kState === "booting") {
     return {
@@ -847,7 +856,7 @@ export function selectSidebarState({
       copyText: null,
     };
   }
-  if (kState === "skipped") {
+  if (kState === "skipped" && !operatorDisabled) {
     return {
       id: "S5",
       substate: "5b",
@@ -881,7 +890,7 @@ export function selectSidebarState({
     ? summaryList.find((r) => r && !r.archivedAt && (r.name === "kernel" || (k?.rigId && r.id === k.rigId)))
     : null;
 
-  if (Array.isArray(summaryList) && !kernelRig && strictKernel) {
+  if (explainOperator && Array.isArray(summaryList) && !kernelRig && strictKernel) {
     return {
       id: "S5",
       substate: "5b",
@@ -895,7 +904,7 @@ export function selectSidebarState({
   let operatorNode = null;
   if (Array.isArray(nodes)) {
     operatorNode = nodes.find((n) => n && (n.logicalId === "operator.agent" || String(n.canonicalSessionName ?? "").startsWith("operator-agent@"))) ?? null;
-    if (!operatorNode) {
+    if (!operatorNode && explainOperator) {
       return {
         id: "S5",
         substate: "5d",
@@ -905,12 +914,12 @@ export function selectSidebarState({
         copyText: STATE_COPY["5d"].copyText,
       };
     }
-    const opRunning = (
+    const opRunning = operatorNode && (
       operatorNode.sessionStatus === "running" ||
       operatorNode.sessionStatus === "ready" ||
       (operatorNode.sessionStatus === undefined && operatorNode.sessionAlive !== false)
     ) && operatorNode.sessionAlive !== false && operatorNode.startupStatus !== "failed";
-    if (!opRunning) {
+    if (!opRunning && explainOperator) {
       const stateWord = operatorNode.startupStatus === "failed"
         ? "failed"
         : (operatorNode.sessionStatus && operatorNode.sessionStatus !== "running" && operatorNode.sessionStatus !== "ready"
@@ -925,7 +934,7 @@ export function selectSidebarState({
         copyText: STATE_COPY["5d"].copyText,
       };
     }
-  } else if (kernelRig && (kernelRig.lifecycleState === "stopped" || kernelRig.hasLiveAgents === false)) {
+  } else if (explainOperator && kernelRig && (kernelRig.lifecycleState === "stopped" || kernelRig.hasLiveAgents === false)) {
     return {
       id: "S5",
       substate: "5d",
@@ -949,7 +958,8 @@ export function selectSidebarState({
     id: "S4",
     substate: null,
     headline: null,
-    hasOperator: true,
+    hasOperator: !operatorDisabled,
+    ...(operatorDisabled ? { operatorDisabled: true } : {}),
     operatorNode,
     noRigs: Array.isArray(summaryList) && nonKernelRigs.length === 0,
     noRigsText: STATE_COPY.S4.noRigsText,
@@ -2118,6 +2128,41 @@ export function writeOutcome(r) {
   return { ok: !failed, json, text: words, warning, ...(notSent ? { notSent: true } : {}), ...(undelivered ? { undelivered: true } : {}) };
 }
 
+/**
+ * Lines under a delivered send's "Sent to <seat>." when OpenRig's send result says the seat may not read it yet: an
+ * unsettled permission or elicitation request (`inputRequest`, OpenRig 0.7.22+, Claude Code seats) and a recorded usage
+ * limit (`usageLimit`, 0.7.23). Each is `{ kind, text, tip }`, where `tip` is OpenRig's own notice, verbatim. The permission
+ * line comes first (the person can act on it). No field, no line: an older OpenRig keeps today's result.
+ */
+export function sendStuckLines(json, { timezone = null, now = Date.now() } = {}) {
+  if (!json || typeof json !== "object") return [];
+  const notice = (field) => (typeof field?.notice === "string" && field.notice.trim() ? field.notice.trim() : null);
+  const lines = [];
+  const input = json.inputRequest;
+  if (input && typeof input === "object") lines.push({ kind: "input", text: "It may be waiting on a permission prompt. Check its terminal.", tip: notice(input) });
+  const limit = json.usageLimit;
+  if (limit && typeof limit === "object") {
+    // OpenRig's own claim, in the past tense: the limit was recorded when the send ran. A reset that has passed by the time the result
+    // shows (a slow send, a dialog left open) is never shown as still ahead.
+    const reset = typeof limit.resetsAt === "string" && limit.resetsAt.trim() && Number.isFinite(Date.parse(limit.resetsAt)) ? limit.resetsAt : null;
+    const when = reset ? resetTime(reset, timezone, now) : null;
+    lines.push({ kind: "limit", tip: notice(limit), text: !reset
+      ? "It was at its usage limit when you sent this, so it isn't expected to read it until the limit resets."
+      : Date.parse(reset) > now ? `It was at its usage limit when you sent this, so it isn't expected to read it before ${when}.`
+      : `It was at its usage limit when you sent this; the reset was due at ${when}.` });
+  }
+  return lines;
+}
+
+/** A reset time as the person reads times ("14:00"), with the weekday first when it isn't today ("Tue 14:00"). */
+function resetTime(iso, timezone, now) {
+  const at = new Date(iso), today = new Date(now), utc = timezone === "UTC" || timezone === "Etc/UTC";
+  const day = (d) => (utc ? [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()] : [d.getFullYear(), d.getMonth(), d.getDate()]).join("-");
+  const time = formatAbsoluteTime(at, { timezone });
+  if (day(at) === day(today)) return time;
+  return `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][utc ? at.getUTCDay() : at.getDay()]} ${time}`;
+}
+
 /** What a menu action is called in a title, a status line or a toast. */
 export function actionTitle(target, action) {
   return { "launch-spec": `Launch ${target.name}?`, send: `Send to ${target.session}`, queue: `Queue work for ${target.session}`,
@@ -2350,6 +2395,21 @@ export function seatStatus(node) {
   return node.sessionStatus ?? "unknown";
 }
 
+/** Explain a typed provider stop without displaying the provider's diagnostic text. */
+export function providerSeatReason(node, status = seatStatus(node)) {
+  const activity = node.agentActivity;
+  if (status !== "attention_required" || node.needsAttention !== true || node.runtime !== "claude-code"
+    || activity?.runtime !== node.runtime || activity?.state !== "unknown" || activity?.evidenceSource !== "runtime_hook"
+    || activity?.rawEvent !== "StopFailure" || activity.stale === true || activity.fallback === true) return null;
+  if (activity.reason === "provider_auth_error" && ["authentication_failed", "oauth_org_not_allowed", "cloud_credential_error"].includes(activity.rawSubtype)) return {
+    word: "signed out", line: "Claude is signed out, so this seat stopped. Open its terminal and sign in again.",
+  };
+  if (activity.reason === "provider_billing_error" && ["billing_error", "account_on_hold"].includes(activity.rawSubtype)) return {
+    word: "billing problem", line: "Claude stopped on a billing problem with its account. Open its terminal to see what Claude says.",
+  };
+  return null;
+}
+
 /** herdr's status vocabulary (theme().working, .blocked, .idle, .done) and the word shown, for a TUI status. */
 export function statusLook(status) {
   switch (status) {
@@ -2528,6 +2588,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null
       const pod = n.podNamespace ?? n.podId ?? "";
       const status = seatStatus(n);
       const look = statusLook(status);
+      const reason = providerSeatReason(n, status);
       const glyphInfo = rowStatusGlyph(status);
       if (!pods.has(pod)) pods.set(pod, []);
       pods.get(pod).push({
@@ -2545,6 +2606,7 @@ export function buildTopology(summary, nodesByRig, nativeSeats = [], conn = null
         slice: n.slice ?? n.activeSlice ?? null,
         status,
         ...look,
+        ...(reason ? { word: reason.word, statusLine: reason.line } : {}),
         glyph: glyphInfo.glyph,
         glyphTone: glyphInfo.tone,
         work: n.assignedWorkCount ?? 0,
@@ -2605,6 +2667,7 @@ export function rigModel(rig, nodes, nativeSeats = [], conn = null) {
   const seats = (nodes ?? []).filter((n) => n.nodeKind !== "service").map((n) => {
     const status = seatStatus(n);
     const look = statusLook(status);
+    const reason = providerSeatReason(n, status);
     const glyphInfo = rowStatusGlyph(status);
     return {
       ...(conn ? { conn } : {}),
@@ -2640,6 +2703,7 @@ export function rigModel(rig, nodes, nativeSeats = [], conn = null) {
       needsInputEvidence: n.needsInputEvidence ?? null,
       status,
       ...look,
+      ...(reason ? { word: reason.word, statusLine: reason.line } : {}),
       glyph: glyphInfo.glyph,
       glyphTone: glyphInfo.tone,
       ...(n.native ? { native: n.native } : native.has(n.canonicalSessionName) ? { native: nativeInfo(native.get(n.canonicalSessionName)) } : {}),
@@ -6688,7 +6752,7 @@ export function parseSidebarState(text) {
 }
 
 /** Serialize `{ open, order, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId }` into `<appHome>/openrig/state.json`, preserving any unrelated keys in `prevText`. */
-export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, sidebarViews, notifiedNeeds, notifiedNeedsByConnection, awayStates } = {}) {
+export function serializeSidebarState(prevText, { open = {}, order = {}, lastSeenNeedsAt, needsView, lastEndedModeApplicationId, lastActiveModeApplicationId, topologyView, sidebarViews, notifiedNeeds, notifiedNeedsByConnection, awayStates, operatorBannerChange } = {}) {
   let base = {};
   try {
     const parsed = JSON.parse(String(prevText ?? "{}"));
@@ -6709,6 +6773,14 @@ export function serializeSidebarState(prevText, { open = {}, order = {}, lastSee
     }
   }
   const next = { ...base, open: cleanOpen, order: cleanOrder };
+  if (operatorBannerChange) {
+    const { scope, substate } = operatorBannerChange;
+    const hidden = { ...next.operatorBannerHidden };
+    if (substate) hidden[scope] = substate;
+    else delete hidden[scope];
+    if (Object.keys(hidden).length) next.operatorBannerHidden = hidden;
+    else delete next.operatorBannerHidden;
+  }
   if(sidebarViews!==undefined)next.sidebarViews=cleanSidebarViews(sidebarViews);
   if (["priority", "rig"].includes(topologyView)) next.topologyView = topologyView;
   if (notifiedNeeds !== undefined) {

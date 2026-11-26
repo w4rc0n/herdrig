@@ -4,7 +4,7 @@ Herdrig brings OpenRig into the Herdr window: a sidebar with six collapsible bra
 specs, scopes, terminals, needs-you items and system state. Single-click selects a row; double-click or Enter opens
 its rig space or graphical page. The Page and the TUI are pop-outs of the sidebar.
 
-Version: v0.5.14
+Version: v0.5.15
 
 For reduced motion, add `"reducedMotion": true` to `<appHome>/openrig/config.json`. Status changes stay calm,
 graphs skip their entrance, handoff routes light briefly then turn off without fading, persistent work lines stay
@@ -259,8 +259,8 @@ The sidebar and these steps use the same words.
 | "OpenRig is installed, but it isn't running." | Daemon stopped | `rig daemon start`, or the **Start OpenRig** button |
 | "OpenRig isn't answering." | The CLI and the window disagree, or the daemon is unhealthy | `rig status`, then OpenRig's help: `rig context get help` |
 | "OpenRig's operator is starting." | Kernel booting | Wait. It clears by itself. |
-| "OpenRig is running without its operator." | Kernel skipped or stopped | Offer `rig up kernel --existing` (copied by **Copy fix**) |
-| "The operator can't start: no Claude Code or Codex sign-in." | No working login | `rig doctor`, then OpenRig's sign-in steps |
+| "OpenRig's operator isn't running." | Kernel skipped or stopped | Run `rig up kernel --existing` in a terminal on that machine. **Copy command** copies it. |
+| "OpenRig's operator can't start: Claude Code and Codex aren't signed in." | No working login | **Copy command** copies `rig doctor`. Run it in a terminal on that machine, then follow OpenRig's sign-in steps. |
 | "The operator isn't running." | Kernel failed or degraded | `rig ps --nodes --rig kernel`, then OpenRig's "Incomplete setup and restart" table |
 | "The rig command failed." | `rig` exists but errors | Read its message, then `rig context get help` |
 
@@ -407,7 +407,7 @@ need a later restart, and Herdrig never restarts the daemon. Other actions run a
 
 **Blocks.** Four self-contained GUI mods, each a folder in `mods/` with its own `main.js`, `mod.json`, the shared
 helpers reachable from its imports, and 41 `rig-*.svg` icons. The packaged JavaScript/CommonJS file counts are
-55 for `rig`, 72 for `rig-view`, 38 for `rig-palette`, and 50 for `rig-menu`; shared files outside a mod's import
+56 for `rig`, 72 for `rig-view`, 38 for `rig-palette`, and 50 for `rig-menu`; shared files outside a mod's import
 closure are not copied there. `rig-link` has `link.js`, `mod.json`, and 12 packaged JavaScript files in total (no SVGs),
 and `rig-spaces` contains three packaged JavaScript files and three SVGs, Herdr's own Spaces list with rig marks (below).
 This repository ships these six mods (five are installed on Herdr versions before 0.1.17 or with `--no-links`):

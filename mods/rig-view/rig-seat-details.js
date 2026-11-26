@@ -1,5 +1,30 @@
 /** The public /api/rigs/:id/nodes activity contract (captured from OpenRig 0.7.11). */
 import { formatAbsoluteTime } from './rig-time.js';
+
+/** Copy for a held limit. The caller preserves the seat's existing status and tone. */
+export function seatUsageLimitWords(node, now = Date.now(), timezone = null) {
+  const limit = node?.activityState?.usageLimit;
+  const parse = value => typeof value === "string" ? Date.parse(value) : NaN;
+  const observed = parse(limit?.observedAt);
+  if (!Number.isFinite(observed)) return null;
+  const useUtc = timezone === "UTC" || timezone === "Etc/UTC";
+  const day = stamp => useUtc ? new Date(stamp).toISOString().slice(0, 10) : new Date(stamp).toDateString();
+  const time = stamp => {
+    const clock = formatAbsoluteTime(stamp, { timezone });
+    if (day(now) === day(stamp)) return clock;
+    const date = new Date(stamp);
+    const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][useUtc ? date.getUTCDay() : date.getDay()];
+    return `${weekday} ${clock}`;
+  };
+  const since = `At its usage limit since ${time(observed)}.`;
+  const reset = parse(limit.resetsAt);
+  if (!Number.isFinite(reset)) return { word: "usage limit", line: `${since} Its reset time wasn't reported.` };
+  const when = time(reset);
+  return reset > now
+    ? { word: `limit · ${when}`, line: `${since} It resets at ${when}.` }
+    : { word: `limit · was ${when}`, line: `${since} The reset was due at ${when}, and it hasn't started a new turn since.` };
+}
+
 export function seatActivityDetails(node, now = Date.now(), timezone = null) {
   const activity = node?.activityState ?? {}, agent = node?.agentActivity ?? {};
   const text = (value) => typeof value === "string" && value ? value : null;
