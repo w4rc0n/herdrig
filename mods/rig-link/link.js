@@ -24,8 +24,8 @@ function readLinkConfig(rawText) {
 
 export async function handleLink(click) {
   const config = await configReads(async () => readLinkConfig(await Promise.resolve().then(() => readTextFile(`${appHome()}/openrig/config.json`)).catch(() => READ_FAILED)));
-  syncRetainedOrigins(config);
   if (!config || config.linkUnavailable || config.configInvalid) return "pass";
+  syncRetainedOrigins(config);
   const pathLink = click?.link?.kind === "file";
   const target = resolveRigLink(click, { config, ...(pathLink ? {
     spaces: spaces(), terminals: terminals(), panes: panes(), state: shared("rig.spaceState"),

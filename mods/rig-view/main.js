@@ -2746,9 +2746,10 @@ export default class RigView extends View {
         const all=shared('rig.compactionDecisions')??{},current=all[token];
         if(!current||typeof current!=='object'||current.status==='expired'
           ||(status==='checking'&&current.status!=='allow')||(status==='dispatched'&&current.status!=='checking')
+          ||(status==='rechecking'&&current.status!=='dispatched')
           ||(status!=='error'&&Date.now()>=current.deadline))return false;
-        setShared('rig.compactionDecisions',{...all,[token]:{deadline:current.deadline,status,
-          dispatched:current.dispatched||status==='dispatched',...(text?{text}:{})}});
+        setShared('rig.compactionDecisions',{...all,[token]:{deadline:current.deadline,status:status==='rechecking'?'checking':status,
+          dispatched:status!=='rechecking'&&(current.dispatched||status==='dispatched'),...(text?{text}:{})}});
         return true;
       },
     });return this.compaction;

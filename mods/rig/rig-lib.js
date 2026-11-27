@@ -10,7 +10,7 @@ import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publi
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions, prepareRigSpaceAdoption, topologyRig } from "./rig-space-context.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickRig, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage, openrigHomeProblem } from "./rig-connections.js";
+import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, AMBIGUOUS_RIG_SEAT, pickRig, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage, openrigHomeProblem } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
 import { counted as countWords, plainError as errorWords, statusWord as stateWords, requestFailed as failedWords, requestWhat as requestWords } from './rig-words.js';
@@ -3284,8 +3284,8 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   };
   const currentRig = rigOfEntry(current);
   const fromRig = from ? rigOfEntry(from) : null;
-  const hasRig = Boolean(currentRig?.rigId || currentRig?.rig || currentRig?.key);
-  const sameRig = Boolean(from && hasRig && fromRig) && (
+  const hasRig = Boolean(currentRig?.ambiguous || currentRig?.rigId || currentRig?.rig || currentRig?.key);
+  const sameRig = Boolean(from && hasRig && fromRig && !currentRig.ambiguous && !fromRig.ambiguous) && (
     currentRig.rigId && fromRig.rigId
       ? currentRig.rigId === fromRig.rigId
       : (currentRig.rig ?? currentRig.key) === (fromRig.rig ?? fromRig.key)
@@ -4086,7 +4086,7 @@ export function diffNeedsNotifications(items, prevState = null, { quiet = false,
  * - If `Array.isArray(items)` is passed and a non-health `id` is no longer present, opens `:needs` with `notice: "This request was already answered"`
  * - Missing `health:` ids keep the item route and connection so the page can offer its System → Health fallback
  */
-export function openNeed(id, { shared, setShared, run, items = null, layout = undefined, spaces = undefined, panes = undefined, conn = null, stay = false, tabId = null } = {}) {
+export function openNeed(id, { shared, setShared, run, notify = undefined, items = null, layout = undefined, spaces = undefined, panes = undefined, conn = null, stay = false, tabId = null } = {}) {
   const rawId = typeof id === "object" && id !== null ? (id.id ?? null) : id;
   const targetId = typeof rawId === "string" && rawId.trim() ? rawId.trim() : null;
   const nav = shared?.("rig.nav") ?? { stack: [] };
@@ -4106,14 +4106,22 @@ export function openNeed(id, { shared, setShared, run, items = null, layout = un
     activateRigPage(entry);
     return { opened: "needs", id: null, expired: false };
   }
-  if (Array.isArray(items) && !isHealthAttention({ id: targetId }) && !items.some((x) => String(x?.id ?? "") === targetId)) {
+  const matching = Array.isArray(items)
+    ? items.filter((x) => x && String(x.id ?? "") === targetId && (!conn || !x.conn || x.conn === conn))
+    : null;
+  if (matching && !isHealthAttention({ id: targetId }) && matching.length === 0) {
     setShared?.("rig.focusNeed", null);
     const entry={ section: "needs", expiredId: targetId, notice: "This request was already answered", ...(conn?{conn}:{}) };
     setShared?.("rig.nav", navPush(nav, entry));
     activateRigPage(entry);
     return { opened: "needs", id: targetId, expired: true };
   }
-  const hit = Array.isArray(items) ? items.find((x) => String(x?.id ?? "") === targetId) : null;
+  // Reject an ambiguous Needs ID spanning multiple connections before stamping entry.conn or mutating state.
+  if (!conn && matching && new Set(matching.map((m) => m.conn ?? "")).size > 1) {
+    (notify ?? routingEnvironment?.()?.notify)?.({ title: "Request", body: AMBIGUOUS_REQUEST, level: "warning" });
+    return { opened: null, id: targetId, expired: false, ambiguous: true, reason: AMBIGUOUS_REQUEST };
+  }
+  const hit = matching ? ((conn ? matching.find((m) => m.conn === conn) : null) ?? matching[0] ?? null) : null;
   const check = sweepFinding(hit);
   const name = check ? checkLabel(check, items) : hit?.summary ?? hit?.title ?? targetId;
   setShared?.("rig.open.page", { ...(shared?.("rig.open.page") ?? {}), [`needs:${targetId}`]: true });
@@ -4916,37 +4924,85 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
   if (check?.about && Array.isArray(items)) {
     const visited = seen ?? new Set();
     if (item.id) visited.add(String(item.id));
-    const target = items.find((r) => r && (!scopedConn || !r.conn || r.conn === scopedConn) && (r.qitemId === check.about || r.id === `queue:${check.about}` || r.id === check.about));
+    const targetMatches = items.filter((r) => r && (!scopedConn || !r.conn || r.conn === scopedConn) && (r.qitemId === check.about || r.id === `queue:${check.about}` || r.id === check.about));
+    if (!scopedConn && new Set(targetMatches.map((r) => r.conn ?? "")).size > 1) {
+      return { rig: null, rigId: null, key: String(check.about), ambiguous: true };
+    }
+    const target = (scopedConn ? targetMatches.find((r) => r.conn === scopedConn) : null) ?? targetMatches[0];
     if (target && !visited.has(String(target.id ?? ""))) {
       const resolved = needRigOf(target, topo, scopedConn, items, visited);
       if (resolved) return resolved;
     }
   }
   const isResolve = item.answer?.verb === "resolve" || item.reply === "resolve";
-  const sessions = [
+  const askingSessions = [item.asker, item.sourceSession, item.session, item.seat, item.logicalId];
+  const waitingSessions = [item.waiting?.owner, item.destinationSession, item.recipient];
+  const primarySessions = [
     ...(check?.backlogSeat ? [check.backlogSeat] : []),
-    ...(isResolve
-      ? [item.waiting?.owner, item.destinationSession, item.recipient, item.asker, item.sourceSession, item.session, item.seat, item.logicalId]
-      : [item.asker, item.sourceSession, item.session, item.seat, item.logicalId, item.waiting?.owner, item.destinationSession, item.recipient]),
+    ...(isResolve ? waitingSessions : askingSessions),
   ];
-  for (const candidate of sessions) {
-    const raw = typeof candidate === "string" ? candidate.trim() : "";
-    if (!raw) continue;
-    const found = resolveAskerSeat(raw, topo, scopedConn);
-    if (found.ambiguous) return { rig: null, rigId: null, key: raw.includes("@") ? raw.slice(raw.lastIndexOf("@") + 1) : raw, ambiguous: true };
-    if (found.found) return { rig: found.seat.rig, rigId: found.seat.rigId, key: found.seat.rigId ?? found.seat.rig, ambiguous: false };
-    const at = raw.lastIndexOf("@");
-    if (at > 0) {
-      const rigPart = raw.slice(at + 1).trim();
-      const byPart = matchRigRef(rigPart, topo.length === 0);
-      if (byPart) return byPart;
+  const secondarySessions = isResolve ? askingSessions : waitingSessions;
+  const splitSessions = (candidates) => {
+    const qualified = [], bare = [];
+    for (const candidate of candidates) {
+      const raw = typeof candidate === "string" ? candidate.trim() : "";
+      if (!raw) continue;
+      if (raw.includes("@")) qualified.push(raw);
+      else bare.push(raw);
     }
-  }
+    return { qualified, bare };
+  };
+  const resolveQualified = (list) => {
+    for (const raw of list) {
+      const found = resolveAskerSeat(raw, topo, scopedConn);
+      if (found.ambiguous) return { rig: null, rigId: null, key: raw.slice(raw.lastIndexOf("@") + 1), ambiguous: true };
+      if (found.found) return { rig: found.seat.rig, rigId: found.seat.rigId, key: found.seat.rigId ?? found.seat.rig, ambiguous: false };
+      const at = raw.lastIndexOf("@");
+      if (at > 0) {
+        const rigPart = raw.slice(at + 1).trim();
+        const byPart = matchRigRef(rigPart, topo.length === 0);
+        if (byPart) return byPart;
+      }
+    }
+    return null;
+  };
+  const resolveBare = (list) => {
+    for (const raw of list) {
+      const wantLogical = raw.replace(/-/g, ".");
+      const hits = [];
+      for (const rig of topo) {
+        if (!rig || typeof rig !== "object") continue;
+        if (scopedConn && rig.conn !== scopedConn) continue;
+        const seats = Array.isArray(rig.seats) ? rig.seats : (rig.pods ?? []).flatMap((p) => p?.seats ?? []);
+        if (seats.some((s) => s && typeof s === "object" && (s.session === raw || s.logicalId === wantLogical || s.logicalId === raw))) {
+          hits.push({ rig: rig.name, rigId: rig.id, conn: rig.conn });
+        }
+      }
+      if (!hits.length) continue;
+      if (!scopedConn && new Set(hits.map((h) => h.conn ?? "")).size > 1) {
+        return { rig: null, rigId: null, key: raw, ambiguous: true };
+      }
+      if (new Set(hits.map((h) => h.rigId ?? h.rig ?? "")).size > 1) {
+        return { rig: null, rigId: null, key: raw, ambiguous: true, reason: AMBIGUOUS_RIG_SEAT };
+      }
+      return { rig: hits[0].rig, rigId: hits[0].rigId, key: hits[0].rigId ?? hits[0].rig, ambiguous: false };
+    }
+    return null;
+  };
+  const primary = splitSessions(primarySessions);
+  const byPrimaryQualified = resolveQualified(primary.qualified);
+  if (byPrimaryQualified) return byPrimaryQualified;
+  // Explicit scope decides the rig before bare primary seat fallback or secondary fields.
   if (typeof item.scope === "string" && item.scope.trim()) {
-    const byScope = matchRigRef(item.scope.trim().replace(/^rig:/, ""), false);
+    const rawScope = item.scope.trim();
+    const explicitRigScope = rawScope.startsWith("rig:");
+    const byScope = matchRigRef(explicitRigScope ? rawScope.slice(4) : rawScope, explicitRigScope && topo.length === 0);
     if (byScope) return byScope;
   }
-  return null;
+  const byPrimaryBare = resolveBare(primary.bare);
+  if (byPrimaryBare) return byPrimaryBare;
+  const secondary = splitSessions(secondarySessions);
+  return resolveQualified(secondary.qualified) ?? resolveBare(secondary.bare);
 }
 
 /** Resolve the rig of a Needs-You entry by its attention `id` from `items` and `topology` (connection-scoped). */
@@ -4956,7 +5012,8 @@ export function resolveNeedRig(id, { items = [], topology = [], conn = null } = 
   const matches = items.filter((it) => it && String(it.id ?? "") === want && (!conn || !it.conn || it.conn === conn));
   if (!matches.length) return null;
   if (!conn && new Set(matches.map((m) => m.conn ?? "")).size > 1) return { rig: null, rigId: null, key: want, ambiguous: true };
-  return needRigOf(matches[0], topology, conn ?? matches[0]?.conn ?? null, items);
+  const chosen = (conn ? matches.find((m) => m.conn === conn) : null) ?? matches[0];
+  return needRigOf(chosen, topology, conn ?? chosen?.conn ?? null, items);
 }
 
 /**

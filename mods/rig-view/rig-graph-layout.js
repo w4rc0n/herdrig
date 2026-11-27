@@ -414,9 +414,13 @@ export function routeGraphColumns(graph, width, { model = graphColumnModel(graph
     if(Math.abs(s.row-t.row)>1)bandTracks[Math.max(s.row,t.row)]++;
   }
   const ent = Object.create(null), pods = [], rowBands = [], tags = new Map(), brackets = [];
-  if(narrow)for(const e of model.links)for(const [ref,peer,incoming] of [[e.from,e.to,false],[e.to,e.from,true]]){
-    if(!tags.has(ref))tags.set(ref,[]);
-    tags.get(ref).push({peer,incoming});
+  const seatIds=narrow?new Set(graph.pods.flatMap(pod=>pod.seats.map(seat=>seat.lid))):null;
+  if(seatIds)for(const e of model.links){
+    if(!seatIds.has(e.from)||!seatIds.has(e.to))continue;
+    for(const [ref,peer,incoming] of [[e.from,e.to,false],[e.to,e.from,true]]){
+      if(!tags.has(ref))tags.set(ref,[]);
+      tags.get(ref).push({peer,incoming});
+    }
   }
   let y = MARGIN;
   rows.forEach((row, ri) => {
@@ -464,14 +468,16 @@ export function routeGraphColumns(graph, width, { model = graphColumnModel(graph
     y = bottom + COLUMN_BAND + bandTracks[ri] * 4;
   });
   const layout = { pods, ent, rowBands, brackets, narrow, headings: model.headings, observers: model.observers,
-    tags, width, height: y + MARGIN, plans: [], columnLayout: true, noDelegation: !graph.edges.length };
+    tags, width, height: y + MARGIN, plans: [], columnLayout: true,
+    noDelegation: !graph.edges.some(edge=>edge.kind==="delegates_to") };
+  if(narrow)return layout;
   const routed = model.links.filter(e => ent[e.from] && ent[e.to]);
   const tracks = new Map(), gutters = new Map(), bands = new Map();
   const use = (map,key,value) => {
     if(!map.has(key))map.set(key,[]);
     map.get(key).push(value);
   };
-  if(!narrow)routed.forEach((edge,index)=>{
+  routed.forEach((edge,index)=>{
     const s=ent[edge.from],t=ent[edge.to],track={lane:16*(index+1)/(routed.length+1),bands:new Map()};
     tracks.set(edge,track);
     if(adjacentColumns(s.pod,t.pod))return;
@@ -500,7 +506,6 @@ export function routeGraphColumns(graph, width, { model = graphColumnModel(graph
     for(const ref of [e.from,e.to])use(exits,ent[ref].pod,ent[ref].y+ent[ref].h/2+offset(e,ref));
   routed.forEach(e => {
     const s = ent[e.from], t = ent[e.to];
-    if (narrow) return;
     const start=offset(e,e.from),end=offset(e,e.to);
     const outer=adjacentColumns(s.pod,t.pod)&&s.x>t.x&&exits.get(t.pod)?.includes(s.y+s.h/2+start);
     const pts = routeColumnLink(layout, s, t, { ...tracks.get(e), start, end, outer });
@@ -509,9 +514,12 @@ export function routeGraphColumns(graph, width, { model = graphColumnModel(graph
   return layout;
 }
 
-export function countGraphRouteCollisions(plans) {
+export function countGraphRouteCollisions(plans,expired=null) {
   const vertical = [], horizontal = [], collinear = new Map(), collisions = new Set();
+  let checks=0;
+  const interrupted=()=>expired&&(checks++%128===0)&&expired();
   for (const [i, plan] of plans.entries()) for (let j = 1; j < plan.pts.length; j++) {
+    if(interrupted())return null;
     const [a, b] = [plan.pts[j - 1], plan.pts[j]];
     const upright=a[0]===b[0],fixed=a[upright?0:1],axis=upright?1:0;
     const segment=[fixed,Math.min(a[axis],b[axis]),Math.max(a[axis],b[axis]),i],key=`${upright}:${fixed}`;
@@ -521,23 +529,27 @@ export function countGraphRouteCollisions(plans) {
   }
   const pair=(i,j)=>i<j?`${i}:${j}`:`${j}:${i}`;
   for (const [x, y0, y1, i] of vertical) for (const [y, x0, x1, j] of horizontal) {
+    if(interrupted())return null;
     if (i !== j && x0 <= x && x <= x1 && y0 <= y && y <= y1) collisions.add(`${pair(i,j)}:${x}:${y}`);
   }
-  for(const [axis,segments] of collinear)for(const [[fixed,a0,a1,i],index] of segments.map((v,i)=>[v,i])){
-    for(const [,b0,b1,j] of segments.slice(index+1)){
+  for(const [axis,segments] of collinear)for(const [index,[fixed,a0,a1,i]] of segments.entries()){
+    for(let k=index+1;k<segments.length;k++){
+      if(interrupted())return null;
+      const [,b0,b1,j]=segments[k];
       if(i===j)continue;
       const lo=Math.max(a0,b0),hi=Math.min(a1,b1);
       if(lo<hi)collisions.add(`${pair(i,j)}:overlap:${axis}:${lo}:${hi}`);
       if(lo===hi)collisions.add(axis.startsWith("true:")?`${pair(i,j)}:${fixed}:${lo}`:`${pair(i,j)}:${lo}:${fixed}`);
     }
   }
-  return collisions.size;
+  return expired?.()?null:collisions.size;
 }
 
 /** Called off the render path. Keep spec-order ties and cap search for large rigs. */
 export function bestGraphColumnOrder(graph, width, model = graphColumnModel(graph), now = Date.now) {
   const ids = graph.pods.map(pod => pod.id).filter(id => id !== model.top);
   if (width < NARROW_GRAPH || ids.length < 2 || !model.links.length) return ids;
+  const deadline=now()+40,expired=()=>now()>=deadline;
   const ranks = new Map(ids.map((id, i) => [id, i]));
   const links = model.links.map(e => [model.podOf(e.from), model.podOf(e.to)]);
   const before = (a, b) => {
@@ -546,10 +558,13 @@ export function bestGraphColumnOrder(graph, width, model = graphColumnModel(grap
   };
   let best = ids, score = [Infinity, Infinity];
   const consider = order => {
+    if(expired())return;
     const points = routeGraphColumns(graph, width, { model, order });
+    if(expired())return;
     const ranks = new Map(order.map((id, i) => [id, i]));
     const span = links.reduce((sum, [a, b]) => sum + (ranks.has(a) && ranks.has(b) ? Math.abs(ranks.get(a) - ranks.get(b)) : 0), 0);
-    const crossings = countGraphRouteCollisions(points.plans);
+    const crossings = countGraphRouteCollisions(points.plans,expired);
+    if(crossings===null)return;
     if (crossings < score[0] || crossings === score[0] && (span < score[1]
         || span === score[1] && before(order, best))) {
       best = order.slice();
@@ -559,11 +574,13 @@ export function bestGraphColumnOrder(graph, width, model = graphColumnModel(grap
   if (ids.length <= 6) {
     const visit = (prefix, remaining) => {
       if (!remaining.length) return consider(prefix);
-      for (const id of remaining) visit([...prefix, id], remaining.filter(other => other !== id));
+      for (const id of remaining) {
+        if(expired())break;
+        visit([...prefix, id], remaining.filter(other => other !== id));
+      }
     };
     visit([], ids);
   } else {
-    const deadline = now() + 40;
     consider(ids);
     for(const start of ids){
       if(now()>=deadline)break;
