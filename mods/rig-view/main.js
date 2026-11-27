@@ -71,7 +71,7 @@ import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, TERMINAL_TOKEN_PROTECTE
   SLICE_FILES, MISSION_FILES, RIG_SECTIONS, SECTION_TITLES, RIG_TABS, currentCapabilities, capabilityDisableReason, capabilitiesSummaryDetail, capabilitiesSummaryRow,
   usagePercentBar, usageWindowTone, formatUsageRows, isUsageWindowsDisabled, normalizeUsageHosts, recentTransitionRows, singleLineText, computePulseCounts, matchesPulseFilter,
   isRigStopped, expandAllTopology, collapseAllTopology, normalizeTerminalPreview, statusMark, statusMarkElement, isTerminalSeat, rigTone, backTarget, entryTitle, treeKeyNav,
-  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRequestCount, isOpenNeed, providerSeatReason, seatRestartReason, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
+  rowStatusGlyph, formatHonestCount, attachToSeat, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, rigOfConnection, requestMarkdownView, parkedWorkOwner, observeNeedDecision, attentionCoverage, requestCardText, requestHeadline, needsRowHeadline, needsRequestCount, isOpenNeed, providerSeatReason, seatRestartReason, escapedLines, sourceLines, openingRowChars, textLinesView, openingMoreText, TEXT_LINE_HEIGHT,
   tierOf, isUpdateNeed, tierStripFor, sortNeedsByTier, enrichAttentionItems, questionsState, submitMissionActions, missionActionPreflight, isDecisionAsk, resolveMissionVerb, formatSafeCloseConflict, sweepFinding, checkLabel, checkReason, checkSeat, needsCheckCount, sinceYouWereAwaySummary, quietModeHeaderChip, deadBindingNotice, whoseQueueSummary, resolveAskerSeat, parseSidebarState, serializeSidebarState,
   viewsPropsFromLayout, openOrFocusRigTab, rigPageOnScreen as rigPageOnScreenIn, closeRigInspection, selectWorkerView, openNeed, markStale, settleRead, formatStaleAge, attachRelayPath, waitWith, queueListPage,
   localSpecRoots, resolveInSpecRoots, specFolderRefusal, specCopyName, isLoopbackDaemonUrl, parseDaemonStatusJson, isValidSessionName, newRigOverlay } from "./rig-lib.js";
@@ -2726,6 +2726,10 @@ export default class RigView extends View {
       cliReason:config=>cliRefusal({...config,person:null}),
       operation:config=>gatedOperation(config?.connectionId),
       get:async(config,path,op)=>{const response=await op.fetch(`${config.daemonUrl}${path}`);if(!response.ok)throw Error(`OpenRig's compaction check failed (error ${response.status}).`);return response.json();},
+      trigger:async(config,body,op)=>{
+        const response=await op.fetch(`${config.daemonUrl}/api/compaction/trigger`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+        return {status:response.status,data:await response.json()};
+      },
       help:async(config,op)=>{const command=writeCommand({...config,person:null},['compact','--help']);const r=await execFor(config,op)(command.command,command.args,{timeout:15000});return r.code===0?/--state/.test(r.stdout):null;},
       exec:(command,op,timeout)=>execFor({connectionId:op.scope},op)(command.command,command.args,{timeout}),
       notify:cx=>{if(!this.closed)cx.notify();},
@@ -5404,18 +5408,19 @@ export default class RigView extends View {
       if (n.criticalHealth) return this.healthNeedsLine(t, n);
       // A blank summary needs the same body the expanded card uses; fetch it only for these rows.
       const queue = n.summaryIsFallback && !n.body && n.qitemId ? this.read(cx, `/api/queue/${encodeURIComponent(n.qitemId)}`).data : null;
-      const text = requestCardText(n, queue?.body), tier = tierOf(n), urgent = ["alert", "escalation"].includes(tier);
+      const headline = needsRowHeadline(n, queue?.body);
+      const tier = tierOf(n), urgent = ["alert", "escalation"].includes(tier);
       const assistant=assistantForNeed(n,this.hostedMembers(cx));
       const owner = n.reply === "resolve" || n.answer?.verb === "resolve" ? parkedWorkOwner(n) : assistant?assistantOwner(assistant):n.asker ?? n.sourceSession;
       const age = Date.parse(n.at ?? ""), mins = Number.isFinite(age) ? Math.max(0, Math.floor((Date.now() - age) / 60000)) : null;
       const shown = Boolean(open[`needs:${n.id}`]);
       // OpenRig's check on another row: labelled by that row, with "check" where a request shows who asked (its sender asked nothing).
-      const check = sweepFinding(n), rowLabel = check ? checkLabel(check, items) : text.headline;
+      const check = sweepFinding(n), rowLabel = check ? checkLabel(check, items) : headline;
       return v_flex().min_w(0).child(h_flex().id(`needs-${i}`).px(8).h(34).overflow_hidden().gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
         .when(this.selectedNeed === this.replyKey(n), el => el.bg(t.selection ?? t.raised))
         .tooltip(`${shown ? "Close" : "Open"} this ${check?'check':'request'}; right-click for its actions`).on_click(() => toggle(n)).on_mouse_down("right", () => this.menu(n))
         .child(div().w(12).text_size(12).text_color(urgent ? t.blocked : t.accent).child(urgent ? "◆" : "●"))
-        .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(check ? rowLabel : rowText(n.summary) || text.headline).child(rowLabel))
+        .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).tooltip(check ? rowLabel : rowText(n.summary) || headline).child(rowLabel))
         .child(check ? div().id(`need-check-chip-${i}`).max_w(180).text_size(11.5).text_color(t.muted).tooltip("OpenRig's check on another row, not a new request").child("check")
           : div().max_w(180).truncate().text_size(11.5).text_color(t.muted).tooltip(String(String(owner ?? "")??"")).child(String(owner ?? "")))
         .child(div().text_size(11).text_color(t.dim).tooltip(this.time(n.at,{exact:true})).child(mins === null ? "" : mins < 1 ? "<1m" : `${mins}m`))

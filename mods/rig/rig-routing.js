@@ -1,6 +1,6 @@
 import { errorDiagnostic } from "./rig-words.js";
 // All explicit opens and background grid reconciliation pass through this coordinator.
-import { MOD_IDS, layoutShowsMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn } from "./rig-lib.js";
+import { MOD_IDS, layoutShowsMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn, resolveNeedRig } from "./rig-lib.js";
 /** The page a Rig tab shows: its own history's top, else the page the router last sent it, else (one OpenRig only) the last page opened anywhere. */
 function tabPageOf(host,config,tab){
   const own=host.shared?.("rig.tabPages")?.[tab]?.stack?.at(-1)??host.shared?.("rig.pageRoutes")?.[tab];
@@ -388,11 +388,17 @@ export async function replaceMigrationTab(host,config,request) {
 
 function requestRig(host, request) {
   const entry=request.entry ?? {};
-  const key=request.rigId ?? request.rig ?? request.seat?.rig ?? entry.rigId ?? entry.rig
-    ?? (entry.kind==="rig" ? entry.name : null);
   const topology=host.topology?.() ?? host.shared?.("rig.data")?.topology ?? [];
   // An id is exact (and with its connection when the request has one); a name on two OpenRigs picks neither.
   const conn=request.conn ?? entry.conn;
+  let key=request.rigId ?? request.rig ?? request.seat?.rig ?? entry.rigId ?? entry.rig
+    ?? (entry.kind==="rig" ? entry.name : null);
+  if(!key && entry.section==="needs" && entry.id){
+    const items=host.attentionItems?.() ?? host.shared?.("rig.data")?.attentionItems ?? [];
+    const needRig=resolveNeedRig(entry.id,{items,topology,conn});
+    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,ambiguous:true};
+    key=needRig?.rigId ?? needRig?.rig ?? needRig?.key ?? null;
+  }
   const byId=pickRig(topology,{rigId:key,conn}).rig;
   // A name on more than one OpenRig is not "no rig": it is refused by the caller (never a home or a space instead).
   const byName=byId?{}:pickRig(topology,{name:key,conn});

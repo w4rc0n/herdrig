@@ -104,6 +104,7 @@ export class SeatCompaction {
     e.uncertain=false;
     e.error=null;
     e.requestedAttemptId=null;
+    e.exactAttempt=null;
   }
   recordRecovery(e,dispatch,accepted=false){
     if(e.dispatch!==dispatch)return;
@@ -132,7 +133,7 @@ export class SeatCompaction {
     const preparation=!Number.isFinite(updated)&&p?.mode==='manual'&&p.attemptId&&p.attemptId!==record.baseline;
     const stage=pi?(s?.status==='completed'?'completed':null):Object.hasOwn(stageWords,s?.stage)?stageWords[s.stage]:null;
     const isBaseline=p?.attemptId&&p.attemptId===record.baseline;
-    const matched=record.attemptId?sameAttempt:!isBaseline&&(recent||preparation);
+    const matched=record.attemptId?sameAttempt:!record.awaitingEarlyReceipt&&!isBaseline&&(recent||preparation);
     const settled=pi?s?.status==='completed'&&matched
       :p?.mode!=='automatic'&&p?.compact!=='uncertain'&&matched&&(stage||preparation);
     if(settled){
@@ -210,8 +211,16 @@ export class SeatCompaction {
     const uncertain=e.uncertain||e.data?.preparation?.compact==='uncertain'||e.node.runtime==='pi'&&e.data?.state?.status==='uncertain';
     return e.node.sessionStatus!=='running'?"This seat isn't running.":!e.snapshot?'The current seat generation could not be checked. Look again.':!resend&&uncertain?'Check the seat before another compaction request.':e.busy||e.review||e.start?'A compaction request is already open.':e.automatic&&compactionView(e.data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,automatic:true}).live?'An automatic compaction is already under way.':null;
   }
+  observedView(e,localError=null){
+    const exact=e.exactAttempt;
+    if(exact&&!exact.data&&!localError)return {text:'OpenRig accepted the request. Waiting for compaction status.',live:true,cancel:false,guidance:[]};
+    const data=exact?exact.data:e.data;
+    const v=compactionView(data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,pending:e.busy,localError,automatic:!exact&&e.automatic,expectedAttemptId:e.requestedAttemptId});
+    if(exact&&e.data?.preparation?.attemptId!==e.requestedAttemptId)v.cancel=false;
+    return v;
+  }
   view(e,forPolling=false){
-    const v=compactionView(e.data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,pending:e.busy,localError:forPolling?null:e.error,automatic:e.automatic,expectedAttemptId:e.requestedAttemptId});
+    const v=this.observedView(e,forPolling?null:e.error);
     if(e.start)return {...v,text:e.start.copy.starting,live:true,cancel:false};
     const recovery=this.recovery(e);
     if(recovery){
@@ -251,10 +260,14 @@ export class SeatCompaction {
     return {applied,data};
   }
   observed(e,data){
-    e.data=data;e.observedAt=Date.now();e.automatic=data?.preparation?.mode==='automatic';
-    const live=compactionView(data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,automatic:e.automatic,expectedAttemptId:e.requestedAttemptId}).live;
+    e.data=data;e.automatic=data?.preparation?.mode==='automatic';
     const preparationId=data?.preparation?.attemptId;
-    const attempt=preparationId??data?.state?.attemptId??data?.state?.requestedAt??'unidentified';
+    const exact=e.exactAttempt;
+    const matchesExact=exact&&preparationId===e.requestedAttemptId&&data?.preparation?.mode==='manual';
+    if(matchesExact)exact.data=data;
+    if(!exact||matchesExact)e.observedAt=Date.now();
+    const live=exact?this.observedView(e).live:compactionView(data,{runtime:e.node.runtime,session:e.node.canonicalSessionName,automatic:e.automatic,expectedAttemptId:e.requestedAttemptId}).live;
+    const attempt=exact?e.requestedAttemptId:preparationId??data?.state?.attemptId??data?.state?.requestedAt??'unidentified';
     const start=e.start;
     // Released Claude triggers return after preparation, without an attempt ID.
     // Before the receipt, require a new preparation consistent with this anonymous CLI request.
@@ -268,14 +281,14 @@ export class SeatCompaction {
         ? e.requestedAttemptId&&data?.state?.attemptId===e.requestedAttemptId
         : data?.preparation?.mode==='manual'&&preparationId
           &&(e.requestedAttemptId?preparationId===e.requestedAttemptId
-            :preparationId!==start.baseline&&(start.allowBaseline||!start.receiptRead&&pendingPreparation))
+            :!start.awaitingEarlyReceipt&&preparationId!==start.baseline&&(start.allowBaseline||!start.receiptRead&&pendingPreparation))
     )){
       this.host.reportStart(start.token,'started');
       e.start=null;
     }
     // Time spent with an idle card does not consume a later attempt's budget.
     // Polling the same live attempt never extends it.
-    if(live&&(!e.observedLive||e.observedAttempt!==attempt))e.pollStartedAt=e.observedAt;
+    if(live&&(!e.observedLive||e.observedAttempt!==attempt))e.pollStartedAt=Date.now();
     else if(!live)e.pollStartedAt=null;
     e.observedLive=live;e.observedAttempt=attempt;
     // Only an id from this call's own successful receipt can identify its result.
@@ -329,7 +342,7 @@ export class SeatCompaction {
             }
           }
           if(review.cancel)e.cancelling=true;
-          else{e.busy=true;e.requestedAttemptId=null;e.pollStartedAt=Date.now();}
+          else{e.busy=true;e.requestedAttemptId=null;e.exactAttempt=null;e.pollStartedAt=Date.now();}
           e.error=null;this.changed(e,cx);cx.spawn(task=>this.act(e,review,task));
         }
       }
@@ -405,23 +418,70 @@ export class SeatCompaction {
         }
         e.recoveryEvidence=null;
       }
-      dispatched=true;const result=await this.host.exec(command,op,240000);
+      let result,exact=false,unsupported=false;
+      dispatched=true;
+      if(dispatch&&this.host.trigger){
+        dispatch.awaitingEarlyReceipt=true;
+        if(start)start.awaitingEarlyReceipt=true;
+        const session=e.node.canonicalSessionName;
+        const response=await this.host.trigger(e.config,{session,earlyAck:true},op);
+        data=response.data;
+        exact=response.status===202;
+        if(exact&&(data?.ok!==true||data.session!==session||data.stage!=='preparing'||typeof data.attemptId!=='string'||!data.attemptId.trim())){
+          data=null;
+          throw Error('OpenRig returned an incomplete compaction receipt.');
+        }
+        unsupported=response.status===422&&data?.ok===false&&data.reason==='early_ack_unsupported'&&e.node.runtime==='pi';
+        if(unsupported&&!start?.expired&&(!start||Date.now()<start.deadline)&&!this.closed&&this.entry===e){
+          dispatched=false;
+          const currentTenure=await this.host.get(e.config,`/api/telemetry/v1/nodes/${encodeURIComponent(e.node.nodeId)}/tenures?limit=1`,op);
+          const currentStatus=await this.host.get(e.config,`/api/seat/status/${encodeURIComponent(session)}`,op);
+          if(start?.expired||this.closed||this.entry!==e)return;
+          if(start&&Date.now()>=start.deadline){
+            start.dispatched=false;
+            this.expireStart(e,start,cx);
+            if(priorWarning)this.saveRecovery(e,priorWarning);
+            return;
+          }
+          if(!sameCompactionSnapshot(review.snapshot,compactionSnapshot(e.node,currentStatus,currentTenure,review.snapshot?.hostId)))throw Error(changedSeat(session));
+          op.check();
+          unsupported=false;
+          dispatched=true;
+          result=await this.host.exec(command,op,240000);
+          data=null;
+        }else{
+          if(typeof data?.ok!=='boolean')throw Error('OpenRig returned no compaction receipt.');
+          result={code:response.status>=200&&response.status<300?0:1};
+        }
+        if(result.code===0&&!exact){
+          dispatch.awaitingEarlyReceipt=false;
+          if(start)start.awaitingEarlyReceipt=false;
+        }
+      }else result=await this.host.exec(command,op,240000);
       received=true;
       if(start)start.receiptRead=true;
-      try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
+      if(!data)try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
+      if(start&&e.start===start&&!start.expired&&Date.now()>=start.deadline)this.expireStart(e,start,cx);
       accepted=result.code===0&&data.ok===true;
       if(!review.cancel&&accepted){
         const attemptId=typeof data.attemptId==='string'&&data.attemptId.trim()?data.attemptId:null;
         const record=this.recovery(e);
         if(record?.token===dispatch.token){
-          this.saveRecovery(e,{...record,accepted:true,attemptId:attemptId??record.attemptId});
+          this.saveRecovery(e,{...record,...(dispatch.awaitingEarlyReceipt===false?{awaitingEarlyReceipt:false}:{}),accepted:true,attemptId:attemptId??record.attemptId});
           if(start?.expired)this.changed(e,cx);
         }
         if(attemptId&&!start?.expired)e.requestedAttemptId=attemptId;
+        if(exact&&!start?.expired){
+          e.exactAttempt={data:null};
+          if(start&&e.start===start){
+            this.host.reportStart(start.token,'started');
+            e.start=null;
+          }
+        }
       }
       if(start?.expired){
         const record=this.recovery(e);
-        if(record&&record.token===dispatch?.token&&!record.accepted&&result.code!==0&&data.ok===false&&!data.preparation&&UNSENT_TRIGGER_REFUSALS.has(data.reason)){
+        if(record&&record.token===dispatch?.token&&!record.accepted&&result.code!==0&&data.ok===false&&!data.preparation&&(unsupported||UNSENT_TRIGGER_REFUSALS.has(data.reason))){
           const current=this.entry?.recoveryKey===e.recoveryKey?this.entry:e;
           this.resetRecovery(current,priorWarning);
           current.error='OpenRig refused the compaction request. Nothing was sent to the seat.';

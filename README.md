@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.17
+Version: v0.5.18
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -64,23 +64,28 @@ The Rig palette: jump to any rig, seat or page from the keyboard.
 - **Configuration:** Pages with more than 30 settings open one category at a time. A category or search shows up to 40 settings. Rows you are editing, selecting or reviewing stay visible, and counts show how many more settings there are. Use the filter to find another setting, or navigate category headers with Enter, Space and the arrow keys. Small pages stay expanded.
 - **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
   OpenRig reports.
-- **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs show pod and seat
-  routes, hover/keyboard selection and briefly lit handoff paths. A working task line pulses green through short idle
-  pauses, then turns dashed after a 15-second grace period. A seat that needs you or is blocked has a steady amber line
-  with a red needs-you chip where there is room to show it. Open tasks for unreachable seats have a muted line
-  and an unreachable label.
+- **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs and specs arrange
+  pods into columns, summarizing broad delegation in a heading above them instead of crossing wires, with observer
+  counts on seat cards and link/work tags at narrow widths. Select a seat to see who gives it work, who watches it,
+  whom it sends work to, and its open tasks (with **Open seat page** on running rigs); use the left and right arrow
+  keys to step through seats and **Escape** to return to the graph. Running rigs also show briefly lit handoff paths:
+  a working task line pulses green through short idle pauses, then turns dashed after a 15-second grace period; a seat
+  that needs you or is blocked has a steady amber line with a red needs-you chip where there is room to show it; open
+  tasks for unreachable seats have a muted line and an unreachable label.
   The legend explains the lines on screen. Hover a task line for summaries and ages. Idle minutes update on redraw
-  after the graph sees the seat stop working. Dense edges group by pod, and the text Edges list stays available.
+  after the graph sees the seat stop working, and the text Edges list stays available.
   Saved previews come from your connected OpenRig server, including a host-to-box tunnel.
   Set `"reducedMotion": true` in `<appHome>/openrig/config.json` to skip entrance, fades and status pulses.
 - **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
-  questions, or reply in your own words), with quiet hours and modes in **System → People**.
+  questions, or reply in your own words), with quiet hours and modes in **System → People**. On OpenRig 0.7.24 and
+  later, a seat's permission request gets its own row under **Needs you** in Topology's Priority view and opens
+  directly on **Allow once** or **Deny**.
 - **Command palette** on `ctrl-alt-r`.
 - **Connected assistants:** queue-checking team members have a folded group under their rig, All seats rows and a read-only detail page. Their own check-in words stay separate from activity counts; Queue work, Copy address and Open rig page are their only actions. Older OpenRig versions without the roster route show nothing.
 - **Right-click menus** on seats (send, queue, pause or resume, change model), Needs requests, specs and slices.
 - **Attach** opens a live seat in its own tab, and Herdr's **Agents** section shows its status.
 - **Follows your space:** the sidebar folds outside OpenRig's spaces, keeping Needs you and search visible. Click its
-  header to expand until you change spaces. Pages go to their rig's existing space or the **OpenRig** home, which
+  header to expand until you change spaces. Pages and Needs alerts go to their rig's existing space or the **OpenRig** home, which
   also holds the TUI on OpenRig's selected machine. Personal spaces stay free of new Rig tabs. Existing tabs offer **Move** or **Keep here**.
 - **More than one OpenRig:** one sidebar for this computer's OpenRig and your Herdr machines'; see
   [Using more than one OpenRig](#using-more-than-one-openrig).

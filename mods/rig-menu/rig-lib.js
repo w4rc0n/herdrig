@@ -10,7 +10,7 @@ import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publi
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions, prepareRigSpaceAdoption, topologyRig } from "./rig-space-context.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage, openrigHomeProblem } from "./rig-connections.js";
+import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickRig, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage, openrigHomeProblem } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
 import { counted as countWords, plainError as errorWords, statusWord as stateWords, requestFailed as failedWords, requestWhat as requestWords } from './rig-words.js';
@@ -161,6 +161,15 @@ export function requestHeadline(item = {}, body = "") {
     ? summary.length <= 140 ? summary : requestFirstSentence(summary)
     : requestFirstSentence(withoutRowIds(String(body || item.body || item.bodyPreview || "").slice(0, HEADLINE_SCAN).replace(/\r\n?/g, "\n").replace(/^\n+/, "").trimEnd()));
   return headline || `Request from ${item.asker ?? item.sourceSession ?? "the asking seat"}`;
+}
+
+export function needsRowHeadline(item, body) {
+  const asker = item.asker ?? item.sourceSession;
+  const prefix = `Permission: ${asker} asks to `;
+  if (asker && isRunnerPermissionNeed(item) && typeof item.summary === "string" && item.summary.startsWith(prefix)) {
+    return requestHeadline({ summary: `Permission: ${item.summary.slice(prefix.length)}` });
+  }
+  return requestHeadline(item, body);
 }
 
 /** Parsed cards by request, so a redraw with the same request and text doesn't parse a long body again. Each entry keeps the exact
@@ -2178,7 +2187,8 @@ export function writeOutcome(r) {
   // A CLI receipt that proves no request left says so in every result. Recorded/retained sends did contact OpenRig:
   // their "not delivered" receipt must never acquire a "nothing was sent" claim.
   const words = notSent && !/nothing was sent/i.test(line) ? `${line} Nothing was sent.` : line;
-  return { ok: !failed, json, text: words, warning, ...(notSent ? { notSent: true } : {}), ...(undelivered ? { undelivered: true } : {}) };
+  const action = failed && typeof json?.error?.action === "string" ? json.error.action.trim() : "";
+  return { ok: !failed, json, text: [words, action].filter(Boolean).join("\n"), warning, ...(notSent ? { notSent: true } : {}), ...(undelivered ? { undelivered: true } : {}) };
 }
 
 /**
@@ -3258,8 +3268,29 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   const onTab = Boolean(onScreen) && (onScreen.single === true || (Boolean(current?.conn) && onScreen.conns.includes(current.conn))
     || fromPage && (current?.conn ?? null) === (from?.conn ?? null));
   // ...and a tab of the rig page on screen (Graph, Health, Recent) is that same page: it stays too, with no read of any space and no jump.
-  const sameRig = Boolean(from) && Boolean(current?.rigId || current?.rig) && (current.rigId ? current.rigId === from.rigId : current.rig === from.rig);
-  const stays = onTab && (sameRig || !current?.rigId && !current?.rig);
+  const rigOfEntry = (e) => {
+    if (!e || typeof e !== "object") return null;
+    if (e.rigId || e.rig) return { rigId: e.rigId ?? null, rig: e.rig ?? null, key: e.rigId ?? e.rig };
+    if (e.kind === "rig" && e.name) return { rigId: null, rig: e.name, key: e.name };
+    if (e.section === "needs" && e.id) {
+      const data = read?.("rig.data");
+      return resolveNeedRig(e.id, {
+        items: host.attentionItems?.() ?? environment.attentionItems?.() ?? data?.attentionItems ?? [],
+        topology: host.topology?.() ?? environment.topology?.() ?? data?.topology ?? [],
+        conn: e.conn ?? null,
+      });
+    }
+    return null;
+  };
+  const currentRig = rigOfEntry(current);
+  const fromRig = from ? rigOfEntry(from) : null;
+  const hasRig = Boolean(currentRig?.rigId || currentRig?.rig || currentRig?.key);
+  const sameRig = Boolean(from && hasRig && fromRig) && (
+    currentRig.rigId && fromRig.rigId
+      ? currentRig.rigId === fromRig.rigId
+      : (currentRig.rig ?? currentRig.key) === (fromRig.rig ?? fromRig.key)
+  );
+  const stays = onTab && (sameRig || !hasRig);
   publish?.("rig.nav", navPush(read?.("rig.nav"), current)); // the log of the last page opened anywhere; tabs don't draw from it
   // The tab the open came from: the clicking page's own tab, else the Rig tab on screen. A page that stays goes onto that tab only.
   const sourceTab = host.sourceTab ?? onScreenRigTab(host.spaces ?? environment.spaces, host.panes ?? environment.panes);
@@ -4063,7 +4094,7 @@ export function openNeed(id, { shared, setShared, run, items = null, layout = un
     // Asked from a Rig page that is on screen: it shows the page in its own tab, in its own space.
     if (stay) { if (tabId) pushTabPage({ shared, setShared, panes }, tabId, entry); return; }
     if (layout !== undefined) {
-      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, section: "needs", mayCreate: true, ...(tabId ? { sourceTab: tabId } : {}) }, entry);
+      openOrFocusRigTab({ shared, setShared, run, spaces, panes, layout, section: "needs", mayCreate: true, ...(Array.isArray(items) ? { attentionItems: () => items } : {}), ...(tabId ? { sourceTab: tabId } : {}) }, entry);
     } else {
       run?.("layout.select", { stack: "rig-work", child: "rig-page" });
     }
@@ -4856,6 +4887,78 @@ export function resolveAskerSeat(asker, topology = [], conn = null) {
   };
 }
 
+/** The rig a Needs-You item belongs to, for one rig == one space routing. Returns `{ rig, rigId, key, ambiguous }` or `null`. */
+export function needRigOf(item, topology = [], conn = null, items = null, seen = null) {
+  if (!item || typeof item !== "object" || isHealthAttention(item) || item.criticalHealth) return null;
+  const scopedConn = conn ?? item.conn ?? null;
+  const topo = Array.isArray(topology) ? topology : [];
+  const matchRigRef = (ref, allowUnloaded = false) => {
+    const raw = typeof ref === "string" ? ref.trim() : "";
+    if (!raw || raw === "external") return null;
+    const byId = pickRig(topo, { rigId: raw, conn: scopedConn });
+    if (byId.rig) return { rig: byId.rig.name, rigId: byId.rig.id, key: byId.rig.id ?? byId.rig.name, ambiguous: false };
+    const byName = pickRig(topo, { name: raw, conn: scopedConn });
+    if (byName.ambiguous) return { rig: null, rigId: null, key: raw, ambiguous: true };
+    if (byName.rig) return { rig: byName.rig.name, rigId: byName.rig.id, key: byName.rig.id ?? byName.rig.name, ambiguous: false };
+    if (allowUnloaded) return { rig: raw, rigId: null, key: raw, ambiguous: false };
+    return null;
+  };
+  if (typeof item.rigId === "string" && item.rigId.trim()) {
+    const matched = matchRigRef(item.rigId, false);
+    if (matched) return matched;
+    return { rig: typeof item.rig === "string" && item.rig.trim() ? item.rig.trim() : null, rigId: item.rigId.trim(), key: item.rigId.trim(), ambiguous: false };
+  }
+  if (typeof item.rig === "string" && item.rig.trim()) {
+    const matched = matchRigRef(item.rig, true);
+    if (matched) return matched;
+  }
+  const check = sweepFinding(item);
+  if (check?.about && Array.isArray(items)) {
+    const visited = seen ?? new Set();
+    if (item.id) visited.add(String(item.id));
+    const target = items.find((r) => r && (!scopedConn || !r.conn || r.conn === scopedConn) && (r.qitemId === check.about || r.id === `queue:${check.about}` || r.id === check.about));
+    if (target && !visited.has(String(target.id ?? ""))) {
+      const resolved = needRigOf(target, topo, scopedConn, items, visited);
+      if (resolved) return resolved;
+    }
+  }
+  const isResolve = item.answer?.verb === "resolve" || item.reply === "resolve";
+  const sessions = [
+    ...(check?.backlogSeat ? [check.backlogSeat] : []),
+    ...(isResolve
+      ? [item.waiting?.owner, item.destinationSession, item.recipient, item.asker, item.sourceSession, item.session, item.seat, item.logicalId]
+      : [item.asker, item.sourceSession, item.session, item.seat, item.logicalId, item.waiting?.owner, item.destinationSession, item.recipient]),
+  ];
+  for (const candidate of sessions) {
+    const raw = typeof candidate === "string" ? candidate.trim() : "";
+    if (!raw) continue;
+    const found = resolveAskerSeat(raw, topo, scopedConn);
+    if (found.ambiguous) return { rig: null, rigId: null, key: raw.includes("@") ? raw.slice(raw.lastIndexOf("@") + 1) : raw, ambiguous: true };
+    if (found.found) return { rig: found.seat.rig, rigId: found.seat.rigId, key: found.seat.rigId ?? found.seat.rig, ambiguous: false };
+    const at = raw.lastIndexOf("@");
+    if (at > 0) {
+      const rigPart = raw.slice(at + 1).trim();
+      const byPart = matchRigRef(rigPart, topo.length === 0);
+      if (byPart) return byPart;
+    }
+  }
+  if (typeof item.scope === "string" && item.scope.trim()) {
+    const byScope = matchRigRef(item.scope.trim().replace(/^rig:/, ""), false);
+    if (byScope) return byScope;
+  }
+  return null;
+}
+
+/** Resolve the rig of a Needs-You entry by its attention `id` from `items` and `topology` (connection-scoped). */
+export function resolveNeedRig(id, { items = [], topology = [], conn = null } = {}) {
+  const want = typeof id === "string" ? id.trim() : "";
+  if (!want || isHealthAttention({ id: want }) || !Array.isArray(items) || !items.length) return null;
+  const matches = items.filter((it) => it && String(it.id ?? "") === want && (!conn || !it.conn || it.conn === conn));
+  if (!matches.length) return null;
+  if (!conn && new Set(matches.map((m) => m.conn ?? "")).size > 1) return { rig: null, rigId: null, key: want, ambiguous: true };
+  return needRigOf(matches[0], topology, conn ?? matches[0]?.conn ?? null, items);
+}
+
 /**
  * The slice of a seat's open work ("Open its slice"): its queue rows' `slice:<id>` tags, in-progress first,
  * matched to `/api/scopes?counts=1` missions by slice id or folder name. Null when no open row names a known slice.
@@ -5585,6 +5688,12 @@ export function singleLineText(value) {
 
 /** The prefix of OpenRig's queue row ids, as people paste them into a row's text (the full id, or one shortened with an ellipsis). */
 const ROW_ID_PREFIX = "qitem-";
+const RUNNER_PERMISSION_ATTENTION_ID = new RegExp(`^queue:${ROW_ID_PREFIX}runner-permission-[0-9a-f]{24}$`);
+/** The queue row carries the tag. Raw attention can arrive before queue enrichment. */
+export function isRunnerPermissionNeed(item) {
+  return (Array.isArray(item?.tags) && item.tags.includes("runner-permission"))
+    || (typeof item?.id === "string" && RUNNER_PERMISSION_ATTENTION_ID.test(item.id) && item.humanQuestions?.[0]?.id === "permission");
+}
 const ROW_ID_SOURCE = `${ROW_ID_PREFIX}(?:[0-9A-Za-z]+(?:-[0-9A-Za-z]+)*(?:…|\\.\\.\\.)?|…|\\.\\.\\.)`;
 const ROW_ID = new RegExp(`\\b(?:queue(?:-update)?:)?${ROW_ID_SOURCE}`, "g"); // a pasted page id (queue:<id>) goes whole
 /** An id in the sentence itself reads as "a row" ("see <id> for the trace" → "see a row for the trace"); after "row" or "item" it just goes. */
