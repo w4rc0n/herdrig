@@ -1266,7 +1266,7 @@ export default class RigView extends View {
 
   /** A cached GET: returns what's known now and fetches in the background when missing, stale or asked again. What it
    *  had stays drawn until the new answer replaces it (the sidebar's `list` does the same). */
-  read(cx, path, force = false, onData = null, as = null, inTask = false) {
+  read(cx, path, force = false, onData = null, as = null, inTask = false, fence = false) {
     if(path==='/api/health'&&this.renderMemo)this.renderMemo.healthRead=true;
     // `as`: a spec operation's own connection (its library re-read after a write), never the page shown when the write ends.
     const conn = as ? as.connectionId : this.activeConnId(), cache = this.cacheFor(conn), cfg = as ?? this.activeConfig();
@@ -1276,19 +1276,19 @@ export default class RigView extends View {
     if (served) cache[path] = served;
     const hit = cache[path];
     const lost = Boolean(hit?.loading) && Number.isFinite(hit.startedAt) && Date.now() - hit.startedAt > READ_LOST_MS;
-    // A spec write needs an observation made after its sync. Fence off earlier reads as soon as that GET starts.
-    const afterSpecSync = inTask && force && path === "/api/specs/library";
-    if (!served && (!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost || afterSpecSync)) {
+    // A spec write or conflict refusal needs an observation made after it; fence off earlier in-flight reads as soon as that GET starts.
+    const fenced = Boolean(fence || (inTask && force && path === "/api/specs/library"));
+    if (!served && (!hit || force || hit.stale || lost) && cfg && (!hit?.loading || lost || fenced)) {
       const published = sharedRigData(cfg, this.sharedOnce);
       const sharedAt = (this.config?.connections?.length ?? 0) > 1 ? published?.byConnection?.[cfg?.connectionId]?.at : published?.at;
       // The read belongs to the daemon and connection it started against: a late answer, after the configuration moved, is dropped.
       const epoch = this.cacheEpoch ?? 0;
       // Each read of a path is numbered. Any outstanding read's answer settles a loading entry; once an answer is shown, an older one is dropped.
       const seq = (hit?.seq ?? 0) + 1;
-      const libraryGeneration = afterSpecSync ? Symbol() : hit?.libraryGeneration;
-      const older = () => libraryGeneration !== cache[path]?.libraryGeneration || seq < (cache[path]?.shownSeq ?? 0);
+      const readGeneration = fenced ? Symbol() : hit?.readGeneration;
+      const older = () => readGeneration !== cache[path]?.readGeneration || seq < (cache[path]?.shownSeq ?? 0);
       let answerChanged = false;
-      const generation = libraryGeneration ? { libraryGeneration } : {};
+      const generation = readGeneration ? { readGeneration } : {};
       cache[path] = { ...(hit ?? {}), ...generation, stale: false, loading: true, startedAt: Date.now(), seq };
       const finish = (outcome) => {
         const pending = cache[path];
@@ -1308,13 +1308,44 @@ export default class RigView extends View {
           ...(pending?.stale ? { stale: true } : {}),
           seq: Math.max(pending?.seq ?? seq, seq), shownSeq: seq,
         };
-        if (outcome.ok && typeof outcome.data?.qitemId === "string" && path.startsWith("/api/queue/")) {
-          const row = outcome.data, at = cache[path].at;
+        if (path.startsWith("/api/queue/")) {
           const readConn = adoptConnection(this.config, conn) ?? null; // the row is this read's OpenRig's: only its own requests' boxes observe it
-          for (const [id, box] of Object.entries(this.replies ?? {})) {
-            if (box.target?.qitemId === row?.qitemId && (adoptConnection(this.config, box.target?.conn) ?? null) === readConn && observeNeedDecision(box, row, at)) {
-              delete this.answered[id];
-              delete this.questionChoices[id];
+          if (outcome.ok && typeof outcome.data?.qitemId === "string") {
+            const row = outcome.data, at = cache[path].at;
+            for (const [id, box] of Object.entries(this.replies ?? {})) {
+              if (box.target?.qitemId !== row?.qitemId || (adoptConnection(this.config, box.target?.conn) ?? null) !== readConn) continue;
+              if (box.result?.conflict && box.result?.unknownTerminalState
+                && typeof box.result.refineMinSeq === "number" && seq >= box.result.refineMinSeq
+                && typeof row.state === "string" && row.state.trim()) {
+                const st = row.state.trim();
+                const refined = formatSafeCloseConflict({
+                  code: "qitem_already_terminal",
+                  currentState: st,
+                  expectedState: box.result.expectedState ?? null,
+                  idx: box.result.stepsCompleted ?? 0,
+                  total: box.result.totalSteps ?? 1,
+                });
+                box.result = { ...box.result, text: refined, unknownTerminalState: false };
+                if (this.refused?.[id] && !this.refused[id].state) this.refused[id] = { ...this.refused[id], text: refined, state: st };
+              }
+              if (observeNeedDecision(box, row, at, { readSeq: seq })) {
+                delete this.answered[id];
+                delete this.questionChoices[id];
+              }
+            }
+          } else if (!outcome.ok) {
+            let readQid = null;
+            try { readQid = decodeURIComponent(path.slice("/api/queue/".length).split("?")[0]); } catch (_) { readQid = null; }
+            if (readQid) {
+              for (const box of Object.values(this.replies ?? {})) {
+                if (box.target?.qitemId !== readQid || (adoptConnection(this.config, box.target?.conn) ?? null) !== readConn) continue;
+                if (typeof box.conflictAwaitingRefresh === "number" && seq >= box.conflictAwaitingRefresh) {
+                  box.conflictAwaitingRefresh = false;
+                }
+                if (box.result?.unknownTerminalState && typeof box.result.refineMinSeq === "number" && seq >= box.result.refineMinSeq) {
+                  box.result = { ...box.result, unknownTerminalState: false };
+                }
+              }
             }
           }
         }
@@ -5715,7 +5746,7 @@ export default class RigView extends View {
     };
 
     const box = !isUpdateNeed(mergedItem) ? this.replyFor(cx, mergedItem) : null;
-    if (box && queueRow && observeNeedDecision(box, queueRow, queueRes.at)) {
+    if (box && queueRow && observeNeedDecision(box, queueRow, queueRes.at, { readSeq: queueRes.shownSeq ?? null })) {
       delete this.answered[this.replyKey(n)];
       delete this.questionChoices[this.replyKey(n)];
     }
@@ -6112,7 +6143,7 @@ export default class RigView extends View {
           }
         } else {
           if (outcome.conflict) {
-            box.conflictAwaitingRefresh = true;
+            box.conflictAwaitingRefresh = false;
             box.composerSnapshot = null;
             (this.refused ??= Object.create(null))[this.replyKey(n)] = {
               id: n.id,
@@ -6130,6 +6161,7 @@ export default class RigView extends View {
             };
             refreshSidebar();
           }
+          let conflictReadSeq = false;
           if (outcome.conflict || outcome.settingsChanged || outcome.partial) { // a settings change or partial stop mid-answer also leaves recorded steps: the card drops them and re-reads the item
             if (Array.isArray(outcome.committedQuestionIds) && outcome.committedQuestionIds.length > 0) {
               const nextChoices = { ...(this.questionChoices[this.replyKey(n)] ?? {}) };
@@ -6141,7 +6173,16 @@ export default class RigView extends View {
             if (rereadCfg) {
               if (outcome.conflict) this.read(cx, viewParam ? `/api/attention?view=${encodeURIComponent(viewParam)}` : "/api/attention", true, null, rereadCfg);
               this.read(cx, `/api/attention?item=${encodeURIComponent(n.id)}`, true, null, rereadCfg);
-              if (qid) this.read(cx, `/api/queue/${encodeURIComponent(qid)}`, true, null, rereadCfg);
+              if (qid) {
+                const qPath = `/api/queue/${encodeURIComponent(qid)}`;
+                // Fence off any pre-refusal in-flight queue GET so stale pre-refusal data can neither refine the refusal nor consume its refresh arm.
+                this.read(cx, qPath, true, null, rereadCfg, false, Boolean(outcome.conflict));
+                if (outcome.conflict) {
+                  const qCache = this.cacheFor(rereadCfg.connectionId)[qPath];
+                  conflictReadSeq = qCache?.loading && typeof qCache.seq === "number" ? qCache.seq : false;
+                  box.conflictAwaitingRefresh = conflictReadSeq;
+                }
+              }
             }
           }
           if (outcome.networkError) {
@@ -6152,6 +6193,7 @@ export default class RigView extends View {
               text: outcome.text || NETWORK_UNCONFIRMED_MESSAGE,
             };
           } else {
+            const unknownTerminalState = Boolean(outcome.conflict && outcome.code === "qitem_already_terminal" && !outcome.currentState && typeof conflictReadSeq === "number");
             box.result = {
               ok: false,
               conflict: Boolean(outcome.conflict),
@@ -6159,6 +6201,13 @@ export default class RigView extends View {
               daemonRefused: Boolean(outcome.daemonRefused),
               unconfirmed: Boolean(outcome.unconfirmed),
               notSent: Boolean(outcome.notSent || outcome.stepNotSent || (outcome.settingsChanged && !outcome.unconfirmed)), // refused before the step left: the text already says what was and was not sent
+              ...(unknownTerminalState ? {
+                unknownTerminalState: true,
+                refineMinSeq: conflictReadSeq,
+                expectedState: expectedState ?? null,
+                stepsCompleted: outcome.stepsCompleted ?? 0,
+                totalSteps: outcome.totalSteps ?? 1,
+              } : {}),
               text: outcome.text || "It didn't work, and the daemon gave no reason.",
             };
           }

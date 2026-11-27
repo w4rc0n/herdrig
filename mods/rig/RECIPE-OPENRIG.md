@@ -87,9 +87,9 @@ The sidebar and these steps use the same words.
 | "OpenRig is installed, but it isn't running." | Daemon stopped | `rig daemon start`, or the **Start OpenRig** button |
 | "OpenRig isn't answering." | The CLI and the window disagree, or the daemon is unhealthy | `rig status`, then OpenRig's help: `rig context get help` |
 | "OpenRig's operator is starting." | Kernel booting | Wait. It clears by itself. |
-| "OpenRig's operator isn't running." | Kernel skipped or stopped | Click **Start operator** on this computer, or use **Copy command** and run it in a terminal on that machine. For a local connection with a custom OpenRig home, the copied command sets that home and selects the local host. |
+| "OpenRig's operator isn't running." | Kernel skipped or stopped | Click **Start operator** on this computer, or use **Copy command** and run it in a terminal on that machine. For a local connection, the copied command selects the local host and sets the custom OpenRig home when configured. |
 | "OpenRig's operator can't start: Claude Code and Codex aren't signed in." | No working login | **Copy command** copies `rig doctor`, with this connection's `OPENRIG_HOME` when configured. Run it on that machine and follow the sign-in steps. For a custom home, use the banner's `export OPENRIG_HOME=…` command in that terminal before running `rig daemon stop` and `rig daemon start` there. |
-| "The operator isn't running." | Kernel failed or degraded | `rig ps --nodes --rig kernel`, then OpenRig's "Incomplete setup and restart" table |
+| "OpenRig's operator has a problem." | Kernel failed, degraded, or missing its spec | **Copy command** copies `rig ps --nodes --rig kernel`, selecting the local host and custom home for local connections. It stays in System after you dismiss the banner. Consult OpenRig's "Incomplete setup and restart" table after running the command. |
 | "The rig command failed." | `rig` exists but errors | Read its message, then `rig context get help` |
 
 For anything else, OpenRig's own help is the source: `rig context get help`. Don't improvise a recovery.

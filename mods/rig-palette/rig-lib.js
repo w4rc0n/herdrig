@@ -258,20 +258,32 @@ export function isOpenNeed(item) {
     && !["done", "closed", "denied", "canceled", "handed-off"].includes(item.state);
 }
 
-/** One request id each, plus prompt-only seats when topology is supplied. */
+/** One request id per connection, plus prompt-only seats when topology is supplied. */
 export function needsRequestCount(topology = [], items = []) {
   const ids = new Set(), attributed = new Set();
+  const unscoped = new Map(), prompts = new Map();
   for (const item of filterAttentionHealth(items)) {
     if (!isOpenNeed(item)) continue;
     if (sweepFinding(item)) continue; // OpenRig's check on another row: counted apart (needsCheckCount), and its sender asked nothing
-    ids.add(item.id);
+    ids.add(qualifyKey(item.conn, `request:${item.id}`));
     const session = item.answer?.verb === "resolve" || item.reply === "resolve" ? item.waiting?.owner ?? item.destinationSession : item.asker ?? item.sourceSession;
-    if (session) attributed.add(session);
+    if (!session) continue;
+    if (item.conn) attributed.add(qualifyKey(item.conn, `prompt:${session}`));
+    else unscoped.set(session, undefined);
   }
   for (const rig of topology ?? []) for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) {
-    if (!attributed.has(seat.session) && (seat.restartNeedsAttention || (!seat.terminal
+    const key = qualifyKey(seat.conn ?? rig.conn, `prompt:${seat.session}`);
+    // Older unstamped requests can claim a seat only if the session identifies one connection.
+    if (unscoped.has(seat.session)) {
+      const owner = unscoped.get(seat.session);
+      if (owner !== key) unscoped.set(seat.session, owner === undefined ? key : null);
+    }
+    if (seat.restartNeedsAttention || (!seat.terminal
       && !["stopped", "detached", "exited"].includes(seat.sessionStatus)
-      && ["needs_input", "attention_required", "failed"].includes(seat.status)))) ids.add(`prompt:${seat.session}`);
+      && ["needs_input", "attention_required", "failed"].includes(seat.status))) prompts.set(key, seat.session);
+  }
+  for (const [key, session] of prompts) {
+    if (!attributed.has(key) && unscoped.get(session) !== key) ids.add(key);
   }
   return ids.size;
 }
@@ -398,7 +410,7 @@ export function needDecisionIdentity(item) {
 
 /** Observe a completed read, retaining only the immediate receipt of our own resulting revision.
  * Cached pre-action data is not a new authoritative decision. A new park can arrive before the first poll. */
-export function observeNeedDecision(box, row, readAt = 0) {
+export function observeNeedDecision(box, row, readAt = 0, { readSeq = null } = {}) {
   if (!row || box.busy) return false;
   const identity = needDecisionIdentity(row);
   const receipt = box.receipt;
@@ -408,14 +420,21 @@ export function observeNeedDecision(box, row, readAt = 0) {
       || (receipt.body !== undefined && row.body !== receipt.body))
     : Boolean(box.observedIdentity && box.observedIdentity !== identity);
   box.observedIdentity = identity;
-  if (!changed) return false;
   // The re-read triggered by a conflict refusal brings the card up to date while keeping the refusal line visible.
-  if (box.result?.conflict && box.conflictAwaitingRefresh) {
+  // Consume the arm on that refresh read even when observedIdentity already matched, so a later change clears the old refusal.
+  const awaiting = box.conflictAwaitingRefresh;
+  const isConflictRefresh = Boolean(awaiting)
+    && (awaiting === true || (typeof awaiting === "number" && typeof readSeq === "number" && readSeq >= awaiting));
+  if (isConflictRefresh) {
     box.conflictAwaitingRefresh = false;
-    box.confirmResolve = false;
-    box.recordedChoiceByQuestion = {};
-    return true;
+    if (!changed) return false;
+    if (box.result?.conflict) {
+      box.confirmResolve = false;
+      box.recordedChoiceByQuestion = {};
+      return true;
+    }
   }
+  if (!changed) return false;
   box.changedSinceAnswered = Boolean(receipt || box.result?.ok);
   box.result = null; box.receipt = null; box.confirmResolve = false;
   // Keep an open composer while the person is still drafting so their open-time snapshot refuses on submit instead of closing mid-typing.
@@ -537,8 +556,8 @@ export const STATE_COPY = Object.freeze({
   }),
   "5d": Object.freeze({
     id: "5d",
-    headline: "The operator isn't running.",
-    actionLabel: "Copy fix",
+    headline: "OpenRig's operator has a problem.",
+    actionLabel: "Copy command",
     copyText: "rig ps --nodes --rig kernel",
   }),
   S6: Object.freeze({ id: "S6", headline: null, suggestedUpgrade: SUGGESTED_UPGRADE_LINE }),
@@ -4347,8 +4366,11 @@ export function formatSafeCloseConflict({ code = "decision_revision_changed", cu
       ? `${earlierParts(idx, total)} recorded; choose the rest again.`
       : "Your earlier part was recorded; choose the rest again.";
   }
-  if ((cur && CLOSED_QUEUE_STATES.has(cur)) || (code === "qitem_already_terminal" && !cur)) {
-    return withEarlierParts(`Not recorded: this request was already ${statusWord(cur ?? "done", "queue")}.`, idx, total);
+  if (cur && CLOSED_QUEUE_STATES.has(cur)) {
+    return withEarlierParts(`Not recorded: this request was already ${statusWord(cur, "queue")}.`, idx, total);
+  }
+  if (code === "qitem_already_terminal" && !cur) {
+    return withEarlierParts("Not recorded: this request was already closed.", idx, total);
   }
   if (cur && (code === "qitem_already_terminal" || code === "qitem_state_changed" || (exp && cur !== exp))) {
     return withEarlierParts(`Not recorded: this request is now ${statusWord(cur, "queue")}. Here it is now.`, idx, total);
@@ -4539,7 +4561,9 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
         };
       }
       if (status === 409 && errCode === "qitem_already_terminal") {
-        const currentState = data?.state ?? data?.currentState ?? "done";
+        const currentState = typeof data?.state === "string" && data.state.trim()
+          ? data.state.trim()
+          : (typeof data?.currentState === "string" && data.currentState.trim() ? data.currentState.trim() : null);
         const message = formatSafeCloseConflict({ code: errCode, currentState, expectedState, partial: false, idx, total: steps.length });
         return {
           ok: false,
@@ -4555,6 +4579,7 @@ export async function submitMissionActions(config, item, act = {}, postOrOpts = 
           data,
           committedQuestionIds,
           stepsCompleted: idx,
+          totalSteps: steps.length,
         };
       }
       const message = withEarlierParts([data?.message, data?.error, res?.error].map((v) => String(v ?? "").trim()).find(Boolean) ?? `OpenRig answered with error ${status}.`, idx, steps.length); // an empty or blank body falls back to the status, never to ". Your earlier part..."

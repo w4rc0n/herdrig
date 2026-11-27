@@ -80,7 +80,7 @@ import { MOD_IDS, sidebarRun, sidebarRefusal, NO_PERSON, ACTION_REFUSED, parseCo
   reflowDesignerGrid, classifyDropZone, gridDockCell, resizeSiblingWeights,
   SWAP_RUNTIMES, changeModelPlan, filterAllowedModels,
   viewsPropsFromLayout, hasRigWorkStack, openOrFocusRigTab, closeRigInspection, selectWorkerView,
-  currentCapabilities, connectionCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, attachToSeat, resetGroupOrder, submitMissionActions, missionActionPreflight, isClosedQueueState, attachRelayPath, waitWith, layoutShowsMod, isLoopbackDaemonUrl,
+  currentCapabilities, connectionCapabilities, capabilityDisableReason, isRigStopped, seatClickTarget, seatOrigin, seatSharedOf, SEAT_NAME_SHARED, attachToSeat, resetGroupOrder, submitMissionActions, missionActionPreflight, isClosedQueueState, formatSafeCloseConflict, attachRelayPath, waitWith, layoutShowsMod, isLoopbackDaemonUrl,
   statusMarkElement, deleteOutcome, rigNameProblem, newRigFromSpecArgs, newRigOneSeatArgs, commandLine, NEW_RIG_RUNTIMES,
   readRigSpecPreview, singleLineText } from "./rig-lib.js";
 
@@ -2339,6 +2339,24 @@ export default class RigMenu extends View {
           expectedState: target.state ?? null,
         }, { fetch: op.fetch });
         if (r.ok || r.conflict) refreshSidebar();
+        if (!r.ok && r.code === "qitem_already_terminal" && !r.currentState) {
+          const qid = target.qitemId ?? (String(target.id ?? "").startsWith("queue:") ? String(target.id).slice(6) : null);
+          if (qid) {
+            try {
+              const qr = await op.fetch(`${cfg.daemonUrl}/api/queue/${encodeURIComponent(qid)}`);
+              if (qr.ok) {
+                const qd = await qr.json();
+                const st = typeof qd?.state === "string" && qd.state.trim() ? qd.state.trim() : null;
+                if (st) {
+                  const msg = !isClosedQueueState(st) && !r.partial
+                    ? "Not recorded: the request changed while you had it open. Open it in Needs to read the latest version."
+                    : formatSafeCloseConflict({ code: r.code, currentState: st, expectedState: target.state ?? null, idx: r.stepsCompleted ?? 0, total: r.totalSteps ?? 1 });
+                  return { ...r, currentState: st, message: msg, text: msg };
+                }
+              }
+            } catch (_) { /* optional refinement: keep generic already-closed refusal */ }
+          }
+        }
         if (!r.ok && r.code === "decision_revision_changed" && !r.partial && !isClosedQueueState(r.currentState)) {
           const msg = "Not recorded: the request changed while you had it open. Open it in Needs to read the latest version.";
           return { ...r, message: msg, text: msg };

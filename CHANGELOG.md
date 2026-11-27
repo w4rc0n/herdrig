@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.17
+
+Group seats by rig inside Topology's Priority view, plus fixes for multi-connection Needs counts, safe-close conflict notices, and operator warnings and Start timing.
+
+- **Rig separators in Topology's Priority view:** when seats from more than one rig share a status group (Needs you, Working, Idle, and so on), Herdrig groups them under their rig names so each rig's rows stay together.
+- **Multi-connection Needs counts:** the combined Needs count counts same-named seats (including seats that stopped retrying) separately across different OpenRig connections.
+- **Safe closes in Needs:** a safe-close refusal waits for its own post-conflict refresh before clearing (an older refresh already in flight can no longer clear it early), and an "already closed" reply without a reported state no longer claims the request is "done".
+- **Operator warnings and Copy command:** a degraded-operator warning shows **Copy command**, can be dismissed, and keeps its diagnostic row under System. **Copy command** for this computer's stopped or degraded operator now targets this computer (including with the default OpenRig home) and sets a custom OpenRig home when configured.
+- **Starting the local operator:** **Start operator** no longer reports a timeout after a newer status check has already confirmed that the operator is running.
+
 ## v0.5.16
 
 Start a stopped local operator from Herdrig, see when OpenRig is restarting or gave up on a kept-alive seat, and refuse stale Needs actions if someone else changed the request while your dialog was open.

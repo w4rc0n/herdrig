@@ -148,6 +148,18 @@ export function needsMark(ui, t, key, compact, iconOf, pulse = null) {
   return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
 }
 
+function priorityRigClusters(members) {
+  const clusters = new Map();
+  for (const row of members) {
+    const rig = row.rig;
+    const key = rig ? qualifyKey(rig.conn, `rig:${rig.id ?? rig.name}`) : null;
+    if (!clusters.has(key)) clusters.set(key, { key, rows: [] });
+    clusters.get(key).rows.push(row);
+  }
+  const rigCount = clusters.size - Number(clusters.has(null));
+  return rigCount >= 2 ? [...clusters.values()] : [{ key: null, rows: members }];
+}
+
 export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper, hover, hovered, selected, iconOf, register, mark, askOwner, machineOf = null, now = Date.now(), staleTip = null }) {
   const { div, svg, h_flex } = ui;
   const out = [];
@@ -164,12 +176,27 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
       .child(div().id(`priority-count-${group.rank}`).text_color(t.dim).when(Boolean(staleTip), (el) => el.tooltip(staleTip)).child(String(members.length)))
       .child(div().flex_1()).child(svg(iconOf(expanded ? "chevron-down" : "chevron-right")).size(11).text_color(t.dim)));
     if (!expanded) continue;
-    for (const row of members) {
+    const clusters = priorityRigClusters(members);
+    const clustered = clusters.length > 1;
+    const displayRows = clusters.flatMap(cluster => cluster.rows.map((row, index) => ({
+      row, separator: clustered && index === 0 ? cluster : null,
+    })));
+    for (const { row, separator } of displayRows) {
+      if (separator) {
+        const name = row.rig?.name ?? "other";
+        const machine = row.rig ? machineOf?.(row) : null;
+        const label = machine ? `${name} · ${machine}` : name;
+        // Keep positional scroll metadata paired with the visual row without giving it a focus key.
+        register({ separator: true, parentKey: key });
+        out.push(h_flex().id(`${key}:rig-separator:${separator.key ?? "other"}`).h(22).pt(6).pl(16).pr(14).gap(8).items_center()
+          .child(div().max_w(150).min_w(0).truncate().text_size(10.5).text_color(t.dim).tooltip(label).child(label))
+          .child(div().flex_1().h(1).bg(t.border)));
+      }
       const helperKey = `priority-helpers:${row.key}`, helpersOpen = folds[helperKey] ?? true;
       const where = machineOf?.(row) ?? null; // with more than one OpenRig: show seat, rig, then machine
       const context0 = row.ask?.criticalHealth ? "health" : askOwner?.(row.ask) ?? (row.kind === "ask" && row.seat
-        ? [row.seat.logicalId, row.rig?.name].filter(Boolean).join(" · ") : row.rig?.name ?? "no seat");
-      const context = where && context0 !== "health" ? `${context0} · ${where}` : context0;
+        ? [row.seat.logicalId, clustered ? null : row.rig?.name].filter(Boolean).join(" · ") : clustered ? "" : row.rig?.name ?? "no seat");
+      const context = where && context0 !== "health" ? [context0, where].filter(Boolean).join(" · ") : context0;
       register({ key: row.key, foldKey: helperKey, expandable: row.helpers.length > 0, isOpen: helpersOpen, parentKey: key, priorityRow: row });
       out.push(h_flex().id(`priority-${row.key}`).px(12).h(30).gap(7).rounded(8).items_center().cursor_pointer()
         .when(row.focused || selected === row.key, (el) => el.bg(t.selected ?? t.selection ?? t.raised))
@@ -178,8 +205,9 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
         .on_click((event,cx) => open(row,event,cx)).on_mouse_down("right", () => menu(row))
         .when(!row.check, el => el.child(svg(iconOf(row.kind === "ask" ? "rig-bell" : row.seat.terminal ? "rig-terminal-prompt" : "rig-seat")).size(13).flex_none().text_color(t.muted)))
         .child(h_flex().flex_1().min_w(0).gap(4).text_size(12.5)
-          .child(div().min_w(0).max_w(130).truncate().text_color(row.rank === 0 ? t.dim : row.rank === 1 ? t.muted : t.foreground).tooltip(String(row.name??"")).child(row.name))
-          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).tooltip(row.check ? "OpenRig check" : context).child(row.check ? "· check" : `· ${context}`)))
+          .child(div().min_w(0).when(!clustered, el => el.max_w(130)).when(clustered && !context && !row.check, el => el.flex_1())
+            .truncate().text_color(row.rank === 0 ? t.dim : row.rank === 1 ? t.muted : t.foreground).tooltip(String(row.name??"")).child(row.name))
+          .when(!clustered || Boolean(context || row.check), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).tooltip(row.check ? "OpenRig check" : context).child(row.check ? "· check" : `· ${context}`))))
         .when(row.helpers.length > 0, (el) => el.child(div().id(`priority-fold-${row.key}`).px(3).h(18).text_color(t.dim)
           .on_click((_e, cx) => { cx.stop_propagation(); fold(helperKey, !helpersOpen, cx); })
           .child(svg(iconOf(helpersOpen ? "chevron-down" : "chevron-right")).size(11))

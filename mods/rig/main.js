@@ -272,7 +272,8 @@ const FULL_ATTENTION_SLOW_MS = 3000;
 const QUIET_RECONCILE_MS = 60_000;
 /** Herdr 0.1.18 reports `window()?.visible === false` while hidden; older Herdr (undefined) and `herdr-app check` (null) count as visible. */
 const windowHidden = () => window()?.visible === false;
-const dismissibleOperatorBanner = sub => sub === "5b" || sub === "5c";
+const dismissibleOperatorBanner = sub => sub === "5b" || sub === "5c" || sub === "5d";
+const operatorBannerCondition = state => state?.substate === "5d" ? `5d:${state.stateWord ?? ""}` : state?.substate;
 const OPERATOR_RECHECK_MS = [5000, 15000, 30000, 60000];
 const OPERATOR_FOCUS_GAP_MS = 10000;
 const OPERATOR_START_FAILED = "OpenRig couldn't start its operator. Copy the command to run it yourself.";
@@ -789,7 +790,7 @@ export default class RigSidebar extends View {
     const scope = operatorBannerScope(feed.config);
     const hidden = scope && shared("rig.operatorBannerHidden")?.[scope];
     // Only a successful read retires a dismissal for a previous condition.
-    if (hidden && hidden !== feed.sidebarState?.substate) this.saveOperatorBannerDismissal(scope, null);
+    if (hidden && hidden !== operatorBannerCondition(feed.sidebarState)) this.saveOperatorBannerDismissal(scope, null);
   }
 
   beginOperatorRead(feed) {
@@ -802,7 +803,17 @@ export default class RigSidebar extends View {
     if (generation < (feed.operatorStateGeneration ?? 0)) return false;
     feed.operatorStateGeneration = generation;
     feed.sidebarState = state;
-    if (state.operatorDisabled || (ready && state.id === "S4" && feed.operatorStart?.error)) feed.operatorStart = null;
+    if (state.operatorDisabled) {
+      feed.operatorChecks = null;
+      feed.operatorStart = null;
+    } else if (ready && state.id === "S4") {
+      feed.operatorChecks = null;
+      const start = feed.operatorStart;
+      if (start && this.stillCurrent(feed, start.config)) {
+        if (start.confirming || start.error) feed.operatorStart = null;
+        if (start.confirming) notify({ title: "OpenRig's operator is running", level: "info" });
+      }
+    }
     if (observed) this.observeOperatorBanner(feed);
     return true;
   }
@@ -1079,16 +1090,6 @@ export default class RigSidebar extends View {
       if (changed) {
         if (feed.data) feed.data = { ...feed.data, sidebarState: state };
         this.publishData(cx);
-      }
-      if (state.id === "S4") {
-        feed.operatorChecks = null;
-        const start = feed.operatorStart;
-        if (state.operatorDisabled && start?.confirming) feed.operatorStart = null;
-        if (ready && start?.confirming && this.stillCurrent(feed, start.config)) {
-          feed.operatorStart = null;
-          notify({ title: "OpenRig's operator is running", level: "info" });
-          cx.notify();
-        }
       }
     } catch {
       // This is an extra read. Keep the last known state and let ordinary connection recovery report failures.
@@ -4099,7 +4100,7 @@ export default class RigSidebar extends View {
     const elements=priorityElements({ div, svg, h_flex }, t, rows, {
       askOwner:ask=>{if(ask?.reply==='resolve'||ask?.answer?.verb==='resolve')return ask.waiting?.owner??ask.destinationSession??null;const member=assistantForNeed(ask,this.rosterOf(ask?.conn));return member?assistantOwner(member):null;},
       folds, selected: this.viewState("rig.sel")?.key, iconOf: icon,
-      register: (row) => {this.visibleTreeRows.push(row);registered.push(row);},
+      register: (row) => { if (!row.separator) this.visibleTreeRows.push(row); registered.push(row); },
       fold: (key, value, cx) => { this.fold(key, value,[],stateConn); cx.notify(); },
       open: (row, event, cx) => {
         if((event?.click_count??1)>=2) this.openPriority(row);
@@ -4121,7 +4122,10 @@ export default class RigSidebar extends View {
       staleTip: this.error && this.data?.at ? asOf(this.data.at, this.uiTimezone) : null, // a failed read: last known words, dimmed
     });
     return [...(this.data?.topology ?? []).filter(r => r.nodesUnavailable).map(r => this.rigSeatsUnavailable(t, cx, r)),
-      ...elements.map((el,i)=>this.scrollRow(el,registered[i]?.key,registered[i]?.key?.startsWith("priority-helper:")?26:30)),...this.archivedRows(t,cx)];
+      ...elements.map((el, i) => {
+        const row = registered[i];
+        return this.scrollRow(el, row?.key, row?.separator ? 22 : row?.helper ? 26 : 30, row?.parentKey);
+      }), ...this.archivedRows(t, cx)];
   }
 
   archivedRows(t, cx, host = null, indent = 18) {
@@ -4234,7 +4238,8 @@ export default class RigSidebar extends View {
     const feed = this.viewFeed ?? this.primary;
     const scope = operatorBannerScope(feed.config);
     const canDismiss = dismissibleOperatorBanner(sub) && Boolean(scope);
-    if (canDismiss && shared("rig.operatorBannerHidden")?.[scope] === sub) return null;
+    const condition = operatorBannerCondition(this.sidebarState);
+    if (canDismiss && shared("rig.operatorBannerHidden")?.[scope] === condition) return null;
     const baseHeadline = this.sidebarState.headline ?? STATE_COPY[sub]?.headline ?? STATE_COPY["5d"].headline;
     const machine = feed.config?.daemonMachine ?? (isLoopbackDaemonUrl(feed.config?.daemonUrl) ? "this computer" : "OpenRig's machine");
     const headline = this.feeds.length > 1 ? baseHeadline.replace(/^OpenRig's operator\b/, `OpenRig's operator on ${machine}`) : baseHeadline;
@@ -4250,12 +4255,13 @@ export default class RigSidebar extends View {
             .text_color(t.muted).hover(s => s.text_color(t.foreground)).tooltip("Don't show this again for this OpenRig")
             .child(svg(icon("x")).size(14)),
           cx => {
-            if (feed.closed || operatorBannerScope(feed.config) !== scope || feed.sidebarState?.substate !== sub) return;
-            this.saveOperatorBannerDismissal(scope, sub);
+            if (feed.closed || operatorBannerScope(feed.config) !== scope || operatorBannerCondition(feed.sidebarState) !== condition) return;
+            this.saveOperatorBannerDismissal(scope, condition);
             cx?.notify?.();
           }, el => el.border_1().border_color(t.accent)))))
       .when(Boolean(detail), el => el.child(div().text_size(11).text_color(t.dim).child(detail)))
-      .when(Boolean(stateWord), el => el.child(div().text_size(11).text_color(t.dim).child(statusWord(stateWord, "startup"))))
+      .when(Boolean(stateWord), el => el.child(div().text_size(11).text_color(t.dim)
+        .child(`${statusWord(stateWord, "startup")}.${sub === "5d" ? " Copy command shows which seats are down." : ""}`)))
       .when(Boolean(controls), el => el.child(controls))
       .when(Boolean(result), el => el.child(result));
   }
@@ -4271,19 +4277,19 @@ export default class RigSidebar extends View {
     const config = feed.config;
     const expected = feed.healthz;
     const baseCopyText = feed.sidebarState?.copyText ?? STATE_COPY[sub]?.copyText;
-    const localStopped = sub === "5b" && !config?.daemonMachine && isLoopbackDaemonUrl(config?.daemonUrl);
-    const assignment = sub === "5c" || localStopped ? operatorHomeAssignment(config) : null;
-    const copyText = assignment && baseCopyText
-      ? `${assignment}${localStopped ? " OPENRIG_HOST_SELECTED=local" : ""} ${baseCopyText}` : baseCopyText;
+    const localOperatorCommand = (sub === "5b" || sub === "5d") && !config?.daemonMachine && isLoopbackDaemonUrl(config?.daemonUrl);
+    const assignment = sub === "5c" || localOperatorCommand ? operatorHomeAssignment(config) : null;
+    const copyText = baseCopyText && [assignment, localOperatorCommand ? "OPENRIG_HOST_SELECTED=local" : null, baseCopyText]
+      .filter(Boolean).join(" ");
     const actionLabel = feed.sidebarState?.actionLabel ?? STATE_COPY[sub]?.actionLabel;
     if (!copyText || !actionLabel) return null;
     const start = feed.operatorStart && this.stillCurrent(feed, feed.operatorStart.config) ? feed.operatorStart : null;
-    const copyKey = `s5:${operatorBannerScope(config)}:${sub}`;
+    const copyKey = `s5:${operatorBannerScope(config)}:${operatorBannerCondition(feed.sidebarState)}`;
     const copied = this.copiedKey === copyKey;
     const copy = child => {
       if (!this.copyToClipboard(child, copyText, copyKey) || !dismissibleOperatorBanner(sub)) return;
       const next = sub === "5b" ? " This note goes once the operator is up." : "";
-      notify({ title: `Copied: ${localStopped ? copyText : baseCopyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
+      notify({ title: `Copied: ${localOperatorCommand ? copyText : baseCopyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
       if (this.stillCurrent(feed, config) && !start?.confirming) this.scheduleOperatorChecks(feed, config);
     };
     const button = (id, label, action, color, background) => {
@@ -4297,7 +4303,7 @@ export default class RigSidebar extends View {
     return v_flex().gap(4)
       .when(sub === "5c" && Boolean(assignment), el => el.child(div().text_size(11).text_color(t.dim)
         .child(`This OpenRig keeps its files in ${config.openrigHome}. In that terminal, run export ${assignment} first.`)))
-      .when((localStopped || sub === "5c") && Boolean(config?.openrigHome) && !assignment,
+      .when((localOperatorCommand || sub === "5c") && Boolean(config?.openrigHome) && !assignment,
         el => el.child(div().text_size(11).text_color(t.dim).child("Set OPENRIG_HOME for this OpenRig before running the command.")))
       .child(h_flex().gap(5)
         .when(this.canStartOperator(feed, config), el => el.child(button(startId,
@@ -5210,13 +5216,15 @@ export default class RigSidebar extends View {
       if (this.sidebarState?.operatorDisabled) out.push(div().id("system-operator-disabled").pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(t.muted).child("OpenRig's operator is turned off here."));
       const operatorSub = rowFeed.sidebarState?.substate;
+      const operatorWord = operatorSub === "5b" ? "not running" : operatorSub === "5c" ? "no sign-in"
+        : statusWord(rowFeed.sidebarState?.stateWord ?? "stopped", "startup");
       const startResult = this.operatorStartResult(t, rowFeed, true);
       const operatorStarting = operatorSub === "5a" && rowFeed.operatorStart && this.stillCurrent(rowFeed, rowFeed.operatorStart.config);
       if (dismissibleOperatorBanner(operatorSub) || operatorStarting || startResult) {
         const machine = rowConfig?.daemonMachine ?? (isLoopbackDaemonUrl(rowConfig?.daemonUrl) ? "this computer" : "OpenRig's machine");
         out.push(v_flex().id("system-operator-warning").pl(treeIndent(1)).pr(8).py(3).gap(4)
           .when(operatorStarting || dismissibleOperatorBanner(operatorSub), el => el.child(div().text_size(12).text_color(t.muted)
-            .child(operatorStarting ? "Operator: starting" : operatorSub === "5b" ? "Operator: not running" : "Operator: no sign-in")))
+            .child(`Operator: ${operatorStarting ? "starting" : operatorWord}`)))
           .when(dismissibleOperatorBanner(operatorSub), el => el.child(this.operatorRecoveryActions(t, cx, rowFeed, operatorSub, machine, true)))
           .when(Boolean(startResult), el => el.child(startResult)));
       }
