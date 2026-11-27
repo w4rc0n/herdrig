@@ -434,17 +434,25 @@ export class SeatCompaction {
         unsupported=response.status===422&&data?.ok===false&&data.reason==='early_ack_unsupported'&&e.node.runtime==='pi';
         if(unsupported&&!start?.expired&&(!start||Date.now()<start.deadline)&&!this.closed&&this.entry===e){
           dispatched=false;
+          if(priorWarning)this.saveRecovery(e,priorWarning);
+          if(start){
+            start.dispatched=false;
+            if(!this.host.reportStart(start.token,'rechecking')){
+              this.expireStart(e,start,cx);return;
+            }
+          }
           const currentTenure=await this.host.get(e.config,`/api/telemetry/v1/nodes/${encodeURIComponent(e.node.nodeId)}/tenures?limit=1`,op);
           const currentStatus=await this.host.get(e.config,`/api/seat/status/${encodeURIComponent(session)}`,op);
           if(start?.expired||this.closed||this.entry!==e)return;
-          if(start&&Date.now()>=start.deadline){
-            start.dispatched=false;
-            this.expireStart(e,start,cx);
-            if(priorWarning)this.saveRecovery(e,priorWarning);
-            return;
-          }
           if(!sameCompactionSnapshot(review.snapshot,compactionSnapshot(e.node,currentStatus,currentTenure,review.snapshot?.hostId)))throw Error(changedSeat(session));
           op.check();
+          if(start){
+            if(Date.now()>=start.deadline||!this.host.reportStart(start.token,'dispatched')){
+              this.expireStart(e,start,cx);return;
+            }
+            start.dispatched=true;
+          }
+          if(priorWarning)this.saveRecovery(e,null);
           unsupported=false;
           dispatched=true;
           result=await this.host.exec(command,op,240000);
@@ -499,8 +507,12 @@ export class SeatCompaction {
         // Released Claude triggers return a failure receipt when Cancel stops preparation.
         const receipt=data.preparation, latest=observed?.data?.preparation;
         const confirmedCancel=receipt?.attemptId&&receipt.attemptId===latest?.attemptId
-          &&cancelled(receipt.reason)&&latest.status==='stopped'&&cancelled(latest.reason);
+          &&cancelled(receipt.reason??data.reason)&&latest.status==='stopped'&&cancelled(latest.reason);
         if(!confirmedCancel)e.error=data.error??data.reason??'OpenRig refused compaction.';
+        else if(start&&e.start===start){
+          this.host.reportStart(start.token,'started');
+          e.start=null;
+        }
       }
     }catch(error){
       // A gate refusal during readback describes the GET, never the preceding command.

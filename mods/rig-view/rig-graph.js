@@ -135,7 +135,8 @@ export class RigGraph{
     if(!this.focus&&!this.focusPending&&cx.focus_handle){this.focusPending=true;
       schedule(0,()=>{this.focus=this.liveCx.focus_handle();this.focusPending=false;notify();});}
     const focus=this.focus,emphasis=this.hovered??this.selected;
-    const panelSeat=this.panelOpen&&layout.ent[this.selected];
+    const selectedSeat=layout.ent[this.selected];
+    const panelSeat=this.panelOpen&&selectedSeat?.lid?selectedSeat:null;
     if(!panelSeat)this.panelOpen=false;
     const select=(seat,cx)=>{this.selected=seat;this.panelOpen=true;this.hovered=null;this.detail=null;this.expandedRelations=new Set();focus?.focus?.();cx.notify();};
     const closePanel=cx=>{this.panelOpen=false;this.hovered=null;this.detail=null;focus?.focus?.();cx.notify();};
@@ -321,7 +322,9 @@ export class RigGraph{
         .id(id+"-pod-meta-"+p.id));
       for(const seat of p.seats){const s=layout.ent[seat.lid],status=running?(seat.status??seatStatus(seat.node??{})):null;
         const needs=["blocked","needs_input","attention_required"].includes(status),parts=seat.lid.split("."),model=String(seat.model??"").split("/").at(-1),profile=["default","none"].includes(seat.profile)?null:seat.profile;
-        const watchers=layout.observers.get(seat.lid), skipped=layout.headings.some(heading=>heading.skipped.has(seat.lid));
+        const watchers=layout.observers.get(seat.lid);
+        const skipped=layout.headings.some(heading=>heading.skipped.has(seat.lid))
+          &&!layout.headings.some(heading=>heading.covered.has(seat.lid));
         const tags=layout.tags.get(seat.lid)??[],tasks=workBySeat.get(seat.lid);
         const card=placed(s.x,s.y,s.w,s.h).id(id+"-seat-"+seat.lid).tooltip(running ? `Show ${seat.lid}'s relationships; right-click for its actions` : "Show seat relationships").px(9).py(7).rounded(6).bg(t.background).border_1().border_color(needs?t.blocked:emphasis===seat.lid?t.input:t.border).cursor_pointer()
           .on_hover((on,cx)=>{this.hovered=on?seat.lid:null;cx.notify();})

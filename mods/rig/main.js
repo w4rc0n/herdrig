@@ -925,7 +925,7 @@ export default class RigSidebar extends View {
       }
     }
     const items = wanted && Array.isArray(all) ? all.filter((i) => (i?.conn ?? this.primary.id) === wanted) : all;
-    const res = openNeed(id, { shared, setShared, run, items, layout, spaces, panes, conn: wanted });
+    const res = openNeed(id, { shared, setShared, run, notify, items, layout, spaces, panes, conn: wanted });
     if (shared("rig.pendingNeed")) setShared("rig.pendingNeed", null);
     cx?.notify?.();
     return res;

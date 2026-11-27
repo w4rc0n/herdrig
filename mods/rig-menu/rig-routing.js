@@ -396,7 +396,7 @@ function requestRig(host, request) {
   if(!key && entry.section==="needs" && entry.id){
     const items=host.attentionItems?.() ?? host.shared?.("rig.data")?.attentionItems ?? [];
     const needRig=resolveNeedRig(entry.id,{items,topology,conn});
-    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,ambiguous:true};
+    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,ambiguous:true,...(needRig.reason?{ambiguousReason:needRig.reason}:{})};
     key=needRig?.rigId ?? needRig?.rig ?? needRig?.key ?? null;
   }
   const byId=pickRig(topology,{rigId:key,conn}).rig;
@@ -642,9 +642,9 @@ function select(host,space,tab,terminal){
   if(terminal) host.run("pane.focus",{terminal});
 }
 
-async function perform(host,config,request,rig,key,ambiguous=false){
-  // ONE RIG == ONE SPACE: a rig named only by a name that two OpenRigs share cannot be told apart, so nothing is opened for it.
-  if(ambiguous&&!request.background&&(request.kind==="grid"||request.kind==="page"&&!request.home))return fail(AMBIGUOUS_NAME);
+async function perform(host,config,request,rig,key,ambiguous=false,ambiguousReason=null){
+  // ONE RIG == ONE SPACE: a rig named only by a name that two OpenRigs share (or a bare seat in multiple rigs) cannot be told apart, so nothing is opened for it.
+  if(ambiguous&&!request.background&&(request.kind==="grid"||request.kind==="page"&&!request.home))return fail(ambiguousReason||AMBIGUOUS_NAME);
   if(request.background){
     const targetRigId=rig?.id??request.rigId??key;
     if(targetRigId&&activeInPlaceOpen(host,config,targetRigId))return {ok:true,skipped:true};
@@ -865,10 +865,12 @@ export async function routeOpen(host,config,request={}){
     ? receiverLive(host) && layoutShowsMod(tree,MOD_IDS.sidebar)
     : layoutShowsMod(tree,MOD_IDS.sidebar);
   if(!host.routeOwner && !selected.background && forward){
-    const targetConn=selected.conn??selected.entry?.conn??selected.seat?.conn??(selected.kind==="page"&&!requestRig(host,selected).key?config?.connectionId:undefined);
+    const explicitConn=selected.conn??selected.entry?.conn??selected.seat?.conn;
+    const routedRig=!explicitConn&&selected.kind==="page"?requestRig(host,selected):null;
+    const targetConn=explicitConn??(selected.kind==="page"&&!routedRig?.key&&!routedRig?.ambiguous?config?.connectionId:undefined);
     return forwardRigOpen(host,targetConn?{...selected,conn:targetConn}:selected);
   }
-  const {rig,key,ambiguous}=requestRig(host,selected);
+  const {rig,key,ambiguous,ambiguousReason}=requestRig(host,selected);
   const queueKey=JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine??"",rig?.name??key??"home"]);
   const previous=jobs.get(queueKey);
   const waitJob=previous?(host.waitQueue?host.waitQueue(()=>previous.settled):previous.settled):Promise.resolve();
@@ -878,7 +880,7 @@ export async function routeOpen(host,config,request={}){
     if(current?.configInvalid)return fail(current.configInvalid);
     // ...and a CHANGED connection refuses it too: the captured rig and key belong to the daemon it was queued for (another address would open that rig's viewers in a space labelled for the new one).
     if(!configUnchanged(host,config))return fail("OpenRig's connection changed. Nothing was opened.");
-    return perform(host,config,selected,rig,key,ambiguous);
+    return perform(host,config,selected,rig,key,ambiguous,ambiguousReason);
   });
   const jobEntry=queueBarrier(job,host,0,previous);
   jobs.set(queueKey,jobEntry);

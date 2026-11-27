@@ -279,6 +279,8 @@ export const operatorCommandFor = (config) => ((config?.connections?.length ?? 0
 export const tuiCommandFor = (config) => ((config?.connections?.length ?? 0) > 1 && config?.connectionId ? `rig.tui:${config.connectionId}` : "rig.tui");
 /** A request id that is on more than one OpenRig, asked for without a connection the sidebar can use. */
 export const AMBIGUOUS_REQUEST = "That request is on more than one OpenRig. Open it from its row in the sidebar. Nothing was opened.";
+/** A bare seat name that appears in more than one rig on the same OpenRig, asked for without a rig or scope. */
+export const AMBIGUOUS_RIG_SEAT = "That seat name is in more than one rig. Open it from its rig in the sidebar. Nothing was opened.";
 /** A row or group key made specific to one connection, so two OpenRigs never share a fold, order or selection key. The legacy connection's
  *  keys are the old ones (stored state stays found). */
 export const qualifyKey = (conn, key) => (conn && conn !== LEGACY_CONNECTION_ID ? `${conn}|${key}` : key);
