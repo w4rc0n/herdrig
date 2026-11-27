@@ -1,6 +1,6 @@
 import { errorDiagnostic } from "./rig-words.js";
 // All explicit opens and background grid reconciliation pass through this coordinator.
-import { MOD_IDS, layoutShowsMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn, resolveNeedRig } from "./rig-lib.js";
+import { MOD_IDS, OTHER_CONNECTION_REFUSAL, layoutShowsMod, navPush, tuiArgv, isTuiArgv, attachToSeat, rigSeatServers, pushTabPage, pickRigTab, machineSpaceConn, resolveNeedRig } from "./rig-lib.js";
 /** The page a Rig tab shows: its own history's top, else the page the router last sent it, else (one OpenRig only) the last page opened anywhere. */
 function tabPageOf(host,config,tab){
   const own=host.shared?.("rig.tabPages")?.[tab]?.stack?.at(-1)??host.shared?.("rig.pageRoutes")?.[tab];
@@ -389,20 +389,24 @@ export async function replaceMigrationTab(host,config,request) {
 function requestRig(host, request) {
   const entry=request.entry ?? {};
   const topology=host.topology?.() ?? host.shared?.("rig.data")?.topology ?? [];
-  // An id is exact (and with its connection when the request has one); a name on two OpenRigs picks neither.
+  // An id is exact (and with its connection when the request has one); a name or duplicate id on two OpenRigs picks neither.
   const conn=request.conn ?? entry.conn;
+  let routeConn=conn;
   let key=request.rigId ?? request.rig ?? request.seat?.rig ?? entry.rigId ?? entry.rig
     ?? (entry.kind==="rig" ? entry.name : null);
   if(!key && entry.section==="needs" && entry.id){
     const items=host.attentionItems?.() ?? host.shared?.("rig.data")?.attentionItems ?? [];
     const needRig=resolveNeedRig(entry.id,{items,topology,conn});
-    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,ambiguous:true,...(needRig.reason?{ambiguousReason:needRig.reason}:{})};
+    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,conn:null,ambiguous:true,...(needRig.reason?{ambiguousReason:needRig.reason}:{})};
     key=needRig?.rigId ?? needRig?.rig ?? needRig?.key ?? null;
+    if(!routeConn && needRig?.conn) routeConn=needRig.conn;
   }
-  const byId=pickRig(topology,{rigId:key,conn}).rig;
+  const byIdRes=pickRig(topology,{rigId:key,conn:routeConn});
+  if(byIdRes.ambiguous)return {rig:undefined,key,conn:null,ambiguous:true};
+  const byId=byIdRes.rig;
   // A name on more than one OpenRig is not "no rig": it is refused by the caller (never a home or a space instead).
-  const byName=byId?{}:pickRig(topology,{name:key,conn});
-  return {rig:byId??byName.rig,key,ambiguous:Boolean(byName.ambiguous)};
+  const byName=byId?{}:pickRig(topology,{name:key,conn:routeConn});
+  return {rig:byId??byName.rig,key,conn:routeConn??byId?.conn??byName.rig?.conn??null,ambiguous:Boolean(byName.ambiguous)};
 }
 const vouchOf=(host,rig)=>({sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:typeof host?.selfHostId==="function"?host.selfHostId():host?.selfHostId});
 function rigSpace(host,config,rig,key,strictOrigin=false){
@@ -704,7 +708,7 @@ async function perform(host,config,request,rig,key,ambiguous=false,ambiguousReas
     if(!request.home&&!key&&source?.owned&&source.rigs.length){
       // A cross-rig page still belongs to its connection. Check only its source, using the same origin/host vouch as a keyed page.
       const scoped={...host,spaces:()=>list(host,"spaces").filter(s=>s.id===source.id)};
-      const sourceRig=(host.topology?.()??[]).find(r=>source.rigs.some(name=>name===r.id||name===r.name));
+      const sourceRig=(host.topology?.()??[]).find(r=>(!config?.connectionId||!r.conn||r.conn===config.connectionId)&&source.rigs.some(name=>name===r.id||name===r.name));
       const vouch={...vouchOf(host,sourceRig),strictOrigin:true};
       const adopted=await prepareRigSpaceAdoption(scoped,config,source.rigs,vouch);
       if(!adopted.ok)return adopted;
@@ -867,10 +871,11 @@ export async function routeOpen(host,config,request={}){
   if(!host.routeOwner && !selected.background && forward){
     const explicitConn=selected.conn??selected.entry?.conn??selected.seat?.conn;
     const routedRig=!explicitConn&&selected.kind==="page"?requestRig(host,selected):null;
-    const targetConn=explicitConn??(selected.kind==="page"&&!routedRig?.key&&!routedRig?.ambiguous?config?.connectionId:undefined);
+    const targetConn=explicitConn??(routedRig?.ambiguous?undefined:routedRig?.conn??(selected.kind==="page"&&!routedRig?.key?config?.connectionId:undefined));
     return forwardRigOpen(host,targetConn?{...selected,conn:targetConn}:selected);
   }
-  const {rig,key,ambiguous,ambiguousReason}=requestRig(host,selected);
+  const {rig,key,conn:rigConn,ambiguous,ambiguousReason}=requestRig(host,selected);
+  if(!selected.background&&!ambiguous&&rigConn&&config?.connectionId&&rigConn!==config.connectionId)return fail(OTHER_CONNECTION_REFUSAL);
   const queueKey=JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine??"",rig?.name??key??"home"]);
   const previous=jobs.get(queueKey);
   const waitJob=previous?(host.waitQueue?host.waitQueue(()=>previous.settled):previous.settled):Promise.resolve();

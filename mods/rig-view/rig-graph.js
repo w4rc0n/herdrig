@@ -395,9 +395,13 @@ export class RigGraph{
         incoming.set(from,{lid:from,kind:leads?"delegates":"link"});
       }
     }
-    const taskLines=work.filter(line=>line.target===lid);
-    for(const line of taskLines)if(!incoming.has(line.source))incoming.set(line.source,{lid:line.source,kind:"link"});
-    const workFrom=new Map(taskLines.map(line=>[line.source,line]));
+    const workFrom=new Map();
+    for(const line of work){
+      if(line.source===lid)outgoing.add(line.target);
+      if(line.target!==lid)continue;
+      workFrom.set(line.source,line);
+      if(!incoming.has(line.source))incoming.set(line.source,{lid:line.source,kind:"link"});
+    }
     const tasks=running?graphWorkForSeat(workRows,seat).map(task=>singleLineText(task.summary??"Task")||"Task"):[];
     const firstTask=tasks.length?[...tasks[0]]:[];
     const taskPreview=firstTask.length>22?firstTask.slice(0,21).join("")+"…":firstTask.join("");

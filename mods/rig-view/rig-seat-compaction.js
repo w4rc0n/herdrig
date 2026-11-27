@@ -20,6 +20,12 @@ const contextPercent=node=>Number.isFinite(node.contextUsage?.usedPercentage)?Ma
 const timestamp=value=>typeof value==='number'?value:Date.parse(value??'');
 export const compactionRuntime = n => ['claude-code','pi'].includes(n?.runtime);
 export const compactionVersion = health => health?.semver??health?.openrigVersion?.semver??null;
+function supportsEarlyCompactionReceipt(version){
+  const match=typeof version==='string'&&/^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version);
+  if(!match)return false;
+  const [,major,minor,patch]=match.map(Number);
+  return major>0||minor>7||(minor===7&&patch>=24);
+}
 export function compactionCommand(config, session, cancel=false) {
   const refusal=cliRefusal(config);if(refusal)throw Error(refusal);
   if(typeof session!=='string'||!session||session.startsWith('-')||/[\s\x00-\x1f\x7f]/.test(session))throw Error('This seat has no usable session address.');
@@ -386,6 +392,10 @@ export class SeatCompaction {
     let dispatched=false,received=false,accepted=false,dispatch=null,data=null,priorWarning=null;
     try{
       const op=review.operation??this.host.operation(e.config);
+      // OpenRig exposes no earlyAck capability. Before 0.7.24 the same POST can
+      // wait for completion and omit the ID, so choose using this daemon's current version before any write.
+      const useEarlyReceipt=!review.cancel&&this.host.trigger
+        &&supportsEarlyCompactionReceipt(compactionVersion(await this.host.get(e.config,'/healthz',op)));
       const tenure=await this.host.get(e.config,`/api/telemetry/v1/nodes/${encodeURIComponent(e.node.nodeId)}/tenures?limit=1`,op);
       const status=await this.host.get(e.config,`/api/seat/status/${encodeURIComponent(e.node.canonicalSessionName)}`,op);
       if(start?.expired)return;
@@ -420,7 +430,7 @@ export class SeatCompaction {
       }
       let result,exact=false,unsupported=false;
       dispatched=true;
-      if(dispatch&&this.host.trigger){
+      if(dispatch&&useEarlyReceipt){
         dispatch.awaitingEarlyReceipt=true;
         if(start)start.awaitingEarlyReceipt=true;
         const session=e.node.canonicalSessionName;
