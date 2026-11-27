@@ -10,7 +10,7 @@ import { gatedFetch, gatedOperationOrRefusal, rethrowGate, CONFIG_LOADING, publi
 import { healthCounts, classifyHealth } from "./rig-health.js";
 import { resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, markRigSpace, rigOrigin, openRigSpaceContext, sameDaemonOrigin, vouchedSpace, rigSessions, prepareRigSpaceAdoption, topologyRig } from "./rig-space-context.js";
 import { followedConnection, spaceMachine } from "./rig-follow.js";
-import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
+import { localDaemonOrigin, connectionsOf, LEGACY_CONNECTION_ID, HOME_NEEDED, configOfConnection, AMBIGUOUS_NAME, pickSeat, seatMatchesRef, ambiguousSeatMessage, qualifyKey, plainExecError, isKnownUnsentError, unsentErrorMessage, openrigHomeProblem } from "./rig-connections.js";
 import { assistantActionRefusal } from './rig-connected-assistants.js';
 import { SYSTEM_PAGE_VIEWS } from './rig-page-nav.js';
 import { counted as countWords, plainError as errorWords, statusWord as stateWords, requestFailed as failedWords, requestWhat as requestWords } from './rig-words.js';
@@ -874,7 +874,10 @@ export function selectSidebarState({
       copyText: null,
     };
   }
-  if (kState === "skipped" && !operatorDisabled) {
+  const operatorStopped = bootReady && !liveReady && Array.isArray(k?.agents)
+    && k.agents.some(agent => agent?.session_name === "operator-agent@kernel" && agent.down === true
+      && agent.startup_status !== "failed");
+  if ((kState === "skipped" && !operatorDisabled) || operatorStopped) {
     return {
       id: "S5",
       substate: "5b",
@@ -939,6 +942,13 @@ export function selectSidebarState({
       (operatorNode.sessionStatus === undefined && operatorNode.sessionAlive !== false)
     ) && operatorNode.sessionAlive !== false && operatorNode.startupStatus !== "failed";
     if (!opRunning && explainOperator) {
+      if (bootReady && !Array.isArray(k?.agents) && !operatorNode.terminalServerGone
+          && operatorNode.startupStatus !== "failed" && ["stopped", "detached", "exited"].includes(operatorNode.sessionStatus)) {
+        return {
+          id: "S5", substate: "5b", headline: STATE_COPY["5b"].headline,
+          actionLabel: STATE_COPY["5b"].actionLabel, copyText: STATE_COPY["5b"].copyText,
+        };
+      }
       const stateWord = operatorNode.startupStatus === "failed"
         ? "failed"
         : (operatorNode.sessionStatus && operatorNode.sessionStatus !== "running" && operatorNode.sessionStatus !== "ready"
@@ -1869,7 +1879,10 @@ function shq(v) {
   return `'${String(v ?? "").replace(/'/g, "'\\''")}'`;
 }
 
-export const operatorHomeAssignment = config => config?.openrigHome ? `OPENRIG_HOME=${shq(config.openrigHome)}` : null;
+export function operatorHomeAssignment(config) {
+  const home = config?.openrigHome;
+  return openrigHomeProblem(home) || /[\x80-\x9f\u2028\u2029]/.test(home) ? null : `OPENRIG_HOME=${shq(home)}`;
+}
 
 export function changeModelPlan(target = {}, pick = {}, extra = null) {
   // The names go into text a lead agent reads and runs: one line each, and quoted in every command.

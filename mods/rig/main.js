@@ -999,7 +999,8 @@ export default class RigSidebar extends View {
   canStartOperator(feed, config) {
     return this.stillCurrent(feed, config) && !feed.error && feed.sidebarState?.substate === "5b"
       && !config?.daemonMachine && isLoopbackDaemonUrl(config?.daemonUrl)
-      && Boolean(feed.healthz?.selfHostId) && !cliRefusal(config);
+      && Boolean(feed.healthz?.selfHostId) && !cliRefusal(config)
+      && (!config.openrigHome || operatorHomeAssignment(config) !== null);
   }
 
   scheduleOperatorChecks(feed, config) {
@@ -1045,6 +1046,19 @@ export default class RigSidebar extends View {
     });
   }
 
+  async readOperatorSnapshot(feed, op) {
+    const kernelStatus = await this.get("/api/kernel/status", feed, op);
+    const bootReady = ["ready", "partial_ready"].includes(kernelStatus?.kernel_state);
+    let kernelNodes;
+    if (bootReady && !Array.isArray(kernelStatus.agents)) {
+      const summary = await this.get("/api/rigs/summary", feed, op);
+      const rig = Array.isArray(summary) && summary.find(row => !row.archivedAt && row.name === "kernel");
+      if (rig?.id) kernelNodes = await this.get(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`, feed, op);
+    }
+    op.check();
+    return { kernelStatus, bootReady, kernelNodes };
+  }
+
   async recheckOperator(cx, feed, config) {
     if (!this.stillCurrent(feed, config)) return;
     const op = gatedOperationOrRefusal(config.connectionId);
@@ -1055,19 +1069,8 @@ export default class RigSidebar extends View {
         if (!sameDaemon(expected, health)) return; // normal refresh will rediscover the CLI address
       }
       const generation = this.beginOperatorRead(feed);
-      const kernelStatus = await this.get("/api/kernel/status", feed, op);
-      op.check();
+      const { kernelStatus, bootReady, kernelNodes } = await this.readOperatorSnapshot(feed, op);
       if (!this.stillCurrent(feed, config) || !KERNEL_STATES.has(kernelStatus?.kernel_state)) return;
-      const bootReady = ["ready", "partial_ready"].includes(kernelStatus.kernel_state);
-      let kernelNodes;
-      if (bootReady && !Array.isArray(kernelStatus.agents)) {
-        const summary = await this.get("/api/rigs/summary", feed, op);
-        const rig = Array.isArray(summary) && summary.find(row => !row.archivedAt && row.name === "kernel");
-        if (!rig?.id) return;
-        kernelNodes = await this.get(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`, feed, op);
-        op.check();
-        if (!this.stillCurrent(feed, config) || !Array.isArray(kernelNodes)) return;
-      }
       const ready = kernelOperatorReady(kernelStatus) || kernelOperatorNodeReady(kernelNodes);
       const state = selectSidebarState({ kernelStatus, kernelNodes, capabilities: feed.data?.capabilities });
       if (!ready && bootReady && state.id === "S4") return;
@@ -1099,14 +1102,14 @@ export default class RigSidebar extends View {
     cx.notify();
     return cx.spawn(async task => {
       try {
-        const kernelStatus = await this.get("/api/kernel/status", feed, op);
+        const { kernelStatus, kernelNodes } = await this.readOperatorSnapshot(feed, op);
         const health = await this.get("/healthz", feed, op);
         op.check();
         if (!this.canStartOperator(feed, config) || !sameDaemon(expected, health)) {
           start.error = "The OpenRig connection changed. Refresh it before trying again.";
           return;
         }
-        if (selectSidebarState({ kernelStatus }).substate !== "5b") {
+        if (selectSidebarState({ kernelStatus, kernelNodes }).substate !== "5b") {
           await this.recheckOperator(task, feed, config);
           return;
         }
@@ -4268,8 +4271,10 @@ export default class RigSidebar extends View {
     const config = feed.config;
     const expected = feed.healthz;
     const baseCopyText = feed.sidebarState?.copyText ?? STATE_COPY[sub]?.copyText;
-    const assignment = sub === "5c" ? operatorHomeAssignment(config) : null;
-    const copyText = assignment && baseCopyText ? `${assignment} ${baseCopyText}` : baseCopyText;
+    const localStopped = sub === "5b" && !config?.daemonMachine && isLoopbackDaemonUrl(config?.daemonUrl);
+    const assignment = sub === "5c" || localStopped ? operatorHomeAssignment(config) : null;
+    const copyText = assignment && baseCopyText
+      ? `${assignment}${localStopped ? " OPENRIG_HOST_SELECTED=local" : ""} ${baseCopyText}` : baseCopyText;
     const actionLabel = feed.sidebarState?.actionLabel ?? STATE_COPY[sub]?.actionLabel;
     if (!copyText || !actionLabel) return null;
     const start = feed.operatorStart && this.stillCurrent(feed, feed.operatorStart.config) ? feed.operatorStart : null;
@@ -4278,7 +4283,7 @@ export default class RigSidebar extends View {
     const copy = child => {
       if (!this.copyToClipboard(child, copyText, copyKey) || !dismissibleOperatorBanner(sub)) return;
       const next = sub === "5b" ? " This note goes once the operator is up." : "";
-      notify({ title: `Copied: ${baseCopyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
+      notify({ title: `Copied: ${localStopped ? copyText : baseCopyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
       if (this.stillCurrent(feed, config) && !start?.confirming) this.scheduleOperatorChecks(feed, config);
     };
     const button = (id, label, action, color, background) => {
@@ -4290,8 +4295,10 @@ export default class RigSidebar extends View {
     const startId = system ? "system-operator-start" : `rig-s5-start-${sub}`;
     const copyId = system ? "system-operator-copy" : `rig-s5-copy-${sub}`;
     return v_flex().gap(4)
-      .when(Boolean(assignment), el => el.child(div().text_size(11).text_color(t.dim)
+      .when(sub === "5c" && Boolean(assignment), el => el.child(div().text_size(11).text_color(t.dim)
         .child(`This OpenRig keeps its files in ${config.openrigHome}. In that terminal, run export ${assignment} first.`)))
+      .when((localStopped || sub === "5c") && Boolean(config?.openrigHome) && !assignment,
+        el => el.child(div().text_size(11).text_color(t.dim).child("Set OPENRIG_HOME for this OpenRig before running the command.")))
       .child(h_flex().gap(5)
         .when(this.canStartOperator(feed, config), el => el.child(button(startId,
           start?.busy ? "Starting…" : system ? "Start…" : "Start operator",
