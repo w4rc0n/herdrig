@@ -10,6 +10,11 @@ export function graphHeaderChips(p){
   const count=`${p.seats.length} seat${p.seats.length===1?"":"s"}`,budget=p.w-12-40;
   const label=Math.min(10+7.2*String(p.label??p.id).length,CARD_W+POD_PAD-6-40);
   let rightWidth=8+6.3*p.id.length+6+6.2*count.length,rightText=`${p.id} · ${count}`;
+  if(p.columnLayout){
+    const seatCountWidth=14+6.2*count.length;
+    if(p.w-18-rightWidth<36){rightText=count;rightWidth=Math.min(seatCountWidth,p.w-12);}
+    return{labelWidth:Math.max(0,Math.min(label,p.w-18-rightWidth)),rightWidth,rightText};
+  }
   if(label+rightWidth>budget){rightWidth=8+6.3*p.id.length;rightText=p.id;}
   if(label+rightWidth>budget){rightWidth=0;rightText=null;}
   return{labelWidth:Math.max(0,Math.min(label,budget)),rightWidth,rightText};
@@ -199,6 +204,7 @@ export function routeGraph(graph,width){
 export function graphSeatPath(layout,from,to){
   let plan=layout.plans.find(pl=>pl.e.from===from&&pl.e.to===to);
   if(plan)return{points:plan.pts,plan};
+  if(layout.columnLayout)return null;
   plan=layout.plans.find(pl=>pl.e.members.some(m=>m.from===from&&m.to===to));
   if(!plan)return null;
   const points=plan.routePoints.map(p=>[...p]),s=layout.ent[from],t=layout.ent[to];if(!s||!t)return null;
@@ -215,6 +221,15 @@ export function graphSeatPath(layout,from,to){
 export function graphWorkPath(layout,from,to){
   const authored=graphSeatPath(layout,from,to);if(authored)return authored;
   const s=layout.ent[from],t=layout.ent[to];if(!s||!t)return null;
+  if(layout.columnLayout){
+    if(layout.narrow)return null;
+    const bracket=layout.brackets.find(row=>row.columns.includes(t.pod.id)&&row.heading.source===from&&row.heading.covered.has(to));
+    if(bracket){
+      const x=t.pod.x-16,y=t.y+t.h/2;
+      return {points:[[t.pod.x+6,bracket.y],[x,bracket.y],[x,y],[t.x,y]]};
+    }
+    return {points:routeColumnLink(layout,s,t)};
+  }
   const exit=en=>[[en.x+en.w,en.y+en.h/2],[en.x+en.w+6,en.y+en.h/2],[en.x+en.w+6,en.y+en.h+6],[en.pod.x+en.pod.w+6,en.y+en.h+6]];
   const a=exit(s),b=exit(t),points=[...a];
   if(s.pod!==t.pod){
@@ -300,4 +315,285 @@ export function nearestGraphSeat(layout,current,direction){
   const source=layout.ent[current],horizontal=direction==="left"||direction==="right",sign=["left","up"].includes(direction)?-1:1;
   return seats.filter(([id,s])=>id!==current&&sign*(horizontal?s.x-source.x:s.y-source.y)>0)
     .sort(([,a],[,b])=>Math.hypot(a.x-source.x,a.y-source.y)-Math.hypot(b.x-source.x,b.y-source.y))[0]?.[0]??current;
+}
+
+const COLUMN_GAP = 36, COLUMN_BAND = 24, BRACKET_HEAD = 25, NARROW_GRAPH = 520;
+const columnEdge = e => e.kind === "delegates_to" || e.kind === "spawned_by";
+
+/** Based on authored delegation only. The source array is never treated as leadership or rank. */
+export function graphColumnModel(graph) {
+  const seats = new Map(graph.pods.flatMap(pod => pod.seats.map(seat => [seat.lid, pod.id])));
+  const podOf = ref => seats.get(ref) ?? (typeof ref === "string" && ref.startsWith("pod:") ? ref.slice(4) : null);
+  const coverage = new Map(), observers = new Map(), downstream = new Set();
+  for (const e of graph.edges) {
+    const from = podOf(e.from), to = podOf(e.to);
+    if (e.kind === "can_observe" && seats.has(e.to)) {
+      if (!observers.has(e.to)) observers.set(e.to, new Set());
+      observers.get(e.to).add(e.from);
+    }
+    if (e.kind !== "delegates_to" || !seats.has(e.from) || !seats.has(e.to) || from === to) continue;
+    downstream.add(to);
+    if (!coverage.has(e.from)) coverage.set(e.from, new Set());
+    coverage.get(e.from).add(e.to);
+  }
+  const candidates = [...seats.keys()].flatMap(source => {
+    const origin = seats.get(source), below = graph.pods.filter(pod => pod.id !== origin && pod.seats.length);
+    const targets = coverage.get(source);
+    if (!targets || downstream.has(origin)) return [];
+    const whole = below.filter(pod => pod.seats.every(seat => targets.has(seat.lid)));
+    const total = below.reduce((n, pod) => n + pod.seats.length, 0);
+    const all = targets.size >= 2 && targets.size * 3 >= total * 2;
+    const columns = all ? below : whole;
+    const covered = new Set(columns.flatMap(pod => pod.seats.filter(seat => targets.has(seat.lid)).map(seat => seat.lid)));
+    if (covered.size < 2) return [];
+    const skipped = new Set(columns.flatMap(pod => pod.seats.filter(seat => !targets.has(seat.lid)).map(seat => seat.lid)));
+    return [{ source, origin, all, columns: columns.map(pod => pod.id), covered, skipped }];
+  }).sort((a, b) => b.covered.size - a.covered.size);
+  const top = candidates[0]?.origin ?? null;
+  const headings = candidates.filter(h => h.origin === top).slice(0, 3);
+  const links = graph.edges.filter(e => columnEdge(e) && podOf(e.from) && podOf(e.to)
+    && !headings.some(h => e.kind === "delegates_to" && h.source === e.from && h.covered.has(e.to)));
+  return { top, headings, links, podOf, observers: new Map([...observers].map(([seat, incoming]) => [seat, incoming.size])) };
+}
+
+function adjacentColumns(s,t) {
+  return s !== t && s.row === t.row && Math.abs(s.col - t.col) === 1;
+}
+
+function routeColumnLink(layout, source, target, track = {}) {
+  const { rowBands, width } = layout;
+  const s = source.pod, t = target.pod;
+  const mid = box => box.y + box.h / 2;
+  const toward = target.y > source.y ? 1 : -1;
+  if (s === t && !source.isPod && !target.isPod && Math.abs(source.prow - target.prow) === 1 && source.x === target.x) {
+    const x = source.x + source.w / 2 + (track.lane ?? 0);
+    return [[x, toward > 0 ? source.y + source.h : source.y], [x, toward > 0 ? target.y : target.y + target.h]];
+  }
+  const port = (box, delta) => mid(box) + delta;
+  const sy = port(source, track.start ?? 0), ty = port(target, track.end ?? 0);
+  const right = box => box.x + box.w;
+  const lane = track.lane ?? 0;
+  const gutter = (box, pod, offset) => Math.min(right(pod.cols > 1 ? box : pod) + 4 + (pod.cols > 1 ? offset / 3 : offset), width - 5);
+  const sx = gutter(source, s, track.sourceLane ?? lane), tx = gutter(target, t, track.targetLane ?? lane);
+  if (s === t && s.cols === 1) return simplifyGraphPoints([[right(source), sy], [sx, sy], [sx, ty], [right(target), ty]]);
+  if (s === t && source.prow === target.prow && Math.abs(source.pcol - target.pcol) === 1) {
+    const forward = source.x < target.x;
+    return [[forward ? right(source) : source.x, sy], [forward ? target.x : right(target), sy]];
+  }
+  if (adjacentColumns(s,t)) {
+    const forward = s.x < t.x;
+    const gap = (forward ? right(s) : right(t)) + (track.outer ? 23 + lane / 2 : 2 + lane / 8);
+    return simplifyGraphPoints([[forward ? right(source) : source.x, sy], [gap, sy], [gap, ty], [forward ? target.x : right(target), ty]]);
+  }
+  const band = row => rowBands[row] + (track.bands?.get(row) ?? 0);
+  if (Math.abs(s.row-t.row)<=1) {
+    const y=band(Math.min(s.row,t.row));
+    return simplifyGraphPoints([[right(source), sy], [sx, sy], [sx, y], [tx, y], [tx, ty], [right(target), ty]]);
+  }
+  const outer = width - 4 - lane;
+  return simplifyGraphPoints([[right(source), sy], [sx, sy], [sx, band(s.row)], [outer, band(s.row)],
+    [outer, band(t.row)], [tx, band(t.row)], [tx, ty], [right(target), ty]]);
+}
+
+/** Column geometry with stable cards, reserved bottom bands and bounded orthogonal links. */
+export function routeGraphColumns(graph, width, { model = graphColumnModel(graph), order = null } = {}) {
+  const narrow = width < NARROW_GRAPH, byId = new Map(graph.pods.map(pod => [pod.id, pod]));
+  const ids = (order ?? graph.pods.map(pod => pod.id)).filter(id => id !== model.top);
+  const podWidth = narrow ? Math.max(1, width - 2 * MARGIN) : CARD_W + 2 * POD_PAD;
+  const inset = !narrow&&model.headings.length ? 20 : 0;
+  const columns = narrow ? 1 : Math.max(1, Math.min(5, Math.floor((width - 2 * MARGIN - inset) / (podWidth + COLUMN_GAP))));
+  const rows = [];
+  if (model.top) rows.push([model.top]);
+  for (let i = 0; i < ids.length; i += columns) rows.push(ids.slice(i, i + columns));
+  const coordinates = new Map(rows.flatMap((row, index) => row.map((id, col) => [id, {row:index,col}])));
+  const bandTracks = rows.map(() => 0);
+  if(!narrow)for(const edge of model.links){
+    const s=coordinates.get(model.podOf(edge.from)),t=coordinates.get(model.podOf(edge.to));
+    if(!s||!t||s===t&&model.top!==model.podOf(edge.from)||adjacentColumns(s,t))continue;
+    bandTracks[Math.min(s.row,t.row)]++;
+    if(Math.abs(s.row-t.row)>1)bandTracks[Math.max(s.row,t.row)]++;
+  }
+  const ent = Object.create(null), pods = [], rowBands = [], tags = new Map(), brackets = [];
+  if(narrow)for(const e of model.links)for(const [ref,peer,incoming] of [[e.from,e.to,false],[e.to,e.from,true]]){
+    if(!tags.has(ref))tags.set(ref,[]);
+    tags.get(ref).push({peer,incoming});
+  }
+  let y = MARGIN;
+  rows.forEach((row, ri) => {
+    const rowHeadings = model.headings.filter(heading => heading.columns.some(id => row.includes(id))
+      && (!narrow || !brackets.some(bracket=>bracket.heading===heading)));
+    const rowX = MARGIN + inset, y0 = y;
+    const gap = Math.max(COLUMN_GAP, Math.min(116, (width - 2 * MARGIN - inset - 28 - row.length * podWidth) / Math.max(1,row.length - 1)));
+    y += rowHeadings.length * BRACKET_HEAD;
+    let bottom = y;
+    const topRow = model.top && ri === 0;
+    row.forEach((id, col) => {
+      const pod = byId.get(id);
+      const cardW = narrow ? Math.max(1, podWidth - 2 * POD_PAD) : CARD_W;
+      const topCols = Math.max(1, Math.min(pod.seats.length, Math.floor((width - 2 * MARGIN - inset - POD_PAD * 2 + CARD_GAP) / (CARD_W + CARD_GAP))));
+      const cols = topRow && !narrow ? topCols : 1, prows = Math.max(1, Math.ceil(pod.seats.length / cols));
+      const heightOf = seat => CARD_H + (narrow && tags.has(seat.lid) ? 22 : 0);
+      const x = rowX + col * (podWidth + gap);
+      const w = 2 * POD_PAD + cols * cardW + (cols - 1) * CARD_GAP;
+      const cardsHeight = narrow ? pod.seats.reduce((sum,seat)=>sum+heightOf(seat),0) || CARD_H : prows * CARD_H;
+      const h = POD_HEAD + cardsHeight + (prows - 1) * CARD_GAP + POD_PAD;
+      const box = { ...pod, x, y, w, h, row: ri, col, cols, prows, columnLayout: true };
+      pods.push(box);
+      bottom = Math.max(bottom, y + h);
+      ent["pod:" + id] = { ...box, isPod: true, pod: box };
+      let narrowY=y+POD_HEAD;
+      pod.seats.forEach((seat, i) => {
+        const prow = Math.floor(i / cols);
+        ent[seat.lid] = { ...seat, x: x + POD_PAD + (i % cols) * (cardW + CARD_GAP),
+          y: narrow?narrowY:y+POD_HEAD+prow*(CARD_H+CARD_GAP), w: cardW, h: heightOf(seat), pod: box, prow, pcol: i % cols };
+        narrowY+=heightOf(seat)+CARD_GAP;
+      });
+    });
+    rowHeadings.forEach((heading, i) => {
+      const runs = [];
+      for (const pod of pods.filter(p => p.row === ri && heading.columns.includes(p.id))) {
+        const previous = runs.at(-1);
+        if (previous?.at(-1).col === pod.col - 1) previous.push(pod);
+        else runs.push([pod]);
+      }
+      for (const run of runs) brackets.push({ heading, row: ri, columns: run.map(pod => pod.id),
+        x: run[0].x - 6, end: run.at(-1).x + run.at(-1).w + 6, y: y0 + i * BRACKET_HEAD + 19,
+        label: !brackets.some(b => b.heading === heading) });
+    });
+    rowBands.push(bottom + 8);
+    y = bottom + COLUMN_BAND + bandTracks[ri] * 4;
+  });
+  const layout = { pods, ent, rowBands, brackets, narrow, headings: model.headings, observers: model.observers,
+    tags, width, height: y + MARGIN, plans: [], columnLayout: true, noDelegation: !graph.edges.length };
+  const routed = model.links.filter(e => ent[e.from] && ent[e.to]);
+  const tracks = new Map(), gutters = new Map(), bands = new Map();
+  const use = (map,key,value) => {
+    if(!map.has(key))map.set(key,[]);
+    map.get(key).push(value);
+  };
+  if(!narrow)routed.forEach((edge,index)=>{
+    const s=ent[edge.from],t=ent[edge.to],track={lane:16*(index+1)/(routed.length+1),bands:new Map()};
+    tracks.set(edge,track);
+    if(adjacentColumns(s.pod,t.pod))return;
+    use(gutters,s.pod,[s,"sourceLane",track,t.pod.row<s.pod.row]);
+    use(gutters,t.pod,[t,"targetLane",track,s.pod.row<t.pod.row]);
+    if(s.pod===t.pod&&s.pod.cols===1)return;
+    const span=Math.abs(s.pod.row-t.pod.row)<=1?Math.abs(s.x-t.x):width;
+    use(bands,Math.min(s.pod.row,t.pod.row),[span,track]);
+    if(Math.abs(s.pod.row-t.pod.row)>1)use(bands,Math.max(s.pod.row,t.pod.row),[span,track]);
+  });
+  for(const entries of gutters.values())entries.sort(([a,,,upA],[b,,,upB])=>Number(upA)-Number(upB)||(upA?a.y-b.y:b.y-a.y))
+    .forEach(([,side,track],i)=>{track[side]=16*(i+1)/(entries.length+1);});
+  for(const [row,entries] of bands)entries.sort(([a],[b])=>a-b)
+    .forEach(([,track],i)=>track.bands.set(row,i*4));
+  const ports = new Map();
+  for (const e of routed) for (const ref of [e.from, e.to]) {
+    if (!ports.has(ref)) ports.set(ref, []);
+    ports.get(ref).push(e);
+  }
+  const offset = (e, ref) => {
+    const peers = ports.get(ref);
+    return peers.length < 2 ? 0 : -16 + 32 * peers.indexOf(e) / (peers.length - 1);
+  };
+  const exits=new Map();
+  for(const e of routed)if(!adjacentColumns(ent[e.from].pod,ent[e.to].pod))
+    for(const ref of [e.from,e.to])use(exits,ent[ref].pod,ent[ref].y+ent[ref].h/2+offset(e,ref));
+  routed.forEach(e => {
+    const s = ent[e.from], t = ent[e.to];
+    if (narrow) return;
+    const start=offset(e,e.from),end=offset(e,e.to);
+    const outer=adjacentColumns(s.pod,t.pod)&&s.x>t.x&&exits.get(t.pod)?.includes(s.y+s.h/2+start);
+    const pts = routeColumnLink(layout, s, t, { ...tracks.get(e), start, end, outer });
+    if (pts.length >= 2) layout.plans.push({ e: { ...e, members: [e] }, s, t, pts, routePoints: pts });
+  });
+  return layout;
+}
+
+export function countGraphRouteCollisions(plans) {
+  const vertical = [], horizontal = [], collinear = new Map(), collisions = new Set();
+  for (const [i, plan] of plans.entries()) for (let j = 1; j < plan.pts.length; j++) {
+    const [a, b] = [plan.pts[j - 1], plan.pts[j]];
+    const upright=a[0]===b[0],fixed=a[upright?0:1],axis=upright?1:0;
+    const segment=[fixed,Math.min(a[axis],b[axis]),Math.max(a[axis],b[axis]),i],key=`${upright}:${fixed}`;
+    (upright?vertical:horizontal).push(segment);
+    if(!collinear.has(key))collinear.set(key,[]);
+    collinear.get(key).push(segment);
+  }
+  const pair=(i,j)=>i<j?`${i}:${j}`:`${j}:${i}`;
+  for (const [x, y0, y1, i] of vertical) for (const [y, x0, x1, j] of horizontal) {
+    if (i !== j && x0 <= x && x <= x1 && y0 <= y && y <= y1) collisions.add(`${pair(i,j)}:${x}:${y}`);
+  }
+  for(const [axis,segments] of collinear)for(const [[fixed,a0,a1,i],index] of segments.map((v,i)=>[v,i])){
+    for(const [,b0,b1,j] of segments.slice(index+1)){
+      if(i===j)continue;
+      const lo=Math.max(a0,b0),hi=Math.min(a1,b1);
+      if(lo<hi)collisions.add(`${pair(i,j)}:overlap:${axis}:${lo}:${hi}`);
+      if(lo===hi)collisions.add(axis.startsWith("true:")?`${pair(i,j)}:${fixed}:${lo}`:`${pair(i,j)}:${lo}:${fixed}`);
+    }
+  }
+  return collisions.size;
+}
+
+/** Called off the render path. Keep spec-order ties and cap search for large rigs. */
+export function bestGraphColumnOrder(graph, width, model = graphColumnModel(graph), now = Date.now) {
+  const ids = graph.pods.map(pod => pod.id).filter(id => id !== model.top);
+  if (width < NARROW_GRAPH || ids.length < 2 || !model.links.length) return ids;
+  const ranks = new Map(ids.map((id, i) => [id, i]));
+  const links = model.links.map(e => [model.podOf(e.from), model.podOf(e.to)]);
+  const before = (a, b) => {
+    const first = a.findIndex((id, i) => id !== b[i]);
+    return first >= 0 && ranks.get(a[first]) < ranks.get(b[first]);
+  };
+  let best = ids, score = [Infinity, Infinity];
+  const consider = order => {
+    const points = routeGraphColumns(graph, width, { model, order });
+    const ranks = new Map(order.map((id, i) => [id, i]));
+    const span = links.reduce((sum, [a, b]) => sum + (ranks.has(a) && ranks.has(b) ? Math.abs(ranks.get(a) - ranks.get(b)) : 0), 0);
+    const crossings = countGraphRouteCollisions(points.plans);
+    if (crossings < score[0] || crossings === score[0] && (span < score[1]
+        || span === score[1] && before(order, best))) {
+      best = order.slice();
+      score = [crossings, span];
+    }
+  };
+  if (ids.length <= 6) {
+    const visit = (prefix, remaining) => {
+      if (!remaining.length) return consider(prefix);
+      for (const id of remaining) visit([...prefix, id], remaining.filter(other => other !== id));
+    };
+    visit([], ids);
+  } else {
+    const deadline = now() + 40;
+    consider(ids);
+    for(const start of ids){
+      if(now()>=deadline)break;
+      const greedy = [start];
+      const remaining = new Set(ids.filter(id=>id!==start));
+      while (remaining.size) {
+        const previous = greedy.at(-1);
+        const degree = id => links.filter(([a, b]) => a === previous && b === id || b === previous && a === id).length;
+        const next = [...remaining].sort((a, b) => degree(b) - degree(a))[0];
+        greedy.push(next);
+        remaining.delete(next);
+      }
+      consider(greedy);
+    }
+    for(let pass=0;pass<3&&now()<deadline;pass++){
+      const beforePass=best;
+      for (let i = 0; i < ids.length && now() < deadline; i++) for (let j = i + 1; j < ids.length && now() < deadline; j++) {
+        const swapped = best.slice();
+        [swapped[i], swapped[j]] = [swapped[j], swapped[i]];
+        consider(swapped);
+      }
+      if(beforePass===best)break;
+    }
+    const near=best;
+    for(let i=0;i<ids.length&&now()<deadline;i++)for(let j=0;j<ids.length&&now()<deadline;j++){
+      if(Math.abs(i-j)<2)continue;
+      const moved=near.slice();
+      moved.splice(j,0,moved.splice(i,1)[0]);
+      consider(moved);
+    }
+  }
+  return best;
 }

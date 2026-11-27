@@ -14,6 +14,11 @@ const SNAPSHOT_GAP_MS=3000;
 export const WORK_IDLE_DEBOUNCE_MS=15000;
 /** The breath of a line whose work is being done: slow, narrow, one shared phase for every working line. */
 export const WORK_PULSE={from:.55,to:.9,period:2000,easing:'ease-in-out'};
+export function graphWorkForSeat(rows,seat){
+ const target=sessionKey(seat.session);
+ return target?rows.filter(row=>row.state==="in-progress"&&sessionKey(field(row,"destinationSession","destination_session"))===target)
+   .sort((a,b)=>(rowAt(b)??-Infinity)-(rowAt(a)??-Infinity)):[];
+}
 export function graphWorkLines(graph,rows,now){
  const seats=new Map(graph.pods.flatMap(p=>p.seats).map(s=>[sessionKey(s.session),s]).filter(([key])=>key)),pairs=new Map();
  for(const row of rows??[]){

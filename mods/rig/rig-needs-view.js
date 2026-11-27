@@ -3,7 +3,7 @@
 // Modified for herdrig: OpenRig seats and asks instead of herdr agents; see Third-party code in README.md.
 // This file is licensed under the Apache License, Version 2.0 (LICENSES/herdr-app-Apache-2.0.txt).
 import { qualifyKey } from "./rig-connections.js";
-import { needsToastFor, diffNeedsNotifications, findAttachedSeat, seatOrigin, statusMarkElement, isUpdateNeed, requestHeadline, statusNeedHalo, resolveAskerSeat, sweepFinding, checkLabel } from "./rig-lib.js";
+import { needsToastFor, diffNeedsNotifications, findAttachedSeat, seatOrigin, statusMarkElement, isUpdateNeed, needsRowHeadline, statusNeedHalo, resolveAskerSeat, sweepFinding, checkLabel, isRunnerPermissionNeed } from "./rig-lib.js";
 
 export const PRIORITY_GROUPS = [
   // A seat whose tmux server stopped answering: right after Needs you, in the needs colour, but its own group (it isn't a request).
@@ -75,8 +75,10 @@ export class NeedsTracker {
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
       const owner = seatOf(ask, session) ?? seatOf(ask, resolveAskerSeat(session, topology.filter((r) => sameConn(ask, r))).seat?.session);
       const check = sweepFinding(ask);
-      if (!check && owner && !excluded(owner.seat)) owner.asks.push(ask);
-      else rows.push({ key: qualifyKey(ask.conn, `ask:${ask.id}`), kind: "ask", ask, check, seat: owner?.seat, rig: owner?.rig, name: check ? checkLabel(check, attention) : requestHeadline(ask), helpers: [], asks: [ask] });
+      const permission = !check && isRunnerPermissionNeed(ask);
+      if (!check && !permission && owner && !excluded(owner.seat)) owner.asks.push(ask);
+      else rows.push({ key: qualifyKey(ask.conn, `ask:${ask.id}`), kind: "ask", ask, check, permission, seat: owner?.seat, rig: owner?.rig,
+        name: check ? checkLabel(check, attention) : needsRowHeadline(ask), helpers: [], asks: [ask] });
     }
     for (const row of rows) {
       if (row.kind === "ask") {
@@ -196,7 +198,9 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
       const where = machineOf?.(row) ?? null; // with more than one OpenRig: show seat, rig, then machine
       const context0 = row.ask?.criticalHealth ? "health" : askOwner?.(row.ask) ?? (row.kind === "ask" && row.seat
         ? [row.seat.logicalId, clustered ? null : row.rig?.name].filter(Boolean).join(" · ") : clustered ? "" : row.rig?.name ?? "no seat");
-      const context = where && context0 !== "health" ? [context0, where].filter(Boolean).join(" · ") : context0;
+      const context = row.permission && row.seat?.logicalId
+        ? row.seat.logicalId
+        : where && context0 !== "health" ? [context0, where].filter(Boolean).join(" · ") : context0;
       register({ key: row.key, foldKey: helperKey, expandable: row.helpers.length > 0, isOpen: helpersOpen, parentKey: key, priorityRow: row });
       out.push(h_flex().id(`priority-${row.key}`).px(12).h(30).gap(7).rounded(8).items_center().cursor_pointer()
         .when(row.focused || selected === row.key, (el) => el.bg(t.selected ?? t.selection ?? t.raised))
@@ -205,9 +209,9 @@ export function priorityElements(ui, t, rows, { folds, fold, open, menu, helper,
         .on_click((event,cx) => open(row,event,cx)).on_mouse_down("right", () => menu(row))
         .when(!row.check, el => el.child(svg(iconOf(row.kind === "ask" ? "rig-bell" : row.seat.terminal ? "rig-terminal-prompt" : "rig-seat")).size(13).flex_none().text_color(t.muted)))
         .child(h_flex().flex_1().min_w(0).gap(4).text_size(12.5)
-          .child(div().min_w(0).when(!clustered, el => el.max_w(130)).when(clustered && !context && !row.check, el => el.flex_1())
+          .child(div().min_w(0).when(!row.permission && !clustered, el => el.max_w(130)).when(!row.permission && clustered && !context && !row.check, el => el.flex_1())
             .truncate().text_color(row.rank === 0 ? t.dim : row.rank === 1 ? t.muted : t.foreground).tooltip(String(row.name??"")).child(row.name))
-          .when(!clustered || Boolean(context || row.check), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).tooltip(row.check ? "OpenRig check" : context).child(row.check ? "· check" : `· ${context}`))))
+          .when(!clustered || Boolean(context || row.check), el => el.child(div().flex_1().min_w(0).when(row.permission, x => x.max_w(84)).truncate().text_color(t.dim).tooltip(row.check ? "OpenRig check" : context).child(row.check ? "· check" : `· ${context}`))))
         .when(row.helpers.length > 0, (el) => el.child(div().id(`priority-fold-${row.key}`).px(3).h(18).text_color(t.dim)
           .on_click((_e, cx) => { cx.stop_propagation(); fold(helperKey, !helpersOpen, cx); })
           .child(svg(iconOf(helpersOpen ? "chevron-down" : "chevron-right")).size(11))

@@ -75,7 +75,7 @@ import {
   utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine, sameDaemon, kernelOperatorReady, kernelOperatorNodeReady, operatorHomeAssignment, cliRefusal,
   buildTopology, readRigRepresentative, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
-  asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, isOpenNeed, requestHeadline, sweepFinding, checkLabel,
+  asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, isOpenNeed, needsRowHeadline, sweepFinding, checkLabel,
   readCommand, writeCommand, writeOutcome, actionArgs, actionTitle, doneWords, startOneClick, qualifyBusyKey, oneClickBusyKey, ONE_CLICK, PROVIDER_HOME_ACTIONS, providerHomeRefusal, appHomeArgsRefusal, listAddedMachine, RIG_SECTIONS, SECTION_TITLES, CONFIG_CATEGORIES,
   navPush, navBack, backTarget, navKey, onScreenRigTab, pushTabPage, tabPagesBack, machineSpaceConn,
   probeCapabilities, currentCapabilities, connectionCapabilities, capabilityDisableReason, herdrAppAvailability, isNeedsVisible, openNeed, worstHealthChip,
@@ -1245,7 +1245,7 @@ export default class RigSidebar extends View {
   shownConnId() { return this.feeds.length > 1 ? (this.drawnConnId ?? this.follow?.shownId ?? null) : this.primary.id; }
   /** `rig.open-seat:<session>`: the seat of the box the sidebar shows; a session name two OpenRigs hold and no shown box that has it is refused, never the first. */
   openSeatBySession(cx, session, conn = null) {
-    const rows = this.priorityRows().filter((r) => r.seat?.session === session), shown = this.shownConnId();
+    const rows = this.priorityRows().filter((r) => r.kind === "seat" && r.seat.session === session), shown = this.shownConnId();
     if (conn) { // a toast names its connection: that OpenRig's seat, never the shown box's same-named one
       const own = rows.find((r) => (r.rig?.conn ?? this.primary.id) === conn);
       if (own) this.seatClick(own.rig, own.seat, own.pod);
@@ -1344,7 +1344,7 @@ export default class RigSidebar extends View {
   }
 
   routeHost(cx, consent = null, feed = this.primary, attempt = null) {
-    return { ...this.attachHost(cx, consent, feed, attempt), notify, currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], selfHostId: () => feed.healthz?.selfHostId,
+    return { ...this.attachHost(cx, consent, feed, attempt), notify, currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], attentionItems: () => feed.data?.attentionItems ?? [], selfHostId: () => feed.healthz?.selfHostId,
       saveRouteState: patch => this.trackRouteOp(feed, attempt, true, () => this.saveSpaceState(patch)),
       syncGrid: (rig, options) => this.spaceController(cx, consent, feed, attempt).sync(rig, feed.config, options) };
   }
@@ -5593,7 +5593,7 @@ export default class RigSidebar extends View {
         if (!n.update) {
           // OpenRig's check on another row reads as that: labelled by the row it names, with "check" where a request shows who asked.
           const check = sweepFinding(n);
-          const headline = check ? checkLabel(check, orderedNeeds) : requestHeadline(n);
+          const headline = check ? checkLabel(check, orderedNeeds) : needsRowHeadline(n);
           const assistant=assistantForNeed(n,this.rosterOf(n.conn));
           const owner = check ? "check" : n.reply === "resolve" ? n.waiting?.owner ?? n.destinationSession : assistant?assistantOwner(assistant):n.asker ?? n.sourceSession;
           const mins = Math.max(0, Math.floor((Date.now() - (Date.parse(n.at ?? "") || Date.now())) / 60000));

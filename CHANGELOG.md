@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.18
+
+Open Needs alerts in the rig's existing space, read the Rig graph as pod columns with a per-seat relationship panel, and answer OpenRig 0.7.24 permission requests from their own Needs row.
+
+- **Needs alerts open in the rig's own space:** clicking a Needs notification toast, a terminal's **needs you** badge, or a Needs item from the sidebar, menu, or command palette opens the request in that rig's existing space instead of creating a new one.
+- **Pod columns in the Rig graph:** the Rig graph arranges pods into columns and summarizes broad delegation in a heading above them instead of crossing wires. Seat cards show observer counts, and narrow graphs stack pods with links and open work shown as tags.
+- **Selected-seat panel in the Rig graph:** select any seat in the Rig graph to see who gives it work, who watches it, whom it sends work to, and its open tasks (with a link to the seat page on running rigs). Press the left or right arrow keys to step through seats, and **Escape** to return to the graph.
+- **Dedicated Needs rows for permission requests (OpenRig 0.7.24+):** a seat's permission request now gets its own row under **Needs you** in Topology's Priority view and opens directly on **Allow once** or **Deny**.
+- **Exact Claude Code compaction tracking (OpenRig 0.7.24+):** when OpenRig reports which Claude Code compaction attempt it accepted, the seat page follows that attempt even if another appears for the same seat. Pi seats keep their existing compaction behavior. Without an attempt ID, a request that takes longer than Herdr's 30-second timeout can still show as unconfirmed; Herdrig never retries it automatically.
+- **Next-step guidance on refused commands:** when OpenRig refuses a command (such as while OpenRig is stopped) and includes a next step, Herdrig shows those instructions on their own line.
+- **Safer terminal-link settings reads:** terminal links now serialize settings reads through the same gate as the rest of Herdrig, so overlapping Ctrl-clicks while removing an OpenRig connection cannot re-open the removed connection, and a missing or unreadable settings file clears open link connections.
+
 ## v0.5.17
 
 Group seats by rig inside Topology's Priority view, plus fixes for multi-connection Needs counts, safe-close conflict notices, and operator warnings and Start timing.
