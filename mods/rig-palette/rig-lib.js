@@ -75,7 +75,18 @@ export const crossesConnections = (config, target) => Boolean(target?.conn && co
 
 export function routeRigOpen(host, config, request) {
   if (crossesConnections(config, request) || crossesConnections(config, request?.entry) || crossesConnections(config, request?.seat)) return Promise.resolve({ ok: false, reason: OTHER_CONNECTION_REFUSAL });
-  const environment = routingEnvironment?.(request?.conn ?? request?.entry?.conn ?? request?.seat?.conn ?? config?.connectionId) ?? {};
+  let targetConn = request?.conn ?? request?.entry?.conn ?? request?.seat?.conn ?? config?.connectionId;
+  if (!targetConn && request?.kind === "page" && request?.entry?.section === "needs" && request?.entry?.id) {
+    const baseEnv = routingEnvironment?.() ?? {};
+    const data = (host?.shared ?? baseEnv.shared)?.("rig.data");
+    const needRig = resolveNeedRig(request.entry.id, {
+      items: host?.attentionItems?.() ?? baseEnv.attentionItems?.() ?? data?.attentionItems ?? [],
+      topology: host?.topology?.() ?? baseEnv.topology?.() ?? data?.topology ?? [],
+      conn: null,
+    });
+    if (needRig && !needRig.ambiguous && needRig.conn) targetConn = needRig.conn;
+  }
+  const environment = routingEnvironment?.(targetConn) ?? {};
   return routeOpen({ ...environment, ...host }, config ?? environment.config, request);
 }
 
@@ -3265,13 +3276,11 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   // A tab or link clicked on a Rig page that is on screen (`fromPage`) is on that tab whatever the settings say: a page for the same OpenRig (or one that
   // names none, as the page didn't) is shown there even while the tab can't be read (no settings yet, an unstamped page, a machine with no single connection).
   const fromPage = host.fromPage === true, from = fromPage ? host.fromEntry ?? null : null;
-  const onTab = Boolean(onScreen) && (onScreen.single === true || (Boolean(current?.conn) && onScreen.conns.includes(current.conn))
-    || fromPage && (current?.conn ?? null) === (from?.conn ?? null));
   // ...and a tab of the rig page on screen (Graph, Health, Recent) is that same page: it stays too, with no read of any space and no jump.
   const rigOfEntry = (e) => {
     if (!e || typeof e !== "object") return null;
-    if (e.rigId || e.rig) return { rigId: e.rigId ?? null, rig: e.rig ?? null, key: e.rigId ?? e.rig };
-    if (e.kind === "rig" && e.name) return { rigId: null, rig: e.name, key: e.name };
+    if (e.rigId || e.rig) return { rigId: e.rigId ?? null, rig: e.rig ?? null, conn: e.conn ?? null, key: e.rigId ?? e.rig };
+    if (e.kind === "rig" && e.name) return { rigId: null, rig: e.name, conn: e.conn ?? null, key: e.name };
     if (e.section === "needs" && e.id) {
       const data = read?.("rig.data");
       return resolveNeedRig(e.id, {
@@ -3284,20 +3293,26 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   };
   const currentRig = rigOfEntry(current);
   const fromRig = from ? rigOfEntry(from) : null;
+  const resolvedCurrent = current && !current.conn && currentRig?.conn && !currentRig.ambiguous
+    ? { ...current, conn: currentRig.conn }
+    : current;
+  const onTab = Boolean(onScreen) && (onScreen.single === true || (Boolean(resolvedCurrent?.conn) && onScreen.conns.includes(resolvedCurrent.conn))
+    || fromPage && (resolvedCurrent?.conn ?? null) === (from?.conn ?? null));
   const hasRig = Boolean(currentRig?.ambiguous || currentRig?.rigId || currentRig?.rig || currentRig?.key);
-  const sameRig = Boolean(from && hasRig && fromRig && !currentRig.ambiguous && !fromRig.ambiguous) && (
+  const sameConn = (currentRig?.conn ?? resolvedCurrent?.conn ?? null) === (fromRig?.conn ?? from?.conn ?? null);
+  const sameRig = Boolean(from && hasRig && fromRig && !currentRig.ambiguous && !fromRig.ambiguous) && sameConn && (
     currentRig.rigId && fromRig.rigId
       ? currentRig.rigId === fromRig.rigId
       : (currentRig.rig ?? currentRig.key) === (fromRig.rig ?? fromRig.key)
   );
   const stays = onTab && (sameRig || !hasRig);
-  publish?.("rig.nav", navPush(read?.("rig.nav"), current)); // the log of the last page opened anywhere; tabs don't draw from it
+  publish?.("rig.nav", navPush(read?.("rig.nav"), resolvedCurrent)); // the log of the last page opened anywhere; tabs don't draw from it
   // The tab the open came from: the clicking page's own tab, else the Rig tab on screen. A page that stays goes onto that tab only.
   const sourceTab = host.sourceTab ?? onScreenRigTab(host.spaces ?? environment.spaces, host.panes ?? environment.panes);
   if (stays) {
     const config = host.currentConfig?.() ?? environment.currentConfig?.() ?? host.config ?? environment.config;
     const space = (((host.spaces ?? environment.spaces)?.()) ?? []).find((s) => (s?.tabs ?? []).some((t) => t?.id === sourceTab));
-    pushTabPage({ shared: read, setShared: publish, panes: host.panes ?? environment.panes }, sourceTab, current, { spaceConn: machineSpaceConn(config, space) });
+    pushTabPage({ shared: read, setShared: publish, panes: host.panes ?? environment.panes }, sourceTab, resolvedCurrent, { spaceConn: machineSpaceConn(config, space) });
     return Promise.resolve({ ok: true, stayed: true });
   }
   const loading = routingNotReady(host, null);
@@ -3307,7 +3322,7 @@ export function openOrFocusRigTab(host = {}, entry = null) {
   }
   // A rig's page is routed to that rig's own space; a rig with none opens in the Rig tab on screen (stayIfNoSpace) rather than in the home space.
   // Only an explicit open (the sidebar, the palette, a menu, a need) may make a space; a page's own tab or link never does.
-  return routeRigOpen(host, null, { kind: "page", entry: current, ...(onTab ? { stayIfNoSpace: true } : {}), ...(sourceTab ? { sourceTab } : {}), ...(host.mayCreate === true && !fromPage ? { mayCreate: true } : {}) }).then(result => {
+  return routeRigOpen(host, null, { kind: "page", entry: resolvedCurrent, ...(onTab ? { stayIfNoSpace: true } : {}), ...(sourceTab ? { sourceTab } : {}), ...(host.mayCreate === true && !fromPage ? { mayCreate: true } : {}) }).then(result => {
     if (!result.ok || result.inPlace) {
       (host.notify ?? environment.notify)?.({ title: "OpenRig", body: result.note ?? result.reason, level: "warning" });
     }
@@ -4900,21 +4915,23 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
   if (!item || typeof item !== "object" || isHealthAttention(item) || item.criticalHealth) return null;
   const scopedConn = conn ?? item.conn ?? null;
   const topo = Array.isArray(topology) ? topology : [];
+  const withConn = (c) => (c ? { conn: c } : {});
   const matchRigRef = (ref, allowUnloaded = false) => {
     const raw = typeof ref === "string" ? ref.trim() : "";
     if (!raw || raw === "external") return null;
     const byId = pickRig(topo, { rigId: raw, conn: scopedConn });
-    if (byId.rig) return { rig: byId.rig.name, rigId: byId.rig.id, key: byId.rig.id ?? byId.rig.name, ambiguous: false };
+    if (byId.ambiguous) return { rig: null, rigId: null, key: raw, ambiguous: true };
+    if (byId.rig) return { rig: byId.rig.name, rigId: byId.rig.id, ...withConn(byId.rig.conn ?? scopedConn), key: byId.rig.id ?? byId.rig.name, ambiguous: false };
     const byName = pickRig(topo, { name: raw, conn: scopedConn });
     if (byName.ambiguous) return { rig: null, rigId: null, key: raw, ambiguous: true };
-    if (byName.rig) return { rig: byName.rig.name, rigId: byName.rig.id, key: byName.rig.id ?? byName.rig.name, ambiguous: false };
-    if (allowUnloaded) return { rig: raw, rigId: null, key: raw, ambiguous: false };
+    if (byName.rig) return { rig: byName.rig.name, rigId: byName.rig.id, ...withConn(byName.rig.conn ?? scopedConn), key: byName.rig.id ?? byName.rig.name, ambiguous: false };
+    if (allowUnloaded) return { rig: raw, rigId: null, ...withConn(scopedConn), key: raw, ambiguous: false };
     return null;
   };
   if (typeof item.rigId === "string" && item.rigId.trim()) {
     const matched = matchRigRef(item.rigId, false);
     if (matched) return matched;
-    return { rig: typeof item.rig === "string" && item.rig.trim() ? item.rig.trim() : null, rigId: item.rigId.trim(), key: item.rigId.trim(), ambiguous: false };
+    return { rig: typeof item.rig === "string" && item.rig.trim() ? item.rig.trim() : null, rigId: item.rigId.trim(), ...withConn(scopedConn), key: item.rigId.trim(), ambiguous: false };
   }
   if (typeof item.rig === "string" && item.rig.trim()) {
     const matched = matchRigRef(item.rig, true);
@@ -4930,7 +4947,7 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
     }
     const target = (scopedConn ? targetMatches.find((r) => r.conn === scopedConn) : null) ?? targetMatches[0];
     if (target && !visited.has(String(target.id ?? ""))) {
-      const resolved = needRigOf(target, topo, scopedConn, items, visited);
+      const resolved = needRigOf(target, topo, scopedConn ?? target.conn ?? null, items, visited);
       if (resolved) return resolved;
     }
   }
@@ -4956,7 +4973,7 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
     for (const raw of list) {
       const found = resolveAskerSeat(raw, topo, scopedConn);
       if (found.ambiguous) return { rig: null, rigId: null, key: raw.slice(raw.lastIndexOf("@") + 1), ambiguous: true };
-      if (found.found) return { rig: found.seat.rig, rigId: found.seat.rigId, key: found.seat.rigId ?? found.seat.rig, ambiguous: false };
+      if (found.found) return { rig: found.seat.rig, rigId: found.seat.rigId, ...withConn(found.seat.conn ?? scopedConn), key: found.seat.rigId ?? found.seat.rig, ambiguous: false };
       const at = raw.lastIndexOf("@");
       if (at > 0) {
         const rigPart = raw.slice(at + 1).trim();
@@ -4985,7 +5002,7 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
       if (new Set(hits.map((h) => h.rigId ?? h.rig ?? "")).size > 1) {
         return { rig: null, rigId: null, key: raw, ambiguous: true, reason: AMBIGUOUS_RIG_SEAT };
       }
-      return { rig: hits[0].rig, rigId: hits[0].rigId, key: hits[0].rigId ?? hits[0].rig, ambiguous: false };
+      return { rig: hits[0].rig, rigId: hits[0].rigId, ...withConn(hits[0].conn ?? scopedConn), key: hits[0].rigId ?? hits[0].rig, ambiguous: false };
     }
     return null;
   };

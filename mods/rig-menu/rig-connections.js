@@ -301,8 +301,9 @@ const onConn = (row, conn) => !conn || !row?.conn || row.conn === conn;
 export function pickRig(rigs, { rigId, conn, name } = {}) {
   const list = Array.isArray(rigs) ? rigs : [];
   if (rigId) {
-    const hit = list.find((r) => r.id === rigId && onConn(r, conn));
-    if (hit || connsOf(list) > 1) return { rig: hit };
+    const hits = list.filter((r) => r.id === rigId && onConn(r, conn));
+    if (connsOf(hits) > 1) return { ambiguous: true };
+    if (hits.length || connsOf(list) > 1) return { rig: hits[0] };
   }
   if (!name) return { rig: undefined };
   const hits = list.filter((r) => r.name === name && onConn(r, conn));
