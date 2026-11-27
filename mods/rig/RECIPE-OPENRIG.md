@@ -88,7 +88,7 @@ The sidebar and these steps use the same words.
 | "OpenRig isn't answering." | The CLI and the window disagree, or the daemon is unhealthy | `rig status`, then OpenRig's help: `rig context get help` |
 | "OpenRig's operator is starting." | Kernel booting | Wait. It clears by itself. |
 | "OpenRig's operator isn't running." | Kernel skipped or stopped | Click **Start operator** on this computer, or run `rig up kernel --existing` in a terminal on that machine (**Copy command** copies it). |
-| "OpenRig's operator can't start: Claude Code and Codex aren't signed in." | No working login | **Copy command** copies `rig doctor`. Run it in a terminal on that machine and follow the sign-in steps. Then run `rig daemon stop` followed by `rig daemon start`. |
+| "OpenRig's operator can't start: Claude Code and Codex aren't signed in." | No working login | **Copy command** copies `rig doctor`, with this connection's `OPENRIG_HOME` when configured. Run it on that machine and follow the sign-in steps. For a custom home, use the banner's `export OPENRIG_HOME=…` command in that terminal before running `rig daemon stop` and `rig daemon start` there. |
 | "The operator isn't running." | Kernel failed or degraded | `rig ps --nodes --rig kernel`, then OpenRig's "Incomplete setup and restart" table |
 | "The rig command failed." | `rig` exists but errors | Read its message, then `rig context get help` |
 

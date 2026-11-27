@@ -72,7 +72,7 @@ const net = { connect: (host, port) => gatedConnect((h, p) => rawNet.connect(h, 
 const netFor = (config) => (host, port) => gatedConnect((h, p) => rawNet.connect(h, p), host, port, config?.connectionId);
 import {
   stampRows, messageDialogSpace, rowsIdentityOf, ROWS_STALE, MOD_IDS, STATE_COPY, NO_PERSON, ACTION_REFUSED, TERMINAL_TOKEN_PROTECTED, REMOTE_OPERATOR_REASON, s1CopyLine, routeRigOpen, registerRigRouting,
-  utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine, sameDaemon, kernelOperatorReady, cliRefusal,
+  utf8, sseParser, parseConfig, sameConfig, preserveCliDiscoveredConfig, discoverDaemonFromCli, selectSidebarState, probeOpenRigState, formatOpenRigVersionLine, sameDaemon, kernelOperatorReady, kernelOperatorNodeReady, operatorHomeAssignment, cliRefusal,
   buildTopology, readRigRepresentative, viewsForRig, rigFoldOpen, podFoldOpen, foldChoice,
   rigKey, podKey, branchKey, hostKey, viewsKey, branchFoldOpen, specNamespaceOf, hostOf,
   asOf, notAnsweringMarker, followedOpenRigName, needTarget, iconsAt, paletteKey, openOrFocusTui, needsRequestCount, isOpenNeed, requestHeadline, sweepFinding, checkLabel,
@@ -788,7 +788,6 @@ export default class RigSidebar extends View {
   observeOperatorBanner(feed) {
     const scope = operatorBannerScope(feed.config);
     const hidden = scope && shared("rig.operatorBannerHidden")?.[scope];
-    if (feed.operatorStart && !feed.operatorStart.busy && feed.sidebarState?.substate !== "5b") feed.operatorStart = null;
     // Only a successful read retires a dismissal for a previous condition.
     if (hidden && hidden !== feed.sidebarState?.substate) this.saveOperatorBannerDismissal(scope, null);
   }
@@ -799,10 +798,11 @@ export default class RigSidebar extends View {
   }
 
   /** Apply only observations at least as recent as the last published read for this connection. */
-  publishOperatorState(feed, generation, state, observed) {
+  publishOperatorState(feed, generation, state, observed, ready = false) {
     if (generation < (feed.operatorStateGeneration ?? 0)) return false;
     feed.operatorStateGeneration = generation;
     feed.sidebarState = state;
+    if (state.operatorDisabled || (ready && state.id === "S4" && feed.operatorStart?.error)) feed.operatorStart = null;
     if (observed) this.observeOperatorBanner(feed);
     return true;
   }
@@ -1058,15 +1058,24 @@ export default class RigSidebar extends View {
       const kernelStatus = await this.get("/api/kernel/status", feed, op);
       op.check();
       if (!this.stillCurrent(feed, config) || !KERNEL_STATES.has(kernelStatus?.kernel_state)) return;
-      const ready = kernelOperatorReady(kernelStatus)
-        || (kernelStatus.kernel_state === "ready" && !Array.isArray(kernelStatus.agents));
-      if (!ready && ["ready", "partial_ready"].includes(kernelStatus.kernel_state)) return;
-      const state = selectSidebarState({ kernelStatus, capabilities: feed.data?.capabilities });
+      const bootReady = ["ready", "partial_ready"].includes(kernelStatus.kernel_state);
+      let kernelNodes;
+      if (bootReady && !Array.isArray(kernelStatus.agents)) {
+        const summary = await this.get("/api/rigs/summary", feed, op);
+        const rig = Array.isArray(summary) && summary.find(row => !row.archivedAt && row.name === "kernel");
+        if (!rig?.id) return;
+        kernelNodes = await this.get(`/api/rigs/${encodeURIComponent(rig.id)}/nodes`, feed, op);
+        op.check();
+        if (!this.stillCurrent(feed, config) || !Array.isArray(kernelNodes)) return;
+      }
+      const ready = kernelOperatorReady(kernelStatus) || kernelOperatorNodeReady(kernelNodes);
+      const state = selectSidebarState({ kernelStatus, kernelNodes, capabilities: feed.data?.capabilities });
+      if (!ready && bootReady && state.id === "S4") return;
       const changed = !sameValue(state, feed.sidebarState);
-      if (!this.publishOperatorState(feed, generation, state, true)) return;
+      if (!this.publishOperatorState(feed, generation, state, true, ready)) return;
       if (changed) {
         if (feed.data) feed.data = { ...feed.data, sidebarState: state };
-        this.publishData(cx, feed);
+        this.publishData(cx);
       }
       if (state.id === "S4") {
         feed.operatorChecks = null;
@@ -3122,6 +3131,7 @@ export default class RigSidebar extends View {
         const initialPerson=feed.config.person?String(feed.config.person).replace(/@external$/i,''):null;
         // Kick independent reads together; only nodes and detail rows wait on their own parent response.
         // The transport can batch these without a debounce timer or a captured post-await view context.
+        const probeOperatorRead = operatorRead;
         operatorRead = this.beginOperatorRead(feed);
         const [tz,summary,hostedMembers,attention,attentionHealth,attentionAgg,native,hzRes,krRes,initialQuiet]=await Promise.all([
           get('/api/config/ui.timezone').catch(rethrowGate(null)),summaryRead,
@@ -3155,7 +3165,9 @@ export default class RigSidebar extends View {
             if (hzBody) feed.healthz = steadyHealthz(hzBody);
           }
         }
-        const kernelStatus = (krRes?.ok ? await krRes.json().catch(rethrowGate(null)) : null) ?? probed?.statusProbe?.kernel ?? null;
+        const freshKernelStatus = krRes?.ok ? await krRes.json().catch(rethrowGate(null)) : null;
+        const probeKernelStatus = probed?.statusProbe?.kernel ?? null;
+        const kernelStatus = freshKernelStatus ?? probeKernelStatus;
         let capabilities;
         const forceProbe = Boolean(feed.forceCapabilityProbe);
         feed.forceCapabilityProbe = false;
@@ -3215,7 +3227,9 @@ export default class RigSidebar extends View {
           sidebarModId: MOD_IDS.sidebar,
           strictKernel,
         });
-        this.publishOperatorState(feed, operatorRead, sidebarState, kernelStatus || kernelNodes?.length);
+        const kernelGeneration = freshKernelStatus || !probeKernelStatus ? operatorRead : probeOperatorRead;
+        this.publishOperatorState(feed, kernelGeneration, sidebarState, kernelStatus || kernelNodes?.length,
+          kernelOperatorReady(kernelStatus) || (!Array.isArray(kernelStatus?.agents) && kernelOperatorNodeReady(kernelNodes)));
         const versionLine = formatOpenRigVersionLine({ healthz: feed.healthz, cliVersion: feed.cliVersion });
         const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
         feed.data = {
@@ -3276,7 +3290,7 @@ export default class RigSidebar extends View {
     if (feed.data && !feed.error) { try { this.notifyTerminalLoss(feed); } catch (error) { console.error("rig: terminal loss notification failed", error); } } // never skips what follows
     if (observeRaw && feed.data && !feed.error) await this.observeDismissals(feed);
     if (feed.data && !feed.error) this.prepareSidebarNeeds(feed);
-    this.publishData(cx, feed);
+    this.publishData(cx);
     this.publishDismissals();
     if (!feed.error && feed.data) this.syncRigSpaces(cx);
     if (feed.again) { feed.again = false; await this.refresh(cx, feed); }
@@ -3302,7 +3316,8 @@ export default class RigSidebar extends View {
   }
 
   /** Publishes `rig.data`: the primary feed's state, with the merged rows of every connection that answers when there are several. */
-  publishData(cx, feed = this.primary) {
+  publishData(cx) {
+    const feed = this.primary;
     // Projected rows carry their connection at the top level. With several connections only the per-connection
     // entries carry raw nodes, since two OpenRigs can share a rig ID. Raw attention and health inputs stay in the sidebar.
     const several = this.feeds.length > 1;
@@ -3325,7 +3340,8 @@ export default class RigSidebar extends View {
       // Each connection's own state under its id: a second connection writes only its own entry, never another's (the readers above still see
       // the merged rows of the connections that answer).
       byConnection: Object.fromEntries(this.feeds.map((f) => [f.id ?? f.config?.connectionId ?? LEGACY_CONNECTION_ID, {
-        machine: f.config?.daemonMachine ?? null, answering: Boolean(f.data) && !f.error, error: f.error, retryDelayMs:f.error?f.refreshRetry?.delay??null:null, needsApproval: f.needsApproval === true, approvalsUnreadable: f.approvalsUnreadable === true, live: f.live, config: f.config, healthz: f.healthz, healthRevision:f.healthRevision??0, ...(f.data && !f.error ? own(f.data) : {}), // no stale rows or roster of a connection that does not answer
+        machine: f.config?.daemonMachine ?? null, answering: Boolean(f.data) && !f.error, error: f.error, retryDelayMs:f.error?f.refreshRetry?.delay??null:null, needsApproval: f.needsApproval === true, approvalsUnreadable: f.approvalsUnreadable === true, live: f.live, config: f.config, healthz: f.healthz, healthRevision:f.healthRevision??0,
+        ...(f.data && !f.error ? { ...own(f.data), sidebarState: f.sidebarState } : {}), // no stale rows or roster of a connection that does not answer
       }])),
     };
     // rig.data is large and herdr copies it into every reader and rewrites its shared file on each change, so a refresh that read the same content
@@ -3603,7 +3619,8 @@ export default class RigSidebar extends View {
         summary, kernelStatus, kernelNodes,
         strictKernel: kernelStatus !== null, sidebarModId: MOD_IDS.sidebar,
       });
-      this.publishOperatorState(feed, operatorRead, sidebarState, kernelStatus || kernelNodes?.length);
+      this.publishOperatorState(feed, operatorRead, sidebarState, kernelStatus || kernelNodes?.length,
+        kernelOperatorReady(kernelStatus) || (!Array.isArray(kernelStatus?.agents) && kernelOperatorNodeReady(kernelNodes)));
       const carryFrom = feed.data?.daemonUrl === feed.config.daemonUrl ? feed.data : null;
       feed.data = { daemonUrl: feed.config.daemonUrl, topology, attention: attentionItems ? needsRequestCount(topology, attentionItems) : null, attentionItems, attentionRaw: raw ?? [], hostedMembers,
         attentionHealth: attentionHealth?.records ?? [], attentionPerspective: attention?.perspective ?? null,
@@ -4220,6 +4237,8 @@ export default class RigSidebar extends View {
     const headline = this.feeds.length > 1 ? baseHeadline.replace(/^OpenRig's operator\b/, `OpenRig's operator on ${machine}`) : baseHeadline;
     const detail = STATE_COPY[sub]?.detail?.replace("on this computer", `on ${machine}`);
     const stateWord = this.sidebarState.stateWord ?? null;
+    const controls = this.operatorRecoveryActions(t, this.focusRenderCx, feed, sub, machine, false);
+    const result = this.operatorStartResult(t, feed, false);
     return v_flex().id(`rig-banner-${sub}`).mx(8).my(4).p(8).gap(6).rounded(6).bg(t.raised)
       .child(h_flex().gap(6).items_start().justify_between()
         .child(v_flex().flex_1().min_w_0().child(div().text_size(11.5).text_color(t.muted).child(headline)))
@@ -4234,13 +4253,23 @@ export default class RigSidebar extends View {
           }, el => el.border_1().border_color(t.accent)))))
       .when(Boolean(detail), el => el.child(div().text_size(11).text_color(t.dim).child(detail)))
       .when(Boolean(stateWord), el => el.child(div().text_size(11).text_color(t.dim).child(statusWord(stateWord, "startup"))))
-      .child(this.operatorRecoveryActions(t, this.focusRenderCx, feed, sub, machine, false));
+      .when(Boolean(controls), el => el.child(controls))
+      .when(Boolean(result), el => el.child(result));
+  }
+
+  operatorStartResult(t, feed, system) {
+    const start = feed.operatorStart;
+    if (!start?.error || !this.stillCurrent(feed, start.config)) return null;
+    return div().id(system ? "system-operator-error" : "rig-operator-start-error")
+      .text_size(11).text_color(t.blocked).child(plainError(start.error).text);
   }
 
   operatorRecoveryActions(t, cx, feed, sub, machine, system) {
     const config = feed.config;
     const expected = feed.healthz;
-    const copyText = feed.sidebarState?.copyText ?? STATE_COPY[sub]?.copyText;
+    const baseCopyText = feed.sidebarState?.copyText ?? STATE_COPY[sub]?.copyText;
+    const assignment = sub === "5c" ? operatorHomeAssignment(config) : null;
+    const copyText = assignment && baseCopyText ? `${assignment} ${baseCopyText}` : baseCopyText;
     const actionLabel = feed.sidebarState?.actionLabel ?? STATE_COPY[sub]?.actionLabel;
     if (!copyText || !actionLabel) return null;
     const start = feed.operatorStart && this.stillCurrent(feed, feed.operatorStart.config) ? feed.operatorStart : null;
@@ -4249,7 +4278,7 @@ export default class RigSidebar extends View {
     const copy = child => {
       if (!this.copyToClipboard(child, copyText, copyKey) || !dismissibleOperatorBanner(sub)) return;
       const next = sub === "5b" ? " This note goes once the operator is up." : "";
-      notify({ title: `Copied: ${copyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
+      notify({ title: `Copied: ${baseCopyText}`, body: `Run it in a terminal on ${machine}.${next}`, level: "info", timeout: 4000 });
       if (this.stillCurrent(feed, config) && !start?.confirming) this.scheduleOperatorChecks(feed, config);
     };
     const button = (id, label, action, color, background) => {
@@ -4261,14 +4290,14 @@ export default class RigSidebar extends View {
     const startId = system ? "system-operator-start" : `rig-s5-start-${sub}`;
     const copyId = system ? "system-operator-copy" : `rig-s5-copy-${sub}`;
     return v_flex().gap(4)
+      .when(Boolean(assignment), el => el.child(div().text_size(11).text_color(t.dim)
+        .child(`This OpenRig keeps its files in ${config.openrigHome}. In that terminal, run export ${assignment} first.`)))
       .child(h_flex().gap(5)
         .when(this.canStartOperator(feed, config), el => el.child(button(startId,
           start?.busy ? "Starting…" : system ? "Start…" : "Start operator",
           start?.busy ? null : child => this.startOperator(child, feed, config, expected),
           start?.busy ? t.dim : t.accent, t.hover)))
-        .child(button(copyId, copied ? "Copied" : actionLabel, copy, copied ? (t.working ?? t.accent) : t.accent, t.chrome)))
-      .when(Boolean(start?.error) && sub === "5b", el => el.child(div().id(system ? "system-operator-error" : "rig-operator-start-error")
-        .text_size(11).text_color(t.blocked).child(plainError(start.error).text)));
+        .child(button(copyId, copied ? "Copied" : actionLabel, copy, copied ? (t.working ?? t.accent) : t.accent, t.chrome)));
   }
 
   /** The always-visible marker under the header after a failed read while the sidebar still holds data: "Not answering · as of HH:MM"
@@ -5174,11 +5203,15 @@ export default class RigSidebar extends View {
       if (this.sidebarState?.operatorDisabled) out.push(div().id("system-operator-disabled").pl(treeIndent(1)).pr(8).text_size(12)
         .text_color(t.muted).child("OpenRig's operator is turned off here."));
       const operatorSub = rowFeed.sidebarState?.substate;
-      if (dismissibleOperatorBanner(operatorSub)) {
+      const startResult = this.operatorStartResult(t, rowFeed, true);
+      const operatorStarting = operatorSub === "5a" && rowFeed.operatorStart && this.stillCurrent(rowFeed, rowFeed.operatorStart.config);
+      if (dismissibleOperatorBanner(operatorSub) || operatorStarting || startResult) {
         const machine = rowConfig?.daemonMachine ?? (isLoopbackDaemonUrl(rowConfig?.daemonUrl) ? "this computer" : "OpenRig's machine");
         out.push(v_flex().id("system-operator-warning").pl(treeIndent(1)).pr(8).py(3).gap(4)
-          .child(div().text_size(12).text_color(t.muted).child(operatorSub === "5b" ? "Operator: not running" : "Operator: no sign-in"))
-          .child(this.operatorRecoveryActions(t, cx, rowFeed, operatorSub, machine, true)));
+          .when(operatorStarting || dismissibleOperatorBanner(operatorSub), el => el.child(div().text_size(12).text_color(t.muted)
+            .child(operatorStarting ? "Operator: starting" : operatorSub === "5b" ? "Operator: not running" : "Operator: no sign-in")))
+          .when(dismissibleOperatorBanner(operatorSub), el => el.child(this.operatorRecoveryActions(t, cx, rowFeed, operatorSub, machine, true)))
+          .when(Boolean(startResult), el => el.child(startResult)));
       }
       const cleanupResult=this.oldViewsCloseResult();
       if(cleanupResult?.text)out.push(div().id('system-old-worker-views-result').pl(treeIndent(1)).pr(8).text_size(12)

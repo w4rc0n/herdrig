@@ -756,6 +756,12 @@ export async function discoverDaemonFromCli(config, execFn, { timeoutKind = "rea
 export const kernelOperatorReady = kernel => Array.isArray(kernel?.agents)
   && kernel.agents.some(agent => agent?.session_name === "operator-agent@kernel" && agent.startup_status === "ready" && !agent.down);
 
+const kernelOperatorNode = nodes => nodes.find(n => n && (n.logicalId === "operator.agent" || String(n.canonicalSessionName ?? "").startsWith("operator-agent@"))) ?? null;
+export function kernelOperatorNodeReady(nodes) {
+  const node = Array.isArray(nodes) ? kernelOperatorNode(nodes) : null;
+  return node?.startupStatus === "ready" && node.sessionAlive !== false && ["ready", "running"].includes(node.sessionStatus);
+}
+
 /**
  * Pure state selector for the seven sidebar states (`S0`–`S7`) and four `S5` sub-states (`5a`–`5d`).
  */
@@ -853,7 +859,8 @@ export function selectSidebarState({
     : (typeof k?.kernel_state === "string" ? k.kernel_state : null);
   // The boot result can stay skipped after `rig up kernel --existing`. The endpoint
   // derives agents from current sessions, including whether a historical ready seat is down.
-  const liveReady = (bootState === "skipped" || bootState === "auth_blocked") && kernelOperatorReady(k);
+  const bootReady = bootState === "ready" || bootState === "partial_ready";
+  const liveReady = (bootReady || bootState === "skipped" || bootState === "auth_blocked") && kernelOperatorReady(k);
   const operatorDisabled = bootState === "skipped" && k?.detail === "OPENRIG_NO_KERNEL=1" && !liveReady;
   const kState = liveReady ? "ready" : bootState;
   const explainOperator = !liveReady && !operatorDisabled;
@@ -885,12 +892,13 @@ export function selectSidebarState({
       copyText: STATE_COPY["5c"].copyText,
     };
   }
-  if (kState === "bootstrap_failed" || kState === "degraded" || kState === "spec_missing") {
+  const operatorMissing = bootReady && Array.isArray(k?.agents) && !liveReady;
+  if (operatorMissing || kState === "bootstrap_failed" || kState === "degraded" || kState === "spec_missing") {
     return {
       id: "S5",
       substate: "5d",
       headline: STATE_COPY["5d"].headline,
-      stateWord: kState,
+      stateWord: operatorMissing ? "stopped" : kState,
       actionLabel: STATE_COPY["5d"].actionLabel,
       copyText: STATE_COPY["5d"].copyText,
     };
@@ -914,7 +922,7 @@ export function selectSidebarState({
   const nodes = Array.isArray(kernelNodes) ? kernelNodes : (Array.isArray(k?.nodes) ? k.nodes : null);
   let operatorNode = null;
   if (Array.isArray(nodes)) {
-    operatorNode = nodes.find((n) => n && (n.logicalId === "operator.agent" || String(n.canonicalSessionName ?? "").startsWith("operator-agent@"))) ?? null;
+    operatorNode = kernelOperatorNode(nodes);
     if (!operatorNode && explainOperator) {
       return {
         id: "S5",
@@ -1860,6 +1868,8 @@ function oneLine(v) {
 function shq(v) {
   return `'${String(v ?? "").replace(/'/g, "'\\''")}'`;
 }
+
+export const operatorHomeAssignment = config => config?.openrigHome ? `OPENRIG_HOME=${shq(config.openrigHome)}` : null;
 
 export function changeModelPlan(target = {}, pick = {}, extra = null) {
   // The names go into text a lead agent reads and runs: one line each, and quoted in every command.
