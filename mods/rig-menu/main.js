@@ -20,7 +20,7 @@ import { sharedLoopbackDaemonUrl, sharedRigData, requestFailed, requestWhat, wit
 import { sendStuckLines } from "./rig-lib.js";
 import { timezoneValue } from "./rig-time.js";
 import { registerRigRouting, stampRows, messageDialogSpace, ROWS_STALE, tabPagesScrub } from "./rig-lib.js";
-import { targetConnection, pickRig, configOfConnection, adoptConnection, UNKNOWN_CONNECTION, NO_CONNECTION, commandFor, operatorCommandFor, tuiCommandFor, connectionBoxLabel, logExecError, plainExecError, parseExecTimeout, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
+import { targetConnection, pickRig, configOfConnection, adoptConnection, UNKNOWN_CONNECTION, NO_CONNECTION, LEGACY_CONNECTION_ID, commandFor, operatorCommandFor, tuiCommandFor, connectionBoxLabel, logExecError, plainExecError, parseExecTimeout, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import { typeahead } from "./rig-typeahead.js";
 import { revealAfterKey } from "./rig-scroll-reveal.js";
 import { dismissible, requestDismissal, updateKey, dismissalScope } from "./rig-dismiss.js";
@@ -1482,8 +1482,12 @@ export default class RigMenu extends View {
       out.push({ divider: "" });
       // Resume when paused, Pause when not; with the state unknown or mixed, both.
       const stoppedRig = isRigStopped(target.lifecycle, this.rigSeats(target));
+      const operatorData = target.rig === "kernel" && moveConnection.ok ? sharedRigData(moveConnection.config, shared) : null;
+      const operatorState = operatorData?.byConnection
+        ? operatorData.byConnection[moveConnection.config.connectionId ?? LEGACY_CONNECTION_ID]?.sidebarState
+        : operatorData?.sidebarState;
       if (!stoppedRig && target.lifecycle !== "stopped") item("rig-pause", "Pause rig…", () => dialog(target, { action: "pause", load: "pause" }, 360));
-      if (!target.operatorDisabled && (stoppedRig || target.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
+      if (!target.operatorDisabled && !operatorState?.operatorDisabled && (stoppedRig || target.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
       // Delete, with Archive beside it as the reversible choice. Never for the kernel: it's the daemon's own rig.
       if (target.rig !== "kernel" && !target.archived) item("rig-archive", "Archive rig…", () => dialog(target, { action: "archive-rig", load: "pause" }, 320), "archive-rig");
       if (target.rig !== "kernel") item("rig-trash", "Delete rig…", () => dialog(target, { action: "delete-rig", load: "pause" }, 540), "delete-rig");

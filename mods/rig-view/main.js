@@ -5983,20 +5983,35 @@ export default class RigView extends View {
         //   between this GET and the POST that keeps the same open-phase revision cannot be rejected atomically on this API.
         let outcome = null;
         const resolvedVerb = resolveMissionVerb(itemForAction, actWithProgress);
+        const isRetry = Boolean(typeof actWithProgress.operationHashPrefix === "string" && actWithProgress.operationHashPrefix);
         if ((resolvedVerb === "approve" || resolvedVerb === "deny")
           && (resolvedVerb !== "approve" || isDecisionAsk(itemForAction, queueRow))
           && latestRevision !== null && latestRevision !== undefined && expectedState && qid) {
-          const stateCheckFailed = (reason) => ({
-            ok: false,
-            status: 0,
-            code: "state_check_failed",
-            conflict: false,
-            notSent: true,
-            message: reason,
-            text: reason,
-            committedQuestionIds: [],
-            stepsCompleted: 0,
-          });
+          const stateCheckFailed = (reason) => isRetry
+            // A retry follows an earlier uncertain POST that may have committed: never claim "Nothing was sent." or drop Check and finish.
+            ? {
+                ok: false,
+                status: 0,
+                code: "network_error",
+                networkError: true,
+                conflict: false,
+                operationHashPrefix: actWithProgress.operationHashPrefix,
+                message: NETWORK_UNCONFIRMED_MESSAGE,
+                text: NETWORK_UNCONFIRMED_MESSAGE,
+                committedQuestionIds: [],
+                stepsCompleted: 0,
+              }
+            : {
+                ok: false,
+                status: 0,
+                code: "state_check_failed",
+                conflict: false,
+                notSent: true,
+                message: reason,
+                text: reason,
+                committedQuestionIds: [],
+                stepsCompleted: 0,
+              };
           try {
             const qr = await op.fetch(`${daemonUrl}/api/queue/${encodeURIComponent(qid)}`);
             if (!qr.ok) {
@@ -6011,8 +6026,13 @@ export default class RigView extends View {
               } else {
                 this.cacheFor(config.connectionId)[`/api/queue/${encodeURIComponent(qid)}`] = { data: qd, status: qr.status, at: Date.now() };
                 const stateMoved = qd.state !== expectedState;
-                const revMoved = qd.decisionRevision !== undefined && qd.decisionRevision !== null && String(qd.decisionRevision) !== String(latestRevision);
-                if (stateMoved || revMoved) {
+                const hasRev = qd.decisionRevision !== undefined && qd.decisionRevision !== null;
+                const revMoved = hasRev && String(qd.decisionRevision) !== String(latestRevision);
+                const revConfirmedSame = hasRev && String(qd.decisionRevision) === String(latestRevision);
+                // On a retry (Check and finish), a moved/absent revision may be our own earlier committed operation:
+                // forward to OpenRig so its operationId replay check reconciles 200 or rejects 409 authoritatively.
+                // Only refuse locally on retry when decisionRevision is confirmed unchanged (so Approve/Deny never committed) and state moved.
+                if (isRetry ? (revConfirmedSame && stateMoved) : (stateMoved || revMoved)) {
                   const code = stateMoved ? "qitem_state_changed" : "decision_revision_changed";
                   const message = formatSafeCloseConflict({ code, currentState: qd.state, expectedState });
                   outcome = {
