@@ -2,7 +2,7 @@ import * as kit from "gpui-kit";
 const {div,svg}=kit;
 import {h_flex,v_flex} from "gpui-base";
 import {settings} from "herdr";
-import {routeGraphColumns,graphColumnModel,bestGraphColumnOrder,graphWorkPath,graphWorkInk,graphWorkChip,nearestGraphSeat,graphHeaderChips} from "./rig-graph-layout.js";
+import {routeGraphColumns,graphHeadingTitle,graphWorkPath,graphWorkInk,nearestGraphSeat} from "./rig-graph-layout.js";
 import {GraphMotion,GRAPH_FADE_MS} from "./rig-graph-state.js";
 import {GraphWorkProjection,WORK_PULSE,graphWorkForSeat} from "./rig-graph-work.js";
 import {statusMarkElement,seatStatus,statusLook,counted,singleLineText} from "./rig-lib.js";
@@ -49,7 +49,7 @@ export function graphPathElements(points,kind,t,assets,override={}){
   return out;
 }
 
-function roundedLink(points){
+function roundedLink(points,thickness=1.4,arrow=null){
   const toward=(a,b,d)=>[a[0]+Math.sign(b[0]-a[0])*d,a[1]+Math.sign(b[1]-a[1])*d];
   const last=points.at(-1),prior=points.at(-2),end=toward(last,prior,Math.min(6,distance(last,prior)));
   const route=[...points.slice(0,-1),end],samples=[route[0]];
@@ -64,10 +64,10 @@ function roundedLink(points){
     }
   }
   samples.push(end);
-  return strokePath(samples,1.4);
+  return strokePath(samples,thickness,arrow);
 }
 
-function strokePath(samples,thickness){
+function strokePath(samples,thickness,arrow=null){
   const normals=[];
   for(let i=1;i<samples.length;i++){
     const a=samples[i-1],b=samples[i],dx=b[0]-a[0],dy=b[1]-a[1],length=Math.hypot(dx,dy);
@@ -78,7 +78,9 @@ function strokePath(samples,thickness){
     const scale=sign*thickness/2/(1+a[0]*b[0]+a[1]*b[1]||1);
     return [x+(a[0]+b[0])*scale,y+(a[1]+b[1])*scale];
   });
-  return kit.PathBuilder.fill().add_polygon([...side(1),...side(-1).reverse()],true).build();
+  const path=kit.PathBuilder.fill().add_polygon([...side(1),...side(-1).reverse()],true);
+  if(arrow)path.add_polygon(arrow,true);
+  return path.build();
 }
 
 function panelCurve([x1,y1],[x2,y2]){
@@ -97,35 +99,18 @@ export function handoffAgo(seconds) {
 }
 
 export class RigGraph{
-  constructor(){this.width=700;this.motion=new GraphMotion();this.selected=null;this.hovered=null;this.eventCursor=0;this.workProjection=new GraphWorkProjection();this.workRoutes=new Map();}
-  reset(){this.columnSearch=null;this.workPulseTimer?.cancel?.();this.workPulseTimer=null;this.workPulseUntil=null;this.workPulseEpoch=(this.workPulseEpoch??0)+1;this.motion.leave();this.active=false;this.workProjection.reset();this.workRoutes.clear();this.workChipLines=null;this.workChips=null;this.workChipLayout=null;}
+  constructor(){this.width=960;this.motion=new GraphMotion();this.selected=null;this.hovered=null;this.eventCursor=0;this.workProjection=new GraphWorkProjection();this.workRoutes=new Map();}
+  reset(){this.workPulseTimer?.cancel?.();this.workPulseTimer=null;this.workPulseUntil=null;this.workPulseEpoch=(this.workPulseEpoch??0)+1;this.motion.leave();this.active=false;this.workProjection.reset();this.workRoutes.clear();}
   render(t,cx,graph,{id,assets,running=false,reducedMotion=false,events=[],workRows=[],workReady=true,open,menu,now=Date.now()}={}){
     const schedule=(ms,fn)=>this.liveCx.timer.after(ms,live=>{this.liveCx=live;fn();}),notify=()=>this.liveCx?.notify?.();
     this.liveCx=cx;
-    if(this.graphData!==graph){
-      const key=JSON.stringify([graph.pods.map(pod=>[pod.id,pod.seats.map(seat=>seat.lid)]),
-        graph.edges.map(e=>JSON.stringify([e.from,e.to,e.kind])).sort()]);
-      if(this.columnKey!==key){this.columnKey=key;this.columnModel=graphColumnModel(graph);this.columnOrders=new Map();this.columnSearch=null;}
-    }
-    if(this.graphData!==graph||this.layoutWidth!==this.width||!this.layout){
-      this.layout=routeGraphColumns(graph,this.width,{model:this.columnModel,order:this.columnOrders.get(this.width)});
-      this.graphData=graph;this.layoutWidth=this.width;
+    const {lines:work,taskCount}=running?this.workProjection.read(graph,workRows,now,{ready:workReady,reducedMotion}):{lines:[],taskCount:0};
+    const workKey=JSON.stringify(work.map(line=>line.key).sort());
+    if(this.graphData!==graph||this.layoutWidth!==this.width||this.layoutWorkKey!==workKey||!this.layout){
+      this.layout=routeGraphColumns(graph,this.width,{work:work.slice().sort((a,b)=>a.key.localeCompare(b.key))});
+      this.graphData=graph;this.layoutWidth=this.width;this.layoutWorkKey=workKey;
     }
     const layout=this.layout, width=this.width;
-    if(!layout.narrow&&this.columnModel.links.length&&layout.pods.length-(this.columnModel.top?1:0)>1
-        &&!this.columnOrders.has(width)&&this.columnSearch?.width!==width){
-      const search=this.columnSearch={width},model=this.columnModel;
-      schedule(0,()=>{
-        if(this.columnSearch!==search)return;
-        this.columnSearch=null;
-        if(this.width!==width||!this.active)return;
-        const order=bestGraphColumnOrder(graph,width,model);
-        if(this.columnOrders.size>=8)this.columnOrders.delete(this.columnOrders.keys().next().value);
-        this.columnOrders.set(width,order);
-        const drawn=layout.pods.filter(p=>p.id!==model.top).map(p=>p.id);
-        if(order.some((pod,i)=>pod!==drawn[i])){this.layout=null;notify();}
-      });
-    }
     const mono=settings()?.font_family??"monospace";
     if(reducedMotion){this.motion.entering=false;this.motion.started=true;}
     if(!this.active){this.active=true;this.eventCursor=events.at(-1)?.serial??0;if(running)this.motion.enter(schedule,notify,layout.pods.length+graph.seatCount,{reducedMotion});}
@@ -158,7 +143,6 @@ export class RigGraph{
         else if(["left","right","up","down"].includes(key)){this.selected=nearestGraphSeat(layout,this.selected,key);cx.stop_propagation?.();cx.notify();}
         else if(["enter","return"].includes(key)&&this.selected){cx.stop_propagation?.();select(this.selected,cx);}})
       .on_size_change((size,cx)=>{const width=Math.floor(size.width);if(width>0&&width!==this.width){this.width=width;cx.notify();}});
-    const {lines:work,taskCount}=running?this.workProjection.read(graph,workRows,now,{ready:workReady,reducedMotion}):{lines:[],taskCount:0};
     const nativeInk=typeof kit.PathBuilder?.fill==='function'&&typeof globalThis.window?.paint_path==='function';
     // Native loops need one notification when the idle debounce ends.
     const pulseUntil=work.reduce((at,line)=>line.pulseUntil?Math.min(at,line.pulseUntil):at,Infinity);
@@ -185,31 +169,26 @@ export class RigGraph{
       root.child(placed(first.x,bottom+3,width-first.x,16).text_size(11).text_color(t.dim).child("No delegation in this rig's spec."));
     }
     for(const [i,bracket] of layout.brackets.entries()){
-      const {heading,x,end,y,label}=bracket;
+      const {heading,x,end,y,label,titleHeight}=bracket;
       if(label){
-        const names=heading.columns.map(podId=>graph.pods.find(p=>p.id===podId)?.label??podId).join(", ");
-        const target=heading.all?`every seat below${heading.skipped.size?` except ${heading.skipped.size}`:""}`:`every seat in ${names}`;
         const last=layout.brackets.findLast(part=>part.heading===heading&&part.row===bracket.row);
-        const title=`${heading.source} delegates to ${target} (${heading.covered.size})`;
-        const labelWidth=layout.narrow?width-x-12:Math.min(width-24,Math.max(last.end-x,title.length*6.4+20));
-        const labelX=layout.narrow?x:Math.max(12,Math.min(width-labelWidth-12,(x+last.end-labelWidth)/2));
-        root.child(placed(labelX,y-17,Math.max(1,labelWidth),16).id(id+"-heading-"+i).tooltip(title).truncate().text_size(11.5).text_color(t.muted)
+        const title=singleLineText(graphHeadingTitle(graph,heading));
+        const labelWidth=layout.narrow?width-32:Math.min(width-32,Math.max(last.end-x,title.length*6.4+20));
+        const labelX=layout.narrow?16:Math.max(16,Math.min(width-labelWidth-16,(x+last.end-labelWidth)/2));
+        const titleY=y-titleHeight-4;
+        root.child(placed(labelX,titleY,Math.max(1,labelWidth),titleHeight).id(id+"-heading-"+i).tooltip(title)
+          .whitespace_normal().line_height("16px").text_size(11.5).text_color(t.muted)
           .when(!layout.narrow,e=>e.text_center())
           .child(title));
         if(!layout.narrow&&heading===layout.headings[0]){
-          const top=layout.pods[0],stemY=top.y+top.h,stemX=Math.max(top.x+6,Math.min(x,top.x+top.w-6));
-          const joinY=stemX===x?stemY:stemY+6;
-          root.child(placed(x,joinY,2,y-joinY).border_l(1.25).border_color(t.border));
-          if(stemX!==x)root.children([
-            placed(stemX,stemY,2,6).border_l(1.25).border_color(t.border),
-            placed(Math.min(stemX,x),joinY,Math.abs(x-stemX),2).border_t(1.25).border_color(t.border),
-          ]);
+          const top=layout.pods[0],stemY=top.y+top.h;
+          root.child(placed(top.x+top.w/2,stemY,2,titleY-stemY).border_l(1.25).border_color(t.dim));
         }
       }
       if(!layout.narrow)root.children([
-        placed(x,y,end-x,2).border_t(1.25).border_color(t.border),
-        placed(x,y,2,6).border_l(1.25).border_color(t.border),
-        placed(end-1,y,2,6).border_l(1.25).border_color(t.border),
+        placed(x,y,end-x,2).border_t(1.25).border_color(t.dim),
+        placed(x,y,2,6).border_l(1.25).border_color(t.dim),
+        placed(end-1,y,2,6).border_l(1.25).border_color(t.dim),
       ]);
     }
     const edges=placed(0,0,this.width,layout.height).id(id+"-edges");
@@ -222,20 +201,19 @@ export class RigGraph{
       }else edges.children(fallback);
     }
     root.child(edges);
-    const workBySeat=new Map();
-    if(layout.narrow)for(const line of work)workBySeat.set(line.target,(workBySeat.get(line.target)??0)+line.rows.length);
+    const workBySeat=new Map(), headingSources=new Map(layout.headings.map(heading=>[heading.source,heading]));
+    for(const line of work){
+      if(!workBySeat.has(line.target))workBySeat.set(line.target,{count:0,tips:[],active:false,pulse:false});
+      const entry=workBySeat.get(line.target);
+      entry.count+=line.rows.length;entry.tips.push(line.tip);
+      if(headingSources.get(line.source)?.covered.has(line.target)){
+        entry.active||=line.status==="active"||line.pulseUntil!==null;
+        entry.pulse||=line.pulse;
+      }
+    }
     if(this.workLayout!==layout){this.workRoutes.clear();this.workLayout=layout;}
     for(const line of work)if(!this.workRoutes.has(line.key))this.workRoutes.set(line.key,graphWorkPath(layout,line.source,line.target));
-    if(this.workChipLines!==work||this.workChipLayout!==layout){
-      const arrows=[...layout.plans.map(plan=>plan.pts),...work.map(line=>this.workRoutes.get(line.key)?.points).filter(Boolean)];
-      const placedChips=[];this.workChips=new Map();
-      for(const line of work)if(line.chip){
-        const chip=graphWorkChip(layout,this.workRoutes.get(line.key)?.points??[],line.chip,arrows,placedChips);
-        this.workChips.set(line.key,chip);if(chip)placedChips.push(chip);
-      }
-      this.workChipLines=work;this.workChipLayout=layout;
-    }
-    const workChipElements=[],steadyWork=new Map(),workLegend=new Map();
+    const steadyWork=new Map(),workLegend=new Map();
     // Every working line breathes in one shared layer, so all of them share one phase (and one native loop).
     let breathing=null;
     for(const [i,line]of work.entries()){
@@ -245,13 +223,22 @@ export class RigGraph{
         :line.status==='terminal_gone'?'open task, seat unreachable'
         :line.color==='muted'?'open task, seat stopped'
         :(line.pulseUntil!==null||line.status==='active')?'open task, seat working':'open task';
-      workLegend.set(label,{color:t[line.color],width:2.5,dashed:line.dashed});
+      workLegend.set(label,{color:t[line.color],width:2,dashed:line.dashed});
       if(nativeInk&&(!route.ink||route.ink.dashed!==line.dashed)){
-        const segments=graphWorkInk(route.points,2.5,{dashed:line.dashed}),builder=kit.PathBuilder.fill();
-        for(const segment of segments)for(const polygon of segment.polygons)builder.add_polygon(polygon.map(([x,y])=>[x+segment.x,y+segment.y]),true);
+        const segments=graphWorkInk(route.points,2,{dashed:line.dashed});
+        const absolute=(segment,polygon)=>polygon.map(([x,y])=>[x+segment.x,y+segment.y]);
+        let path;
+        if(!line.dashed&&route.points.length>2){
+          const last=segments.at(-1);
+          path=roundedLink(route.points,2,absolute(last,last.polygons.at(-1)));
+        }else{
+          const builder=kit.PathBuilder.fill();
+          for(const segment of segments)for(const polygon of segment.polygons)builder.add_polygon(absolute(segment,polygon),true);
+          path=builder.build();
+        }
         // A render can be interrupted during construction. Publish only the complete
         // geometry and Path together, so the next draw retries an unfinished build.
-        route.ink={segments,path:builder.build(),dashed:line.dashed};
+        route.ink={segments,path,dashed:line.dashed};
       }
       // NativePath ignores element opacity on 0.1.16. Background alpha is
       // honoured; older hosts and border/SVG paths keep an opacity wrapper.
@@ -283,14 +270,10 @@ export class RigGraph{
         target.child(paint);
         // Native Path has no tooltip listeners. Plain divs keep hover bounds on the actual segments.
         target.children(route.ink.segments.map(segment=>placed(segment.x,segment.y,segment.w,segment.h).tooltip(line.tip)));
-      }else target.children(graphPathElements(route.points,'delegates_to',t,assets,{color:t[line.color],width:2.5,dashed:line.dashed}).map((el,j)=>{
+      }else target.children(graphPathElements(route.points,'delegates_to',t,assets,{color:t[line.color],width:2,dashed:line.dashed}).map((el,j)=>{
         if(j===0)el.id(id+'-work-'+i);
         return el.tooltip(line.tip);
       }));
-      const chip=this.workChips.get(line.key);
-      if(chip){
-        workChipElements.push(placed(chip.x,chip.y,chip.w,chip.h).id(id+'-work-chip-'+i).rounded(8).bg(t.surface).border_1().border_color(t[line.chipColor??line.color])
-          .text_size(10).text_color(t[line.chipColor??line.color]).text_center().tooltip(line.tip).child(line.chip));}
     }
     // Steady routes must not cover breathing segments or their hover targets.
     root.children([...steadyWork.values(),...(breathing?[breathing]:[])]);
@@ -312,19 +295,16 @@ export class RigGraph{
       root.child(layer);
     }
     for(const p of layout.pods){
-      const chip=(x,w,text)=>nodeMotion(placed(x,p.y+5,w,16).px(4).bg(t.raised).truncate().text_size(11.5).text_color(t.muted)
-        .on_hover((on,cx)=>{this.detail=on?`${p.label} · ${p.id} · ${counted(p.seats.length,"seat")}`:null;cx.notify();}).child(text),"pod:"+p.id,p.y+5);
-      const {labelWidth,rightWidth,rightText}=graphHeaderChips(p);
-      root.child(chip(p.x+6,labelWidth,p.label));
-      if(rightWidth)root.child(chip(p.x+p.w-6-rightWidth,rightWidth,h_flex().gap(6).items_center()
-        .when(rightText!==counted(p.seats.length,"seat"),e=>e.child(div().text_size(10.5).font_family(mono).text_color(t.dim).child(p.id)))
-        .when(rightText!==p.id,e=>e.child(div().text_size(11).text_color(t.dim).child(counted(p.seats.length,"seat")))))
-        .id(id+"-pod-meta-"+p.id));
+      const label=p.label??p.id;
+      const header=placed(p.x+10,p.y+4,p.w-20,p.headerHeight-8).id(id+"-pod-meta-"+p.id)
+        .tooltip(label).on_hover((on,cx)=>{this.detail=on?`${label} · ${p.id} · ${counted(p.seats.length,"seat")}`:null;cx.notify();})
+        .child(h_flex().w_full().gap(8).items_start()
+          .child(div().id(id+"-pod-label-"+p.id).flex_1().min_w(0).whitespace_normal().line_height("16px").text_size(11.5).text_color(t.muted).child(label))
+          .child(div().flex_none().text_size(11).text_color(t.dim).child(counted(p.seats.length,"seat"))));
+      root.child(nodeMotion(header,"pod:"+p.id,p.y+4));
       for(const seat of p.seats){const s=layout.ent[seat.lid],status=running?(seat.status??seatStatus(seat.node??{})):null;
-        const needs=["blocked","needs_input","attention_required"].includes(status),parts=seat.lid.split("."),model=String(seat.model??"").split("/").at(-1),profile=["default","none"].includes(seat.profile)?null:seat.profile;
+        const needs=["blocked","needs_input","attention_required"].includes(status),parts=seat.lid.split("."),model=singleLineText(String(seat.model??"").split("/").at(-1));
         const watchers=layout.observers.get(seat.lid);
-        const skipped=layout.headings.some(heading=>heading.skipped.has(seat.lid))
-          &&!layout.headings.some(heading=>heading.covered.has(seat.lid));
         const tags=layout.tags.get(seat.lid)??[],tasks=workBySeat.get(seat.lid);
         const card=placed(s.x,s.y,s.w,s.h).id(id+"-seat-"+seat.lid).tooltip(running ? `Show ${seat.lid}'s relationships; right-click for its actions` : "Show seat relationships").px(9).py(7).rounded(6).bg(t.background).border_1().border_color(needs?t.blocked:emphasis===seat.lid?t.input:t.border).cursor_pointer()
           .on_hover((on,cx)=>{this.hovered=on?seat.lid:null;cx.notify();})
@@ -334,19 +314,24 @@ export class RigGraph{
           .child(h_flex().h(16).gap(6).items_center().child(svg(`${assets}/rig-seat.svg`).size(12).text_color(t.muted))
             .child(h_flex().min_w(0).flex_1().child(div().text_size(12.5).text_color(t.dim).child(parts.shift()+"."))
               .child(div().truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(parts.join("."))))
-            .when(Boolean(watchers),e=>e.child(h_flex().gap(3).items_center().tooltip(counted(watchers,"observer"))
-              .child(svg(`${assets}/rig-follow.svg`).size(11).text_color(t.dim)).child(div().text_size(10).text_color(t.dim).child(String(watchers)))))
+            .when(headingSources.has(seat.lid),e=>e.child(div().flex_none().text_size(10).text_color(t.dim).child("Lead")))
+            .when(Boolean(tasks),e=>e.child(div().id(id+"-seat-tasks-"+seat.lid).flex_none().px(4).rounded(3)
+              .text_size(10).text_color(t.ansi2).bg(t.raised).tooltip(tasks.tips.join("\n")).child(counted(tasks.count,"task"))))
             .when(running,e=>e.child(statusMarkElement({div,svg},t,status,{iconOf:name=>`${assets}/${name}.svg`}))));
         card.child(h_flex().h(18).mt(3).gap(6).items_center().child(div().px(5).h(16).rounded(3).bg(t.raised).text_size(10.5).font_family(mono).text_color(t.muted).child(statusWord(seat.runtime??"?","runtime")))
-          .when(Boolean(model),e=>e.child(div().flex_1().truncate().text_size(11).text_color(t.dim).child(model)))
-          .when(Boolean(profile),e=>e.child(div().text_size(11).text_color(t.muted).child("· "+profile)))
-          .when(skipped,e=>e.child(div().text_size(10).text_color(t.dim).child("not from lead")))
-          .when(Boolean(tasks)&&!tags.length,e=>e.child(div().text_size(10.5).text_color(t.ansi2).child(counted(tasks,"task")))));
-        if(layout.narrow&&tags.length)card.child(h_flex().gap(6).items_center().mt(3)
+          .when(Boolean(model),e=>e.child(div().flex_1().min_w(0).truncate().tooltip(model).text_size(11).text_color(t.dim).child(model)))
+          .when(Boolean(watchers),e=>e.child(h_flex().flex_none().gap(3).items_center().tooltip(counted(watchers,"observer"))
+            .child(svg(`${assets}/rig-follow.svg`).size(11).text_color(t.dim)).child(div().text_size(10).text_color(t.dim).child(String(watchers)))))
+        );
+        if(tags.length)card.child(h_flex().gap(6).items_center().mt(3)
           .children(tags.slice(0,2).map(({peer,incoming})=>div().truncate().text_size(10.5).text_color(t.accent).cursor_pointer()
-            .on_click((_e,cx)=>{cx.stop_propagation?.();this.selected=peer;cx.notify();}).child(`${incoming?"←":"→"} ${peer}`)))
-          .when(tags.length>2,e=>e.child(div().text_size(10.5).text_color(t.dim).child(`+${tags.length-2}`)))
-          .when(Boolean(tasks),e=>e.child(div().text_size(10.5).text_color(t.ansi2).child(counted(tasks,"task")))));
+            .tooltip(`Show ${peer}'s relationships`)
+            .on_click((_e,cx)=>{cx.stop_propagation?.();select(peer,cx);}).child(`${incoming?"←":"→"} ${peer}`)))
+          .when(tags.length>2,e=>e.child(div().text_size(10.5).text_color(t.dim).child(`+${tags.length-2}`))));
+        if(tasks?.active){
+          const ring=div().absolute().inset_0().rounded(6).border_1().border_color(t.ansi2).opacity(.7);
+          card.child(tasks.pulse&&typeof ring.loop==="function"?ring.loop("opacity",WORK_PULSE):ring);
+        }
         if(emphasis===seat.lid)card.child(div().absolute().left(1).top(1).right(1).bottom(1).rounded(5).border_1().border_color(t.input));
         root.child(nodeMotion(card,seat.lid,s.y));
         const flash=this.motion.flashes.get(seat.lid);if(running&&flash){
@@ -356,7 +341,6 @@ export class RigGraph{
         }
       }
     }
-    root.children(workChipElements);
     const count=[counted(graph.seatCount??graph.pods.reduce((n,p)=>n+p.seats.length,0),"seat"),counted(graph.pods.length,"pod"),counted(graph.edges.length,"edge")].join(" · ");
     const last=running&&this.motion.last,baseNote=last?`Last handoff ${handoffAgo(Math.max(0,Math.floor((now-Number(new Date(last.at)))/1000)))} ago: ${last.source??last.from} → ${last.target??last.to}`:count;
     const note=taskCount?`${counted(taskCount,'task')} in progress · ${last?'last'+baseNote.slice(4):baseNote}`:baseNote;
@@ -365,7 +349,7 @@ export class RigGraph{
       ...["pendingWorkCount","inProgressWorkCount","blockedWorkCount"].filter(k=>running&&Number.isFinite(seat.node?.[k])).map(k=>`${seat.node[k]} ${k==="pendingWorkCount"?"pending":k==="inProgressWorkCount"?"in progress":"blocked"}`)].filter(Boolean).join(" · "):null);
     // The legend shrinks and wraps inside its own box at narrow widths (its items are fixed, so the row's shape depends on the width alone).
     const legend=h_flex().id(id+"-legend").flex_shrink(1).min_w(0).flex_wrap().gap(12)
-      .when(layout.plans.length>0,el=>el.child(h_flex().gap(5).items_center()
+      .when(layout.plans.some(plan=>plan.type!=="chain"&&!plan.e.workOnly),el=>el.child(h_flex().gap(5).items_center()
         .child(div().relative().w(24).h(10).children(graphPathElements([[0,5],[22,5]],"delegates_to",t,assets,{color:t.accent,width:1.4})))
         .child(div().text_size(11).text_color(t.muted).child("pod link"))));
     for(const [label,style]of workLegend)legend.child(h_flex().gap(5).items_center()
@@ -444,7 +428,7 @@ export class RigGraph{
       .child(div().flex_1())
       .child(div().text_size(11).text_color(t.dim).child("Esc closes · ← → next seat"));
     const panel=v_flex().id(panelId).w_full().rounded(8).border_1().border_color(t.border).child(header);
-    if(layout.narrow)return panel.child(v_flex().gap(12).px(12).pb(12).child(card)
+    if(layout.width<520)return panel.child(v_flex().gap(12).px(12).pb(12).child(card)
       .child(list("send","gives it work",senders)).child(list("watch","watches it",watching)));
 
     const width=Math.min(layout.width,860),sideWidth=Math.min(170,Math.floor((width-304)/2));

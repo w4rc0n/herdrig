@@ -153,7 +153,7 @@ export class NowTailCache {
         const data = response.data ?? {}, ok = response.ok !== false;
         const parsed = typeof data.content === "string" ? nowLine(data.content, data.ingestHealth?.runtime ?? seat.runtime) : nowLine("");
         const record = { parsed, ingestHealth: data.ingestHealth ?? previous?.ingestHealth ?? {},
-          status: response.status, error: ok ? null : String(data.error ?? response.error ?? "Transcript unavailable"),
+          status: response.status, error: ok ? null : errorDiagnostic(data.error ?? response.error ?? "Transcript unavailable"),
           fetchedAt: Date.now(), attemptAt: now };
         this.records.set(key, record);
         const fingerprint = r => JSON.stringify([r?.parsed, r?.error, r?.status, r?.ingestHealth?.state, r?.ingestHealth?.reason]);

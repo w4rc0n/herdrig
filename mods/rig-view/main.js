@@ -30,7 +30,7 @@ import {withFocusContext,focusHandleFor} from './rig-lib.js';
 // Needs-You: a request row expands in place to the request's words and a reply box (Answer or
 // Resolve, Ctrl+Enter); the item page shows the same. Drafts are rig-menu's (`shared("rig.drafts")`, draftKey).
 import { View, div, svg } from "gpui-kit";
-import { sharedLoopbackDaemonUrl, sharedRigData, stampRows, messageDialogSpace, rowsIdentityOf, RIG_DATA_STAMP } from "./rig-lib.js";
+import { sharedLoopbackDaemonUrl, sharedRigData, rigOperatorDisabled, stampRows, messageDialogSpace, rowsIdentityOf, RIG_DATA_STAMP } from "./rig-lib.js";
 import { relativeTimeText, specRealpathAvailable, sameDaemon, listAddedMachine, requestFailed } from "./rig-lib.js";
 import { counted, plainError, statusWord, errorDiagnostic } from "./rig-words.js";
 import {activationPair} from './rig-activation.js';
@@ -86,7 +86,7 @@ import { pageBodyLayout } from "./rig-page-layout.js";
 import {allSeatsView} from './rig-all-seats-view.js';
 import {HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantSentence,assistantForNeed,assistantOwner,terminalAttention} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
-import { normalizeRunningGraph, graphActivityOf } from "./rig-graph-state.js";
+import { normalizeRunningGraph, runningGraphTopology, graphActivityOf } from "./rig-graph-state.js";
 import { GraphWorkCache } from "./rig-graph-work.js";
 import { pageViewKind, pageViewOptions, selectedPageView, entryWithPageView, compactLocationCrumbs, visiblePageTabs, pageSectionChoices } from "./rig-page-nav.js";
 import { readRigSpecPreview, groupSpecLibrary, rowHeadline, rowTitle, rowTip, rowText, rowIdOnly } from "./rig-lib.js";
@@ -1365,7 +1365,7 @@ export default class RigView extends View {
           if (r.ok && onData) onData(data);
           finish(r.ok
             ? { ok: true, data, status: r.status, ...(path.startsWith("/api/queue/list?") && { queuePage: queueListPage(r) }) }
-            : { ok: false, error: `GET ${path} → ${r.status}${data?.error ? `: ${data.error}` : ""}`, status: r.status, errorData: data });
+            : { ok: false, error: `GET ${path} → ${r.status}${data?.error ? `: ${errorDiagnostic(data.error)}` : ""}`, status: r.status, errorData: data });
         } catch (e) { if (epoch === (this.cacheEpoch ?? 0)) { const failure = plainError(e); finish({ ok: false, error: failure.text, errorDetail: failure.detail }); } }
         if (answerChanged) this.noteAnswer(cx);
       };
@@ -2235,7 +2235,7 @@ export default class RigView extends View {
     // /healthz is the page's own read only while no running sidebar is its source (a sidebar refresh carries its reading): with one, a
     // refresh re-reads nothing extra, as before; without one, at most once per live refresh.
     const ownHealth = !this.attentionFromSidebar || this.attentionFromSidebar !== this.activeConnId();
-    markStale(this.cache, (path) => (seatStatus && seatStatusRead(path)) || path==='/api/config/ui.timezone' || (ownHealth && path === '/healthz') || path.startsWith('/api/views/execution?') || path.startsWith("/api/rigs") || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
+    markStale(this.cache, (path) => (seatStatus && seatStatusRead(path)) || path==='/api/config/ui.timezone' || (ownHealth && path === '/healthz') || path.startsWith('/api/views/execution?') || (path.startsWith("/api/rigs")&&!path.endsWith("/spec.json")) || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
   }
 
   /** The sidebar doesn't mirror handoff history, workflow execution or request detail. Keep those shown-page reads live without polling full attention. */
@@ -2299,6 +2299,9 @@ export default class RigView extends View {
     const goneSeats = model.seats.filter((s) => s.status === "terminal_gone").length;
     const tone = counts.needs ? "needs_input" : counts.blocked ? "blocked" : counts.gone ? "gone" : counts.working ? "working" : rigTone(model.seats);
     const target = { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, lifecycle };
+    const operatorDisabled = rigOperatorDisabled(this.config, this.sharedOnce, target);
+    if (operatorDisabled) target.operatorDisabled = true;
+    const canResume = !operatorDisabled && knownLifecycle && (stoppedRig || lifecycle !== "running");
     const viewTarget = { kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn, view: `rig:${rig.name}` };
     const dialog = (step, height) => this.open({ mod: MOD_IDS.menu, kind: "dialog", width: 460, height, props: { target, step } });
     const more = () => this.moreButton(t, `rig-more-${rig.id}`, () => this.menu(target));
@@ -2308,6 +2311,8 @@ export default class RigView extends View {
     this.pageRows?.push({ key: rigRowKey, foldKey: rigRowKey, expandable: true, isOpen: expanded, entry: rigEntry, target, seats: model.seats });
     const rigSelected = this.pageSel === rigRowKey;
     const resume = () => this.button(t, `rig-resume-${rig.id}`, "Resume…", () => dialog({ action: "resume", confirm: true }, 380), { tip: `Resume ${rig.name}: asks before starting its seats`, small: true, iconName: "rig-play" });
+    const operatorOff = () => div().id(`rig-operator-off-${rig.id}`).text_size(12).text_color(t.dim)
+      .tooltip("OpenRig was started with its operator turned off, so there's nothing to resume here.").child("operator off");
     // A count filters the page to seats in that state.
     const count = (n, word, color, key, shown = word) => n ? h_flex().id(`rig-count-${key}-${rig.name}`).tooltip(key === "gone" ? TERMINAL_GONE_TOOLTIP : key === "needs" ? `Show only ${rig.name}'s seats that need you` : key === "unreported" ? `Show only ${rig.name}'s seats that haven't reported a status` : `Show only ${rig.name}'s seats that are ${word}`).gap(4).items_center().cursor_pointer().on_click(() => { this.push({ ...(entry.section ? entry : { section: "topology" }), filter: word }); })
       .child(div().text_size(11.5).text_color(color === "working" ? (t.ansi2 ?? t.working) : color === "blocked" ? t.blocked : color==="dim"?t.dim:t.muted).child(`${n} ${shown}`)) : null;
@@ -2327,7 +2332,8 @@ export default class RigView extends View {
         .children([count(counts.working, "working", "working", "working"), count(counts.blocked, "blocked", "blocked", "blocked"), count(counts.needs, "needs you", "blocked", "needs", needsYouWord(counts.needs)), count(counts.gone ?? 0, "unreachable", "blocked", "gone"), count(counts.idle, "idle", "idle", "idle"),count(counts.unreported,"not reported","dim","unreported")].filter(Boolean)))
       .when(noMatch, (el) => el.child(div().text_size(11.5).text_color(t.dim).child("no matching seats")))
       .child(div().flex_1())
-      .when(!showBody && knownLifecycle && (stoppedRig || lifecycle !== "running"), (el) => el.child(resume()))
+      .when(!showBody && canResume, (el) => el.child(resume()))
+      .when(!showBody && operatorDisabled, (el) => el.child(operatorOff()))
       .when(!showBody, (el) => el.child(more()));
     const body = [];
     if (showBody) {
@@ -2346,8 +2352,8 @@ export default class RigView extends View {
         .child(this.button(t, `rig-follow-${rig.id}`, on ? "Following" : "Follow", () => this.oneClick(viewTarget, on ? "unfollow" : "follow", `rig-follow-${rig.id}`), { tip: on ? `Stop updating ${rig.name}'s worker view; the view stays open as it is` : `Keep a worker view of ${rig.name} open and up to date`, small: true, iconName: on ? "check" : "rig-follow", disabled: !!followReason, tooltip: followReason, actionKey: on ? "unfollow" : "follow", conn: rig.conn ?? this.shownConnId() }))
         .child(this.button(t, `rig-snapshot-${rig.id}`, "Snapshot", () => this.oneClick({ kind: "rig", rig: rig.name, rigId: rig.id, conn: rig.conn }, "snapshot", `rig-snapshot-${rig.id}`), { tip: `Take a snapshot of ${rig.name} now, to restore later`, small: true, iconName: "rig-snapshot", actionKey: "snapshot", conn: rig.conn ?? this.shownConnId() }))
         .when(knownLifecycle && !stoppedRig && lifecycle !== "stopped", (el) => el.child(this.button(t, `rig-pause-${rig.id}`, "Pause…", () => dialog({ action: "pause", load: "pause" }, 360), { tip: `Pause ${rig.name}: asks before stopping its seats`, small: true, iconName: "rig-pause" })))
-        .when(knownLifecycle && (stoppedRig || lifecycle !== "running"), (el) => el.child(resume()))
-        .child(div().flex_1()).child(more());
+        .when(canResume, (el) => el.child(resume()))
+        .child(div().flex_1()).when(operatorDisabled, (el) => el.child(operatorOff())).child(more());
       this.inPageActions=false;
       if(dedicated)this.pageActions=actionBar;else body.push(actionBar);
       if(!knownLifecycle)body.push(this.dim(t,"OpenRig hasn't reported this rig's state yet, so Pause and Resume aren't offered."));
@@ -2388,11 +2394,26 @@ export default class RigView extends View {
           const graphPath = `/api/rigs/${encodeURIComponent(rig.id)}/graph`;
           const graphGot = this.read(cx, graphPath);
           const graphView=this.graphFor(`running:${rig.id}`);
+          const graphConn=this.activeConnId();
+          let topologyChanged=false;
+          if(graphGot.data&&graphView.publicData!==graphGot.data){
+            const topology=runningGraphTopology(graphGot.data);
+            topologyChanged=graphView.orderConnection===graphConn&&graphView.topology!=null&&graphView.topology!==topology;
+            graphView.topology=topology;
+            graphView.orderConnection=graphConn;
+          }
+          const exported=this.read(cx,`/api/rigs/${encodeURIComponent(rig.id)}/spec.json`,topologyChanged,null,null,false,topologyChanged);
+          const spec=exported.error?null:exported.data;
+          const awaitingOrder=exported.loading&&!spec&&!graphView.projection;
           this.wideGraph=true;
           // Made again when the graph, the rig's seats or the live nodes change: a tmux server going or coming back changes the seats, not the graph.
           const liveNodes=nodes.data;
-          if(graphGot.data&&(graphView.publicData!==graphGot.data||graphView.modelSeats!==model.seats||graphView.liveNodes!==liveNodes)){graphView.projection=normalizeRunningGraph(graphGot.data,model.seats);graphView.publicData=graphGot.data;graphView.modelSeats=model.seats;graphView.liveNodes=liveNodes;}
+          if(graphGot.data&&!awaitingOrder&&(graphView.publicData!==graphGot.data||graphView.modelSeats!==model.seats||graphView.liveNodes!==liveNodes||graphView.spec!==spec)){
+            graphView.projection=normalizeRunningGraph(graphGot.data,model.seats,spec);
+            graphView.publicData=graphGot.data;graphView.modelSeats=model.seats;graphView.liveNodes=liveNodes;graphView.spec=spec;
+          }
           if(graphHidden)body.push(this.dim(t,"Widen the pane to see the graph.").id(`rig-graph-narrow-${rig.id}`));
+          else if(awaitingOrder)body.push(this.skeleton(t));
           else if(graphGot.data){const work=this.graphWorkRows(cx,rig);body.push(graphView.render(t,cx,graphView.projection,{
             id:`rig-graph-${rig.id}`,assets:ASSETS,running:true,reducedMotion:this.config?.reducedMotion===true,
             events:graphActivityOf(shared,this.activeConnId())?.origin===this.activeConfig()?.daemonUrl?graphActivityOf(shared,this.activeConnId()).events:[],
@@ -2417,7 +2438,9 @@ export default class RigView extends View {
       }
     }
     return v_flex().id(`rig-block-${rig.id}`).rounded(10).bg(t.background).border_1().border_color(focused ? t.accent : t.border).p(compact ? 4 : 10).gap(6).when(!dedicated,el=>el.child(head))
-      .children(body.length ? [v_flex().ml(compact ? 8 : 22).pl(compact ? 6 : 10).gap(8).border_l(1).border_color(t.border).children(body)] : []);
+      .children(body.length ? [v_flex().gap(8)
+        .when(!dedicated||entry.tab!=="graph",el=>el.ml(compact ? 8 : 22).pl(compact ? 6 : 10).border_l(1).border_color(t.border))
+        .children(body)] : []);
   }
 
   /** The findings banner (only when the rig has findings), Recent activity disclosure, and Edges disclosure. */
@@ -2742,14 +2765,14 @@ export default class RigView extends View {
           const next={...all};delete next[token];setShared('rig.compactionDecisions',next);return value;
         }
       },
-      reportStart:(token,status,text)=>{
+      reportStart:(token,status,text,uncertain=false)=>{
         const all=shared('rig.compactionDecisions')??{},current=all[token];
         if(!current||typeof current!=='object'||current.status==='expired'
           ||(status==='checking'&&current.status!=='allow')||(status==='dispatched'&&current.status!=='checking')
           ||(status==='rechecking'&&current.status!=='dispatched')
           ||(status!=='error'&&Date.now()>=current.deadline))return false;
         setShared('rig.compactionDecisions',{...all,[token]:{deadline:current.deadline,status:status==='rechecking'?'checking':status,
-          dispatched:status!=='rechecking'&&(current.dispatched||status==='dispatched'),...(text?{text}:{})}});
+          dispatched:status!=='rechecking'&&(current.dispatched||status==='dispatched'),...(text?{text}:{}),...(uncertain?{uncertain}:{})}});
         return true;
       },
     });return this.compaction;
@@ -4244,7 +4267,7 @@ export default class RigView extends View {
       rename: async (id, name) => {
         const res = await post(`/api/specs/library/${encodeURIComponent(id)}/rename`, { headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
         let data; try { data = JSON.parse(await res.text()); } catch (e) { data = rethrowGate(null)(e); }
-        if (!res.ok) throw new Error(`The copy was made but couldn't be renamed${data?.error ?? data?.message ? `: ${data?.error ?? data?.message}` : ` (error ${res.status}).`}`);
+        if (!res.ok) throw new Error(`The copy was made but couldn't be renamed${data?.error ?? data?.message ? `: ${errorDiagnostic(data?.error ?? data?.message)}` : ` (error ${res.status}).`}`);
         return data?.entry ?? null;
       },
     };
@@ -6399,7 +6422,7 @@ export default class RigView extends View {
             const detail = failedLeg.error ?? failedLeg.reason ?? failedLeg.status ?? null;
             say({
               ok: false,
-              text: detail ? `Refreshed (some hosts/providers failed: ${detail}).` : "Refreshed (some hosts/providers failed).",
+              text: detail ? `Refreshed (some hosts/providers failed: ${errorDiagnostic(detail)}).` : "Refreshed (some hosts/providers failed).",
             });
           } else {
             say({ ok: true, text: "Refreshed." });

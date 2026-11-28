@@ -2,7 +2,14 @@
 import {seatStatus} from "./rig-lib.js";
 import {LEGACY_CONNECTION_ID,perConnection,withConnection} from "./rig-connections.js";
 export const GRAPH_HOLD_MS=1600,GRAPH_FADE_MS=500,GRAPH_MAX_PATHS=8;
-export function normalizeRunningGraph(data,fallback=[]){
+export function runningGraphTopology(data){
+  const nodes=Array.isArray(data?.nodes)?data.nodes:[],edges=Array.isArray(data?.edges)?data.edges:[];
+  return JSON.stringify([
+    nodes.map(n=>JSON.stringify([n.id,n.parentId,n.type,n.data?.logicalId])).sort(),
+    edges.map(e=>JSON.stringify([e.source??e.from,e.target??e.to,e.label??e.data?.kind??e.kind])).sort(),
+  ]);
+}
+export function normalizeRunningGraph(data,fallback=[],spec=null){
   const nodes=Array.isArray(data?.nodes)?data.nodes:[],pods=[],byId=new Map(),refs=new Map();
   const live=new Map(fallback.map(n=>[n.logicalId,n]));
   const group=(id,label)=>{if(!byId.has(id)){const p={id,label:label||id,seats:[]};byId.set(id,p);pods.push(p);}return byId.get(id);};
@@ -22,6 +29,10 @@ export function normalizeRunningGraph(data,fallback=[]){
     group(parent,d.podLabel).seats.push({lid,runtime:d.runtime,model:d.model,profile:d.profile,session:d.canonicalSessionName??d.session,status,node:d});if(typeof node.id==="string")refs.set(node.id,lid);refs.set(lid,lid);
   }
   const edges=(Array.isArray(data?.edges)?data.edges:[]).map(e=>({from:refs.get(e.source??e.from)??e.source??e.from,to:refs.get(e.target??e.to)??e.target??e.to,kind:e.label??e.data?.kind??e.kind??"edge"}));
+  const order=new Map((Array.isArray(spec?.pods)?spec.pods:[]).map((p,i)=>[p?.id,i]));
+  // A partial export can be from a different topology revision. Use one complete order.
+  const complete=pods.every(p=>order.has(p.id));
+  pods.sort((a,b)=>complete ? order.get(a.id)-order.get(b.id) : a.id<b.id ? -1 : a.id>b.id ? 1 : 0);
   return{pods,edges,seatCount:pods.reduce((n,p)=>n+p.seats.length,0)};
 }
 export function graphQueueEvent(event,now=Date.now()){

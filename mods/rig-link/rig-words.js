@@ -1,7 +1,12 @@
 // Plain display words. Kept dependency-free so transport and presentation modules can use the same vocabulary.
 export const counted = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 export function errorDiagnostic(error) {
-  return /^(?:TypeError|SyntaxError|RangeError|ReferenceError)$/.test(error?.name ?? "") ? String(error) : String(error?.message ?? error);
+  if (/^(?:TypeError|SyntaxError|RangeError|ReferenceError)$/.test(error?.name ?? "")) return String(error);
+  const payload = error?.error ?? error;
+  if (typeof payload?.fact === "string" && payload.fact.trim()) {
+    return [payload.fact, payload.consequence, payload.action].filter(value => typeof value === "string" && value.trim()).join(" ");
+  }
+  return String(error?.message ?? payload?.message ?? payload);
 }
 const STATUS_WORDS = {
   rig: { running: "running", stopped: "stopped", recoverable: "stopped (can be resumed)", degraded: "partly working", attention_required: "needs attention", partially_restored: "partly restored", left_attached: "left attached", unknown: "not reported" },
@@ -42,8 +47,7 @@ function withoutPaths(text) {
 }
 /** Human wording plus the original diagnostic. Callers keep detail in Details/Copy and their error log. */
 export function plainError(error, { where = "OpenRig's machine", what = null, who = where === "OpenRig's machine" ? "OpenRig" : where === "this computer" ? "The rig command" : where, toast = false, readingReply = true, outcomeUnknown = false } = {}) {
-  const exceptionName = /^(?:TypeError|SyntaxError|RangeError|ReferenceError)$/;
-  const detail = typeof error === "string" ? error : exceptionName.test(error?.name ?? "") ? String(error) : String(error?.message ?? error?.error?.message ?? error?.error ?? error ?? "The operation failed without saying why.");
+  const detail = errorDiagnostic(error ?? "The operation failed without saying why.");
   // Certainty wins over nicer wording. Preserve the whole caution, including the producer's recovery advice.
   if (outcomeUnknown || /\bunconfirmed\b|\boutcome\s+is\s+unknown\b|\bnot\s+confirmed\b|\b(?:may|might)\s+(?:still\s+)?(?:not\s+)?have\b|\bdid(?:n't| not)\s+finish\s+in\s+time\b|\bpartly done\b|\bearlier part was recorded\b|\bwrite reached\b|\banswer couldn't be read\b/i.test(detail)) {
     return { text: withoutPaths(detail), detail };
