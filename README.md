@@ -7,7 +7,7 @@
 
 # Herdrig
 
-Version: v0.5.18
+Version: v0.5.19
 
 **[OpenRig](https://github.com/mvschwarz/openrig) Mod for [Herdr](https://github.com/herdrdev/herdr-app)**
 
@@ -64,18 +64,20 @@ The Rig palette: jump to any rig, seat or page from the keyboard.
 - **Configuration:** Pages with more than 30 settings open one category at a time. A category or search shows up to 40 settings. Rows you are editing, selecting or reviewing stay visible, and counts show how many more settings there are. Use the filter to find another setting, or navigate category headers with Enter, Space and the arrow keys. Small pages stay expanded.
 - **The Page:** the full view of whatever you select. A rig, a seat card, a spec you can edit in place, or the files
   OpenRig reports.
-- **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs and specs arrange
-  pods into columns, summarizing broad delegation in a heading above them instead of crossing wires, with observer
-  counts on seat cards and link/work tags at narrow widths. Select a seat to see who gives it work, who watches it,
-  whom it sends work to, and its open tasks (with **Open seat page** on running rigs); use the left and right arrow
-  keys to step through seats and **Escape** to return to the graph. Running rigs also show briefly lit handoff paths:
-  a working task line pulses green through short idle pauses, then turns dashed after a 15-second grace period; a seat
-  that needs you or is blocked has a steady amber line with a red needs-you chip where there is room to show it; open
-  tasks for unreachable seats have a muted line and an unreachable label.
-  The legend explains the lines on screen. Hover a task line for summaries and ages. Idle minutes update on redraw
-  after the graph sees the seat stop working, and the text Edges list stays available.
-  Saved previews come from your connected OpenRig server, including a host-to-box tunnel.
-  Set `"reducedMotion": true` in `<appHome>/openrig/config.json` to skip entrance, fades and status pulses.
+- **Rig graphs:** saved rig specs start with a static Graph/YAML view and Launch. Running rigs and specs center pod
+  columns beneath the lead pod in the rig spec's own pod order, wrap long pod names instead of truncating them, keep
+  in-pod chains stacked together, and summarize broad delegation in a heading above the columns (naming one or two
+  skipped seats, or a count for three or more). Seat cards show observer counts and green open-task badges; links that
+  exceed a gap's capacity, cross wrapped rows, or appear at narrow widths stay clickable as card tags. Select a seat to
+  see who gives it work, who watches it, whom it sends work to, and its open tasks (with **Open seat page** on running
+  rigs); use the left and right arrow keys to step through seats and **Escape** to return to the graph. Running rigs
+  also show active work and briefly lit handoff paths: work from a heading delegator highlights the target seat's
+  border without drawing a wire over the heading, while work along a pod link lights that link (pulsing green while
+  working, dashed after a 15-second idle grace period, amber when a seat needs you or is blocked, and muted when
+  stopped or unreachable). The legend explains the lines on screen. Hover a task badge or task line for summaries and
+  ages, and use the folded **Edges as text** list for copyable edges. Saved previews come from your connected OpenRig
+  server, including a host-to-box tunnel. Set `"reducedMotion": true` in `<appHome>/openrig/config.json` to skip
+  entrance, fades and status pulses.
 - **Needs answered in place:** human requests render as Decision Cards (Approve, Deny with a reason, answer the
   questions, or reply in your own words), with quiet hours and modes in **System → People**. On OpenRig 0.7.24 and
   later, a seat's permission request gets its own row under **Needs you** in Topology's Priority view and opens

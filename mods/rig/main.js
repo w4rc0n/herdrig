@@ -15,7 +15,7 @@ import { configWatchChanged } from "./rig-lib.js";
 //   `<appHome>/openrig/state.json`.
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
-import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, NO_CONNECTION, formatHostId, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
+import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, AMBIGUOUS_RIG, NO_CONNECTION, formatHostId, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
 import {SYSTEM_PAGE_VIEWS} from './rig-page-nav.js';
@@ -1918,7 +1918,7 @@ export default class RigSidebar extends View {
     const topology = (this.data?.topology ?? []).filter(r=>!conn||(r.conn??this.primary.id)===conn), byId = topology.find((r) => r.id === id), named = topology.filter((r) => r.name === id);
     if (!byId && new Set(named.map((r) => r.conn ?? this.primary.id)).size > 1) { notify({ title: "Rig space", body: AMBIGUOUS_NAME, level: "warning" }); return; }
     // An id is unique within one OpenRig only: with no connection named, an id two OpenRigs both list is refused, never the first one's.
-    if (!conn && byId && new Set(topology.filter((r) => r.id === id).map((r) => r.conn ?? this.primary.id)).size > 1) { notify({ title: "Rig space", body: "That rig is on more than one OpenRig. Open it from its row in the sidebar, which names the machine. Nothing was opened.", level: "warning" }); return; }
+    if (!conn && byId && new Set(topology.filter((r) => r.id === id).map((r) => r.conn ?? this.primary.id)).size > 1) { notify({ title: "Rig space", body: AMBIGUOUS_RIG, level: "warning" }); return; }
     const rig = byId ?? named[0];
     const feed = rig ? this.exactFeed(rig.conn) : null; // the rig's OWN connection, never the first in place of a removed one
     if (rig && !feed) { notify({ title: "Rig space", body: UNKNOWN_CONNECTION, level: "warning" }); return; }

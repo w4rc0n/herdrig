@@ -2,6 +2,7 @@
 import {writeCommand,cliRefusal,asOf} from './rig-lib.js';
 import {formatAbsoluteTime} from './rig-time.js';
 import {isKnownUnsentError} from './rig-connections.js';
+import {errorDiagnostic} from './rig-words.js';
 const STOP_WORDS={preparation_incomplete:'the restore map was not completed',draft_input_busy:'the input box is busy',draft_input_unknown:'the input box could not be read',draft_input_changed:'the input box changed',stale_generation:'the seat changed',map_complete_seat_never_idle:'the map is ready, but the seat did not become idle',preparation_needs_input:'the seat needs an answer to a prompt',occupant_generation_unavailable:'the seat generation could not be checked',terminal_policy_refused:'the terminal policy refused the request'};
 const cancelled = reason => reason === 'compaction_cancelled' || reason === 'preparation_cancelled';
 function observedTime(at,timezone){
@@ -43,6 +44,8 @@ export function compactionStartCopy(session){
     starting:'Starting compaction…',
     unsent:`The request wasn't sent, so nothing reached ${session}. Try again.`,
     uncertain:`OpenRig hasn't confirmed a start yet. The request may have reached it; check ${session}'s card before trying again.`,
+    uncertainTitle:`${session} may have compacted`,
+    uncertainBody:"OpenRig didn't confirm this compaction, so it may or may not have happened. Use Check again on the seat page before sending it again.",
   };
 }
 export function compactionSnapshot(node,status,tenures,hostId){
@@ -143,10 +146,11 @@ export class SeatCompaction {
     const settled=pi?s?.status==='completed'&&matched
       :p?.mode!=='automatic'&&p?.compact!=='uncertain'&&matched&&(stage||preparation);
     if(settled){
-      const at=this.recoveryClock(recent?updated:Date.now()),seat=e.node.canonicalSessionName,words=stage??stageWords.preparing;
+      const at=this.recoveryClock(recent?updated:Date.now()),seat=e.node.canonicalSessionName;
+      const stageDetail=pi?'':` (${stage??stageWords.preparing})`;
       this.resetRecovery(e);
-      e.recoveryEvidence=recent?`OpenRig recorded a manual compaction for ${seat} at ${at} (${words}), after your request.`
-        :`At ${at}, Herdrig saw OpenRig's manual compaction record for ${seat} (${words}), after your request.`;
+      e.recoveryEvidence=recent?`OpenRig recorded a manual compaction for ${seat} at ${at}${stageDetail}, after your request.`
+        :`At ${at}, Herdrig saw OpenRig's manual compaction record for ${seat}${stageDetail}, after your request.`;
       return;
     }
     this.saveRecovery(e,{...record,contextNow:contextPercent(e.node)});
@@ -324,7 +328,7 @@ export class SeatCompaction {
     e.uncertain=!!start.dispatched;
     e.error=start.dispatched?start.copy.uncertain:start.copy.unsent;
     if(start.dispatched&&e.dispatch?.token===start.token)this.recordRecovery(e,e.dispatch);
-    this.host.reportStart?.(start.token,'error',e.error);
+    this.host.reportStart?.(start.token,'error',e.error,e.uncertain);
     this.changed(e,cx);
   }
   tick(cx){
@@ -464,9 +468,13 @@ export class SeatCompaction {
           }
           if(priorWarning)this.saveRecovery(e,null);
           unsupported=false;
+          // Recovery now describes the CLI call, not the HTTP refusal.
+          data=null;
+          dispatch.at=Date.now();
+          dispatch.awaitingEarlyReceipt=false;
+          if(start)start.awaitingEarlyReceipt=false;
           dispatched=true;
           result=await this.host.exec(command,op,240000);
-          data=null;
         }else{
           if(typeof data?.ok!=='boolean')throw Error('OpenRig returned no compaction receipt.');
           result={code:response.status>=200&&response.status<300?0:1};
@@ -479,6 +487,7 @@ export class SeatCompaction {
       received=true;
       if(start)start.receiptRead=true;
       if(!data)try{data=JSON.parse(result.stdout);}catch{throw Object.assign(Error(result.stderr||'OpenRig returned no compaction receipt.'),{outcomeUnknown:true});}
+      if(typeof data?.ok!=='boolean')throw Object.assign(Error('OpenRig returned no compaction receipt.'),{outcomeUnknown:true});
       if(start&&e.start===start&&!start.expired&&Date.now()>=start.deadline)this.expireStart(e,start,cx);
       accepted=result.code===0&&data.ok===true;
       if(!review.cancel&&accepted){
@@ -518,7 +527,7 @@ export class SeatCompaction {
         const receipt=data.preparation, latest=observed?.data?.preparation;
         const confirmedCancel=receipt?.attemptId&&receipt.attemptId===latest?.attemptId
           &&cancelled(receipt.reason??data.reason)&&latest.status==='stopped'&&cancelled(latest.reason);
-        if(!confirmedCancel)e.error=data.error??data.reason??'OpenRig refused compaction.';
+        if(!confirmedCancel)e.error=errorDiagnostic(data.error??data.reason??'OpenRig refused compaction.');
         else if(start&&e.start===start){
           this.host.reportStart(start.token,'started');
           e.start=null;
@@ -541,7 +550,7 @@ export class SeatCompaction {
     }
     finally{
       if(!start?.expired){
-        if(start&&e.start===start&&e.error){this.host.reportStart(start.token,'error',e.error);e.start=null;}
+        if(start&&e.start===start&&e.error){this.host.reportStart(start.token,'error',e.error,e.uncertain);e.start=null;}
         if(review.cancel)e.cancelling=false;else e.busy=false;
         e.nextAt=Date.now();this.changed(e,cx);
       }

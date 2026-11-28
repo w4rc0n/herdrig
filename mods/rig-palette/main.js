@@ -121,7 +121,7 @@ export default class RigPalette extends View {
           if (Array.isArray(entries)) {
             this.registry = entries;
             try { localStorage.setItem("registry", JSON.stringify({ version, entries })); } catch (_) {}
-          } else this.error = (r.stderr || (entries?.error?.message ?? entries?.error) || r.stdout || "rig tui commands gave no list").toString().trim();
+          } else this.error = errorDiagnostic(r.stderr || entries?.error || r.stdout || "rig tui commands gave no list").trim();
         }
       }
       cx.notify();
@@ -658,7 +658,8 @@ export default class RigPalette extends View {
       const top = this.shownPage() ?? { section: "topology" };
       const acting = this.actingOn(top, opts); // the row's box, else the page's, else the followed one's, never the merged list
       if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return true; }
-      const route = paletteRoute({ line }, top, this.rigsOf(acting));
+      const conn = opts.conn ?? (this.perBox() ? acting?.config?.connectionId : null) ?? null;
+      const route = paletteRoute({ line, ...(conn ? { conn } : {}) }, top, this.rigsOf(acting), conn);
       if (route.error) { this.error = route.error; cx.notify(); return true; }
       this.applyRoute(route, acting);
       return true;
@@ -802,7 +803,8 @@ export default class RigPalette extends View {
         const nav = shared("rig.nav") ?? { stack: [] };
         // The page the line was typed on, as `acting` is its OpenRig: a page shown by the time the resolve answers never re-aims the act.
         const top = pageTop ?? { section: "topology" };
-        const route = paletteRoute({ ...res, line, ...(opts.conn ? { conn: opts.conn } : {}), ...(opts.rigId ? { rigId: opts.rigId } : {}) }, top, this.rigsOf(acting));
+        const conn = opts.conn ?? (this.perBox() ? acting?.config?.connectionId : null) ?? null;
+        const route = paletteRoute({ ...res, line, ...(conn ? { conn } : {}), ...(opts.rigId ? { rigId: opts.rigId } : {}) }, top, this.rigsOf(acting), conn);
         if (route.error) { this.error = route.error; cx.notify(); return; }
         if (route.note) { this.note = route.note; cx.notify(); return; }
         if (route.back) { this.goBack(nav, pageTop, acting); return; }
