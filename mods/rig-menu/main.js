@@ -230,7 +230,7 @@ function complete(target, config) {
   if (!target || !target.rig || target.archived) return target;
   // By id and connection, never by the name of an earlier rig of another OpenRig; a bare name on two OpenRigs finds nothing (the action is then
   // refused for want of a connection, never defaulted).
-  const { rig } = pickRig(sharedRigData(config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig });
+  const { rig } = pickRig(sharedRigData(config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig, config });
   if (!rig) return target;
   const seat = target.session
     ? rig.pods.flatMap((p) => p.seats).find((s) => s.session === target.session)
@@ -1444,7 +1444,7 @@ export default class RigMenu extends View {
       out.push({ divider: "" }); // the popup header already names the rig
       const spaceConn = target.conn ?? target.spaceConn;
       const rigTarget = { kind: "rig", rig: target.rig, rigId: target.rigId, conn: target.conn, name: target.rig,
-        lifecycle: pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: spaceConn, name: target.rig }).rig?.lifecycle ?? null };
+        lifecycle: pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: spaceConn, name: target.rig, config: this.config }).rig?.lifecycle ?? null };
       // A space's own OpenRig: its home or origin-matched space opens that OpenRig's page and operator, not the shown or first one's; rig writes still require topology ownership (`target.conn`).
       item("rig-popout", "Open Rig page", () => page(target.home ? { section: "topology", ...(spaceConn ? { conn: spaceConn } : {}) } : { section: "topology", kind: "rig", rig: target.rig, rigId: target.rigId, ...(spaceConn ? { conn: spaceConn } : {}), name: target.rig }));
       sidebarItem("rig-operator", "Attach operator", "rig.operator", () => {
@@ -1475,7 +1475,7 @@ export default class RigMenu extends View {
       const followReason = capReasonOf(on ? "unfollow" : "follow");
       out.push({ icon: on ? "check" : "rig-follow", label: "Follow active workers", act: () => oneClick({ ...target, view: `rig:${target.rig}` }, on ? "unfollow" : "follow"), disabled: !!followReason, reason: followReason });
       // Every seat of this rig sits on a tmux server that stopped answering: its rig space, a worker view or Follow would only fail.
-      if (rigTerminalsGone(pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig }).rig))
+      if (rigTerminalsGone(pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig, config: this.config }).rig))
         for (const it of out) if (["Open rig space", "Worker view", "New worker view"].includes(it.label) || (it.label === "Follow active workers" && !on)) { it.disabled = true; it.reason = TERMINAL_GONE_RIG_REASON; } // turning Follow off needs no tmux server
       item("rig-snapshot", "Snapshot now", () => oneClick(target, "snapshot"));
       item("rig-target", "Open mission…", () => openMission(target));
@@ -1658,7 +1658,7 @@ export default class RigMenu extends View {
   /** The seats of a target's rig (the sidebar's topology), plus any a view being edited holds that it doesn't know. */
   rigSeats(target) {
     if (target?.archived) return [];
-    const { rig } = pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig });
+    const { rig } = pickRig(sharedRigData(this.config, shared)?.topology ?? [], { rigId: target.rigId, conn: target.conn, name: target.rig, config: this.config });
     const seats = rig ? rig.pods.flatMap((p) => p.seats) : [];
     for (const c of target.cells ?? []) {
       if (c.seat && !seats.some((s) => s.session === c.seat)) seats.push({ session: c.seat, logicalId: String(c.seat).split("@")[0], status: "running", word: "in view" });

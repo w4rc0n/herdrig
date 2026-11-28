@@ -9,7 +9,7 @@ function tabPageOf(host,config,tab){
 }
 import { openRigSpaceContext, resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, unconfirmedSpaceNextSteps, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue, prepareRigSpaceAdoption } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
-import { LEGACY_CONNECTION_ID, pickRig, AMBIGUOUS_NAME, qualifyKey, spaceStatusKey } from "./rig-connections.js";
+import { LEGACY_CONNECTION_ID, resolveRig, STALE_RIG_REFUSAL, AMBIGUOUS_NAME, qualifyKey, spaceStatusKey } from "./rig-connections.js";
 import { gateSameConfig, gateIdentity } from "./rig-gate.js";
 /** The singular `homeSpace` is the legacy connection's record (older versions read only it). Another connection keeps its home in
  *  `homeSpaces[key]` alone, whose key is [origin, machine] and so is already its own. */
@@ -388,8 +388,9 @@ export async function replaceMigrationTab(host,config,request) {
 
 function requestRig(host, request, config = null) {
   const entry=request.entry ?? {};
-  const topology=host.topology?.() ?? host.shared?.("rig.data")?.topology ?? [];
-  const effectiveConfig=config ?? host.currentConfig?.() ?? host.config ?? null;
+  const sharedData=host.shared?.("rig.data");
+  const topology=host.topology?.() ?? sharedData?.topology ?? [];
+  const effectiveConfig=config ?? host.currentConfig?.() ?? host.config ?? sharedData?.config ?? (sharedData?.byConnection ? { connections: Object.keys(sharedData.byConnection).map((id) => ({ id })) } : null);
   // An id is exact (and with its connection when the request has one); a name or duplicate id on two OpenRigs picks neither.
   const conn=request.conn ?? entry.conn;
   let routeConn=conn;
@@ -404,15 +405,17 @@ function requestRig(host, request, config = null) {
     if(needRig?.rigId) explicitRigId=true;
     if(!routeConn && needRig?.conn) routeConn=needRig.conn;
   }
-  const byIdRes=pickRig(topology,{rigId:key,conn:routeConn});
-  if(byIdRes.ambiguous)return {rig:undefined,key,conn:null,ambiguous:true};
-  const byId=byIdRes.rig;
-  // A name on more than one OpenRig is not "no rig": it is refused by the caller (never a home or a space instead).
-  const multiConn=(effectiveConfig?.connections?.length ?? 0)>1 || new Set((topology ?? []).map((r)=>r?.conn ?? "")).size>1;
-  const byName=byId || (explicitRigId && multiConn)?{}:pickRig(topology,{name:key,conn:routeConn});
-  // A stale explicit rigId that collides with another rig's name on a multi-OpenRig setup must never match that other rig's space by name.
-  const staleIdNameCollision=Boolean(explicitRigId && !byId && multiConn && key && (topology ?? []).some((r)=>(!routeConn || !r.conn || r.conn===routeConn) && r.name===key && r.id!==key));
-  return {rig:byId??byName.rig,key:staleIdNameCollision?null:key,conn:routeConn??byId?.conn??byName.rig?.conn??null,ambiguous:Boolean(byName.ambiguous)};
+  if(!key)return {rig:undefined,key:null,conn:routeConn??null,ambiguous:false};
+  const byIdRes=explicitRigId
+    ? resolveRig(topology,{rigId:key,name:key,conn:routeConn,config:effectiveConfig})
+    : resolveRig(topology,{rigId:key,conn:routeConn,config:effectiveConfig,allowNameFallback:false});
+  if(byIdRes.ambiguous)return {rig:undefined,key,conn:null,ambiguous:true,...(byIdRes.reason?{ambiguousReason:byIdRes.reason}:{})};
+  if(explicitRigId && byIdRes.staleIdNameCollision)return {rig:undefined,key:null,conn:routeConn??null,ambiguous:false,staleRigId:true};
+  if(byIdRes.rig)return {rig:byIdRes.rig,key,conn:routeConn??byIdRes.conn??byIdRes.rig.conn??null,ambiguous:false};
+  if(explicitRigId)return {rig:undefined,key,conn:routeConn??null,ambiguous:false};
+  const byName=resolveRig(topology,{name:key,conn:routeConn,config:effectiveConfig});
+  if(byName.ambiguous)return {rig:undefined,key,conn:null,ambiguous:true,...(byName.reason?{ambiguousReason:byName.reason}:{})};
+  return {rig:byName.rig,key,conn:routeConn??byName.conn??byName.rig?.conn??null,ambiguous:false};
 }
 const vouchOf=(host,rig)=>({sessions:rigSessions(rig),servers:rigSeatServers(rig),hostId:typeof host?.selfHostId==="function"?host.selfHostId():host?.selfHostId});
 function rigSpace(host,config,rig,key,strictOrigin=false){
@@ -652,9 +655,10 @@ function select(host,space,tab,terminal){
   if(terminal) host.run("pane.focus",{terminal});
 }
 
-async function perform(host,config,request,rig,key,ambiguous=false,ambiguousReason=null){
+async function perform(host,config,request,rig,key,ambiguous=false,ambiguousReason=null,staleRigId=false){
   // ONE RIG == ONE SPACE: a rig named only by a name that two OpenRigs share (or a bare seat in multiple rigs) cannot be told apart, so nothing is opened for it.
   if(ambiguous&&!request.background&&(request.kind==="grid"||request.kind==="page"&&!request.home))return fail(ambiguousReason||AMBIGUOUS_NAME);
+  if(staleRigId&&!request.background&&(request.kind==="grid"||request.kind==="page"&&!request.home))return fail(STALE_RIG_REFUSAL);
   if(request.background){
     const targetRigId=rig?.id??request.rigId??key;
     if(targetRigId&&activeInPlaceOpen(host,config,targetRigId))return {ok:true,skipped:true};
@@ -708,13 +712,20 @@ async function perform(host,config,request,rig,key,ambiguous=false,ambiguousReas
     if(!adoption.ok)return publishUnconfirmed(host,config,rig?.id??request.rigId,adoption);
     if(adoption.host)host=adoption.host;
     destination=adoption.space??(request.home ? null : key ? rigSpace(host,config,rig,key,true) : null);
-    // An unlabelled legacy page can still be selected. This does not authorise a new tab or adopt its space.
-    if(!request.home&&!key&&!request.newPage&&source?.legacy&&!source.tuis.length&&source.pages.length
+    // An unlabelled legacy page can still be selected on a single-connection machine. With two connections on the machine, a page-only space could belong to the other OpenRig.
+    const sameMachineConns=(config?.connections??[]).filter(c=>(c?.machine??null)===(config?.daemonMachine||null)).length;
+    if(!request.home&&!key&&!request.newPage&&sameMachineConns<=1&&source?.legacy&&!source.tuis.length&&source.pages.length
       &&spaceMachine(source.space)===(config?.daemonMachine||null)){destination=source.space;legacySelection=true;}
     if(!request.home&&!key&&source?.owned&&source.rigs.length){
       // A cross-rig page still belongs to its connection. Check only its source, using the same origin/host vouch as a keyed page.
       const scoped={...host,spaces:()=>list(host,"spaces").filter(s=>s.id===source.id)};
-      const sourceRig=(host.topology?.()??[]).find(r=>(!config?.connectionId||!r.conn||r.conn===config.connectionId)&&source.rigs.some(name=>name===r.id||name===r.name));
+      const sourceRig=source.rigs.map(ref=>{
+        const byId=resolveRig(host.topology?.()??[],{rigId:ref,conn:config?.connectionId??null,config,allowNameFallback:false});
+        if(byId.ambiguous)return null;
+        if(byId.rig)return byId.rig;
+        const byName=resolveRig(host.topology?.()??[],{name:ref,conn:config?.connectionId??null,config});
+        return byName.ambiguous?null:(byName.rig??null);
+      }).find(Boolean)??null;
       const vouch={...vouchOf(host,sourceRig),strictOrigin:true};
       const adopted=await prepareRigSpaceAdoption(scoped,config,source.rigs,vouch);
       if(!adopted.ok)return adopted;
@@ -877,10 +888,11 @@ export async function routeOpen(host,config,request={}){
   if(!host.routeOwner && !selected.background && forward){
     const explicitConn=selected.conn??selected.entry?.conn??selected.seat?.conn;
     const routedRig=!explicitConn&&selected.kind==="page"?requestRig(host,selected,config):null;
+    if(routedRig?.staleRigId)return fail(STALE_RIG_REFUSAL);
     const targetConn=explicitConn??(routedRig?.ambiguous?undefined:routedRig?.conn??(selected.kind==="page"&&!routedRig?.key?config?.connectionId:undefined));
     return forwardRigOpen(host,targetConn?{...selected,conn:targetConn}:selected);
   }
-  const {rig,key,conn:rigConn,ambiguous,ambiguousReason}=requestRig(host,selected,config);
+  const {rig,key,conn:rigConn,ambiguous,ambiguousReason,staleRigId}=requestRig(host,selected,config);
   if(!selected.background&&!ambiguous&&rigConn&&config?.connectionId&&rigConn!==config.connectionId)return fail(OTHER_CONNECTION_REFUSAL);
   const queueKey=JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine??"",rig?.name??key??"home"]);
   const previous=jobs.get(queueKey);
@@ -891,7 +903,7 @@ export async function routeOpen(host,config,request={}){
     if(current?.configInvalid)return fail(current.configInvalid);
     // ...and a CHANGED connection refuses it too: the captured rig and key belong to the daemon it was queued for (another address would open that rig's viewers in a space labelled for the new one).
     if(!configUnchanged(host,config))return fail("OpenRig's connection changed. Nothing was opened.");
-    return perform(host,config,selected,rig,key,ambiguous,ambiguousReason);
+    return perform(host,config,selected,rig,key,ambiguous,ambiguousReason,staleRigId);
   });
   const jobEntry=queueBarrier(job,host,0,previous);
   jobs.set(queueKey,jobEntry);

@@ -2235,7 +2235,9 @@ export default class RigView extends View {
     // /healthz is the page's own read only while no running sidebar is its source (a sidebar refresh carries its reading): with one, a
     // refresh re-reads nothing extra, as before; without one, at most once per live refresh.
     const ownHealth = !this.attentionFromSidebar || this.attentionFromSidebar !== this.activeConnId();
-    markStale(this.cache, (path) => (seatStatus && seatStatusRead(path)) || path==='/api/config/ui.timezone' || (ownHealth && path === '/healthz') || path.startsWith('/api/views/execution?') || (path.startsWith("/api/rigs")&&!path.endsWith("/spec.json")) || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
+    const cache=this.cache;
+    const retrySpec=path=>Boolean(cache[path]?.error)&&![404,405,410,501].includes(cache[path].status);
+    markStale(cache, (path) => (seatStatus && seatStatusRead(path)) || path==='/api/config/ui.timezone' || (ownHealth && path === '/healthz') || path.startsWith('/api/views/execution?') || (path.startsWith("/api/rigs")&&(!path.endsWith("/spec.json")||retrySpec(path))) || path.startsWith("/api/attention") || path.startsWith("/api/health") || path.startsWith("/api/native-seats") || path.startsWith("/api/queue") || path.startsWith("/api/gateway"));
   }
 
   /** The sidebar doesn't mirror handoff history, workflow execution or request detail. Keep those shown-page reads live without polling full attention. */
@@ -4600,7 +4602,7 @@ export default class RigView extends View {
       const resolved={...entry,project:project??entry.project};
       if(entry.workflow||this.activePageView==='workflows'){
         const panel=new WorkflowPanel(this,{navigate:entry=>this.push(entry),monoFamily:settings()?.font_family??'JetBrains Mono',ownerEntry:session=>{
-          const found=resolveAskerSeat(session,this.currentTopology(cx),entry.conn??null);if(!found.found)return null;
+          const found=resolveAskerSeat(session,this.currentTopology(cx),entry.conn??null,this.config);if(!found.found)return null;
           const s=found.seat;return {section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,conn:s.conn,name:s.logicalId,session:s.session,pod:s.pod};
         },queueEntry:id=>validHealthQitemId(id)?{section:'system',subview:'health',healthQitem:id}:null,
         time:(value,exact=false)=>value==='INDETERMINATE'?'unknown':value==null?'not reported':this.time?this.time(value,{exact}):asOf(value).replace(/^as of /,'')});
@@ -4759,7 +4761,7 @@ export default class RigView extends View {
     const degraded = normalized.degraded;
     const pages = normalized.pages;
     const rigName = normalized.rigName;
-    const rigEntry = rigName ? rigOfConnection(this.rigData()?.topology ?? [], rigName, this.activeConnId()) : null; // within the page's own connection
+    const rigEntry = rigName ? rigOfConnection(this.rigData()?.topology ?? [], rigName, this.activeConnId(), this.config) : null; // within the page's own connection
     const noAttachableReason = opened.length === 0
       ? `No attachable seats (${absent.length} absent${degraded.length ? `, ${degraded.length} degraded` : ""})`
       : null;
@@ -4881,7 +4883,7 @@ export default class RigView extends View {
     const asker = n?.asker ?? (n?.logicalId && n?.rig ? `${n.logicalId}@${n.rig}` : null);
     const assistant=assistantForNeed({...n,asker},this.hostedMembers(cx));
     if(assistant){const rig=this.currentTopology(cx).find(r=>r.name===assistant.rig&&r.conn===assistant.conn);this.push({section:'topology',kind:'assistant',session:assistant.seat,conn:assistant.conn,rig:assistant.rig,rigId:rig?.id,name:assistant.name});return;}
-    const resolved = resolveAskerSeat(asker, this.currentTopology(cx), n?.conn ?? null); // the request's OWN connection: a name two OpenRigs share is never the first one's
+    const resolved = resolveAskerSeat(asker, this.currentTopology(cx), n?.conn ?? null, this.config); // the request's OWN connection: a name two OpenRigs share is never the first one's
     if (!resolved.found) {
       this.askerNotes[this.replyKey(n)] = resolved.message;
       cx?.notify?.();
@@ -5540,7 +5542,7 @@ export default class RigView extends View {
     const ownerRun = rowTags.includes("owner-run") || rowTags.includes("gate:human");
     const kind = check ? "OpenRig check" : resolve ? "Parked · needs your words" : qState.totalCount ? "Decision" : verb === "approve" ? (decision ? "Approval" : "Request") : "Question";
     const owner = resolve ? parkedWorkOwner(queueRow ?? n) : asker;
-    const resolved = resolveAskerSeat(owner, this.currentTopology(cx), n.conn ?? null);
+    const resolved = resolveAskerSeat(owner, this.currentTopology(cx), n.conn ?? null, this.config);
     const logical = resolved.found ? resolved.seat.logicalId : String(owner ?? "the asking seat").split("@")[0].replace(/-/g, ".");
     const requestLine = ownerRun ? `${logical} is asking you to do this yourself. Reply with what you did or what you found, or say why not.` : `Reply to ${logical} with your answer, or what you did.`;
     const rig = resolved.found ? resolved.seat.rig : String(owner ?? "").split("@").slice(1).join("@");

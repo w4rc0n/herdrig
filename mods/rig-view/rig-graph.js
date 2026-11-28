@@ -4,7 +4,7 @@ import {h_flex,v_flex} from "gpui-base";
 import {settings} from "herdr";
 import {routeGraphColumns,graphHeadingTitle,graphWorkPath,graphWorkInk,nearestGraphSeat} from "./rig-graph-layout.js";
 import {GraphMotion,GRAPH_FADE_MS} from "./rig-graph-state.js";
-import {GraphWorkProjection,WORK_PULSE,graphWorkForSeat} from "./rig-graph-work.js";
+import {GraphWorkProjection,WORK_PULSE,graphTasksByDestination,graphWorkForSeat} from "./rig-graph-work.js";
 import {statusMarkElement,seatStatus,statusLook,counted,singleLineText} from "./rig-lib.js";
 import {statusWord} from "./rig-words.js";
 
@@ -104,7 +104,7 @@ export class RigGraph{
   render(t,cx,graph,{id,assets,running=false,reducedMotion=false,events=[],workRows=[],workReady=true,open,menu,now=Date.now()}={}){
     const schedule=(ms,fn)=>this.liveCx.timer.after(ms,live=>{this.liveCx=live;fn();}),notify=()=>this.liveCx?.notify?.();
     this.liveCx=cx;
-    const {lines:work,taskCount}=running?this.workProjection.read(graph,workRows,now,{ready:workReady,reducedMotion}):{lines:[],taskCount:0};
+    const {lines:work}=running?this.workProjection.read(graph,workRows,now,{ready:workReady,reducedMotion}):{lines:[]};
     const workKey=JSON.stringify(work.map(line=>line.key).sort());
     if(this.graphData!==graph||this.layoutWidth!==this.width||this.layoutWorkKey!==workKey||!this.layout){
       this.layout=routeGraphColumns(graph,this.width,{work:work.slice().sort((a,b)=>a.key.localeCompare(b.key))});
@@ -201,11 +201,23 @@ export class RigGraph{
       }else edges.children(fallback);
     }
     root.child(edges);
-    const workBySeat=new Map(), headingSources=new Map(layout.headings.map(heading=>[heading.source,heading]));
+    if(this.taskRows!==workRows){this.taskRows=workRows;this.tasksByDestination=graphTasksByDestination(workRows);}
+    const workBySeat=new Map(),headingSources=new Map(layout.headings.map(heading=>[heading.source,heading]));
+    const linedRows=new Set(work.flatMap(line=>line.rows));
+    if(running)for(const seat of graph.pods.flatMap(pod=>pod.seats)){
+      const rows=graphWorkForSeat(workRows,seat,{byDestination:this.tasksByDestination,sorted:false});
+      if(!rows.length)continue;
+      const withoutWire=rows.filter(row=>!linedRows.has(row));
+      const active=withoutWire.length>0&&seat.status==="active";
+      const tips=withoutWire.slice(0,8).map(row=>singleLineText(row.summary??"Task")||"Task");
+      if(withoutWire.length>8)tips.push(`+ ${withoutWire.length-8} more`);
+      workBySeat.set(seat.lid,{count:rows.length,tips,active,pulse:active&&!reducedMotion});
+    }
+    const taskCount=[...workBySeat.values()].reduce((count,entry)=>count+entry.count,0);
     for(const line of work){
-      if(!workBySeat.has(line.target))workBySeat.set(line.target,{count:0,tips:[],active:false,pulse:false});
       const entry=workBySeat.get(line.target);
-      entry.count+=line.rows.length;entry.tips.push(line.tip);
+      if(!entry)continue;
+      entry.tips.push(line.tip);
       if(headingSources.get(line.source)?.covered.has(line.target)){
         entry.active||=line.status==="active"||line.pulseUntil!==null;
         entry.pulse||=line.pulse;
@@ -434,10 +446,9 @@ export class RigGraph{
     const width=Math.min(layout.width,860),sideWidth=Math.min(170,Math.floor((width-304)/2));
     const left=12,right=width-sideWidth-12;
     const cardW=Math.min(300,width-2*(sideWidth+48)),cardX=(width-cardW)/2,cardY=38;
-    const outgoingWidth=[...outgoing].reduce((total,name)=>total+(name.length+1)*7,54);
-    const cardHeight=cardY+145+Math.ceil(outgoingWidth/(cardW-24))*22;
-    const height=Math.max(cardHeight,40+30*Math.max(countRows("send",senders),countRows("watch",watching)));
-    const scene=div().relative().w(width).flex_none().h(height);
+    const height=40+30*Math.max(countRows("send",senders),countRows("watch",watching));
+    // The center card stays in flow, so its wrapped content can grow the scene beyond the side lists.
+    const scene=v_flex().id(panelId+"-scene").relative().w(width).flex_none().min_h(height).pt(cardY).pb(12).items_center();
     const breathing=placed(0,0,width,height);
     let hasPulse=false;
     for(const [side,items] of [["send",visible("send",senders)],["watch",visible("watch",watching)]]){
@@ -467,7 +478,7 @@ export class RigGraph{
     }
     if(hasPulse)scene.child(typeof breathing.loop==="function"?breathing.loop("opacity",WORK_PULSE):breathing);
     scene.child(div().absolute().left(left).top(0).w(sideWidth).child(list("send","gives it work",senders)))
-      .child(div().absolute().left(cardX).top(cardY).w(cardW).child(card))
+      .child(div().w(cardW).child(card))
       .child(div().absolute().left(right).top(0).w(sideWidth).child(list("watch","watches it",watching)));
     return panel.child(h_flex().w_full().justify_center().child(scene));
   }
