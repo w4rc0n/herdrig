@@ -9,7 +9,7 @@ function tabPageOf(host,config,tab){
 }
 import { openRigSpaceContext, resolveRigSpace, unconfirmedRigSpace, unconfirmedSpaceReason, unconfirmedSpaceNextSteps, rigOrigin, rigSessions, homeCandidate, markHomeSpace, hostLabelValue, prepareRigSpaceAdoption } from "./rig-space-context.js";
 import { machineId, machineLocalId } from "./rig-remote.js";
-import { LEGACY_CONNECTION_ID, resolveRig, STALE_RIG_REFUSAL, AMBIGUOUS_NAME, qualifyKey, spaceStatusKey } from "./rig-connections.js";
+import { LEGACY_CONNECTION_ID, partitionRowsByConnection, resolveRig, STALE_RIG_REFUSAL, AMBIGUOUS_NAME, qualifyKey, spaceStatusKey } from "./rig-connections.js";
 import { gateSameConfig, gateIdentity } from "./rig-gate.js";
 /** The singular `homeSpace` is the legacy connection's record (older versions read only it). Another connection keeps its home in
  *  `homeSpaces[key]` alone, whose key is [origin, machine] and so is already its own. */
@@ -386,6 +386,17 @@ export async function replaceMigrationTab(host,config,request) {
   return {ok:true,...opened,error};
 }
 
+function topologyLoadedFor(host, sharedData, topology, conn, config) {
+  if (typeof host?.topologyLoaded === "function") return Boolean(host.topologyLoaded(conn));
+  const byConn = sharedData?.byConnection;
+  if (byConn && typeof byConn === "object") {
+    if (conn && Object.hasOwn(byConn, conn)) return byConn[conn]?.answering === true;
+    const entries = Object.values(byConn);
+    if (!conn && entries.length === 1) return entries[0]?.answering === true;
+  }
+  return partitionRowsByConnection(topology, null, { conn, config }).eligible.length > 0;
+}
+
 function requestRig(host, request, config = null) {
   const entry=request.entry ?? {};
   const sharedData=host.shared?.("rig.data");
@@ -400,19 +411,21 @@ function requestRig(host, request, config = null) {
   if(!key && entry.section==="needs" && entry.id){
     const items=host.attentionItems?.() ?? host.shared?.("rig.data")?.attentionItems ?? [];
     const needRig=resolveNeedRig(entry.id,{items,topology,conn,config:effectiveConfig});
-    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,conn:null,ambiguous:true,...(needRig.reason?{ambiguousReason:needRig.reason}:{})};
+    if(needRig?.ambiguous)return {rig:undefined,key:needRig.key,conn:null,ambiguous:true,...(needRig.unownedNeed?{unownedNeed:true}:{}),...(needRig.reason?{ambiguousReason:needRig.reason}:{})};
     key=needRig?.rigId ?? needRig?.rig ?? needRig?.key ?? null;
     if(needRig?.rigId) explicitRigId=true;
     if(!routeConn && needRig?.conn) routeConn=needRig.conn;
   }
   if(!key)return {rig:undefined,key:null,conn:routeConn??null,ambiguous:false};
-  const byIdRes=explicitRigId
-    ? resolveRig(topology,{rigId:key,name:key,conn:routeConn,config:effectiveConfig})
-    : resolveRig(topology,{rigId:key,conn:routeConn,config:effectiveConfig,allowNameFallback:false});
+  const byIdRes=resolveRig(topology,{rigId:key,conn:routeConn,config:effectiveConfig,allowNameFallback:false});
   if(byIdRes.ambiguous)return {rig:undefined,key,conn:null,ambiguous:true,...(byIdRes.reason?{ambiguousReason:byIdRes.reason}:{})};
   if(explicitRigId && byIdRes.staleIdNameCollision)return {rig:undefined,key:null,conn:routeConn??null,ambiguous:false,staleRigId:true};
   if(byIdRes.rig)return {rig:byIdRes.rig,key,conn:routeConn??byIdRes.conn??byIdRes.rig.conn??null,ambiguous:false};
-  if(explicitRigId)return {rig:undefined,key,conn:routeConn??null,ambiguous:false};
+  if(explicitRigId){
+    const loaded=topologyLoadedFor(host,sharedData,topology,routeConn??config?.connectionId??effectiveConfig?.connectionId??null,effectiveConfig);
+    if(loaded)return {rig:undefined,key:null,conn:routeConn??null,ambiguous:false,staleRigId:true};
+    return {rig:undefined,key,conn:routeConn??null,ambiguous:false};
+  }
   const byName=resolveRig(topology,{name:key,conn:routeConn,config:effectiveConfig});
   if(byName.ambiguous)return {rig:undefined,key,conn:null,ambiguous:true,...(byName.reason?{ambiguousReason:byName.reason}:{})};
   return {rig:byName.rig,key,conn:routeConn??byName.conn??byName.rig?.conn??null,ambiguous:false};
@@ -877,6 +890,8 @@ export async function routeOpen(host,config,request={}){
     (typeof config.daemonMachine!=="string"||!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(config.daemonMachine)))
     return fail("daemonMachine must name a Herdr machine. No local terminal was started.");
   const selected={...request,sourceSpace:request.sourceSpace??active(host)};
+  const preRig=selected.kind==="page"&&!selected.background&&!selected.home?requestRig(host,selected,config):null;
+  if(preRig?.unownedNeed)return fail(preRig.ambiguousReason||AMBIGUOUS_NAME);
   // A page with no entry is Topology, stamped with this connection when several are set up (an unstamped page names no OpenRig there).
   if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology",...((config?.connections?.length??0)>1&&config?.connectionId?{conn:config.connectionId}:{})}));
   const tree=typeof host.layout==="function"?host.layout():host.layout;
@@ -887,12 +902,12 @@ export async function routeOpen(host,config,request={}){
     : layoutShowsMod(tree,MOD_IDS.sidebar);
   if(!host.routeOwner && !selected.background && forward){
     const explicitConn=selected.conn??selected.entry?.conn??selected.seat?.conn;
-    const routedRig=!explicitConn&&selected.kind==="page"?requestRig(host,selected,config):null;
+    const routedRig=!explicitConn&&selected.kind==="page"?(preRig??requestRig(host,selected,config)):null;
     if(routedRig?.staleRigId)return fail(STALE_RIG_REFUSAL);
     const targetConn=explicitConn??(routedRig?.ambiguous?undefined:routedRig?.conn??(selected.kind==="page"&&!routedRig?.key?config?.connectionId:undefined));
     return forwardRigOpen(host,targetConn?{...selected,conn:targetConn}:selected);
   }
-  const {rig,key,conn:rigConn,ambiguous,ambiguousReason,staleRigId}=requestRig(host,selected,config);
+  const {rig,key,conn:rigConn,ambiguous,ambiguousReason,staleRigId}=preRig??requestRig(host,selected,config);
   if(!selected.background&&!ambiguous&&rigConn&&config?.connectionId&&rigConn!==config.connectionId)return fail(OTHER_CONNECTION_REFUSAL);
   const queueKey=JSON.stringify([rigOrigin(config?.daemonUrl)??origin(config),config?.daemonMachine??"",rig?.name??key??"home"]);
   const previous=jobs.get(queueKey);

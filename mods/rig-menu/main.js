@@ -16,7 +16,7 @@ import {assistantAddress,assistantActionRefusal,verifyAssistantTarget} from './r
 // A need target comes from rig-lib needTarget.
 import { View, div, svg } from "gpui-kit";
 import {readRestorePlan,readConversationRollCall,restorePlanIdentity,restorePlanView,rollCallView} from './rig-resume.js';
-import { sharedLoopbackDaemonUrl, sharedRigData, rigOperatorDisabled, requestFailed, requestWhat, withFocusContext, releaseFocusTargets } from "./rig-lib.js";
+import { sharedLoopbackDaemonUrl, sharedRigData, canOfferRigResume, requestFailed, requestWhat, withFocusContext, releaseFocusTargets } from "./rig-lib.js";
 import { sendStuckLines } from "./rig-lib.js";
 import { timezoneValue } from "./rig-time.js";
 import { registerRigRouting, stampRows, messageDialogSpace, ROWS_STALE, tabPagesScrub } from "./rig-lib.js";
@@ -1456,7 +1456,7 @@ export default class RigMenu extends View {
         item("rig-snapshot", "Snapshot now", () => oneClick(rigTarget, "snapshot"));
         const stoppedRig = isRigStopped(rigTarget.lifecycle, this.rigSeats(rigTarget));
         if (!stoppedRig && rigTarget.lifecycle !== "stopped") item("rig-pause", "Pause rig…", () => dialog(rigTarget, { action: "pause", load: "pause" }, 360));
-        if (!rigOperatorDisabled(this.config, shared, { ...rigTarget, conn: spaceConn, operatorDisabled: target.operatorDisabled }) && (stoppedRig || rigTarget.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(rigTarget, { action: "resume", confirm: true }, 380));
+        if (canOfferRigResume(this.config, shared, { ...rigTarget, conn: spaceConn, operatorDisabled: target.operatorDisabled }) && (stoppedRig || rigTarget.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(rigTarget, { action: "resume", confirm: true }, 380));
       }
     }
     if (target.kind === "rig" || target.kind === "pod" || target.kind === "seat") {
@@ -1483,7 +1483,7 @@ export default class RigMenu extends View {
       // Resume when paused, Pause when not; with the state unknown or mixed, both.
       const stoppedRig = isRigStopped(target.lifecycle, this.rigSeats(target));
       if (!stoppedRig && target.lifecycle !== "stopped") item("rig-pause", "Pause rig…", () => dialog(target, { action: "pause", load: "pause" }, 360));
-      if (!rigOperatorDisabled(this.config, shared, target) && (stoppedRig || target.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
+      if (canOfferRigResume(this.config, shared, target) && (stoppedRig || target.lifecycle !== "running")) item("rig-play", "Resume rig…", () => dialog(target, { action: "resume", confirm: true }, 380));
       // Delete, with Archive beside it as the reversible choice. Never for the kernel: it's the daemon's own rig.
       if (target.rig !== "kernel" && !target.archived) item("rig-archive", "Archive rig…", () => dialog(target, { action: "archive-rig", load: "pause" }, 320), "archive-rig");
       if (target.rig !== "kernel") item("rig-trash", "Delete rig…", () => dialog(target, { action: "delete-rig", load: "pause" }, 540), "delete-rig");

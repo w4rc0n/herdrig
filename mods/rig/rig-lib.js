@@ -1242,15 +1242,30 @@ export function sharedRigData(config, shared) {
   const published = shared("rig.data");
   return published && !publishedUnder(config, published) ? undefined : published; // rows published under other settings are not this reader's (it falls back to its own reads)
 }
-export function rigOperatorDisabled(config, shared, target) {
-  if (target.operatorDisabled) return true;
-  if (target.rig !== "kernel") return false;
+function resolveKernelConn(config, shared, target) {
+  if (target?.conn) return target.conn;
   const connections = config?.connections ?? [];
-  if (!target.conn && connections.length > 1) return false;
-  const conn = target.conn ?? connections[0]?.id ?? LEGACY_CONNECTION_ID;
+  if (connections.length <= 1) return connections[0]?.id ?? LEGACY_CONNECTION_ID;
+  const data = sharedRigData(config, shared);
+  const topo = data?.topology ?? [];
+  const resolved = target?.rigId
+    ? resolveRig(topo, { rigId: target.rigId, config })
+    : resolveRig(topo, { name: target?.rig, config });
+  return resolved.ambiguous ? null : (resolved.conn ?? null);
+}
+export function rigOperatorDisabled(config, shared, target) {
+  if (target?.operatorDisabled) return true;
+  if (target?.rig !== "kernel") return false;
+  const conn = resolveKernelConn(config, shared, target);
+  if (!conn) return false;
   const data = sharedRigData(configOfConnection(config, conn), shared);
   const state = data?.byConnection ? data.byConnection[conn]?.sidebarState : data?.sidebarState;
   return state?.operatorDisabled === true;
+}
+export function canOfferRigResume(config, shared, target) {
+  if (rigOperatorDisabled(config, shared, target)) return false;
+  if (target?.rig === "kernel" && (config?.connections ?? []).length > 1 && !resolveKernelConn(config, shared, target)) return false;
+  return true;
 }
 /** Why the CLI must not run for this config, or null. A connection other than the legacy one authenticates from its OpenRig home alone (the
  *  inherited home and bearer variables are unset), so without a home of its own the CLI would fall back to the default home (~/.openrig)
@@ -3306,6 +3321,11 @@ export function openOrFocusRigTab(host = {}, entry = null) {
     return null;
   };
   const currentRig = rigOfEntry(current);
+  if (currentRig?.unownedNeed) {
+    const reason = currentRig.reason ?? AMBIGUOUS_REQUEST;
+    (host.notify ?? environment.notify)?.({ title: "OpenRig", body: reason, level: "warning" });
+    return Promise.resolve({ ok: false, reason });
+  }
   const fromRig = from ? rigOfEntry(from) : null;
   const resolvedCurrent = current && !current.conn && currentRig?.conn && !currentRig.ambiguous
     ? { ...current, conn: currentRig.conn }
@@ -4959,7 +4979,7 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
     const byId = resolveRig(topo, { rigId: raw, conn: scopedConn, config, allowNameFallback: false });
     if (byId.ambiguous) return { rig: null, rigId: null, key: raw, ambiguous: true };
     if (byId.rig) return { rig: byId.rig.name, rigId: byId.rig.id, ...withConn(byId.conn ?? scopedConn), key: byId.rig.id ?? byId.rig.name, ambiguous: false };
-    if (idOnly && adoption.isMulti) return null;
+    if (idOnly) return null;
     const byName = resolveRig(topo, { name: raw, conn: scopedConn, config });
     if (byName.ambiguous) return { rig: null, rigId: null, key: raw, ambiguous: true };
     if (byName.rig) return { rig: byName.rig.name, rigId: byName.rig.id, ...withConn(byName.conn ?? scopedConn), key: byName.rig.id ?? byName.rig.name, ambiguous: false };
@@ -4979,13 +4999,21 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
   if (check?.about && Array.isArray(items)) {
     const visited = seen ?? new Set();
     if (item.id) visited.add(String(item.id));
-    const targetMatches = items.filter((r) => r && (!scopedConn || !r.conn || r.conn === scopedConn) && (r.qitemId === check.about || r.id === `queue:${check.about}` || r.id === check.about));
-    if (!scopedConn && new Set(targetMatches.map((r) => r.conn ?? "")).size > 1) {
+    const { eligible, unstampedRejected } = partitionRowsByConnection(
+      items,
+      (r) => r.qitemId === check.about || r.id === `queue:${check.about}` || r.id === check.about,
+      { conn: scopedConn, config, multi: adoption.isMulti },
+    );
+    if (!eligible.length && unstampedRejected.length > 0) {
+      return { rig: null, rigId: null, key: String(check.about), ambiguous: true, ...(scopedConn ? { unownedNeed: true, reason: AMBIGUOUS_REQUEST } : {}) };
+    }
+    if (!scopedConn && new Set(eligible.map((e) => e.conn ?? "")).size > 1) {
       return { rig: null, rigId: null, key: String(check.about), ambiguous: true };
     }
-    const target = (scopedConn ? targetMatches.find((r) => r.conn === scopedConn) : null) ?? targetMatches[0];
+    const targetEntry = (scopedConn ? eligible.find((e) => e.row.conn === scopedConn) : null) ?? eligible[0];
+    const target = targetEntry?.row ?? null;
     if (target && !visited.has(String(target.id ?? ""))) {
-      const resolved = needRigOf(target, topo, scopedConn ?? target.conn ?? null, items, visited, config);
+      const resolved = needRigOf(target, topo, targetEntry.conn ?? scopedConn ?? null, items, visited, config);
       if (resolved) return resolved;
     }
   }
@@ -5064,13 +5092,23 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
 export function resolveNeedRig(id, { items = [], topology = [], conn = null, config = null } = {}) {
   const want = typeof id === "string" ? id.trim() : "";
   if (!want || isHealthAttention({ id: want }) || !Array.isArray(items) || !items.length) return null;
-  const matches = items.filter((it) => it && String(it.id ?? "") === want && (!conn || !it.conn || it.conn === conn));
-  if (!matches.length) return null;
-  if (!conn && new Set(matches.map((it) => it.conn ?? "")).size > 1) {
+  const multi = connectionAdoption(topology, { conn, config }).isMulti;
+  const { eligible, unstampedRejected } = partitionRowsByConnection(
+    items,
+    (it) => String(it.id ?? "") === want,
+    { conn, config, multi },
+  );
+  if (!eligible.length) {
+    if (unstampedRejected.length > 0) {
+      return { rig: null, rigId: null, key: want, ambiguous: true, ...(conn ? { unownedNeed: true, reason: AMBIGUOUS_REQUEST } : {}) };
+    }
+    return null;
+  }
+  if (!conn && new Set(eligible.map((e) => e.conn ?? "")).size > 1) {
     return { rig: null, rigId: null, key: want, ambiguous: true };
   }
-  const chosen = (conn ? matches.find((it) => it.conn === conn) : null) ?? matches[0];
-  return needRigOf(chosen, topology, conn ?? chosen?.conn ?? null, items, null, config);
+  const chosen = (conn ? eligible.find((e) => e.row.conn === conn) : null) ?? eligible[0];
+  return needRigOf(chosen.row, topology, chosen.conn ?? conn ?? null, items, null, config);
 }
 
 /**
@@ -6092,54 +6130,64 @@ export function resolveTuiLineFallback(line) {
   return null;
 }
 
-function resolvePaletteRig(targetArg, top, topology = [], conn = null, config = null) {
+function resolvePaletteRig(targetArg, top, topology = [], conn = null, config = null, explicitRigId = null) {
   const list = Array.isArray(topology) ? topology : [];
   const scopedConn = conn ?? top?.conn ?? null;
   const adoption = connectionAdoption(list, { conn: scopedConn, config });
+  const topSameConn = !conn || (top?.conn ? top.conn === conn : adoption.canAdoptUnstamped);
+  const foreignTop = Boolean(top && !topSameConn);
+  if (explicitRigId) {
+    const byId = resolveRig(list, { rigId: explicitRigId, conn: scopedConn, config, allowNameFallback: false });
+    if (byId.ambiguous) return { error: byId.reason ?? AMBIGUOUS_RIG };
+    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn, foreignTop };
+    return { error: STALE_RIG_REFUSAL };
+  }
   if (targetArg) {
     const byId = resolveRig(list, { rigId: targetArg, conn: scopedConn, config, allowNameFallback: false });
     if (byId.ambiguous) return { error: byId.reason ?? AMBIGUOUS_RIG };
-    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn };
+    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn, foreignTop };
     const byName = resolveRig(list, { name: targetArg, conn: scopedConn, config });
     if (byName.ambiguous) return { error: byName.reason ?? AMBIGUOUS_NAME };
-    if (byName.rig) return { hit: byName.rig, conn: byName.conn ?? scopedConn };
-    return { hit: null, conn: scopedConn };
+    if (byName.rig) return { hit: byName.rig, conn: byName.conn ?? scopedConn, foreignTop };
+    return { hit: null, conn: scopedConn, foreignTop };
   }
-  const topSameConn = !conn || (top?.conn ? top.conn === conn : adoption.canAdoptUnstamped);
   const topRigId = topSameConn ? (top?.rigId ?? null) : null;
   const topRigName = topSameConn ? (top?.rig ?? (top?.kind === "rig" ? top?.name : null) ?? null) : null;
   if (topRigId) {
     const byId = resolveRig(list, { rigId: topRigId, conn: scopedConn, config, allowNameFallback: false });
     if (byId.ambiguous) return { error: byId.reason ?? AMBIGUOUS_RIG };
-    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn };
+    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn, foreignTop };
     if (list.length > 0) return { error: STALE_RIG_REFUSAL };
-    return { hit: null, conn: scopedConn };
+    return { hit: null, conn: scopedConn, foreignTop };
   }
   if (topRigName) {
     const byId = resolveRig(list, { rigId: topRigName, conn: scopedConn, config, allowNameFallback: false });
     if (byId.ambiguous) return { error: byId.reason ?? AMBIGUOUS_RIG };
-    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn };
+    if (byId.rig) return { hit: byId.rig, conn: byId.conn ?? scopedConn, foreignTop };
     const byName = resolveRig(list, { name: topRigName, conn: scopedConn, config });
     if (byName.ambiguous) return { error: byName.reason ?? AMBIGUOUS_NAME };
-    if (byName.rig) return { hit: byName.rig, conn: byName.conn ?? scopedConn };
+    if (byName.rig) return { hit: byName.rig, conn: byName.conn ?? scopedConn, foreignTop };
     if (list.length > 0) return { error: STALE_RIG_REFUSAL };
-    return { hit: null, conn: scopedConn };
+    return { hit: null, conn: scopedConn, foreignTop };
   }
   const { eligible } = partitionRowsByConnection(list, null, { conn: scopedConn, config });
   if (new Set(eligible.map((e) => e.conn ?? "")).size > 1) {
     return { error: AMBIGUOUS_RIG };
   }
   const hit = eligible[0] ?? null;
-  return { hit: hit?.row ?? null, conn: hit?.conn ?? scopedConn };
+  return { hit: hit?.row ?? null, conn: hit?.conn ?? scopedConn, foreignTop };
 }
 
-function resolveOverviewRoute(targetArg, top, topology = [], conn = null, config = null) {
-  const resolved = resolvePaletteRig(targetArg, top, topology, conn, config);
+function resolveOverviewRoute(targetArg, top, topology = [], conn = null, config = null, explicitRigId = null) {
+  const resolved = resolvePaletteRig(targetArg, top, topology, conn, config, explicitRigId);
   if (resolved.error) return { error: resolved.error };
   const hit = resolved.hit;
-  const entryConn = resolved.conn ?? conn ?? top?.conn ?? null;
-  const rigId = hit?.id ?? targetArg ?? top?.rigId ?? top?.name ?? null;
-  const rigName = hit?.name ?? targetArg ?? top?.name ?? top?.rig ?? null;
+  const ownTop = resolved.foreignTop ? null : top;
+  const ownTopRigId = ownTop?.rigId ?? null;
+  const ownTopRigName = ownTop?.rig ?? (ownTop?.kind === "rig" ? ownTop?.name : null) ?? null;
+  const entryConn = resolved.conn ?? conn ?? ownTop?.conn ?? null;
+  const rigId = hit?.id ?? targetArg ?? ownTopRigId ?? ownTopRigName ?? null;
+  const rigName = hit?.name ?? targetArg ?? ownTopRigName ?? null;
   const focusTarget = rigName ?? rigId;
   const open = {
     ...(rigId ? { [`rig:${rigId}`]: true } : {}),
@@ -6156,21 +6204,24 @@ function resolveOverviewRoute(targetArg, top, topology = [], conn = null, config
   };
 }
 
-function resolveRecentRoute(targetArg, top, topology = [], conn = null, config = null) {
+function resolveRecentRoute(targetArg, top, topology = [], conn = null, config = null, explicitRigId = null) {
   const scopedConn = conn ?? top?.conn ?? null;
-  if (targetArg === "instance" || (!targetArg && top?.section === "system")) {
+  if (targetArg === "instance" || (!targetArg && !explicitRigId && top?.section === "system")) {
     return {
       entry: { section: "system", openRecent: "instance", ...(scopedConn ? { conn: scopedConn } : {}) },
       open: { "sys:recent": true },
       focus: "sys:recent",
     };
   }
-  const resolved = resolvePaletteRig(targetArg, top, topology, conn, config);
+  const resolved = resolvePaletteRig(targetArg, top, topology, conn, config, explicitRigId);
   if (resolved.error) return { error: resolved.error };
   const hit = resolved.hit;
+  const ownTop = resolved.foreignTop ? null : top;
+  const ownTopRigId = ownTop?.rigId ?? null;
+  const ownTopRigName = ownTop?.rig ?? (ownTop?.kind === "rig" ? ownTop?.name : null) ?? null;
   const entryConn = resolved.conn ?? scopedConn;
-  const rigName = hit?.name ?? targetArg ?? top?.name ?? top?.rig ?? null;
-  const rigId = hit?.id ?? top?.rigId ?? rigName ?? null;
+  const rigName = hit?.name ?? targetArg ?? ownTopRigName ?? null;
+  const rigId = hit?.id ?? targetArg ?? ownTopRigId ?? rigName ?? null;
   const open = {
     ...(rigId ? { [`rig:${rigId}`]: true, [`rig-recent:${rigId}`]: true } : {}),
     ...(rigName ? { [`rig:${rigName}`]: true, [`rig-recent:${rigName}`]: true } : {}),
@@ -6227,11 +6278,12 @@ export function paletteRoute(res, top, topology = [], conn = null, config = null
   if (typed === "pulse" || typed === ":pulse" || a.type === "pulse" || resolved?.area === "pulse") {
     return { entry: { section: "topology", focus: "pulse" }, focus: "pulse" };
   }
+  const resRigId = res && typeof res === "object" && typeof res.rigId === "string" && res.rigId.trim() ? res.rigId.trim() : null;
   if (typed === "overview" || typed === ":overview" || a.type === "overview") {
-    return resolveOverviewRoute(a.rig ?? typedRig ?? null, top, topology, wantConn, config);
+    return resolveOverviewRoute(a.rig ?? typedRig ?? null, top, topology, wantConn, config, resRigId);
   }
   if (typed === "recent" || typed === ":recent" || a.type === "recent") {
-    return resolveRecentRoute(a.target ?? typedRig ?? null, top, topology, wantConn, config);
+    return resolveRecentRoute(a.target ?? typedRig ?? null, top, topology, wantConn, config, resRigId);
   }
   if (typed === "projects" || typed === ":projects" || a.type === "scopes-projects") {
     return { entry: { section: "scopes", focusProjects: true }, focus: "scopes-projects" };
@@ -6282,7 +6334,7 @@ export function paletteRoute(res, top, topology = [], conn = null, config = null
       if (a.resource === "pod") {
         const slash = String(a.name ?? "").indexOf("/");
         const wantRigId = slash > 0 ? null : (topMatchesConn ? (top?.rigId ?? null) : null);
-        const wantRig = slash > 0 ? a.name.slice(0, slash) : (topMatchesConn ? (top?.rig ?? top?.name ?? null) : null);
+        const wantRig = slash > 0 ? a.name.slice(0, slash) : (topMatchesConn ? (top?.rig ?? (top?.kind === "rig" ? top?.name : null) ?? null) : null);
         const wantPod = slash > 0 ? a.name.slice(slash + 1) : a.name;
         const podRes = resolvePod(topology, { rigId: wantRigId, rigName: wantRig, podName: wantPod, conn: wantConn, config });
         if (podRes.ambiguous) return { error: podRes.reason ?? AMBIGUOUS_NAME };

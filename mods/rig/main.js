@@ -15,7 +15,7 @@ import { configWatchChanged } from "./rig-lib.js";
 //   `<appHome>/openrig/state.json`.
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
-import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, AMBIGUOUS_RIG, NO_CONNECTION, resolveRig, formatHostId, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
+import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, AMBIGUOUS_RIG, STALE_RIG_REFUSAL, NO_CONNECTION, resolveRig, formatHostId, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
 import {SYSTEM_PAGE_VIEWS} from './rig-page-nav.js';
@@ -506,12 +506,12 @@ export default class RigSidebar extends View {
         else if (cmdName === "rebuild-space") {
           const request = shared("rig.rebuildRequest"); setShared("rig.rebuildRequest", null);
           const approved = this.rebuildConfirmations?.take(request);
-          if (approved) this.openRigSpace(cx, approved.rigId, approved.recovery,null,approved.continuation?.relocation,approved.continuation?.worker,approved.continuation?.conn??null);
+          if (approved) this.openRigSpace(cx, approved.rigId, approved.recovery,null,approved.continuation?.relocation,approved.continuation?.worker,approved.continuation?.conn??null,true);
         }
         else if (cmdName === "move-grid") {
           const request=shared("rig.gridMoveRequest");setShared("rig.gridMoveRequest",null);
           const approved=this.gridMoveConfirmations?.take(request);
-          if(approved)this.openRigSpace(cx,approved.rigId,approved.continuation?.rebuild??null,null,approved.recovery,approved.continuation?.worker,approved.continuation?.conn??null);
+          if(approved)this.openRigSpace(cx,approved.rigId,approved.continuation?.rebuild??null,null,approved.recovery,approved.continuation?.worker,approved.continuation?.conn??null,true);
         }
         else if (cmdName.startsWith("space:")) { const [conn, rigId, stale] = this.commandTarget(cmdName.slice(6)); if (stale) this.staleConnection("Rig space"); else this.openRigSpace(cx, rigId, null, null, null, null, conn); }
         else if (cmdName.startsWith("approve-helper:")) {
@@ -1344,7 +1344,7 @@ export default class RigSidebar extends View {
   }
 
   routeHost(cx, consent = null, feed = this.primary, attempt = null) {
-    return { ...this.attachHost(cx, consent, feed, attempt), notify, currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], attentionItems: () => feed.data?.attentionItems ?? [], selfHostId: () => feed.healthz?.selfHostId,
+    return { ...this.attachHost(cx, consent, feed, attempt), notify, currentConfig:()=>feed.config, topology: () => feed.data?.topology ?? [], topologyLoaded: () => Boolean(feed.data && !feed.error && Array.isArray(feed.data.topology)), attentionItems: () => feed.data?.attentionItems ?? [], selfHostId: () => feed.healthz?.selfHostId,
       saveRouteState: patch => this.trackRouteOp(feed, attempt, true, () => this.saveSpaceState(patch)),
       syncGrid: (rig, options) => this.spaceController(cx, consent, feed, attempt).sync(rig, feed.config, options) };
   }
@@ -1913,11 +1913,19 @@ export default class RigSidebar extends View {
     }
   }
 
-  openRigSpace(cx, id, rebuild = null, consent = null, relocation = null, continueWorker = null, conn = null) {
-    // By id first (unique per OpenRig); a bare NAME or duplicate ID across OpenRigs is refused via the shared resolver.
+  openRigSpace(cx, id, rebuild = null, consent = null, relocation = null, continueWorker = null, conn = null, exactId = Boolean(rebuild || relocation)) {
+    // By id first (unique per OpenRig); confirmed rebuild/move opens require exact ID without name fallback.
     const rawTopo = this.data?.topology ?? [], multi = this.feeds.length > 1;
     const byId = resolveRig(rawTopo, { rigId: id, conn, config: this.config, multi, allowNameFallback: false });
     if (byId.ambiguous) { notify({ title: "Rig space", body: byId.reason ?? AMBIGUOUS_RIG, level: "warning" }); return; }
+    if (exactId && !byId.rig) {
+      const targetFeed = conn ? this.exactFeed(conn) : (this.feeds.length === 1 ? this.primary : null);
+      if (conn && !targetFeed) { notify({ title: "Rig space", body: UNKNOWN_CONNECTION, level: "warning" }); return; }
+      const failure = targetFeed ? targetFeed.error : this.error;
+      const loaded = targetFeed ? Boolean(targetFeed.data && !targetFeed.error && Array.isArray(targetFeed.data.topology)) : Boolean(this.data && !this.error && Array.isArray(this.data.topology));
+      notify({ title: "Rig space", body: failure ? String(failure) : loaded ? STALE_RIG_REFUSAL : "OpenRig hasn't loaded this rig yet. Try again in a moment.", level: "warning" });
+      return;
+    }
     const resolved = byId.rig ? byId : resolveRig(rawTopo, { name: id, conn, config: this.config, multi });
     if (resolved.ambiguous) { notify({ title: "Rig space", body: resolved.reason ?? AMBIGUOUS_NAME, level: "warning" }); return; }
     const rig = resolved.rig;
@@ -2001,7 +2009,7 @@ export default class RigSidebar extends View {
           pushTabPage({ shared, setShared, panes }, viewPane.tab, rigEntry, { spaceConn: machineSpaceConn(this.config, activeSp) });
           if (commands().some((c) => c.name === "tab.select")) run("tab.select", { id: viewPane.tab });
         }
-        this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval,relocation,continueWorker,conn), feed, rig.name);
+        this.reviewMachine(result, (cx, approval) => this.openRigSpace(cx, id, rebuild, approval,relocation,continueWorker,conn,exactId), feed, rig.name);
       }
       else if (result.relocated)this.gridMoveResult={...result,name:rig.name,rigId:rig.id,conn:rig.conn,machine:config.daemonMachine,
         changedRows:(result.changed??[]).map(session=>({name:this.gridSeatName(rig,session),reason:result.changedReasons?.[session]??"it changed"})),
