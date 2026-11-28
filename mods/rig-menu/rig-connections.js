@@ -345,7 +345,6 @@ export function partitionRowsByConnection(rows, pred = null, { conn = null, conf
  */
 export function resolveRig(rigs, { rigId, name, conn = null, config = null, multi = null, allowNameFallback } = {}) {
   const list = Array.isArray(rigs) ? rigs : [];
-  const adoption = connectionAdoption(list, { conn, config, multi });
   const distinctConns = (entries) => new Set(entries.map((e) => e.conn ?? "")).size;
 
   if (rigId) {
@@ -356,7 +355,7 @@ export function resolveRig(rigs, { rigId, name, conn = null, config = null, mult
     if (eligible.length > 0) {
       return { rig: eligible[0].row, conn: eligible[0].conn, ambiguous: false };
     }
-    if (adoption.isMulti || allowNameFallback === false) {
+    if (allowNameFallback !== true) {
       const nameCollision = partitionRowsByConnection(list, (r) => r.name === rigId && r.id !== rigId, { conn, config, multi });
       // Rejected unstamped rows are never owner evidence, but a name match on one still proves collision with a stale explicit ID.
       const staleIdNameCollision = nameCollision.eligible.length > 0 || nameCollision.unstampedRejected.length > 0;
@@ -403,6 +402,17 @@ export function resolvePod(rigs, { rigId = null, rigName = null, podName, conn =
   const { eligible } = partitionRowsByConnection(list, hasPod, { conn, config, multi });
   if (new Set(eligible.map((e) => e.conn ?? "")).size > 1) {
     return { rig: undefined, conn: null, ambiguous: true, reason: AMBIGUOUS_NAME };
+  }
+  const distinctRigs = [...new Map(eligible.map((e) => [`${e.conn ?? ""}\0${e.row?.id ?? e.row?.name ?? ""}`, e.row])).values()];
+  if (distinctRigs.length > 1) {
+    const names = distinctRigs.map((r) => r?.name ?? r?.id).filter(Boolean);
+    const example = names[0] ? `pod ${names[0]}/${podName}` : `pod <rig>/${podName}`;
+    return {
+      rig: undefined,
+      conn: null,
+      ambiguous: true,
+      reason: `More than one rig has a pod named ${podName} (${names.join(", ")}). Name the rig too, such as ${example}.`,
+    };
   }
   if (eligible.length > 0) return { rig: eligible[0].row, conn: eligible[0].conn, ambiguous: false };
   return { rig: undefined, conn: conn ?? null, ambiguous: false };
@@ -453,7 +463,7 @@ export function ambiguousSeatMessage(seatArg, picked, { prefix = "", write = fal
  *  OpenRig (or an unadoptable unstamped row), or `{ ambiguous: "rig", rigs, seats }` when it matches more than one seat inside one connection. */
 export function pickSeat(rigs, match, { conn = null, rigId = null, config = null, multi = null, allowFirst = false } = {}) {
   const list = Array.isArray(rigs) ? rigs : [];
-  const { eligible } = partitionRowsByConnection(
+  const { eligible, unstampedRejected } = partitionRowsByConnection(
     list,
     (rig) => !rigId || rig.id === rigId,
     { conn, config, multi },
@@ -479,7 +489,10 @@ export function pickSeat(rigs, match, { conn = null, rigId = null, config = null
       seats: hits.map((h) => `${h.seat?.logicalId ?? h.seat?.member ?? h.seat?.session}@${h.rig?.name}`),
     };
   }
-  if (!hits.length) return {};
+  if (!hits.length) {
+    if (unstampedRejected.some((rig) => matchSeats(rig).length > 0)) return { ambiguous: true };
+    return {};
+  }
   return { rig: hits[0].rig, seat: hits[0].seat, ...(hits[0].conn ? { conn: hits[0].conn } : {}) };
 }
 

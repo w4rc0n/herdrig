@@ -659,7 +659,7 @@ export default class RigPalette extends View {
       const acting = this.actingOn(top, opts); // the row's box, else the page's, else the followed one's, never the merged list
       if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return true; }
       const conn = opts.conn ?? (this.perBox() ? acting?.config?.connectionId : null) ?? null;
-      const route = paletteRoute({ line, ...(conn ? { conn } : {}) }, top, this.rigsOf(acting), conn, this.config);
+      const route = paletteRoute({ line, ...(conn ? { conn } : {}), ...(opts.rigId ? { rigId: opts.rigId } : {}) }, top, this.rigsOf(acting), conn, this.config);
       if (route.error) { this.error = route.error; cx.notify(); return true; }
       this.applyRoute(route, acting);
       return true;

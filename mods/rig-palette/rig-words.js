@@ -47,7 +47,13 @@ function withoutPaths(text) {
 }
 /** Human wording plus the original diagnostic. Callers keep detail in Details/Copy and their error log. */
 export function plainError(error, { where = "OpenRig's machine", what = null, who = where === "OpenRig's machine" ? "OpenRig" : where === "this computer" ? "The rig command" : where, toast = false, readingReply = true, outcomeUnknown = false } = {}) {
-  const detail = errorDiagnostic(error ?? "The operation failed without saying why.");
+  let detail;
+  try {
+    detail = errorDiagnostic(error ?? "The operation failed without saying why.");
+  } catch {
+    const text = "The error details couldn't be read.";
+    return { text, detail: text };
+  }
   // Certainty wins over nicer wording. Preserve the whole caution, including the producer's recovery advice.
   if (outcomeUnknown || /\bunconfirmed\b|\boutcome\s+is\s+unknown\b|\bnot\s+confirmed\b|\b(?:may|might)\s+(?:still\s+)?(?:not\s+)?have\b|\bdid(?:n't| not)\s+finish\s+in\s+time\b|\bpartly done\b|\bearlier part was recorded\b|\bwrite reached\b|\banswer couldn't be read\b/i.test(detail)) {
     return { text: withoutPaths(detail), detail };
