@@ -4995,6 +4995,7 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
     const matched = matchRigRef(item.rig, true);
     if (matched) return matched;
   }
+  let sweepOwnerConn = null;
   const check = sweepFinding(item);
   if (check?.about && Array.isArray(items)) {
     const visited = seen ?? new Set();
@@ -5005,13 +5006,14 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
       { conn: scopedConn, config, multi: adoption.isMulti },
     );
     if (!eligible.length && unstampedRejected.length > 0) {
-      return { rig: null, rigId: null, key: String(check.about), ambiguous: true, ...(scopedConn ? { unownedNeed: true, reason: AMBIGUOUS_REQUEST } : {}) };
+      return { rig: null, rigId: null, key: String(check.about), ambiguous: true, unownedNeed: true, reason: AMBIGUOUS_REQUEST };
     }
     if (!scopedConn && new Set(eligible.map((e) => e.conn ?? "")).size > 1) {
       return { rig: null, rigId: null, key: String(check.about), ambiguous: true };
     }
     const targetEntry = (scopedConn ? eligible.find((e) => e.row.conn === scopedConn) : null) ?? eligible[0];
     const target = targetEntry?.row ?? null;
+    if (targetEntry?.conn) sweepOwnerConn = targetEntry.conn;
     if (target && !visited.has(String(target.id ?? ""))) {
       const resolved = needRigOf(target, topo, targetEntry.conn ?? scopedConn ?? null, items, visited, config);
       if (resolved) return resolved;
@@ -5085,13 +5087,15 @@ export function needRigOf(item, topology = [], conn = null, items = null, seen =
   const byPrimaryBare = resolveBare(primary.bare);
   if (byPrimaryBare) return byPrimaryBare;
   const secondary = splitSessions(secondarySessions);
-  return resolveQualified(secondary.qualified) ?? resolveBare(secondary.bare);
+  return resolveQualified(secondary.qualified)
+    ?? resolveBare(secondary.bare)
+    ?? (sweepOwnerConn ? { rig: null, rigId: null, key: null, conn: sweepOwnerConn, ambiguous: false } : null);
 }
 
 /** Resolve the rig of a Needs-You entry by its attention `id` from `items` and `topology` (connection-scoped). */
 export function resolveNeedRig(id, { items = [], topology = [], conn = null, config = null } = {}) {
   const want = typeof id === "string" ? id.trim() : "";
-  if (!want || isHealthAttention({ id: want }) || !Array.isArray(items) || !items.length) return null;
+  if (!want || !Array.isArray(items) || !items.length) return null;
   const multi = connectionAdoption(topology, { conn, config }).isMulti;
   const { eligible, unstampedRejected } = partitionRowsByConnection(
     items,
@@ -5100,7 +5104,7 @@ export function resolveNeedRig(id, { items = [], topology = [], conn = null, con
   );
   if (!eligible.length) {
     if (unstampedRejected.length > 0) {
-      return { rig: null, rigId: null, key: want, ambiguous: true, ...(conn ? { unownedNeed: true, reason: AMBIGUOUS_REQUEST } : {}) };
+      return { rig: null, rigId: null, key: want, ambiguous: true, unownedNeed: true, reason: AMBIGUOUS_REQUEST };
     }
     return null;
   }
@@ -5108,7 +5112,12 @@ export function resolveNeedRig(id, { items = [], topology = [], conn = null, con
     return { rig: null, rigId: null, key: want, ambiguous: true };
   }
   const chosen = (conn ? eligible.find((e) => e.row.conn === conn) : null) ?? eligible[0];
-  return needRigOf(chosen.row, topology, chosen.conn ?? conn ?? null, items, null, config);
+  const ownerConn = chosen.conn ?? conn ?? null;
+  const resolved = isHealthAttention({ id: want })
+    ? null
+    : needRigOf(chosen.row, topology, ownerConn, items, null, config);
+  if (resolved) return resolved;
+  return ownerConn ? { rig: null, rigId: null, key: null, conn: ownerConn, ambiguous: false } : null;
 }
 
 /**
