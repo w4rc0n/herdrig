@@ -890,16 +890,20 @@ export async function routeOpen(host,config,request={}){
     (typeof config.daemonMachine!=="string"||!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(config.daemonMachine)))
     return fail("daemonMachine must name a Herdr machine. No local terminal was started.");
   const selected={...request,sourceSpace:request.sourceSpace??active(host)};
-  const preRig=selected.kind==="page"&&!selected.background&&!selected.home?requestRig(host,selected,config):null;
-  if(preRig?.unownedNeed)return fail(preRig.ambiguousReason||AMBIGUOUS_NAME);
-  // A page with no entry is Topology, stamped with this connection when several are set up (an unstamped page names no OpenRig there).
-  if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),selected.entry??{section:"topology",...((config?.connections?.length??0)>1&&config?.connectionId?{conn:config.connectionId}:{})}));
   const tree=typeof host.layout==="function"?host.layout():host.layout;
   // Attach owns its normal open path unless a shown sidebar has a live lease; no envelope can cause a second open later.
   // Other request kinds also use their existing own path when the sidebar is not shown.
   const forward = selected.kind === "attach"
     ? receiverLive(host) && layoutShowsMod(tree,MOD_IDS.sidebar)
     : layoutShowsMod(tree,MOD_IDS.sidebar);
+  const preRig=selected.kind==="page"&&!selected.background&&!selected.home?requestRig(host,selected,config):null;
+  if(preRig?.unownedNeed)return fail(preRig.ambiguousReason||AMBIGUOUS_NAME);
+  if((host.routeOwner||!forward)&&!selected.background&&preRig&&!preRig.ambiguous&&preRig.conn&&config?.connectionId&&preRig.conn!==config.connectionId)return fail(OTHER_CONNECTION_REFUSAL);
+  // A page with no entry is Topology, stamped with this connection when several are set up (an unstamped page names no OpenRig there).
+  const navEntry=selected.entry
+    ? (!selected.entry.conn&&preRig?.conn&&!preRig.ambiguous&&(config?.connections?.length??0)>1?{...selected.entry,conn:preRig.conn}:selected.entry)
+    : {section:"topology",...((config?.connections?.length??0)>1&&config?.connectionId?{conn:config.connectionId}:{})};
+  if(selected.kind==="page") host.setShared?.("rig.nav",navPush(host.shared?.("rig.nav"),navEntry));
   if(!host.routeOwner && !selected.background && forward){
     const explicitConn=selected.conn??selected.entry?.conn??selected.seat?.conn;
     const routedRig=!explicitConn&&selected.kind==="page"?(preRig??requestRig(host,selected,config)):null;
