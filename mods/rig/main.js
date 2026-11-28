@@ -15,7 +15,7 @@ import { configWatchChanged } from "./rig-lib.js";
 //   `<appHome>/openrig/state.json`.
 // - One-click writes (`rig.oneclick`, rig-lib startOneClick) run here, as the person: this copy outlives the popup that
 //   asked. Progress, success and failure go to `shared("rig.status")` and a toast.
-import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, AMBIGUOUS_RIG, NO_CONNECTION, formatHostId, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
+import { stampConnection, spaceStatusKey, targetConnection, connectionConfig, qualifyKey, adoptConnection, consentOf, consentText, LEGACY_CONNECTION_ID, addressParts, EXPLICIT_ADDRESS_NEEDED, configOfConnection, UNKNOWN_CONNECTION, AMBIGUOUS_NAME, AMBIGUOUS_REQUEST, AMBIGUOUS_RIG, NO_CONNECTION, resolveRig, formatHostId, plainExecError, isKnownUnsentError, unsentErrorMessage } from "./rig-connections.js";
 import {loadHostedMembers,HostedMembersReader,assistantsForRig,assistantTarget,assistantWord,assistantForNeed,assistantOwner,assistantActionRefusal,verifyAssistantTarget} from './rig-connected-assistants.js';
 import {assistantGroup} from './rig-connected-assistants-view.js';
 import {SYSTEM_PAGE_VIEWS} from './rig-page-nav.js';
@@ -1914,13 +1914,15 @@ export default class RigSidebar extends View {
   }
 
   openRigSpace(cx, id, rebuild = null, consent = null, relocation = null, continueWorker = null, conn = null) {
-    // By id first (unique per OpenRig); a bare NAME two OpenRigs share is refused, never the first one's.
-    const topology = (this.data?.topology ?? []).filter(r=>!conn||(r.conn??this.primary.id)===conn), byId = topology.find((r) => r.id === id), named = topology.filter((r) => r.name === id);
-    if (!byId && new Set(named.map((r) => r.conn ?? this.primary.id)).size > 1) { notify({ title: "Rig space", body: AMBIGUOUS_NAME, level: "warning" }); return; }
-    // An id is unique within one OpenRig only: with no connection named, an id two OpenRigs both list is refused, never the first one's.
-    if (!conn && byId && new Set(topology.filter((r) => r.id === id).map((r) => r.conn ?? this.primary.id)).size > 1) { notify({ title: "Rig space", body: AMBIGUOUS_RIG, level: "warning" }); return; }
-    const rig = byId ?? named[0];
-    const feed = rig ? this.exactFeed(rig.conn) : null; // the rig's OWN connection, never the first in place of a removed one
+    // By id first (unique per OpenRig); a bare NAME or duplicate ID across OpenRigs is refused via the shared resolver.
+    const rawTopo = this.data?.topology ?? [], multi = this.feeds.length > 1;
+    const byId = resolveRig(rawTopo, { rigId: id, conn, config: this.config, multi, allowNameFallback: false });
+    if (byId.ambiguous) { notify({ title: "Rig space", body: byId.reason ?? AMBIGUOUS_RIG, level: "warning" }); return; }
+    const resolved = byId.rig ? byId : resolveRig(rawTopo, { name: id, conn, config: this.config, multi });
+    if (resolved.ambiguous) { notify({ title: "Rig space", body: resolved.reason ?? AMBIGUOUS_NAME, level: "warning" }); return; }
+    const rig = resolved.rig;
+    const rigConn = resolved.conn ?? rig?.conn ?? null;
+    const feed = rig ? this.exactFeed(rigConn) : null; // the rig's OWN connection, never the first in place of a removed one
     if (rig && !feed) { notify({ title: "Rig space", body: UNKNOWN_CONNECTION, level: "warning" }); return; }
     // A real error passes through unchanged: the rig's own feed's, or (no rig found yet) the sidebar's own, as before; the retry line only when nothing failed.
     const failure = rig ? feed.error : this.error;
@@ -5462,7 +5464,7 @@ export default class RigSidebar extends View {
             const key=`workflow:${context.project??''}:${m.mission}:${wf.id}`,expanded=branchFoldOpen(folds,key,true),entry=workflowEntry(context,wf);
             const rowTopology=this.feeds.length>1?(rowFeed?.data?.topology??[]):(this.data?.topology??[]);
             const menuTarget=owner=>{
-              const found=resolveAskerSeat(owner,rowTopology,this.feeds.length>1?rowConn:null),s=found.seat;
+              const found=resolveAskerSeat(owner,rowTopology,this.feeds.length>1?rowConn:null,this.config),s=found.seat;
               const ownerConn=s?.conn??rowConn;
               return {kind:'workflow',...(this.feeds.length>1&&rowConn?{conn:rowConn}:{}),id:wf.id,name:wf.title,ownerEntry:found.found?{section:'topology',kind:'seat',rig:s.rig,rigId:s.rigId,...(ownerConn?{conn:ownerConn}:{}),name:s.logicalId,session:s.session}:null};
             };

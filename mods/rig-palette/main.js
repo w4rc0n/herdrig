@@ -659,7 +659,7 @@ export default class RigPalette extends View {
       const acting = this.actingOn(top, opts); // the row's box, else the page's, else the followed one's, never the merged list
       if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return true; }
       const conn = opts.conn ?? (this.perBox() ? acting?.config?.connectionId : null) ?? null;
-      const route = paletteRoute({ line, ...(conn ? { conn } : {}) }, top, this.rigsOf(acting), conn);
+      const route = paletteRoute({ line, ...(conn ? { conn } : {}) }, top, this.rigsOf(acting), conn, this.config);
       if (route.error) { this.error = route.error; cx.notify(); return true; }
       this.applyRoute(route, acting);
       return true;
@@ -678,13 +678,13 @@ export default class RigPalette extends View {
       const caps = this.caps(acting.config?.connectionId);
       const reason = caps ? capabilityDisableReason("design-view", caps) : null;
       if (reason) { this.note = reason; cx.notify(); return true; }
-      picked = pickRig(this.rigsOf(acting), { name, conn: opts.conn, rigId: opts.rigId });
+      picked = pickRig(this.rigsOf(acting), { name, conn: opts.conn, rigId: opts.rigId, config: this.config });
     } else if (this.gonePage(top)) { this.error = this.gonePage(top); this.note = null; cx.notify(); return true; } // the page in view belongs to a removed connection
     else if (top?.kind === "rig") {
       const caps = this.caps(top.conn ?? null);
       const reason = caps ? capabilityDisableReason("design-view", caps) : null;
       if (reason) { this.note = reason; cx.notify(); return true; }
-      picked = pickRig(all, { rigId: top.rigId, conn: top.conn }); // no name: the rig the PAGE shows, on its own box
+      picked = pickRig(all, { rigId: top.rigId, conn: top.conn, config: this.config }); // no name: the rig the PAGE shows, on its own box
     } else if (this.perBox()) { this.error = "Name a rig (view-design <rig>), or open its page first: this palette works across several OpenRigs."; this.note = null; cx.notify(); return true; } // never the first
     else {
       const caps = this.caps(this.config?.connectionId);
@@ -708,7 +708,7 @@ export default class RigPalette extends View {
     if (seatArg) { // a NAME resolves among the acting box's seats (the chosen row's, else the followed one's): `dev-one@demo` exists on each box
       const acting = this.actingOn(top, opts); // the row's box, else the page's, else the followed one's
       if (!acting.ok) { this.error = acting.reason; this.note = null; cx.notify(); return true; }
-      picked = pickSeat(this.rigsOf(acting), (seat, rig, pod) => seatMatchesRef(seat, rig, pod, seatArg), { conn: opts.conn, rigId: opts.rigId });
+      picked = pickSeat(this.rigsOf(acting), (seat, rig, pod) => seatMatchesRef(seat, rig, pod, seatArg), { conn: opts.conn, rigId: opts.rigId, config: this.config });
     } else {
       // No name: the seat the PAGE shows, on its own box (never searched in another box).
       if (this.gonePage(top)) { this.error = this.gonePage(top); this.note = null; cx.notify(); return true; } // the page in view belongs to a removed connection
@@ -716,12 +716,12 @@ export default class RigPalette extends View {
         ? pickSeat(
             all,
             (seat, rig) => (top.session ? seat.session === top.session : seat.logicalId === top.name) && (!top.rig || rig.name === top.rig),
-            { conn: top.conn, rigId: top.rigId },
+            { conn: top.conn, rigId: top.rigId, config: this.config },
           )
         : {};
       if (shownSeat.seat || shownSeat.ambiguous) picked = shownSeat;
       else if (this.perBox()) { this.error = "Name a seat (change-model <seat>), or open its page first: this palette works across several OpenRigs."; this.note = null; cx.notify(); return true; } // never the first
-      else picked = pickSeat(all, () => true, { allowFirst: true });
+      else picked = pickSeat(all, () => true, { allowFirst: true, config: this.config });
     }
     if (picked.ambiguous) {
       this.error = ambiguousSeatMessage(seatArg ?? top?.name ?? "seat", picked, { write: true });
@@ -804,7 +804,7 @@ export default class RigPalette extends View {
         // The page the line was typed on, as `acting` is its OpenRig: a page shown by the time the resolve answers never re-aims the act.
         const top = pageTop ?? { section: "topology" };
         const conn = opts.conn ?? (this.perBox() ? acting?.config?.connectionId : null) ?? null;
-        const route = paletteRoute({ ...res, line, ...(conn ? { conn } : {}), ...(opts.rigId ? { rigId: opts.rigId } : {}) }, top, this.rigsOf(acting), conn);
+        const route = paletteRoute({ ...res, line, ...(conn ? { conn } : {}), ...(opts.rigId ? { rigId: opts.rigId } : {}) }, top, this.rigsOf(acting), conn, this.config);
         if (route.error) { this.error = route.error; cx.notify(); return; }
         if (route.note) { this.note = route.note; cx.notify(); return; }
         if (route.back) { this.goBack(nav, pageTop, acting); return; }
@@ -894,7 +894,7 @@ export default class RigPalette extends View {
 
   /** The operator seat of the kernel of the connection the palette acts for (the merged data holds every connection's kernel: never the first one's). */
   operatorTarget(config, topology) {
-    const kernelRig = rigOfConnection(topology, "kernel", config?.connectionId);
+    const kernelRig = rigOfConnection(topology, "kernel", config?.connectionId, this.config);
     const operatorSeat = kernelRig?.pods?.flatMap((p) => p.seats ?? [])?.find((s) => s.logicalId === "operator.agent" || String(s.session ?? "").startsWith("operator-agent@"));
     return {
       kind: "seat",

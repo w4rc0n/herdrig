@@ -2,13 +2,13 @@
 
 ## v0.5.19
 
-A cleaner, centered Rig graph that keeps your rig's own pod order and puts open task counts on seat cards, plus clearer compaction errors and connection-scoped palette and Needs routing.
+A cleaner, centered Rig graph that keeps your rig's own pod order and puts open task counts on seat cards, plus clearer compaction errors and connection-scoped rig routing across Herdrig.
 
-- **Centered Rig graph in your rig's pod order:** the Rig graph centers its pod columns beneath the lead pod in the rig spec's own pod order, wraps long pod names onto two lines instead of truncating them, and keeps in-pod delegation chains stacked directly together. Open tasks appear as a green count badge on the target seat card rather than wires over the heading or numbers on lines, cross-pod links route cleanly between columns with wider gutter spacing and staggered turns, and links that don't fit or cross rows stay clickable as card tags.
+- **Centered Rig graph in your rig's pod order:** the Rig graph centers its pod columns beneath the lead pod in the order of the rig spec, wraps long pod names, and keeps in-pod delegation chains stacked together. Seat cards count the same open tasks as their relationship panels, including work from outside the rig, and selected-seat relationship panels grow cleanly with wrapped card content. Cross-pod links use wider gutters and staggered turns. In-pod branches, links that exceed gutter capacity, and cross-row links stay reachable as clickable card tags.
 - **Named exceptions in Rig graph headings:** broad delegation headings above the columns now name one or two skipped seats (for example, `except daemon.qa and layer.build2`) and show a count only for three or more.
 - **Clearer compaction recovery and plain OpenRig errors:** when a compaction reply is lost or unreadable, the confirmation dialog and seat card show a readable warning explaining what to check next, and **Check again** on a Pi seat clears that warning once OpenRig records a completion after the fallback command started. Structured OpenRig errors across Herdrig now render their explanation and next step in plain text.
 - **No Resume button for a disabled operator:** Topology and rig-space menus hide **Resume** when OpenRig was started with its operator turned off on purpose, and the rig header notes `operator off` instead.
-- **Connection-scoped palette and Needs rig routing:** command palette rig commands (`overview`, `recent`, `rig`, `pod`) stay on the active OpenRig connection and refuse ambiguous or stale rig IDs across multiple OpenRigs instead of opening the wrong rig. Needs rig lookups likewise refuse to fall back from a stale rig ID to another rig's name across multiple OpenRigs and match unstamped topology rows only when one OpenRig is configured.
+- **Connection-scoped rig and seat routing across Herdrig:** with more than one OpenRig connected, rig and seat lookups across the sidebar, menus, Rig pages, rig spaces, Needs, and command palette (`overview`, `recent`, `rig`, `pod`) stay on the active OpenRig connection, match unstamped topology rows only when one OpenRig is configured, and ask or refuse rather than guessing or falling back from a stale rig ID to another rig's name.
 
 ## v0.5.18
 

@@ -352,6 +352,22 @@ export function graphColumnModel(graph) {
 
 const COLUMN_WIDTH = 208, COLUMN_CARD = 188, COLUMN_CARD_H = 52, COLUMN_CARD_GAP = 10;
 
+function columnHeaderHeight(pod,width) {
+  const countWidth=(String(pod.seats.length).length+6)*6.7;
+  const budget=Math.max(12,width-20-8-countWidth);
+  const words=String(pod.label??pod.id).trim().split(/\s+/u);
+  let lines=1,used=0;
+  for(const word of words){
+    const size=Array.from(word).reduce((sum,letter)=>sum+(/^[\u0021-\u007e]$/.test(letter)?6.7:11.5),0);
+    if(used&&used+4+size>budget){lines++;used=0;}
+    if(used)used+=4;
+    const extra=Math.max(0,Math.ceil(size/budget)-1);
+    lines+=extra;
+    used+=size-extra*budget;
+  }
+  return lines*16+10;
+}
+
 export function graphHeadingTitle(graph, heading) {
   const names = heading.columns.map(id => graph.pods.find(pod => pod.id === id)?.label ?? id).join(", ");
   const count = heading.skipped.size;
@@ -374,7 +390,8 @@ function orderColumnSeats(pod, edges, lead) {
   const ready = id => remaining.has(id)&&![...incoming.get(id)??[]].some(from=>remaining.has(from));
   while (remaining.size) {
     const successors=outgoing.get(ordered.at(-1)?.lid);
-    const next=ordered.length===0&&ready(lead)?lead:successors?.size===1?[...successors][0]:null;
+    const next=ordered.length===0&&ready(lead)?lead
+      :successors?[...remaining.keys()].find(id=>successors.has(id)&&ready(id)):null;
     const id=ready(next)?next:[...remaining.keys()].find(ready)??remaining.keys().next().value;
     ordered.push(remaining.get(id));
     remaining.delete(id);
@@ -410,7 +427,7 @@ function columnRoutePlan(links, positions, seatIndices, narrow, excluded) {
       planned.push({ edge, type: "chain" });
       return [];
     }
-    if (a === b) return [];
+    if (a === b) { tag(edge); return []; }
     if (narrow||a.row !== b.row||excluded===null||excluded.has(columnRouteKey(edge))) { tag(edge); return []; }
     const right = b.col > a.col, span = Math.abs(a.col - b.col);
     const startGap = right ? a.col : a.col - 1, endGap = right ? b.col - 1 : b.col;
@@ -517,7 +534,7 @@ function layoutGraphColumns(graph,width,model,work,excluded,pass){
       bracketBottom=lineY+(narrow?4:14);
     }
     if(bracketBottom>y)y=bracketBottom+(narrow?0:4);
-    const headerHeight=row.some(pod=>String(pod.label??pod.id).length*6.7+52>w-24)?42:26;
+    const headerHeight=Math.max(...row.map(pod=>columnHeaderHeight(pod,w)));
     const cardH=narrow?CARD_H:COLUMN_CARD_H;
     const cardGap=narrow?CARD_GAP:COLUMN_CARD_GAP;
     const wCard=narrow?w-2*POD_PAD:COLUMN_CARD;

@@ -1,5 +1,5 @@
 import { errorDiagnostic } from "./rig-words.js";
-import { connectionRows } from "./rig-connections.js";
+import { connectionRows, connectionAdoption, resolveRig } from "./rig-connections.js";
 import { publishedUnder, gateGeneration, gateSameConfig, gateIdentity, gatedFetch } from "./rig-gate.js";
 import { decodeRelayToken } from "./rig-relay-payload.js";
 // Space identity and sidebar size state use public lists and labels, never display names.
@@ -331,9 +331,12 @@ export async function prepareRigSpaceAdoption(host,config,names,options={}){
     const published=host.shared?.('rig.data'),singleConnection=(config.connections?.length??0)<=1;
     const ownPublished=publishedUnder(config,published)&&(singleConnection||published?.byConnection)
       ?(connectionRows(published,config.connectionId)??(singleConnection?published:null)):null;
-    const ownTopology=(host.topology?.()??ownPublished?.topology??[]).filter(rig=>!rig.conn||rig.conn===config.connectionId);
-    const nodes=[...Object.values(ownPublished?.nodesByRig??{}).flat(),...ownTopology.flatMap(rig=>Array.isArray(rig.seats)?rig.seats:(rig.pods??[]).flatMap(pod=>pod.seats??[]))]
-      .filter(node=>!node.conn||node.conn===config.connectionId);
+    const rawTopology=host.topology?.()??ownPublished?.topology??[];
+    const topoAdopt=connectionAdoption(rawTopology,{conn:config.connectionId??null,config});
+    const ownTopology=rawTopology.filter(rig=>rig?.conn?rig.conn===config.connectionId:topoAdopt.canAdoptUnstamped);
+    // ownPublished (via connectionRows) and ownTopology are already scoped to config.connectionId; child seat nodes omit .conn.
+    const rawNodes=[...Object.values(ownPublished?.nodesByRig??{}).flat(),...ownTopology.flatMap(rig=>Array.isArray(rig.seats)?rig.seats:(rig.pods??[]).flatMap(pod=>pod.seats??[]))];
+    const nodes=rawNodes.filter(node=>!node?.conn||node.conn===config.connectionId);
     const staleViewerTabs=decision.terminals.flatMap(({terminal:t})=>{
       const argv=t.foreground?.argv??t.argv;
       if(t.labels?.["herdr-openrig.role"]!=="attach"||!Array.isArray(argv)||argv.length!==3||!/(?:^|\/)rig-attach-relay\.cjs$/.test(argv[1]))return [];
@@ -537,13 +540,20 @@ export const unconfirmedSpaceReason=(rigName,machine,origin,daemonUrl,other=null
 export function topologyRig(host,refs,config){
   // The sidebar's rows vouch only for the daemon they were read from: the same gate as every other reader of `rig.data` (a refused list or no config reads nothing; other settings' rows are not used).
   const published=host.topology?null:host.shared?.("rig.data");
-  const conn=config?.connectionId??null,multi=(config?.connections?.length??0)>1;
+  const conn=config?.connectionId??null;
   const scoped=conn?connectionRows(published,conn):published;
   const ownTopology=scoped?.topology??(scoped?.answering===false?null:published?.topology);
   const raw=host.topology?.()??(config&&!config.configInvalid&&publishedUnder(config,published)?ownTopology:null)??[];
-  const topology=conn?raw.filter(rig=>rig?.conn?rig.conn===conn:!multi):raw;
   const wanted=(refs??[]).filter(Boolean);
-  return topology.find(rig=>wanted.some(ref=>rig.id===ref||rig.name===ref))??null;
+  for(const ref of wanted){
+    const byId=resolveRig(raw,{rigId:ref,conn,config,allowNameFallback:false});
+    if(byId.ambiguous)return null;
+    if(byId.rig)return byId.rig;
+    const byName=resolveRig(raw,{name:ref,conn,config});
+    if(byName.ambiguous)return null;
+    if(byName.rig)return byName.rig;
+  }
+  return null;
 }
 
 /** One label-based destination lookup for pages, grids and Attach; never infer ownership from a display name. */

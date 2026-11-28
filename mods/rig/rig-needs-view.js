@@ -2,7 +2,7 @@
 // (https://github.com/herdrdev/herdr-app), licensed under the Apache License, Version 2.0.
 // Modified for herdrig: OpenRig seats and asks instead of herdr agents; see Third-party code in README.md.
 // This file is licensed under the Apache License, Version 2.0 (LICENSES/herdr-app-Apache-2.0.txt).
-import { qualifyKey } from "./rig-connections.js";
+import { qualifyKey, connectionAdoption } from "./rig-connections.js";
 import { needsToastFor, diffNeedsNotifications, findAttachedSeat, seatOrigin, statusMarkElement, isUpdateNeed, needsRowHeadline, statusNeedHalo, resolveAskerSeat, sweepFinding, checkLabel, isRunnerPermissionNeed } from "./rig-lib.js";
 
 export const PRIORITY_GROUPS = [
@@ -55,7 +55,7 @@ export class NeedsTracker {
     this.held = null;
   }
 
-  update(topology = [], attention = [], { now = Date.now(), focusedSession = null, terminals = [] } = {}) {
+  update(topology = [], attention = [], { now = Date.now(), focusedSession = null, terminals = [], config = null } = {}) {
     const rows = topology.flatMap((rig) => rig.pods.flatMap((pod) => pod.seats.map((seat) => ({
       key: qualifyKey(rig.conn, `seat:${seat.session}`), kind: "seat", seat, rig, pod: pod.name, name: seat.logicalId, asks: [], // the same session on two OpenRigs is two rows
       helpers: helpersOf(seat, terminals),
@@ -63,17 +63,18 @@ export class NeedsTracker {
     // A request belongs to the seat of ITS OWN connection: the same session name (every kernel has operator-agent@kernel) exists on each OpenRig.
     const bySession = new Map();
     for (const r of rows) { const list = bySession.get(r.seat.session) ?? []; list.push(r); bySession.set(r.seat.session, list); }
-    const sameConn = (ask, rig) => ask.conn == null || rig?.conn == null || ask.conn === rig.conn;
-    const seatOf = (ask, session) => {
-      const matches = (bySession.get(session) ?? []).filter((r) => sameConn(ask, r.rig));
+    const sameConn = (ask, rig, adopt) => (rig?.conn != null ? (ask.conn == null || ask.conn === rig.conn) : adopt.canAdoptUnstamped);
+    const seatOf = (ask, session, adopt) => {
+      const matches = (bySession.get(session) ?? []).filter((r) => sameConn(ask, r.rig, adopt));
       // A connection-less ask whose session exists on several OpenRigs belongs to none of them: the same session name is a different seat
       // on each box, so attaching to the first would be a wrong-box action. It keeps its own row instead.
       return ask.conn == null && matches.length > 1 ? null : (matches[0] ?? null);
     };
     for (const ask of attention ?? []) {
       if (!ask?.id || isUpdateNeed(ask) || ["done", "closed", "denied", "canceled", "handed-off"].includes(ask.state)) continue;
+      const adopt = connectionAdoption(topology, { conn: ask.conn ?? null, config });
       const session = ask.answer?.verb === "resolve" || ask.reply === "resolve" ? ask.waiting?.owner ?? ask.destinationSession : ask.asker ?? ask.sourceSession;
-      const owner = seatOf(ask, session) ?? seatOf(ask, resolveAskerSeat(session, topology.filter((r) => sameConn(ask, r))).seat?.session);
+      const owner = seatOf(ask, session, adopt) ?? seatOf(ask, resolveAskerSeat(session, topology, ask.conn ?? null, config).seat?.session, adopt);
       const check = sweepFinding(ask);
       const permission = !check && isRunnerPermissionNeed(ask);
       if (!check && !permission && owner && !excluded(owner.seat)) owner.asks.push(ask);

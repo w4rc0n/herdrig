@@ -281,6 +281,8 @@ export const tuiCommandFor = (config) => ((config?.connections?.length ?? 0) > 1
 export const AMBIGUOUS_REQUEST = "That request is on more than one OpenRig. Open it from its row in the sidebar. Nothing was opened.";
 /** A rig id (or no-arg rig route) that spans more than one OpenRig without a connection. */
 export const AMBIGUOUS_RIG = "That rig is on more than one OpenRig. Open it from its row in the sidebar, which names the machine. Nothing was opened.";
+/** A stale explicit rig id that no longer exists in OpenRig's topology (never silently falls back to a name match or keyless page). */
+export const STALE_RIG_REFUSAL = "That rig isn't in OpenRig's topology right now. Nothing was opened.";
 /** A bare seat name that appears in more than one rig on the same OpenRig, asked for without a rig or scope. */
 export const AMBIGUOUS_RIG_SEAT = "That seat name is in more than one rig. Open it from its rig in the sidebar. Nothing was opened.";
 /** A row or group key made specific to one connection, so two OpenRigs never share a fold, order or selection key. The legacy connection's
@@ -293,23 +295,117 @@ export const spaceStatusKey = (conn, rigId, many) => (many ? qualifyKey(conn, ri
 
 /** Said when a name the person typed (or a bare name a row carried) is on more than one OpenRig: it is refused, never picked. */
 export const AMBIGUOUS_NAME = "That name is on more than one OpenRig. Pick it in the sidebar, which names the machine. Nothing was sent.";
-const connsOf = (list) => new Set(list.map((r) => r?.conn ?? "")).size;
-/** A row is on a connection unless it names another (a row without one comes from a single-OpenRig setup, where there is only one). */
-const onConn = (row, conn) => !conn || !row?.conn || row.conn === conn;
 
-/** The rig a reference means in the merged list of every connection's rigs: { rig } (undefined when there is none) or { ambiguous: true }.
- *  An id is exact (with its connection when given) and, with several OpenRigs, never falls back to a name; a name that is on more than one
- *  OpenRig is ambiguous (the same `demo` and `kernel` exist on every one). With one OpenRig this is the plain id-or-name lookup. */
-export function pickRig(rigs, { rigId, conn, name } = {}) {
-  const list = Array.isArray(rigs) ? rigs : [];
-  if (rigId) {
-    const hits = list.filter((r) => r.id === rigId && onConn(r, conn));
-    if (connsOf(hits) > 1) return { ambiguous: true };
-    if (hits.length || connsOf(list) > 1) return { rig: hits[0] };
+/**
+ * Single adoption-rule policy for unstamped rows across every rig/seat/pod lookup:
+ * - An unstamped row (missing `conn`) is adoptable ONLY when at most one OpenRig is configured (and matches `conn` if given).
+ * - Pure: callers may pass `multi: true/false` directly (e.g. `(config?.connections?.length ?? 0) > 1`) or pass `config`.
+ */
+export function connectionAdoption(rows, { conn = null, config = null, multi = null } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const knownConnCount = Array.isArray(config?.connections) ? config.connections.length : null;
+  const soleConnId = knownConnCount === 1 ? (config.connections[0]?.id ?? null) : null;
+  const stampedConns = new Set(list.filter((r) => r && typeof r.conn === "string" && r.conn !== "").map((r) => r.conn));
+  const isMulti = multi === true || (knownConnCount !== null ? knownConnCount > 1 : false) || stampedConns.size > 1;
+  const canAdoptUnstamped = isMulti
+    ? false
+    : knownConnCount !== null
+      ? knownConnCount === 1 && (!conn || !soleConnId || conn === soleConnId)
+      : (stampedConns.size === 0 || (stampedConns.size === 1 && (!conn || stampedConns.has(conn))));
+  const adoptedConn = canAdoptUnstamped
+    ? (soleConnId ?? (stampedConns.size === 1 ? [...stampedConns][0] : (conn ?? null)))
+    : null;
+  return { isMulti, canAdoptUnstamped, adoptedConn, soleConnId, knownConnCount, stampedConns };
+}
+
+/** Partition rows matching `pred` into connection-eligible entries (with effective `conn`) and rejected unstamped rows. */
+export function partitionRowsByConnection(rows, pred = null, { conn = null, config = null, multi = null } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const adoption = connectionAdoption(list, { conn, config, multi });
+  const eligible = [];
+  const unstampedRejected = [];
+  for (const row of list) {
+    if (!row || typeof row !== "object") continue;
+    if (pred && !pred(row)) continue;
+    if (typeof row.conn === "string" && row.conn !== "") {
+      if (!conn || row.conn === conn) eligible.push({ row, conn: row.conn });
+    } else if (adoption.canAdoptUnstamped) {
+      eligible.push({ row, conn: adoption.adoptedConn ?? conn ?? null });
+    } else {
+      unstampedRejected.push(row);
+    }
   }
-  if (!name) return { rig: undefined };
-  const hits = list.filter((r) => r.name === name && onConn(r, conn));
-  return connsOf(hits) > 1 ? { ambiguous: true } : { rig: hits[0] };
+  return { eligible, unstampedRejected, adoption };
+}
+
+/**
+ * Shared rig resolver applying (connection, id) identity, the unstamped-row adoption rule, and refuse-on-ambiguity:
+ * returns `{ rig, conn, ambiguous: false }`, `{ rig: undefined, conn: null, ambiguous: true, reason }`,
+ * or `{ rig: undefined, conn: null, ambiguous: false, staleIdNameCollision? }`.
+ */
+export function resolveRig(rigs, { rigId, name, conn = null, config = null, multi = null, allowNameFallback } = {}) {
+  const list = Array.isArray(rigs) ? rigs : [];
+  const adoption = connectionAdoption(list, { conn, config, multi });
+  const distinctConns = (entries) => new Set(entries.map((e) => e.conn ?? "")).size;
+
+  if (rigId) {
+    const { eligible } = partitionRowsByConnection(list, (r) => r.id === rigId, { conn, config, multi });
+    if (distinctConns(eligible) > 1) {
+      return { rig: undefined, conn: null, ambiguous: true, reason: AMBIGUOUS_RIG };
+    }
+    if (eligible.length > 0) {
+      return { rig: eligible[0].row, conn: eligible[0].conn, ambiguous: false };
+    }
+    if (adoption.isMulti || allowNameFallback === false) {
+      const nameCollision = partitionRowsByConnection(list, (r) => r.name === rigId && r.id !== rigId, { conn, config, multi });
+      // Rejected unstamped rows are never owner evidence, but a name match on one still proves collision with a stale explicit ID.
+      const staleIdNameCollision = nameCollision.eligible.length > 0 || nameCollision.unstampedRejected.length > 0;
+      return { rig: undefined, conn: null, ambiguous: false, ...(staleIdNameCollision ? { staleIdNameCollision: true } : {}) };
+    }
+  }
+
+  if (!name) return { rig: undefined, conn: null, ambiguous: false };
+  const { eligible } = partitionRowsByConnection(list, (r) => r.name === name, { conn, config, multi });
+  if (distinctConns(eligible) > 1) {
+    return { rig: undefined, conn: null, ambiguous: true, reason: AMBIGUOUS_NAME };
+  }
+  if (eligible.length > 0) {
+    return { rig: eligible[0].row, conn: eligible[0].conn, ambiguous: false };
+  }
+  return { rig: undefined, conn: null, ambiguous: false };
+}
+
+/** The rig a reference means in the merged list of every connection's rigs: `{ rig, conn? }` (undefined when none) or `{ ambiguous: true }`. */
+export function pickRig(rigs, opts = {}) {
+  const res = resolveRig(rigs, opts);
+  if (res.ambiguous) return { ambiguous: true };
+  return res.rig ? { rig: res.rig, ...(res.conn ? { conn: res.conn } : {}) } : { rig: undefined };
+}
+
+/** Shared pod resolver applying the same (connection, id) identity, adoption rule, and ambiguity refusal as `resolveRig`. */
+export function resolvePod(rigs, { rigId = null, rigName = null, podName, conn = null, config = null, multi = null } = {}) {
+  const list = Array.isArray(rigs) ? rigs : [];
+  const hasPod = (rig) => (rig?.pods ?? []).some((p) => p?.name === podName);
+  if (rigId) {
+    const byId = resolveRig(list, { rigId, conn, config, multi, allowNameFallback: false });
+    if (byId.ambiguous) return { rig: undefined, conn: null, ambiguous: true, reason: byId.reason ?? AMBIGUOUS_RIG };
+    if (!byId.rig) return { rig: undefined, conn: null, ambiguous: false, staleRigId: list.length > 0 };
+    return hasPod(byId.rig) ? { rig: byId.rig, conn: byId.conn, ambiguous: false } : { rig: undefined, conn: byId.conn, ambiguous: false };
+  }
+  if (rigName) {
+    const byId = resolveRig(list, { rigId: rigName, conn, config, multi, allowNameFallback: false });
+    if (byId.ambiguous) return { rig: undefined, conn: null, ambiguous: true, reason: byId.reason ?? AMBIGUOUS_RIG };
+    const matched = byId.rig ? byId : resolveRig(list, { name: rigName, conn, config, multi });
+    if (matched.ambiguous) return { rig: undefined, conn: null, ambiguous: true, reason: matched.reason ?? AMBIGUOUS_NAME };
+    if (matched.rig && hasPod(matched.rig)) return { rig: matched.rig, conn: matched.conn, ambiguous: false };
+    return { rig: undefined, conn: matched.conn ?? conn ?? null, ambiguous: false };
+  }
+  const { eligible } = partitionRowsByConnection(list, hasPod, { conn, config, multi });
+  if (new Set(eligible.map((e) => e.conn ?? "")).size > 1) {
+    return { rig: undefined, conn: null, ambiguous: true, reason: AMBIGUOUS_NAME };
+  }
+  if (eligible.length > 0) return { rig: eligible[0].row, conn: eligible[0].conn, ambiguous: false };
+  return { rig: undefined, conn: conn ?? null, ambiguous: false };
 }
 
 /** Matches a seat reference typed or chosen in the palette: canonical session (`dev-one@demo`), rig-qualified id (`dev.one@demo`,
@@ -353,16 +449,29 @@ export function ambiguousSeatMessage(seatArg, picked, { prefix = "", write = fal
   return `More than one seat matches ${seatArg} (${(picked?.seats ?? []).join(", ")}). Name the full seat, such as ${example}.${tail}`;
 }
 
-/** The seat a predicate means across the merged list: { rig, seat }, {} when none, { ambiguous: true } when it matches on more than one
- *  OpenRig (`dev-one@demo` exists on each), or { ambiguous: "rig", rigs, seats } when it matches more than one seat inside one connection. */
-export function pickSeat(rigs, match, { conn, rigId, allowFirst = false } = {}) {
+/** The seat a predicate means across the merged list: `{ rig, seat, conn? }`, `{}` when none, `{ ambiguous: true }` when it matches on more than one
+ *  OpenRig (or an unadoptable unstamped row), or `{ ambiguous: "rig", rigs, seats }` when it matches more than one seat inside one connection. */
+export function pickSeat(rigs, match, { conn = null, rigId = null, config = null, multi = null, allowFirst = false } = {}) {
+  const list = Array.isArray(rigs) ? rigs : [];
+  const { eligible } = partitionRowsByConnection(
+    list,
+    (rig) => !rigId || rig.id === rigId,
+    { conn, config, multi },
+  );
+  const matchSeats = (rig) => {
+    const out = [];
+    if (Array.isArray(rig.pods) && rig.pods.length) {
+      for (const pod of rig.pods) for (const seat of pod?.seats ?? []) if (seat && match(seat, rig, pod)) out.push({ rig, seat });
+    } else if (Array.isArray(rig.seats)) {
+      for (const seat of rig.seats) if (seat && match(seat, rig, null)) out.push({ rig, seat });
+    }
+    return out;
+  };
   const hits = [];
-  for (const rig of Array.isArray(rigs) ? rigs : []) {
-    if (!onConn(rig, conn)) continue;
-    if (rigId && rig.id !== rigId) continue;
-    for (const pod of rig.pods ?? []) for (const seat of pod.seats ?? []) if (match(seat, rig, pod)) hits.push({ rig, seat });
+  for (const entry of eligible) {
+    for (const h of matchSeats(entry.row)) hits.push({ ...h, conn: entry.conn });
   }
-  if (connsOf(hits.map((h) => h.rig)) > 1) return { ambiguous: true };
+  if (new Set(hits.map((h) => h.conn ?? "")).size > 1) return { ambiguous: true };
   if (!allowFirst && hits.length > 1) {
     return {
       ambiguous: "rig",
@@ -370,7 +479,8 @@ export function pickSeat(rigs, match, { conn, rigId, allowFirst = false } = {}) 
       seats: hits.map((h) => `${h.seat?.logicalId ?? h.seat?.member ?? h.seat?.session}@${h.rig?.name}`),
     };
   }
-  return hits[0] ?? {};
+  if (!hits.length) return {};
+  return { rig: hits[0].rig, seat: hits[0].seat, ...(hits[0].conn ? { conn: hits[0].conn } : {}) };
 }
 
 const MACHINE_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
